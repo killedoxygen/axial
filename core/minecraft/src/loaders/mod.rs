@@ -288,13 +288,25 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn rejects_empty_version_ids() {
-        let error = validate_version_id(" \t ", "loader build version id").expect_err("error");
-        assert!(matches!(
-            error,
-            LoaderError::InstallExecutionFailed(message)
-                if message == "loader build version id is empty"
-        ));
+    fn rejects_blank_or_whitespace_padded_version_ids() {
+        for (version_id, expected) in [
+            (" \t ", "loader build version id is empty"),
+            (" \n ", "loader build version id is empty"),
+            (
+                " loader-id ",
+                "loader build version id contains surrounding whitespace",
+            ),
+        ] {
+            let error =
+                validate_version_id(version_id, "loader build version id").expect_err("error");
+            assert!(
+                matches!(
+                    &error,
+                    LoaderError::InstallExecutionFailed(message) if message == expected
+                ),
+                "{version_id:?}: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -308,17 +320,6 @@ mod tests {
                 error
             );
         }
-    }
-
-    #[test]
-    fn rejects_whitespace_padded_version_ids() {
-        let error =
-            validate_version_id(" loader-id ", "loader build version id").expect_err("error");
-        assert!(matches!(
-            error,
-            LoaderError::InstallExecutionFailed(message)
-                if message == "loader build version id contains surrounding whitespace"
-        ));
     }
 
     #[test]

@@ -1902,7 +1902,6 @@ mod tests {
     };
     use crate::loaders::{
         build_id_for, continue_install_build_after_base, installed_version_id_for,
-        validate_version_id,
     };
     use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
     use crate::manifest::VersionManifest;
@@ -4939,27 +4938,6 @@ printf '%s' 'processor-terminal' > "$last"
         assert_loader_component_lane_absent(&root, "assets");
         assert_loader_component_lane_absent(&root, "libraries");
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rejects_whitespace_only_installed_version_id() {
-        let error = validate_version_id(" \n ", "installed loader version id").expect_err("error");
-        assert!(matches!(
-            error,
-            LoaderError::InstallExecutionFailed(message)
-                if message == "installed loader version id is empty"
-        ));
-    }
-
-    #[test]
-    fn rejects_whitespace_padded_installed_version_id() {
-        let error =
-            validate_version_id(" loader-id ", "installed loader version id").expect_err("error");
-        assert!(matches!(
-            error,
-            LoaderError::InstallExecutionFailed(message)
-                if message == "installed loader version id contains surrounding whitespace"
-        ));
     }
 
     #[tokio::test]

@@ -163,6 +163,37 @@ fn seed_catalog(service: &SetupService) {
     .unwrap();
 }
 
+#[cfg(unix)]
+fn use_probe_java(
+    root: &std::path::Path,
+    service: &SetupService,
+    prelude: &str,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let java = root.join("java");
+    std::fs::write(
+        &java,
+        format!(
+            "#!/bin/sh\n{prelude}printf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+            std::env::consts::ARCH,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+    service
+        .settings
+        .update(
+            serde_json::from_value(serde_json::json!({
+                "expected_revision": service.settings.current().unwrap().revision,
+                "java_path_override": java.to_str().unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    java
+}
+
 fn select_unowned_microsoft_account(accounts: &AccountDirectory) {
     use crate::accounts::{microsoft::MinecraftProfile, model::MicrosoftIdentity};
 
@@ -856,6 +887,57 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                 .unwrap_or_else(|| Box::new("reopened roots did not settle")),
         );
     }
+}
+
+fn accept_request(listener: &std::net::TcpListener, label: &str) -> (std::net::TcpStream, Vec<u8>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{label} request was not received"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("{label} fixture accept failed: {error}"),
+        }
+    };
+    let request = read_request_head(&mut stream, label);
+    (stream, request)
+}
+
+fn read_request_head(stream: &mut std::net::TcpStream, label: &str) -> Vec<u8> {
+    use std::io::Read;
+
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut request = [0_u8; 4096];
+    let mut length = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !request[..length]
+        .windows(4)
+        .any(|bytes| bytes == b"\r\n\r\n")
+    {
+        stream
+            .set_read_timeout(Some(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap(),
+            ))
+            .unwrap();
+        assert!(
+            length < request.len(),
+            "{label} request headers exceed their bound"
+        );
+        let read = stream.read(&mut request[length..]).unwrap();
+        assert!(read > 0, "{label} request ended before its headers");
+        length += read;
+    }
+    request[..length].to_vec()
 }
 
 fn profile_build(
@@ -1633,7 +1715,7 @@ async fn dropped_resolution_caller_keeps_owned_fetch_until_shutdown() {
 #[tokio::test]
 async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
     use futures_util::FutureExt;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::time::{Duration, Instant};
 
     let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
@@ -1675,31 +1757,8 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
                 requests.len() < 4,
                 "resolution fixture request bound exceeded"
             );
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 4096];
-            let mut length = 0;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !request[..length]
-                .windows(4)
-                .any(|bytes| bytes == b"\r\n\r\n")
-            {
-                stream
-                    .set_read_timeout(Some(
-                        deadline.checked_duration_since(Instant::now()).unwrap(),
-                    ))
-                    .unwrap();
-                assert!(
-                    length < request.len(),
-                    "resolution request headers exceed their bound"
-                );
-                let read = stream.read(&mut request[length..]).unwrap();
-                assert!(read > 0, "resolution request ended before its headers");
-                length += read;
-            }
-            if request[..length].starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n") {
+            let request = read_request_head(&mut stream, "resolution");
+            if request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n") {
                 let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
                 write!(
                     stream,
@@ -1710,7 +1769,7 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
                 stream.write_all(body).unwrap();
                 requests.push("catalog");
             } else {
-                assert!(request[..length].starts_with(b"GET /unavailable-resolution HTTP/1.1\r\n"));
+                assert!(request.starts_with(b"GET /unavailable-resolution HTTP/1.1\r\n"));
                 stream
                     .write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -2013,8 +2072,8 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
 #[tokio::test]
 async fn shutdown_preserves_created_instance_while_install_provider_is_pending() {
     use futures_util::FutureExt;
-    use std::io::{Read, Write};
-    use std::time::{Duration, Instant};
+    use std::io::Write;
+    use std::time::Duration;
 
     let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
@@ -2037,45 +2096,8 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
         let mut requested = Some(requested);
         let mut routes = Vec::new();
         for path in ["/v2/versions/loader/1.21.4", "/pending-install-resolution"] {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "creation provider request was not received"
-                        );
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("creation fixture accept failed: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 4096];
-            let mut length = 0;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !request[..length]
-                .windows(4)
-                .any(|bytes| bytes == b"\r\n\r\n")
-            {
-                stream
-                    .set_read_timeout(Some(
-                        deadline.checked_duration_since(Instant::now()).unwrap(),
-                    ))
-                    .unwrap();
-                assert!(
-                    length < request.len(),
-                    "creation request headers exceed their bound"
-                );
-                let read = stream.read(&mut request[length..]).unwrap();
-                assert!(read > 0, "creation request ended before its headers");
-                length += read;
-            }
-            assert!(request[..length].starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
+            let (mut stream, request) = accept_request(&listener, "creation provider");
+            assert!(request.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
             let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
             write!(
                 stream,
@@ -2417,8 +2439,8 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
 #[tokio::test]
 async fn explicit_build_resolution_cancels_without_publishing() {
     use futures_util::FutureExt;
-    use std::io::{Read, Write};
-    use std::time::{Duration, Instant};
+    use std::io::Write;
+    use std::time::Duration;
 
     for cancel_fetch in [false, true] {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
@@ -2440,45 +2462,8 @@ async fn explicit_build_resolution_cancels_without_publishing() {
         let (requested, observed) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "explicit build request was not received"
-                        );
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("explicit build fixture accept failed: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 4096];
-            let mut length = 0;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !request[..length]
-                .windows(4)
-                .any(|bytes| bytes == b"\r\n\r\n")
-            {
-                stream
-                    .set_read_timeout(Some(
-                        deadline.checked_duration_since(Instant::now()).unwrap(),
-                    ))
-                    .unwrap();
-                assert!(
-                    length < request.len(),
-                    "explicit build headers exceed their bound"
-                );
-                let read = stream.read(&mut request[length..]).unwrap();
-                assert!(read > 0, "explicit build request ended before its headers");
-                length += read;
-            }
-            assert!(request[..length].starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
+            let (mut stream, request) = accept_request(&listener, "explicit build");
+            assert!(request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
             let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
             write!(
                 stream,
@@ -2796,8 +2781,8 @@ fn loader_picker_retains_owned_fetches_and_rejects_library_drift() {
 
 async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
     use futures_util::FutureExt;
-    use std::io::{Read, Write};
-    use std::time::{Duration, Instant};
+    use std::io::Write;
+    use std::time::Duration;
 
     for (cancel_fetch, drift) in [(false, false), (true, false), (false, true)] {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
@@ -2818,42 +2803,8 @@ async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
         let (requested, observed) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "loader request was not received");
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("loader fixture accept failed: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 4096];
-            let mut length = 0;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !request[..length]
-                .windows(4)
-                .any(|bytes| bytes == b"\r\n\r\n")
-            {
-                stream
-                    .set_read_timeout(Some(
-                        deadline.checked_duration_since(Instant::now()).unwrap(),
-                    ))
-                    .unwrap();
-                assert!(
-                    length < request.len(),
-                    "loader request headers exceed their bound"
-                );
-                let read = stream.read(&mut request[length..]).unwrap();
-                assert!(read > 0, "loader request ended before its headers");
-                length += read;
-            }
-            assert!(request[..length].starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
+            let (mut stream, request) = accept_request(&listener, "loader");
+            assert!(request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
             let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
             write!(
                 stream,
@@ -3184,7 +3135,7 @@ async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
     use axial_minecraft::loaders::types::CachedCatalog;
     use futures_util::FutureExt;
     use std::io::{Read, Write};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     for (hold_manifest, cancel_fetch) in
         [(false, false), (false, true), (true, false), (true, true)]
@@ -3239,45 +3190,8 @@ async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
         let (requested, observed) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "supported-version request was not received"
-                        );
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("supported-version accept failed: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 4096];
-            let mut length = 0;
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !request[..length]
-                .windows(4)
-                .any(|bytes| bytes == b"\r\n\r\n")
-            {
-                stream
-                    .set_read_timeout(Some(
-                        deadline.checked_duration_since(Instant::now()).unwrap(),
-                    ))
-                    .unwrap();
-                assert!(
-                    length < request.len(),
-                    "supported-version request exceeds its bound"
-                );
-                let read = stream.read(&mut request[length..]).unwrap();
-                assert!(read > 0, "supported-version request ended before headers");
-                length += read;
-            }
-            assert!(request[..length].starts_with(request_line));
+            let (mut stream, request) = accept_request(&listener, "supported-version");
+            assert!(request.starts_with(request_line));
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -4096,78 +4010,65 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
 #[test]
 fn list_summary_leaves_content_integrity_to_strict_preflight() {
     use futures_util::FutureExt;
-    use std::os::unix::fs::PermissionsExt;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let (root, service, accounts) = runtime.block_on(async { fixture() });
-    let outcome = runtime.block_on(std::panic::AssertUnwindSafe(async {
-    crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
-    accounts.create_offline_account("SummaryPlayer").unwrap();
-    let java = root.path().join("java");
-    std::fs::write(&java, format!(
-        "#!/bin/sh\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
-        std::env::consts::ARCH,
-    )).unwrap();
-    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
-    service
-        .settings
-        .update(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision": service.settings.current().unwrap().revision,
-                "java_path_override": java.to_str().unwrap(),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    let instance = super::super::create::tests::create(&service.instances, "Summary").await;
-    let healthy = service.list().await;
-    let strict_healthy = service.launch.preflight(instance.id.clone()).await;
-    let client = root.path().join("versions/1.21.4/1.21.4.jar");
-    let mut observations = Vec::new();
-    for (case, change) in [
-        ("same-size client", 0),
-        ("missing client", 1),
-        ("client size drift", 2),
-    ] {
-        let original = std::fs::read(&client).unwrap();
-        match change {
-            0 => std::fs::write(&client, vec![b'x'; original.len()]).unwrap(),
-            1 => std::fs::remove_file(&client).unwrap(),
-            _ => std::fs::write(&client, b"different size").unwrap(),
-        }
-        let rows = service.list().await;
-        let strict = service.launch.preflight(instance.id.clone()).await;
-        std::fs::write(&client, original).unwrap();
-        observations.push((case, rows, strict, change == 0));
-    }
-    let strict_restored = service.launch.preflight(instance.id.clone()).await;
-    let healthy = healthy.unwrap();
-    assert_eq!(healthy.instances.len(), 1);
-    assert!(healthy.instances[0].launchable);
-    assert!(strict_healthy.launchable, "{strict_healthy:?}");
-    assert!(strict_restored.launchable, "{strict_restored:?}");
-    for (case, rows, strict, summary_ready) in observations {
-        let rows = rows.unwrap();
-        assert_eq!(rows.instances.len(), 1, "{case}");
-        let row = &rows.instances[0];
-        assert_eq!(row.instance.id, instance.id, "{case}");
-        assert_eq!(row.launchable, summary_ready, "{case}: {row:?}");
-        assert_eq!(
-            row.launch_action.primary_action,
-            if summary_ready { "launch" } else { "install" },
-            "{case}"
-        );
-        assert!(!strict.launchable, "{case}: {strict:?}");
-        assert_eq!(
-            strict.error.unwrap().code,
-            LaunchError::InstallUnavailable,
-            "{case}"
-        );
-    }
-    }).catch_unwind());
+    let outcome = runtime.block_on(
+        std::panic::AssertUnwindSafe(async {
+            crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+            accounts.create_offline_account("SummaryPlayer").unwrap();
+            use_probe_java(root.path(), &service, "");
+            let instance = super::super::create::tests::create(&service.instances, "Summary").await;
+            let healthy = service.list().await;
+            let strict_healthy = service.launch.preflight(instance.id.clone()).await;
+            let client = root.path().join("versions/1.21.4/1.21.4.jar");
+            let mut observations = Vec::new();
+            for (case, change) in [
+                ("same-size client", 0),
+                ("missing client", 1),
+                ("client size drift", 2),
+            ] {
+                let original = std::fs::read(&client).unwrap();
+                match change {
+                    0 => std::fs::write(&client, vec![b'x'; original.len()]).unwrap(),
+                    1 => std::fs::remove_file(&client).unwrap(),
+                    _ => std::fs::write(&client, b"different size").unwrap(),
+                }
+                let rows = service.list().await;
+                let strict = service.launch.preflight(instance.id.clone()).await;
+                std::fs::write(&client, original).unwrap();
+                observations.push((case, rows, strict, change == 0));
+            }
+            let strict_restored = service.launch.preflight(instance.id.clone()).await;
+            let healthy = healthy.unwrap();
+            assert_eq!(healthy.instances.len(), 1);
+            assert!(healthy.instances[0].launchable);
+            assert!(strict_healthy.launchable, "{strict_healthy:?}");
+            assert!(strict_restored.launchable, "{strict_restored:?}");
+            for (case, rows, strict, summary_ready) in observations {
+                let rows = rows.unwrap();
+                assert_eq!(rows.instances.len(), 1, "{case}");
+                let row = &rows.instances[0];
+                assert_eq!(row.instance.id, instance.id, "{case}");
+                assert_eq!(row.launchable, summary_ready, "{case}: {row:?}");
+                assert_eq!(
+                    row.launch_action.primary_action,
+                    if summary_ready { "launch" } else { "install" },
+                    "{case}"
+                );
+                assert!(!strict.launchable, "{case}: {strict:?}");
+                assert_eq!(
+                    strict.error.unwrap().code,
+                    LaunchError::InstallUnavailable,
+                    "{case}"
+                );
+            }
+        })
+        .catch_unwind(),
+    );
     let stopped = runtime.block_on(
         service
             .instances
@@ -4388,31 +4289,11 @@ async fn unavailable_setup_metadata_does_not_fabricate_resume_or_install_permiss
 #[cfg(unix)]
 async fn accepted_setup_fixture() -> (tempfile::TempDir, SetupService, SetupWork) {
     use crate::content::provenance::{ContentManifest, MANIFEST_FILE, ManifestEntry};
-    use std::os::unix::fs::PermissionsExt;
 
     let (root, mut service, accounts) = fixture();
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
     accounts.create_offline_account("FixturePlayer").unwrap();
-    let java = root.path().join("java");
-    std::fs::write(
-        &java,
-        format!(
-            "#!/bin/sh\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
-            std::env::consts::ARCH,
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
-    service
-        .settings
-        .update(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision": service.settings.current().unwrap().revision,
-                "java_path_override": java.to_str().unwrap(),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+    use_probe_java(root.path(), &service, "");
     let client = ProviderClient::new(ClientConfig::default()).unwrap();
     let content = Arc::new(ContentService::new(client.clone()).unwrap());
     let mutations = Arc::new(ContentMutations::new(
@@ -4507,13 +4388,14 @@ async fn resumed_setup_response_is_ready_after_accepted_admission_releases() {
 }
 
 #[tokio::test]
-async fn detached_setup_resumes_same_intent_after_ready_content_rollback() {
-    detached_setup_ready_resume(false).await;
-}
-
-#[tokio::test]
-async fn detached_setup_retains_intent_when_content_rollback_acknowledgement_is_refused() {
-    detached_setup_ready_resume(true).await;
+async fn detached_setup_resumes_after_ready_content_rollback_or_retains_refused_intent() {
+    for (case, refuse_acknowledgement) in [
+        ("acknowledged rollback resumes the same intent", false),
+        ("refused acknowledgement retains the intent", true),
+    ] {
+        eprintln!("detached setup case: {case}");
+        detached_setup_ready_resume(refuse_acknowledgement).await;
+    }
 }
 
 async fn detached_setup_ready_resume(refuse_acknowledgement: bool) {
@@ -4691,11 +4573,8 @@ async fn detached_setup_ready_resume(refuse_acknowledgement: bool) {
 
     let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let library_id = LibraryId::new();
-    let selector = if refuse_acknowledgement {
-        "instances::setup::readiness_tests::detached_setup_retains_intent_when_content_rollback_acknowledgement_is_refused"
-    } else {
-        "instances::setup::readiness_tests::detached_setup_resumes_same_intent_after_ready_content_rollback"
-    };
+    // The child enters the crash branch before any case-specific work.
+    let selector = "instances::setup::readiness_tests::detached_setup_resumes_after_ready_content_rollback_or_retains_refused_intent";
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", selector, "--nocapture"])
         .env(ROOT, root.path())
@@ -4990,33 +4869,12 @@ async fn panicked_setup_keeps_admission_without_publishing_release() {
 #[cfg(unix)]
 #[tokio::test]
 async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (root, service, accounts) = fixture();
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
     let instance = super::super::create::tests::create(&service.instances, "Readiness").await;
     let versions = service.installed().await.unwrap();
     accounts.create_offline_account("FixturePlayer").unwrap();
-    let java = root.path().join("java");
-    std::fs::write(
-        &java,
-        format!(
-            "#!/bin/sh\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
-            std::env::consts::ARCH,
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
-    service
-        .settings
-        .update(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision": service.settings.current().unwrap().revision,
-                "java_path_override": java.to_str().unwrap(),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+    use_probe_java(root.path(), &service, "");
     let ready = service.enrich(instance.clone(), &versions).await;
     assert!(ready.launchable, "{}", ready.status_detail);
     assert_eq!(ready.launch_action.primary_action, "launch");
@@ -5054,28 +4912,15 @@ async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
 #[cfg(unix)]
 #[tokio::test]
 async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
-    use std::os::unix::fs::PermissionsExt;
-
     let (root, service, accounts) = fixture();
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
     accounts.create_offline_account("GroupedPlayer").unwrap();
-    let java = root.path().join("java");
-    std::fs::write(&java, format!(
-        "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nwhile [ ! -f \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
-        std::env::consts::ARCH,
-    )).unwrap();
-    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-    service
-        .settings
-        .update(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision": service.settings.current().unwrap().revision,
-                "java_path_override": java.to_str().unwrap(),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+    use_probe_java(
+        root.path(),
+        &service,
+        "probe_dir=${0%/*}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nwhile [ ! -f \"$probe_dir/probe-release\" ]; do sleep 0.01; done\n",
+    );
     let first = super::super::create::tests::create(&service.instances, "First ready").await;
     let bad = super::super::create::tests::create(&service.instances, "Bad Java").await;
     let bad = service
@@ -5373,20 +5218,19 @@ async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe(
 
 #[test]
 #[cfg(unix)]
-fn grouped_readiness_blocks_early_rows_when_the_library_scan_changes() {
-    check_grouped_readiness_invalidated(false);
-}
-
-#[test]
-#[cfg(unix)]
-fn grouped_readiness_blocks_cached_rows_when_publication_starts() {
-    check_grouped_readiness_invalidated(true);
+fn grouped_readiness_blocks_rows_when_the_scan_changes_or_publication_starts() {
+    for (case, publication_starts) in [
+        ("library scan changes", false),
+        ("publication starts", true),
+    ] {
+        eprintln!("grouped readiness case: {case}");
+        check_grouped_readiness_invalidated(publication_starts);
+    }
 }
 
 #[cfg(unix)]
 fn check_grouped_readiness_invalidated(publication_starts: bool) {
     use futures_util::FutureExt;
-    use std::os::unix::fs::PermissionsExt;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5399,18 +5243,9 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
     let journey = runtime.block_on(std::panic::AssertUnwindSafe(async {
         crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
         accounts.create_offline_account("GroupedPlayer").unwrap();
-        let java = root.path().join("java");
-        std::fs::write(&java, format!(
-            "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\nfi\nprintf 'java.version = 21.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
-            std::env::consts::ARCH,
-        )).unwrap();
-        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(root.path().join("probe-first"), b"").unwrap();
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-        service.settings.update(serde_json::from_value(serde_json::json!({
-            "expected_revision":service.settings.current().unwrap().revision,
-            "java_path_override":java.to_str().unwrap(),
-        })).unwrap()).unwrap();
+        use_probe_java(root.path(), &service, "probe_dir=${0%/*}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\nfi\n");
         let first = super::super::create::tests::create(&service.instances, "First healthy").await;
         let last = super::super::create::tests::create(&service.instances, "Last healthy").await;
         let input = vec![first.clone(), last];

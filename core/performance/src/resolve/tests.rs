@@ -870,63 +870,28 @@ fn nvidium_is_skipped_when_iris_is_installed() {
 }
 
 #[test]
-fn manifest_without_emergency_disables_is_not_current_schema() {
-    let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 3,
-        "generated_at": "2026-04-02T00:00:00Z",
-        "minimum_app_version": "0.4.0-alpha",
-        "rule_channel": "bundled",
-        "artifacts": [],
-        "compositions": []
-    }))
-    .expect_err("missing emergency_disables should be invalid current schema");
+fn manifest_without_a_required_field_is_not_current_schema() {
+    for field in [
+        "emergency_disables",
+        "artifacts",
+        "minimum_app_version",
+        "rule_channel",
+    ] {
+        let mut manifest = serde_json::json!({
+            "schema_version": 3,
+            "generated_at": "2026-04-02T00:00:00Z",
+            "minimum_app_version": "0.4.0-alpha",
+            "rule_channel": "bundled",
+            "artifacts": [],
+            "compositions": [],
+            "emergency_disables": []
+        });
+        manifest.as_object_mut().unwrap().remove(field).unwrap();
+        let error = serde_json::from_value::<Manifest>(manifest)
+            .expect_err("missing field should be invalid current schema");
 
-    assert!(error.to_string().contains("emergency_disables"));
-}
-
-#[test]
-fn manifest_without_artifacts_is_not_current_schema() {
-    let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 3,
-        "generated_at": "2026-04-02T00:00:00Z",
-        "minimum_app_version": "0.4.0-alpha",
-        "rule_channel": "bundled",
-        "compositions": [],
-        "emergency_disables": []
-    }))
-    .expect_err("missing artifacts should be invalid current schema");
-
-    assert!(error.to_string().contains("artifacts"));
-}
-
-#[test]
-fn manifest_without_minimum_app_version_is_not_current_schema() {
-    let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 3,
-        "generated_at": "2026-04-02T00:00:00Z",
-        "rule_channel": "bundled",
-        "artifacts": [],
-        "compositions": [],
-        "emergency_disables": []
-    }))
-    .expect_err("missing minimum_app_version should be invalid current schema");
-
-    assert!(error.to_string().contains("minimum_app_version"));
-}
-
-#[test]
-fn manifest_without_rule_channel_is_not_current_schema() {
-    let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 3,
-        "generated_at": "2026-04-02T00:00:00Z",
-        "minimum_app_version": "0.4.0-alpha",
-        "artifacts": [],
-        "compositions": [],
-        "emergency_disables": []
-    }))
-    .expect_err("missing rule_channel should be invalid current schema");
-
-    assert!(error.to_string().contains("rule_channel"));
+        assert!(error.to_string().contains(field), "{field}: {error}");
+    }
 }
 
 #[test]
@@ -1361,29 +1326,8 @@ fn validation_accepts_builtin_manifest_and_undeclared_mutual_exclusions() {
 }
 
 #[test]
-fn validation_rejects_blank_managed_mod_mutual_exclusions() {
-    for exclusion in ["", " \t "] {
-        let mut manifest = builtin_manifest().expect("manifest");
-        let artifact_id = {
-            let managed_mod = first_managed_mod_mut(&mut manifest);
-            managed_mod.mutual_exclusions = vec![exclusion.to_string()];
-            managed_mod.artifact_id.clone()
-        };
-
-        assert_error_kind(
-            validate_manifest(&manifest),
-            ResolveError::InvalidManagedModMutualExclusion {
-                artifact_id,
-                field: "entry",
-                value: exclusion.to_string(),
-            },
-        );
-    }
-}
-
-#[test]
-fn validation_rejects_whitespace_padded_managed_mod_mutual_exclusions() {
-    for exclusion in [" iris", "iris "] {
+fn validation_rejects_blank_or_padded_managed_mod_mutual_exclusions() {
+    for exclusion in ["", " \t ", " iris", "iris "] {
         let mut manifest = builtin_manifest().expect("manifest");
         let artifact_id = {
             let managed_mod = first_managed_mod_mut(&mut manifest);

@@ -411,82 +411,60 @@ fn expect_runtime_source_failure(
     }
 }
 
-fn assert_runtime_distribution(text: &str, expected: &str) {
-    assert_eq!(detect_distribution(text), expected);
-}
-
 #[test]
-fn detect_runtime_distribution_favors_graalvm_identity() {
-    assert_runtime_distribution(
-        r#"
+fn detect_runtime_distribution_classifies_vendor_identity() {
+    for (text, expected) in [
+        (
+            r#"
                 java.vendor = Oracle Corporation
                 java.vm.name = GraalVM 64-Bit Server VM
             "#,
-        "graalvm",
-    );
-    assert_runtime_distribution(
-        r#"
+            "graalvm",
+        ),
+        (
+            r#"
                 java.vendor = OpenJDK
                 java.runtime.name = GraalVM Runtime Environment
             "#,
-        "graalvm",
-    );
-}
-
-#[test]
-fn detect_runtime_distribution_classifies_openj9_identity() {
-    for text in [
-        "java.vm.name = Eclipse OpenJ9 VM",
-        "java.runtime.name = IBM Semeru Runtime Open Edition",
-        "java.vm.vendor = IBM Corporation",
-    ] {
-        assert_runtime_distribution(text, "openj9");
-    }
-}
-
-#[test]
-fn detect_runtime_distribution_classifies_temurin_identity() {
-    for text in [
-        "java.runtime.name = OpenJDK Runtime Environment Temurin-21.0.2+13",
-        "java.vendor = Eclipse Adoptium",
-        "java.vm.vendor = Eclipse Foundation",
-    ] {
-        assert_runtime_distribution(text, "temurin");
-    }
-}
-
-#[test]
-fn detect_runtime_distribution_classifies_oracle_identity() {
-    assert_runtime_distribution(
-        r#"
+            "graalvm",
+        ),
+        ("java.vm.name = Eclipse OpenJ9 VM", "openj9"),
+        (
+            "java.runtime.name = IBM Semeru Runtime Open Edition",
+            "openj9",
+        ),
+        ("java.vm.vendor = IBM Corporation", "openj9"),
+        (
+            "java.runtime.name = OpenJDK Runtime Environment Temurin-21.0.2+13",
+            "temurin",
+        ),
+        ("java.vendor = Eclipse Adoptium", "temurin"),
+        ("java.vm.vendor = Eclipse Foundation", "temurin"),
+        (
+            r#"
                 java.vendor   =   Oracle Corporation
                 java.vm.name = Java HotSpot(TM) 64-Bit Server VM
             "#,
-        "oracle",
-    );
-}
-
-#[test]
-fn detect_runtime_distribution_classifies_generic_openjdk_identity() {
-    assert_runtime_distribution(
-        r#"
+            "oracle",
+        ),
+        (
+            r#"
                 java.vendor = Debian
                 java.vm.name = OpenJDK 64-Bit Server VM
                 java.runtime.version = 21.0.5+11-Debian-1
             "#,
-        "openjdk",
-    );
-}
-
-#[test]
-fn detect_runtime_distribution_classifies_missing_identity_as_unknown() {
-    assert_runtime_distribution(
-        r#"
+            "openjdk",
+        ),
+        (
+            r#"
                 java.home = /opt/java
                 sun.arch.data.model = 64
             "#,
-        "unknown",
-    );
+            "unknown",
+        ),
+    ] {
+        assert_eq!(detect_distribution(text), expected, "{text}");
+    }
 }
 
 #[test]
@@ -499,64 +477,37 @@ fn component_manifest_destination_accepts_safe_nested_path() {
 }
 
 #[test]
-fn component_manifest_destination_rejects_traversal() {
-    let temp_dir = Path::new("runtime-temp");
-    let message = unsafe_manifest_path_message(component_manifest_destination(
-        &test_runtime_component(),
-        temp_dir,
-        "bin/../java",
-    ));
-
-    assert!(message.contains("unsafe runtime manifest path"));
-    assert!(message.contains("bin/../java"));
-    assert!(!message.contains("runtime-temp"));
-}
-
-#[test]
-fn component_manifest_destination_rejects_absolute_path() {
-    let temp_dir = Path::new("runtime-temp");
+fn component_manifest_destination_rejects_traversal_absolute_and_drive_paths() {
     let absolute_path = if cfg!(windows) {
         r"\Windows\System32"
     } else {
         "/etc/passwd"
     };
-    let message = unsafe_manifest_path_message(component_manifest_destination(
-        &test_runtime_component(),
-        temp_dir,
+    for relative_path in [
+        "bin/../java",
         absolute_path,
-    ));
-
-    assert!(message.contains("unsafe runtime manifest path"));
-    assert!(message.contains(absolute_path));
-    assert!(!message.contains("runtime-temp"));
-}
-
-#[test]
-fn component_manifest_destination_rejects_drive_like_path_with_slashes() {
-    let temp_dir = Path::new("runtime-temp");
-    let message = unsafe_manifest_path_message(component_manifest_destination(
-        &test_runtime_component(),
-        temp_dir,
         "C:/Windows/System32",
-    ));
-
-    assert!(message.contains("unsafe runtime manifest path"));
-    assert!(message.contains("C:/Windows/System32"));
-    assert!(!message.contains("runtime-temp"));
-}
-
-#[test]
-fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
-    let temp_dir = Path::new("runtime-temp");
-    let message = unsafe_manifest_path_message(component_manifest_destination(
-        &test_runtime_component(),
-        temp_dir,
         r"C:\Windows\System32",
-    ));
+    ] {
+        let message = unsafe_manifest_path_message(component_manifest_destination(
+            &test_runtime_component(),
+            Path::new("runtime-temp"),
+            relative_path,
+        ));
 
-    assert!(message.contains("unsafe runtime manifest path"));
-    assert!(message.contains(r"C:\Windows\System32"));
-    assert!(!message.contains("runtime-temp"));
+        assert!(
+            message.contains("unsafe runtime manifest path"),
+            "{relative_path}: {message}"
+        );
+        assert!(
+            message.contains(relative_path),
+            "{relative_path}: {message}"
+        );
+        assert!(
+            !message.contains("runtime-temp"),
+            "{relative_path}: {message}"
+        );
+    }
 }
 
 #[test]
@@ -2276,39 +2227,33 @@ fn managed_runtime_requires_ready_marker_even_when_java_exists() {
 }
 
 #[test]
-fn structural_runtime_discovery_does_not_parse_empty_manifest_proof() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let root = cache
-        .component_root("java-runtime-delta")
-        .expect("runtime root");
-    write_runtime_executable_fixture(&root);
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-    fs::write(
-        root.join(".axial-runtime-manifest.json"),
-        br#"{"files":{}}"#,
-    )
-    .expect("empty runtime manifest proof");
+fn structural_runtime_discovery_does_not_parse_incomplete_manifest_proof() {
+    for (case, proof) in [
+        ("empty manifest", &br#"{"files":{}}"#[..]),
+        (
+            "missing raw download",
+            br#"{"files":{"bin/java":{"type":"file","downloads":{}}}}"#,
+        ),
+    ] {
+        let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let root = cache
+            .component_root("java-runtime-delta")
+            .expect("runtime root");
+        write_runtime_executable_fixture(&root);
+        fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
+        fs::write(root.join(".axial-runtime-manifest.json"), proof)
+            .expect("incomplete runtime manifest proof");
 
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
-    assert!(!admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
-}
-
-#[test]
-fn structural_runtime_discovery_does_not_parse_missing_raw_download_proof() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let root = cache
-        .component_root("java-runtime-delta")
-        .expect("runtime root");
-    write_runtime_executable_fixture(&root);
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-    fs::write(
-        root.join(".axial-runtime-manifest.json"),
-        br#"{"files":{"bin/java":{"type":"file","downloads":{}}}}"#,
-    )
-    .expect("runtime manifest proof without raw download");
-
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
-    assert!(!admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
+        assert_eq!(
+            detect_runtime_state(&root),
+            RuntimeInstallState::Ready,
+            "{case}"
+        );
+        assert!(
+            !admit_runtime_component(&cache, "java-runtime-delta").contents_verified(),
+            "{case}"
+        );
+    }
 }
 
 #[test]
@@ -2543,78 +2488,63 @@ fn runtime_manifest_selection_reports_unsupported_platform_after_empty_fallbacks
 }
 
 #[test]
-fn mach_o_sniff_detects_thin_arm64_binary_as_compatible() {
-    let mut bytes = Vec::new();
-    bytes.extend(0xfeed_facfu32.to_le_bytes());
-    bytes.extend(0x0100_000cu32.to_le_bytes());
-    bytes.extend([0u8; 24]);
-
-    assert_eq!(
-        parse_mach_o_arm64_compatibility(&bytes),
-        MachOArm64Compatibility::HasArm64Slice
-    );
-}
-
-#[test]
-fn mach_o_sniff_detects_thin_x86_64_binary_as_lacking_arm64() {
-    let mut bytes = Vec::new();
-    bytes.extend(0xfeed_facfu32.to_le_bytes());
-    bytes.extend(0x0100_0007u32.to_le_bytes());
-    bytes.extend([0u8; 24]);
-
-    assert_eq!(
-        parse_mach_o_arm64_compatibility(&bytes),
-        MachOArm64Compatibility::LacksArm64Slice
-    );
-}
-
-#[test]
-fn mach_o_sniff_detects_fat_binary_with_arm64_slice_as_compatible() {
-    let mut bytes = Vec::new();
-    bytes.extend(0xcafe_babeu32.to_be_bytes());
-    bytes.extend(2u32.to_be_bytes());
-    bytes.extend(fat_arch32_be(0x0100_0007));
-    bytes.extend(fat_arch32_be(0x0100_000c));
-
-    assert_eq!(
-        parse_mach_o_arm64_compatibility(&bytes),
-        MachOArm64Compatibility::HasArm64Slice
-    );
-}
-
-#[test]
-fn mach_o_sniff_detects_fat_binary_without_arm64_slice_as_lacking_arm64() {
-    let mut bytes = Vec::new();
-    bytes.extend(0xcafe_babeu32.to_be_bytes());
-    bytes.extend(1u32.to_be_bytes());
-    bytes.extend(fat_arch32_be(0x0100_0007));
-
-    assert_eq!(
-        parse_mach_o_arm64_compatibility(&bytes),
-        MachOArm64Compatibility::LacksArm64Slice
-    );
-}
-
-#[test]
-fn mach_o_sniff_handles_fat64_binary_with_arm64_slice() {
-    let mut bytes = Vec::new();
-    bytes.extend(0xcafe_babfu32.to_be_bytes());
-    bytes.extend(2u32.to_be_bytes());
-    bytes.extend(fat_arch64_be(0x0100_0007));
-    bytes.extend(fat_arch64_be(0x0100_000c));
-
-    assert_eq!(
-        parse_mach_o_arm64_compatibility(&bytes),
-        MachOArm64Compatibility::HasArm64Slice
-    );
-}
-
-#[test]
-fn mach_o_sniff_treats_garbage_as_conservatively_compatible() {
-    assert_eq!(
-        parse_mach_o_arm64_compatibility(b"not a mach-o"),
-        MachOArm64Compatibility::UnknownCompatible
-    );
+fn mach_o_sniff_classifies_arm64_compatibility() {
+    let thin = |cpu: u32| {
+        let mut bytes = Vec::new();
+        bytes.extend(0xfeed_facfu32.to_le_bytes());
+        bytes.extend(cpu.to_le_bytes());
+        bytes.extend([0u8; 24]);
+        bytes
+    };
+    let fat = |magic: u32, arches: &[&[u8]]| {
+        let mut bytes = Vec::new();
+        bytes.extend(magic.to_be_bytes());
+        bytes.extend(u32::try_from(arches.len()).unwrap().to_be_bytes());
+        for arch in arches {
+            bytes.extend_from_slice(arch);
+        }
+        bytes
+    };
+    for (case, bytes, expected) in [
+        (
+            "thin arm64",
+            thin(0x0100_000c),
+            MachOArm64Compatibility::HasArm64Slice,
+        ),
+        (
+            "thin x86_64",
+            thin(0x0100_0007),
+            MachOArm64Compatibility::LacksArm64Slice,
+        ),
+        (
+            "fat with arm64",
+            fat(
+                0xcafe_babe,
+                &[&fat_arch32_be(0x0100_0007), &fat_arch32_be(0x0100_000c)],
+            ),
+            MachOArm64Compatibility::HasArm64Slice,
+        ),
+        (
+            "fat without arm64",
+            fat(0xcafe_babe, &[&fat_arch32_be(0x0100_0007)]),
+            MachOArm64Compatibility::LacksArm64Slice,
+        ),
+        (
+            "fat64 with arm64",
+            fat(
+                0xcafe_babf,
+                &[&fat_arch64_be(0x0100_0007), &fat_arch64_be(0x0100_000c)],
+            ),
+            MachOArm64Compatibility::HasArm64Slice,
+        ),
+        (
+            "garbage",
+            b"not a mach-o".to_vec(),
+            MachOArm64Compatibility::UnknownCompatible,
+        ),
+    ] {
+        assert_eq!(parse_mach_o_arm64_compatibility(&bytes), expected, "{case}");
+    }
 }
 
 #[test]
@@ -3176,120 +3106,56 @@ async fn managed_runtime_admission_rejects_unsafe_sizes_before_effects() {
 }
 
 #[tokio::test]
-async fn managed_runtime_admission_rejects_case_aliases_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let file = downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000");
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            ("bin/java.exe".to_string(), file.clone()),
-            ("BIN/JAVA.EXE".to_string(), file),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_explicit_folded_prefix_alias_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            ("bin".to_string(), manifest_file("directory")),
-            (
-                "BIN/java".to_string(),
-                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
-            ),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_implicit_folded_prefix_alias_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let file = downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000");
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            ("bin/a".to_string(), file.clone()),
-            ("BIN/b".to_string(), file),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_case_mismatched_link_target_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            (
-                "legal/base/LICENSE".to_string(),
-                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
-            ),
-            (
-                "legal/module/LICENSE".to_string(),
-                manifest_link("../BASE/LICENSE"),
-            ),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_dangling_link_target_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            (
-                "bin/java".to_string(),
-                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
-            ),
-            (
-                "legal/module/LICENSE".to_string(),
-                manifest_link("../base/LICENSE"),
-            ),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_backslash_link_target_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            (
-                "legal/base/LICENSE".to_string(),
-                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
-            ),
-            (
-                "legal/module/LICENSE".to_string(),
-                manifest_link(r"..\base\LICENSE"),
-            ),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_link_loop_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            (
-                "bin/java".to_string(),
-                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
-            ),
-            ("legal/loop".to_string(), manifest_link("loop")),
-        ]),
-    };
-
-    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+async fn managed_runtime_admission_rejects_aliases_and_invalid_links_before_effects() {
+    fn file(url: &str) -> ComponentManifestFile {
+        downloadable_manifest_file(url, 1, "0000000000000000000000000000000000000000")
+    }
+    let cases: [(&str, fn(&str) -> Vec<(&'static str, ComponentManifestFile)>); 7] = [
+        ("case aliases", |url| {
+            vec![("bin/java.exe", file(url)), ("BIN/JAVA.EXE", file(url))]
+        }),
+        ("explicit folded prefix alias", |url| {
+            vec![("bin", manifest_file("directory")), ("BIN/java", file(url))]
+        }),
+        ("implicit folded prefix alias", |url| {
+            vec![("bin/a", file(url)), ("BIN/b", file(url))]
+        }),
+        ("case-mismatched link target", |url| {
+            vec![
+                ("legal/base/LICENSE", file(url)),
+                ("legal/module/LICENSE", manifest_link("../BASE/LICENSE")),
+            ]
+        }),
+        ("dangling link target", |url| {
+            vec![
+                ("bin/java", file(url)),
+                ("legal/module/LICENSE", manifest_link("../base/LICENSE")),
+            ]
+        }),
+        ("backslash link target", |url| {
+            vec![
+                ("legal/base/LICENSE", file(url)),
+                ("legal/module/LICENSE", manifest_link(r"..\base\LICENSE")),
+            ]
+        }),
+        ("link loop", |url| {
+            vec![
+                ("bin/java", file(url)),
+                ("legal/loop", manifest_link("loop")),
+            ]
+        }),
+    ];
+    for (case, files) in cases {
+        eprintln!("runtime admission case: {case}");
+        let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+        let manifest = ComponentManifest {
+            files: files(&url)
+                .into_iter()
+                .map(|(path, file)| (path.to_string(), file))
+                .collect(),
+        };
+        assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+    }
 }
 
 #[test]
@@ -3618,61 +3484,42 @@ fn runtime_with_non_executable_java_is_broken() {
 }
 
 #[test]
-fn runtime_download_verification_accepts_matching_metadata() {
-    let result = verify_runtime_download(
-        "bin/java",
-        &expected(Some(5), Some("AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D")),
-        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
-    );
+fn runtime_download_verification_compares_only_declared_metadata() {
+    const ACTUAL_SHA1: &str = "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d";
+    for (case, size, sha1, outcome) in [
+        (
+            "matching metadata",
+            Some(5),
+            Some("AAF4C61DDCC5E8A2DABEDE0F3B482CD9AEA9434D"),
+            Ok(()),
+        ),
+        (
+            "size mismatch",
+            Some(6),
+            None,
+            Err(RuntimeDownloadIntegrityError::SizeMismatch {
+                file: "bin/java".to_string(),
+                expected: 6,
+                actual: 5,
+            }),
+        ),
+        (
+            "sha1 mismatch",
+            None,
+            Some("0000000000000000000000000000000000000000"),
+            Err(RuntimeDownloadIntegrityError::Sha1Mismatch {
+                file: "bin/java".to_string(),
+                expected: "0000000000000000000000000000000000000000".to_string(),
+                actual: ACTUAL_SHA1.to_string(),
+            }),
+        ),
+        ("missing metadata", None, None, Ok(())),
+    ] {
+        let result =
+            verify_runtime_download("bin/java", &expected(size, sha1), &actual(5, ACTUAL_SHA1));
 
-    assert_eq!(result, Ok(()));
-}
-
-#[test]
-fn runtime_download_verification_rejects_size_mismatch() {
-    let result = verify_runtime_download(
-        "bin/java",
-        &expected(Some(6), None),
-        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
-    );
-
-    assert_eq!(
-        result,
-        Err(RuntimeDownloadIntegrityError::SizeMismatch {
-            file: "bin/java".to_string(),
-            expected: 6,
-            actual: 5,
-        })
-    );
-}
-
-#[test]
-fn runtime_download_verification_rejects_sha1_mismatch() {
-    let result = verify_runtime_download(
-        "bin/java",
-        &expected(None, Some("0000000000000000000000000000000000000000")),
-        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
-    );
-
-    assert_eq!(
-        result,
-        Err(RuntimeDownloadIntegrityError::Sha1Mismatch {
-            file: "bin/java".to_string(),
-            expected: "0000000000000000000000000000000000000000".to_string(),
-            actual: "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d".to_string(),
-        })
-    );
-}
-
-#[test]
-fn runtime_download_verification_accepts_missing_metadata() {
-    let result = verify_runtime_download(
-        "bin/java",
-        &expected(None, None),
-        &actual(5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d"),
-    );
-
-    assert_eq!(result, Ok(()));
+        assert_eq!(result, outcome, "{case}");
+    }
 }
 
 #[tokio::test]
@@ -3827,34 +3674,42 @@ async fn runtime_file_download_rejects_oversized_content_length() {
 }
 
 #[tokio::test]
-async fn runtime_manifest_file_requires_checksum_proof() {
-    let root = unique_temp_root("axial-runtime-missing-checksum-test");
-    let file = ComponentManifestFile {
-        kind: "file".to_string(),
-        executable: false,
-        downloads: Some(ComponentManifestDownloads {
-            raw: Some(ComponentManifestDownload {
-                url: "https://example.test/runtime.bin".to_string(),
-                sha1: None,
-                size: Some(4),
+async fn runtime_manifest_file_requires_valid_checksum_proof() {
+    for (case, sha1) in [
+        ("missing", None),
+        ("invalid", Some("not-a-sha1".to_string())),
+    ] {
+        let root = unique_temp_root("axial-runtime-checksum-proof-test");
+        let file = ComponentManifestFile {
+            kind: "file".to_string(),
+            executable: false,
+            downloads: Some(ComponentManifestDownloads {
+                raw: Some(ComponentManifestDownload {
+                    url: "https://example.test/runtime.bin".to_string(),
+                    sha1,
+                    size: Some(4),
+                }),
+                lzma: None,
             }),
-            lzma: None,
-        }),
-        target: None,
-    };
+            target: None,
+        };
 
-    let result =
-        install_runtime_manifest_file(&test_runtime_component(), &root, "bin/java", file).await;
+        let result =
+            install_runtime_manifest_file(&test_runtime_component(), &root, "bin/java", file).await;
 
-    assert!(matches!(
-        result,
-        Err(JavaRuntimeLookupError::RuntimeSource(failure))
-            if failure.component() == &test_runtime_component()
-                && failure.kind() == RuntimeSourceFailureKind::MetadataInvalid
-                && failure.detail().contains("missing checksum proof")
-    ));
-    assert!(!root.join("bin").join("java").exists());
-    let _ = fs::remove_dir_all(root);
+        assert!(
+            matches!(
+                result,
+                Err(JavaRuntimeLookupError::RuntimeSource(failure))
+                    if failure.component() == &test_runtime_component()
+                        && failure.kind() == RuntimeSourceFailureKind::MetadataInvalid
+                        && failure.detail().contains("missing checksum proof")
+            ),
+            "{case}"
+        );
+        assert!(!root.join("bin").join("java").exists(), "{case}");
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[tokio::test]
@@ -3880,37 +3735,6 @@ async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
         fs::read(root.join("bin").join("java")).expect("decompressed runtime file"),
         raw_bytes
     );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
-    let root = unique_temp_root("axial-runtime-invalid-checksum-test");
-    let file = ComponentManifestFile {
-        kind: "file".to_string(),
-        executable: false,
-        downloads: Some(ComponentManifestDownloads {
-            raw: Some(ComponentManifestDownload {
-                url: "https://example.test/runtime.bin".to_string(),
-                sha1: Some("not-a-sha1".to_string()),
-                size: Some(4),
-            }),
-            lzma: None,
-        }),
-        target: None,
-    };
-
-    let result =
-        install_runtime_manifest_file(&test_runtime_component(), &root, "bin/java", file).await;
-
-    assert!(matches!(
-        result,
-        Err(JavaRuntimeLookupError::RuntimeSource(failure))
-            if failure.component() == &test_runtime_component()
-                && failure.kind() == RuntimeSourceFailureKind::MetadataInvalid
-                && failure.detail().contains("missing checksum proof")
-    ));
-    assert!(!root.join("bin").join("java").exists());
     let _ = fs::remove_dir_all(root);
 }
 

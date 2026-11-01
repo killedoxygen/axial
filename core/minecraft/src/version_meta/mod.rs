@@ -933,47 +933,24 @@ mod tests {
     }
 
     #[test]
-    fn orders_release_candidate_between_release_and_pre_release() {
-        assert_eq!(
-            compare_version_like("1.21.11", "1.21.11-rc3"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            compare_version_like("1.21.11-rc3", "1.21.11-pre5"),
-            std::cmp::Ordering::Greater
-        );
-    }
+    fn orders_prereleases_snapshots_and_special_families() {
+        use std::cmp::Ordering::{Greater, Less};
 
-    #[test]
-    fn orders_weekly_snapshots_by_year_and_week() {
-        assert_eq!(
-            compare_version_like("25w46a", "25w45b"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            compare_version_like("26w01a", "25w46a"),
-            std::cmp::Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn orders_release_snapshot_after_anchor_and_before_next_release() {
-        assert_eq!(
-            compare_version_like("26.1-snapshot-9", "26.1"),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            compare_version_like("26.1-snapshot-9", "26.1.1"),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    #[test]
-    fn anchors_special_snapshot_families_to_their_release_line() {
-        assert_eq!(
-            compare_version_like("1.18_experimentaI-snapshot-6", "1.16_combat-3"),
-            std::cmp::Ordering::Greater
-        );
+        for (left, right, expected) in [
+            ("1.21.11", "1.21.11-rc3", Greater),
+            ("1.21.11-rc3", "1.21.11-pre5", Greater),
+            ("25w46a", "25w45b", Greater),
+            ("26w01a", "25w46a", Greater),
+            ("26.1-snapshot-9", "26.1", Greater),
+            ("26.1-snapshot-9", "26.1.1", Less),
+            ("1.18_experimentaI-snapshot-6", "1.16_combat-3", Greater),
+        ] {
+            assert_eq!(
+                compare_version_like(left, right),
+                expected,
+                "{left} vs {right}"
+            );
+        }
     }
 
     #[test]

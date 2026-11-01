@@ -1113,6 +1113,27 @@ impl Api {
         serde_json::from_str(&body).unwrap()
     }
 
+    async fn response(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut request = self
+            .client
+            .request(method, format!("{}{path}", self.base))
+            .header(transport::CAPABILITY_HEADER, &self.capability);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        (response.status(), response.json().await.unwrap())
+    }
+
+    async fn read(&self, path: &str) -> (StatusCode, Value) {
+        self.response(reqwest::Method::GET, path, None).await
+    }
+
     async fn get(&self, path: &str) -> Value {
         self.request(reqwest::Method::GET, path, None).await
     }
@@ -1185,6 +1206,57 @@ impl Events {
             assert!(self.buffered.len() <= 1 << 20, "bounded fixture stream");
         }
     }
+}
+
+fn installed_files(root: &std::path::Path, extra: &[&str]) -> Vec<(PathBuf, Vec<u8>)> {
+    let classifier = if cfg!(target_os = "macos") {
+        "natives-macos"
+    } else {
+        "natives-linux"
+    };
+    let asset_hash = sha1(ASSET);
+    [
+        format!("versions/{VERSION}/{VERSION}.json"),
+        format!("versions/{VERSION}/{VERSION}.jar"),
+        "libraries/org/axial/fixture/1.0/fixture-1.0.jar".to_owned(),
+        format!("libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"),
+        "assets/log_configs/fixture-log.xml".to_owned(),
+        "assets/indexes/fixture-assets.json".to_owned(),
+        format!("assets/objects/{}/{asset_hash}", &asset_hash[..2]),
+    ]
+    .into_iter()
+    .chain(extra.iter().map(|relative| (*relative).to_owned()))
+    .map(|relative| {
+        let path = root.join(relative);
+        let bytes = std::fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect()
+}
+
+async fn configure_offline(api: &Api, config: Value) -> (Value, Value) {
+    let account = api
+        .post(
+            "/api/v1/accounts/offline",
+            json!({"username":PLAYER,"expected_selection_revision":0}),
+        )
+        .await;
+    let config = api
+        .request(reqwest::Method::PUT, "/api/v1/config", Some(config))
+        .await;
+    (account, config)
+}
+
+async fn install_vanilla(api: &Api) -> Value {
+    let start = api
+        .post(
+            "/api/v1/install/queue",
+            json!({"kind":"vanilla","version_id":VERSION}),
+        )
+        .await;
+    let terminal = install_terminal(api, &start).await;
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    terminal
 }
 
 async fn install_terminal(api: &Api, start: &Value) -> Value {
@@ -1376,24 +1448,18 @@ const PREPARED_PROVIDER: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_PROVIDER";
 const PREPARED_QUEUED: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_QUEUED";
 const PREPARED_ACTION: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_ACTION";
 
+// Each case owns its profile, provider and crash child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_prepared_performance_apply_resumes_queued_without_blocking_startup() {
-    prepared_performance_restart_journey(true, "apply", false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_prepared_performance_apply_resumes_synchronous_without_blocking_startup() {
-    prepared_performance_restart_journey(false, "apply", false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_prepared_performance_reapply_resumes_synchronous_without_blocking_startup() {
-    prepared_performance_restart_journey(false, "reapply", false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_prepared_performance_rejects_changed_provider_graph_without_file_effects() {
-    prepared_performance_restart_journey(true, "apply", true).await;
+async fn real_prepared_performance_resumes_or_rejects_without_blocking_startup() {
+    for (case, queued, action, changed_graph) in [
+        ("queued apply resumes", true, "apply", false),
+        ("synchronous apply resumes", false, "apply", false),
+        ("synchronous reapply resumes", false, "reapply", false),
+        ("changed provider graph is rejected", true, "apply", true),
+    ] {
+        eprintln!("prepared performance case: {case}");
+        prepared_performance_restart_journey(queued, action, changed_graph).await;
+    }
 }
 
 async fn prepared_performance_restart_journey(queued: bool, action: &str, changed_graph: bool) {
@@ -1599,17 +1665,10 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
                 Value::Null,
             ),
         ] {
-            let response = api
-                .client
-                .request(method, format!("{}{path}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability)
-                .json(&body)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+            let (status, response) = api.response(method, &path, Some(body)).await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
             assert_eq!(
-                response.json::<Value>().await.unwrap(),
+                response,
                 json!({
                     "error":axial_app::instances::model::InstanceError::Busy.to_string()
                 })
@@ -1825,19 +1884,17 @@ async fn ping_fixture_channels(channels: &mut [tokio::net::TcpStream]) {
     .expect("both exact fixture processes must still be alive");
 }
 
+// Each case owns its profile, provider and crash child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_interrupted_launch_preserves_quit_and_restores_fences() {
-    interrupted_launch_preservation_journey(false, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_external_interrupted_launch_preserves_quit_and_restores_fences() {
-    interrupted_launch_preservation_journey(false, true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_interrupted_benchmark_driver_does_not_repeat_unknown_session() {
-    interrupted_launch_preservation_journey(true, false).await;
+async fn real_interrupted_launch_preserves_quit_and_does_not_repeat_unknown_session() {
+    for (case, benchmark, existing) in [
+        ("managed library launch", false, false),
+        ("external library launch", false, true),
+        ("benchmark driver", true, false),
+    ] {
+        eprintln!("interrupted launch case: {case}");
+        interrupted_launch_preservation_journey(benchmark, existing).await;
+    }
 }
 
 async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool) {
@@ -1856,27 +1913,12 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
         assert_external_library(&services, &profile, selection);
     }
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
+    configure_offline(
+        &api,
+        json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
     )
     .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
-            "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-        })),
-    )
-    .await;
-    let install = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    let terminal = install_terminal(&api, &install).await;
-    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -2075,16 +2117,15 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
             assert_eq!(retained["runs"][0]["launch_intent"], intent);
             assert_eq!(retained["runs"][1], suite["runs"][1]);
         } else {
-            let replay = api
-                .client
-                .post(format!("{}/api/v1/launch", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability)
-                .json(&json!({"instance_id":instance,"intent_key":intent}))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(replay.status(), reqwest::StatusCode::CONFLICT);
-            assert_eq!(replay.json::<Value>().await.unwrap()["code"], "interrupted");
+            let (status, replay) = api
+                .response(
+                    reqwest::Method::POST,
+                    "/api/v1/launch",
+                    Some(json!({"instance_id":instance,"intent_key":intent})),
+                )
+                .await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
+            assert_eq!(replay["code"], "interrupted");
         }
         for (method, path, body) in [
             (
@@ -2098,17 +2139,10 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
                 Value::Null,
             ),
         ] {
-            let response = api
-                .client
-                .request(method, format!("{}{path}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability)
-                .json(&body)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+            let (status, response) = api.response(method, &path, Some(body)).await;
+            assert_eq!(status, reqwest::StatusCode::CONFLICT);
             assert_eq!(
-                response.json::<Value>().await.unwrap(),
+                response,
                 json!({
                     "error":axial_app::instances::model::InstanceError::Busy.to_string()
                 })
@@ -2285,27 +2319,12 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
     let mut processes = BTreeSet::new();
     let journey = std::panic::AssertUnwindSafe(async {
         let api = Api::new(&services);
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
+        configure_offline(
+            &api,
+            json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
         )
         .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({
-                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-            })),
-        )
-        .await;
-        let install = api
-            .post(
-                "/api/v1/install/queue",
-                json!({"kind":"vanilla","version_id":VERSION}),
-            )
-            .await;
-        let terminal = install_terminal(&api, &install).await;
-        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        install_vanilla(&api).await;
         let created = api
             .post(
                 "/api/v1/instances",
@@ -2363,16 +2382,13 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
 
         // No task-owner idle wait or mutation retry separates Stop from Resume.
         for (action, state) in [("stop", "stopped"), ("resume", "running")] {
-            let response = api
-                .client
-                .post(format!("{}{driver_path}/{action}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability)
-                .json(&json!({}))
-                .send()
-                .await
-                .unwrap();
-            let status = response.status();
-            let body: Value = response.json().await.unwrap();
+            let (status, body) = api
+                .response(
+                    reqwest::Method::POST,
+                    &format!("{driver_path}/{action}"),
+                    Some(json!({})),
+                )
+                .await;
             let checkpoint = api.get(&driver_path).await;
             assert_eq!(
                 status,
@@ -2597,27 +2613,12 @@ async fn benchmark_driver_automatically_resumes_remaining_run_once() {
             .unwrap(),
         );
         let api = Api::new(services.as_ref().unwrap());
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
+        configure_offline(
+            &api,
+            json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
         )
         .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({
-                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-            })),
-        )
-        .await;
-        let install = api
-            .post(
-                "/api/v1/install/queue",
-                json!({"kind":"vanilla","version_id":VERSION}),
-            )
-            .await;
-        let terminal = install_terminal(&api, &install).await;
-        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        install_vanilla(&api).await;
         let created = api
             .post(
                 "/api/v1/instances",
@@ -2934,27 +2935,12 @@ async fn real_observed_settlement_survives_report_failure_and_process_restart() 
         .await
         .unwrap();
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
+    configure_offline(
+        &api,
+        json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
     )
     .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
-            "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-        })),
-    )
-    .await;
-    let install = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    let terminal = install_terminal(&api, &install).await;
-    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -3114,28 +3100,15 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
         .await
         .unwrap();
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
+    let (_, config) = configure_offline(
+        &api,
+        json!({
+            "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
+            "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
+        }),
     )
     .await;
-    let config = api
-        .request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({
-                "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
-                "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
-            })),
-        )
-        .await;
-    let start = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -3311,27 +3284,12 @@ async fn publication_preflight(retain_runtime: &mut bool) {
     };
     let api = Api::new(&services);
     let journey = std::panic::AssertUnwindSafe(async {
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
+        configure_offline(
+            &api,
+            json!({"expected_revision":0,"performance_mode":"vanilla"}),
         )
         .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
-        )
-        .await;
-        let install = api
-            .post(
-                "/api/v1/install/queue",
-                json!({"kind":"vanilla","version_id":VERSION}),
-            )
-            .await;
-        assert_eq!(
-            install_terminal(&api, &install).await["outcome"],
-            "succeeded"
-        );
+        install_vanilla(&api).await;
         let created = api
             .post(
                 "/api/v1/instances",
@@ -3351,19 +3309,9 @@ async fn publication_preflight(retain_runtime: &mut bool) {
         let instance = created["id"].as_str().unwrap().to_owned();
         let sibling = second["id"].as_str().unwrap().to_owned();
         let detail_path = format!("/api/v1/instances/{instance}");
-        let read_projection = |path: &str| {
-            let request = api
-                .client
-                .get(format!("{}{path}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability);
-            async move {
-                let response = request.send().await.unwrap();
-                (response.status(), response.json::<Value>().await.unwrap())
-            }
-        };
         assert_eq!(api.get(&preflight).await["launchable"], true);
-        let ready_detail = read_projection(&detail_path).await;
-        let ready_list = read_projection("/api/v1/instances").await;
+        let ready_detail = api.read(&detail_path).await;
+        let ready_list = api.read("/api/v1/instances").await;
         let pin = services.library.admit().unwrap();
         let operation = pin.managed_library().unwrap();
         let root = pin.read_projection().unwrap();
@@ -3379,28 +3327,23 @@ async fn publication_preflight(retain_runtime: &mut bool) {
         let mut changed_client = original_client.clone();
         changed_client[0] ^= 0xff;
         std::fs::write(client, changed_client).unwrap();
-        let summary_detail = read_projection(&detail_path).await;
-        let summary_list = read_projection("/api/v1/instances").await;
+        let summary_detail = api.read(&detail_path).await;
+        let summary_list = api.read("/api/v1/instances").await;
         let private_args = "-Dsummary.private.arguments=retained";
-        let summary_update = api
-            .client
-            .put(format!("{}{detail_path}", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({
-                "expected_revision":created["revision"],
-                "name":"Summary updated",
-                "java_path":COMPONENT,
-                "extra_jvm_args":private_args
-            }))
-            .send()
-            .await
-            .unwrap();
-        let summary_updated = (
-            summary_update.status(),
-            summary_update.json::<Value>().await.unwrap(),
-        );
-        let updated_detail = read_projection(&detail_path).await;
-        let updated_list = read_projection("/api/v1/instances").await;
+        let summary_updated = api
+            .response(
+                reqwest::Method::PUT,
+                &detail_path,
+                Some(json!({
+                    "expected_revision":created["revision"],
+                    "name":"Summary updated",
+                    "java_path":COMPONENT,
+                    "extra_jvm_args":private_args
+                })),
+            )
+            .await;
+        let updated_detail = api.read(&detail_path).await;
+        let updated_list = api.read("/api/v1/instances").await;
         let private_updated = services
             .instances
             .registry()
@@ -3416,13 +3359,13 @@ async fn publication_preflight(retain_runtime: &mut bool) {
             axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
         let started = std::time::Instant::now();
         let busy = api.get(&preflight).await;
-        let busy_detail = read_projection(&detail_path).await;
-        let busy_list = read_projection("/api/v1/instances").await;
+        let busy_detail = api.read(&detail_path).await;
+        let busy_list = api.read("/api/v1/instances").await;
         let elapsed = started.elapsed();
         drop(publication);
         let recovered = api.get(&preflight).await;
-        let recovered_detail = read_projection(&detail_path).await;
-        let recovered_list = read_projection("/api/v1/instances").await;
+        let recovered_detail = api.read(&detail_path).await;
+        let recovered_list = api.read("/api/v1/instances").await;
         let target_busy_guard = services
             .instances
             .directories()
@@ -3437,40 +3380,36 @@ async fn publication_preflight(retain_runtime: &mut bool) {
         let conflict = b"non-directory publication lane";
         std::fs::write(&lane, conflict).unwrap();
         let unsafe_lane = api.get(&preflight).await;
-        let unsafe_detail = read_projection(&detail_path).await;
-        let unsafe_list = read_projection("/api/v1/instances").await;
+        let unsafe_detail = api.read(&detail_path).await;
+        let unsafe_list = api.read("/api/v1/instances").await;
         let conflict_after = std::fs::read(&lane).unwrap();
         std::fs::remove_file(&lane).unwrap();
         std::fs::rename(&retained_lane, &lane).unwrap();
         let restored = api.get(&preflight).await;
-        let restored_detail = read_projection(&detail_path).await;
-        let restored_list = read_projection("/api/v1/instances").await;
+        let restored_detail = api.read(&detail_path).await;
+        let restored_list = api.read("/api/v1/instances").await;
         let publication =
             axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
-        let update = api
-            .client
-            .put(format!("{}{detail_path}", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({
-                "expected_revision":summary_updated.1["revision"],
-                "name":"Publication updated"
-            }))
-            .send()
-            .await
-            .unwrap();
-        let updated = (update.status(), update.json::<Value>().await.unwrap());
-        let duplicate = api
-            .client
-            .post(format!("{}{detail_path}/duplicate", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({"name":"Publication duplicate"}))
-            .send()
-            .await
-            .unwrap();
-        let duplicated = (duplicate.status(), duplicate.json::<Value>().await.unwrap());
+        let updated = api
+            .response(
+                reqwest::Method::PUT,
+                &detail_path,
+                Some(json!({
+                    "expected_revision":summary_updated.1["revision"],
+                    "name":"Publication updated"
+                })),
+            )
+            .await;
+        let duplicated = api
+            .response(
+                reqwest::Method::POST,
+                &format!("{detail_path}/duplicate"),
+                Some(json!({"name":"Publication duplicate"})),
+            )
+            .await;
         drop(publication);
-        let committed_detail = read_projection(&detail_path).await;
-        let committed_list = read_projection("/api/v1/instances").await;
+        let committed_detail = api.read(&detail_path).await;
+        let committed_list = api.read("/api/v1/instances").await;
         let pending = api.get("/api/v1/instances/pending").await;
         let requests_after = provider.state.requests.lock().unwrap().clone();
         let queue_after = api.get("/api/v1/install/queue").await;
@@ -3738,27 +3677,8 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
     let api = Api::new(&services);
     let mut processes = BTreeSet::new();
     let journey = std::panic::AssertUnwindSafe(async {
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
-        )
-        .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
-        )
-        .await;
-        let install = api
-            .post(
-                "/api/v1/install/queue",
-                json!({"kind":"vanilla","version_id":VERSION}),
-            )
-            .await;
-        assert_eq!(
-            install_terminal(&api, &install).await["outcome"],
-            "succeeded"
-        );
+        configure_offline(&api, json!({"expected_revision":0,"performance_mode":"vanilla"})).await;
+        install_vanilla(&api).await;
         let created = api
             .post(
                 "/api/v1/instances",
@@ -3781,38 +3701,9 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
             original_client,
             provider.state.routes["GET /artifacts/client.jar"]
         );
-        let classifier = if cfg!(target_os = "macos") {
-            "natives-macos"
-        } else {
-            "natives-linux"
-        };
-        let asset_hash = sha1(ASSET);
-        let protected: Vec<_> = [
-            format!("versions/{VERSION}/{VERSION}.json"),
-            format!("versions/{VERSION}/{VERSION}.jar"),
-            "libraries/org/axial/fixture/1.0/fixture-1.0.jar".to_owned(),
-            format!("libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"),
-            "assets/log_configs/fixture-log.xml".to_owned(),
-            "assets/indexes/fixture-assets.json".to_owned(),
-            format!("assets/objects/{}/{asset_hash}", &asset_hash[..2]),
-        ]
-        .into_iter()
-        .map(|relative| {
-            let path = root.join(relative);
-            let bytes = std::fs::read(&path).unwrap();
-            (path, bytes)
-        })
-        .collect();
+        let protected = installed_files(&root, &[]);
         let queue_before = api.get("/api/v1/install/queue").await;
         let requests_before = provider.state.requests.lock().unwrap().clone();
-        let read_projection = |path: &str| {
-            let request = api.client.get(format!("{}{path}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability);
-            async move {
-                let response = request.send().await.unwrap();
-                (response.status(), response.json::<Value>().await.unwrap())
-            }
-        };
         // This is an external library entry, not another accepted installation.
         let unrelated = root.join("versions/external-degraded-entry");
         assert!(std::fs::symlink_metadata(&unrelated)
@@ -3821,22 +3712,20 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
         let metadata = unrelated.join("external-degraded-entry.json");
         let malformed = b"{not valid version metadata\n";
         std::fs::write(&metadata, malformed).unwrap();
-        let degraded_versions = read_projection("/api/v1/versions").await;
-        let degraded = read_projection(&preflight_path).await;
-        let degraded_detail = read_projection(&detail_path).await;
-        let degraded_list = read_projection("/api/v1/instances").await;
+        let degraded_versions = api.read("/api/v1/versions").await;
+        let degraded = api.read(&preflight_path).await;
+        let degraded_detail = api.read(&detail_path).await;
+        let degraded_list = api.read("/api/v1/instances").await;
         let intact: Vec<_> = protected.iter()
             .map(|(path, _)| std::fs::read(path).unwrap()).collect();
         let malformed_after = std::fs::read(&metadata).unwrap();
-        let response = api.client
-            .post(format!("{}/api/v1/launch", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
-            .send()
-            .await
-            .unwrap();
-        let play_status = response.status();
-        let play_body: Value = response.json().await.unwrap();
+        let (play_status, play_body) = api
+            .response(
+                reqwest::Method::POST,
+                "/api/v1/launch",
+                Some(json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()})),
+            )
+            .await;
         if play_status.is_success() {
             let session = play_body["session_id"].as_str().unwrap();
             processes.extend(observe_and_stop_session(&api, session).await);
@@ -3847,10 +3736,10 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
         std::fs::remove_file(&client).unwrap();
         let missing_before = std::fs::symlink_metadata(&client)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        let combined_versions = read_projection("/api/v1/versions").await;
-        let combined = read_projection(&preflight_path).await;
-        let combined_detail = read_projection(&detail_path).await;
-        let combined_list = read_projection("/api/v1/instances").await;
+        let combined_versions = api.read("/api/v1/versions").await;
+        let combined = api.read(&preflight_path).await;
+        let combined_detail = api.read(&detail_path).await;
+        let combined_list = api.read("/api/v1/instances").await;
         let missing_after = std::fs::symlink_metadata(&client)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         let malformed_combined = std::fs::read(&metadata).unwrap();
@@ -3859,10 +3748,10 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
         std::fs::remove_dir(&unrelated).unwrap();
         let unrelated_absent = std::fs::symlink_metadata(&unrelated)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        let restored_versions = read_projection("/api/v1/versions").await;
-        let restored = read_projection(&preflight_path).await;
-        let restored_detail = read_projection(&detail_path).await;
-        let restored_list = read_projection("/api/v1/instances").await;
+        let restored_versions = api.read("/api/v1/versions").await;
+        let restored = api.read(&preflight_path).await;
+        let restored_detail = api.read(&detail_path).await;
+        let restored_list = api.read("/api/v1/instances").await;
         let restored_bytes: Vec<_> = protected.iter()
             .map(|(path, _)| std::fs::read(path).unwrap()).collect();
         let requests_after = provider.state.requests.lock().unwrap().clone();
@@ -4003,17 +3892,7 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
         .unwrap();
     let api = Api::new(&services);
     let journey = std::panic::AssertUnwindSafe(async {
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
-        )
-        .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
-        )
-        .await;
+        configure_offline(&api, json!({"expected_revision":0,"performance_mode":"vanilla"})).await;
         let pin = services.library.admit().unwrap();
         let operation = pin.managed_library().unwrap();
         let root = pin.read_projection().unwrap();
@@ -4054,42 +3933,12 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
         let installed_catalog = api.get("/api/v1/versions/catalog").await;
         let installed_versions = api.get("/api/v1/versions").await;
         let installed_view = api.get(view_path).await;
-        let classifier = if cfg!(target_os = "macos") {
-            "natives-macos"
-        } else {
-            "natives-linux"
-        };
-        let asset_hash = sha1(ASSET);
-        let protected: Vec<_> = [
-            format!("versions/{VERSION}/{VERSION}.json"),
-            format!("versions/{VERSION}/{VERSION}.jar"),
-            "libraries/org/axial/fixture/1.0/fixture-1.0.jar".to_owned(),
-            format!("libraries/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-{classifier}.jar"),
-            "assets/log_configs/fixture-log.xml".to_owned(),
-            "assets/indexes/fixture-assets.json".to_owned(),
-            format!("assets/objects/{}/{asset_hash}", &asset_hash[..2]),
-            "cache/version_manifest_v2.json".to_owned(),
-        ]
-        .into_iter()
-        .map(|relative| {
-            let path = root.join(relative);
-            let bytes = std::fs::read(&path).unwrap();
-            (path, bytes)
-        })
-        .collect();
+        let protected = installed_files(&root, &["cache/version_manifest_v2.json"]);
         let client_source = provider.state.routes["GET /artifacts/client.jar"].clone();
         let instances_before = api.get("/api/v1/instances").await;
         let pending_before = api.get("/api/v1/instances/pending").await;
         let queue_before = api.get("/api/v1/install/queue").await;
         let requests_before = provider.state.requests.lock().unwrap().clone();
-        let read_projection = |path: &str| {
-            let request = api.client.get(format!("{}{path}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability);
-            async move {
-                let response = request.send().await.unwrap();
-                (response.status(), response.json::<Value>().await.unwrap())
-            }
-        };
         // An external malformed entry does not replace the managed target.
         let unrelated = root.join("versions/external-degraded-entry");
         let absent_before = std::fs::symlink_metadata(&unrelated)
@@ -4098,20 +3947,18 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
         let metadata = unrelated.join("external-degraded-entry.json");
         let malformed = b"{not valid external version metadata\n";
         std::fs::write(&metadata, malformed).unwrap();
-        let degraded_versions = read_projection("/api/v1/versions").await;
-        let degraded_view = read_projection(view_path).await;
-        let response = api.client
-            .post(format!("{}/api/v1/instances", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({
-                "name":"Degraded scan create","selection_id":format!("vanilla|{VERSION}")
-            }))
-            .send()
-            .await
-            .unwrap();
-        let create_status = response.status();
-        let create_body: Value = response.json().await.unwrap();
-        let instances_after = read_projection("/api/v1/instances").await;
+        let degraded_versions = api.read("/api/v1/versions").await;
+        let degraded_view = api.read(view_path).await;
+        let (create_status, create_body) = api
+            .response(
+                reqwest::Method::POST,
+                "/api/v1/instances",
+                Some(json!({
+                    "name":"Degraded scan create","selection_id":format!("vanilla|{VERSION}")
+                })),
+            )
+            .await;
+        let instances_after = api.read("/api/v1/instances").await;
         let pending_after = api.get("/api/v1/instances/pending").await;
         let queue_after = api.get("/api/v1/install/queue").await;
         let requests_after = provider.state.requests.lock().unwrap().clone();
@@ -4126,7 +3973,7 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
                 &format!("/api/v1/instances/{id}?keep_files=true&operation_id={operation}"),
                 None,
             ).await;
-            let absent = read_projection(&format!("/api/v1/instances/{id}")).await;
+            let absent = api.read(&format!("/api/v1/instances/{id}")).await;
             Some((id, operation, removed, absent))
         } else {
             None
@@ -4284,17 +4131,9 @@ async fn created_instance_survives_install_queue_refusal_and_reopen() {
             );
             let initial = services.as_ref().unwrap();
             let api = Api::new(initial);
-            api.post(
-                "/api/v1/accounts/offline",
-                json!({"username":PLAYER,"expected_selection_revision":0}),
-            )
-            .await;
-            api.request(
-                reqwest::Method::PUT,
-                "/api/v1/config",
-                Some(json!({
-                    "expected_revision":0,"performance_mode":"vanilla"
-                })),
+            configure_offline(
+                &api,
+                json!({"expected_revision":0,"performance_mode":"vanilla"}),
             )
             .await;
             let pin = initial.library.admit().unwrap();
@@ -4344,15 +4183,15 @@ async fn created_instance_survives_install_queue_refusal_and_reopen() {
             initial.installs.close_admission();
             let queue_before = api.get("/api/v1/install/queue").await;
             let requests_before = provider.state.requests.lock().unwrap().clone();
-            let response = api.client
-            .post(format!("{}/api/v1/instances", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({
-                "name":"Created before queue refusal","selection_id":format!("vanilla|{VERSION}")
-            }))
-            .send().await.unwrap();
-            let status = response.status();
-            let created: Value = response.json().await.unwrap();
+            let (status, created) = api
+                .response(
+                    reqwest::Method::POST,
+                    "/api/v1/instances",
+                    Some(json!({
+                        "name":"Created before queue refusal","selection_id":format!("vanilla|{VERSION}")
+                    })),
+                )
+                .await;
             let id = created["id"]
                 .as_str()
                 .expect("one returned creation identity")
@@ -4570,15 +4409,9 @@ fn instance_list_refuses_input_scratch_pressure() {
             );
             let initial = services.as_ref().unwrap();
             let api = Api::new(initial);
-            api.post(
-                "/api/v1/accounts/offline",
-                json!({"username":PLAYER,"expected_selection_revision":0}),
-            )
-            .await;
-            api.request(
-                reqwest::Method::PUT,
-                "/api/v1/config",
-                Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
+            configure_offline(
+                &api,
+                json!({"expected_revision":0,"performance_mode":"vanilla"}),
             )
             .await;
             let pin = initial.library.admit().unwrap();
@@ -4804,27 +4637,15 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         .await
         .unwrap();
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
-    )
-    .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
+    configure_offline(
+        &api,
+        json!({
             "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
             "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
-        })),
+        }),
     )
     .await;
-    let start = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -5339,27 +5160,15 @@ async fn preflight_reports_missing_java_override_without_launching() {
         .await
         .unwrap();
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
-    )
-    .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
+    configure_offline(
+        &api,
+        json!({
             "expected_revision":0,"performance_mode":"vanilla","jvm_preset":"",
             "java_path_override":"","max_memory_mb":2048,"min_memory_mb":1024
-        })),
+        }),
     )
     .await;
-    let start = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -5657,18 +5466,13 @@ async fn preflight_reports_missing_java_override_without_launching() {
 
 #[test]
 fn real_offline_vanilla_install_launch_stop_and_restart() {
-    run_with_kill_capture(async {
-        offline_vanilla_journey(false).await;
-        Ok(())
-    });
-}
-
-#[test]
-fn real_external_offline_vanilla_install_launch_stop_and_restart() {
-    run_with_kill_capture(async {
-        offline_vanilla_journey(true).await;
-        Ok(())
-    });
+    for (case, existing) in [("managed library", false), ("external library", true)] {
+        eprintln!("offline vanilla case: {case}");
+        run_with_kill_capture(async {
+            offline_vanilla_journey(existing).await;
+            Ok(())
+        });
+    }
 }
 
 #[test]
@@ -5776,17 +5580,9 @@ async fn missing_default_runtime_after_reopen() {
         );
         let initial = services.as_ref().unwrap();
         let api = Api::new(initial);
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
-        )
-        .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({
-                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-            })),
+        configure_offline(
+            &api,
+            json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
         )
         .await;
         let install = api
@@ -5902,16 +5698,13 @@ async fn missing_default_runtime_after_reopen() {
             .get_live(&instance.parse().unwrap()).unwrap().instance.settings.extra_jvm_args;
         let readonly_requests_after = provider.state.requests.lock().unwrap().clone();
         let request_count = provider.state.requests.lock().unwrap().len();
-        let response = restarted_api
-            .client
-            .post(format!("{}/api/v1/launch", restarted_api.base))
-            .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
-            .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
-            .send()
-            .await
-            .unwrap();
-        let status = response.status();
-        let body: Value = response.json().await.unwrap();
+        let (status, body) = restarted_api
+            .response(
+                reqwest::Method::POST,
+                "/api/v1/launch",
+                Some(json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()})),
+            )
+            .await;
         let mut verify_guards = None;
         if status.is_success() {
             let session = body["session_id"].as_str().unwrap();
@@ -5951,13 +5744,13 @@ async fn missing_default_runtime_after_reopen() {
             let mut changed_java = original_java.clone();
             changed_java[0] ^= 1;
             std::fs::write(executable, &changed_java).unwrap();
-            let response = restarted_api.client
-                .post(format!("{}/api/v1/launch", restarted_api.base))
-                .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
-                .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
-                .send().await.unwrap();
-            let corrupt_status = response.status();
-            let corrupt_body: Value = response.json().await.unwrap();
+            let (corrupt_status, corrupt_body) = restarted_api
+                .response(
+                    reqwest::Method::POST,
+                    "/api/v1/launch",
+                    Some(json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()})),
+                )
+                .await;
             if corrupt_status.is_success() {
                 processes.extend(observe_and_stop_session(
                     &restarted_api, corrupt_body["session_id"].as_str().unwrap(),
@@ -5981,13 +5774,13 @@ async fn missing_default_runtime_after_reopen() {
             std::fs::rename(&runtime, &preserved_runtime).unwrap();
             let override_preflight = restarted_api.get(&preflight).await;
             let override_instance = restarted_api.get(&instance_path).await;
-            let response = restarted_api.client
-                .post(format!("{}/api/v1/launch", restarted_api.base))
-                .header(transport::CAPABILITY_HEADER, &restarted_api.capability)
-                .json(&json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()}))
-                .send().await.unwrap();
-            let override_status = response.status();
-            let override_body: Value = response.json().await.unwrap();
+            let (override_status, override_body) = restarted_api
+                .response(
+                    reqwest::Method::POST,
+                    "/api/v1/launch",
+                    Some(json!({"instance_id":instance,"intent_key":uuid::Uuid::new_v4().to_string()})),
+                )
+                .await;
             if override_status.is_success() {
                 processes.extend(observe_and_stop_session(
                     &restarted_api, override_body["session_id"].as_str().unwrap(),
@@ -6189,31 +5982,14 @@ async fn offline_vanilla_journey(existing: bool) {
     }
     let api = Api::new(&services);
     assert_installed(&api, false).await;
-    let account = api
-        .post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
-        )
-        .await;
+    let (account, config) = configure_offline(
+        &api,
+        json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
+    )
+    .await;
     assert_eq!(account["selection_revision"], 1);
-    let config = api
-        .request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({
-                "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-            })),
-        )
-        .await;
     assert_eq!(config["launch_auth_mode"], "offline");
-    let start = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    let terminal = install_terminal(&api, &start).await;
-    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    install_vanilla(&api).await;
     assert_installed(&api, true).await;
 
     let created = api
@@ -6399,26 +6175,12 @@ async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
         .await
         .unwrap();
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
+    configure_offline(
+        &api,
+        json!({"expected_revision":0,"performance_mode":"managed","java_path_override":""}),
     )
     .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
-            "expected_revision":0,"performance_mode":"managed","java_path_override":""
-        })),
-    )
-    .await;
-    let start = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -6581,24 +6343,12 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
         );
         let initial = services.as_ref().unwrap();
         let api = Api::new(initial);
-        api.post(
-            "/api/v1/accounts/offline",
-            json!({"username":PLAYER,"expected_selection_revision":0}),
+        configure_offline(
+            &api,
+            json!({"expected_revision":0,"performance_mode":"vanilla"}),
         )
         .await;
-        api.request(
-            reqwest::Method::PUT,
-            "/api/v1/config",
-            Some(json!({"expected_revision":0,"performance_mode":"vanilla"})),
-        )
-        .await;
-        let start = api
-            .post(
-                "/api/v1/install/queue",
-                json!({"kind":"vanilla","version_id":VERSION}),
-            )
-            .await;
-        assert_eq!(install_terminal(&api, &start).await["outcome"], "succeeded");
+        install_vanilla(&api).await;
         let created = api
             .post(
                 "/api/v1/instances",
@@ -6621,16 +6371,15 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
         processes.extend(observed);
         let before = api.get(&format!("/api/v1/instances/{instance}")).await;
         assert!(!before["last_played_at"].as_str().unwrap().is_empty());
-        let rename = api
-            .client
-            .put(format!("{}/api/v1/instances/{instance}", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({"name":"Renamed while playing","expected_revision":before["revision"]}))
-            .send()
-            .await
-            .unwrap();
-        let rename_status = rename.status();
-        let renamed: Value = rename.json().await.unwrap();
+        let (rename_status, renamed) = api
+            .response(
+                reqwest::Method::PUT,
+                &format!("/api/v1/instances/{instance}"),
+                Some(
+                    json!({"name":"Renamed while playing","expected_revision":before["revision"]}),
+                ),
+            )
+            .await;
         if !rename_status.is_success() {
             // The intended red must still settle the real fixture process and API.
             observe_and_stop_session(&api, first).await;
@@ -6932,27 +6681,12 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
         .await
         .unwrap();
     let api = Api::new(&services);
-    api.post(
-        "/api/v1/accounts/offline",
-        json!({"username":PLAYER,"expected_selection_revision":0}),
+    configure_offline(
+        &api,
+        json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
     )
     .await;
-    api.request(
-        reqwest::Method::PUT,
-        "/api/v1/config",
-        Some(json!({
-            "expected_revision":0,"performance_mode":"vanilla","java_path_override":""
-        })),
-    )
-    .await;
-    let installation = api
-        .post(
-            "/api/v1/install/queue",
-            json!({"kind":"vanilla","version_id":VERSION}),
-        )
-        .await;
-    let terminal = install_terminal(&api, &installation).await;
-    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    install_vanilla(&api).await;
     let created = api
         .post(
             "/api/v1/instances",
@@ -7216,17 +6950,16 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
         settled["session"]["exit_code"]
     );
     for run_index in [Value::Null, json!(0)] {
-        let result = api
-            .client
-            .post(format!("{}/api/v1/launch/benchmark/suite/tick", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .json(&json!({"suite_id":"report-loss-suite","run_index":run_index}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(result.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let (status, result) = api
+            .response(
+                reqwest::Method::POST,
+                "/api/v1/launch/benchmark/suite/tick",
+                Some(json!({"suite_id":"report-loss-suite","run_index":run_index})),
+            )
+            .await;
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            result.json::<Value>().await.unwrap(),
+            result,
             json!({
                 "error":axial_app::performance::benchmarks::BenchmarkError::Unavailable.to_string()
             })
@@ -7297,15 +7030,13 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
         .await
         .expect("real materialization must request the client body");
         let before = api.get(&status_path).await;
-        let response = api
-            .client
-            .post(format!("{}/api/v1/install/{id}/cancel", api.base))
-            .header(transport::CAPABILITY_HEADER, &api.capability)
-            .send()
-            .await
-            .unwrap();
-        let cancel_status = response.status();
-        let cancel_body: Value = response.json().await.unwrap();
+        let (cancel_status, cancel_body) = api
+            .response(
+                reqwest::Method::POST,
+                &format!("/api/v1/install/{id}/cancel"),
+                None,
+            )
+            .await;
         let held_shutdown = initial.tasks.shutdown(Duration::from_secs(2)).await;
         let held_receipt = initial.tasks.shutdown_receipt().is_some();
         eprintln!(

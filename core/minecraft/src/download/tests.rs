@@ -4629,72 +4629,55 @@ async fn authenticated_source_interrupted_stream_retries() {
 }
 
 #[tokio::test]
-async fn authenticated_source_rejects_checksum_mismatch() {
-    let body = b"wrong source".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(b"right source"));
-    let (url, requests) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
+async fn authenticated_source_rejects_integrity_and_memory_bound_failures_without_retry() {
+    let oversize = b"oversize source".to_vec();
+    for (case, body, expected, limit, label) in [
+        (
+            "checksum mismatch",
+            b"wrong source".to_vec(),
+            ExpectedIntegrity::from_mojang(
+                b"wrong source".len() as i64,
+                &sha1_hex(b"right source"),
+            ),
+            1024,
+            "minecraft_version_json_1.21.1",
+        ),
+        (
+            "size mismatch",
+            b"asset index".to_vec(),
+            ExpectedIntegrity {
+                size: Some(b"asset index".len() as u64 + 1),
+                sha1: Some(sha1_hex(b"asset index")),
+            },
+            1024,
+            "minecraft_asset_index_legacy",
+        ),
+        (
+            "memory bound",
+            oversize.clone(),
+            ExpectedIntegrity::from_mojang(oversize.len() as i64, &sha1_hex(&oversize)),
+            4,
+            "minecraft_version_json_1.21.1",
+        ),
+    ] {
+        let (url, requests) =
+            spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)])
+                .await;
 
-    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
-        &expected,
-        1024,
-        "minecraft_version_json_1.21.1",
-        &[Duration::ZERO],
-    )
-    .await
-    .err()
-    .expect("checksum mismatch must fail");
+        acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
+            &build_http_client(Duration::from_secs(5)),
+            &url,
+            &expected,
+            limit,
+            label,
+            &[Duration::ZERO],
+        )
+        .await
+        .err()
+        .expect(case);
 
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn authenticated_source_rejects_size_mismatch() {
-    let body = b"asset index".to_vec();
-    let expected = ExpectedIntegrity {
-        size: Some(body.len() as u64 + 1),
-        sha1: Some(sha1_hex(&body)),
-    };
-    let (url, requests) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-
-    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
-        &expected,
-        1024,
-        "minecraft_asset_index_legacy",
-        &[Duration::ZERO],
-    )
-    .await
-    .err()
-    .expect("size mismatch must fail");
-
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn authenticated_source_rejects_oversize_body() {
-    let body = b"oversize source".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, requests) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-
-    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
-        &expected,
-        4,
-        "minecraft_version_json_1.21.1",
-        &[Duration::ZERO],
-    )
-    .await
-    .err()
-    .expect("memory bound must fail");
-
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "{case}");
+    }
 }
 
 #[tokio::test]

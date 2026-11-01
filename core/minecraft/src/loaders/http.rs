@@ -527,37 +527,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_json_rejects_oversized_content_length() {
-        let server = TestServer::spawn(|stream| {
-            respond_oversized_json_content_length(stream);
-        });
+    async fn fetch_json_rejects_responses_past_max_size() {
+        for (case, respond) in [
+            (
+                "oversized content length",
+                respond_oversized_json_content_length as fn(TcpStream),
+            ),
+            ("chunked body past max size", respond_oversized_chunked_json),
+        ] {
+            let server = TestServer::spawn(respond);
 
-        let error = fetch_json_once::<Value>(
-            &server.url("/metadata.json"),
-            LoaderSourceTransportPolicy::AllowHttpForTest,
-        )
-        .await
-        .expect_err("oversized response");
+            let error = fetch_json_once::<Value>(
+                &server.url("/metadata.json"),
+                LoaderSourceTransportPolicy::AllowHttpForTest,
+            )
+            .await
+            .expect_err(case);
 
-        assert_loader_json_too_large(error);
-        assert_eq!(server.request_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn fetch_json_rejects_chunked_response_past_max_size() {
-        let server = TestServer::spawn(|stream| {
-            respond_oversized_chunked_json(stream);
-        });
-
-        let error = fetch_json_once::<Value>(
-            &server.url("/metadata.json"),
-            LoaderSourceTransportPolicy::AllowHttpForTest,
-        )
-        .await
-        .expect_err("oversized response");
-
-        assert_loader_json_too_large(error);
-        assert_eq!(server.request_count(), 1);
+            assert_loader_json_too_large(error);
+            assert_eq!(server.request_count(), 1, "{case}");
+        }
     }
 
     #[tokio::test]

@@ -20111,74 +20111,51 @@ mod tests {
     }
 
     #[test]
-    fn live_pending_move_receipt_blocks_terminal_drain_and_remains_claimable() {
-        let temporary = crate::test_tempdir().expect("temporary root");
-        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
-        std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root capability");
-        let domain = root
-            .open_directory(&LeafName::new("domain").expect("domain leaf"))
-            .expect("domain capability");
-        let owner = domain.create_effect_owner().expect("effect owner");
-        let file = domain
-            .open_file(&LeafName::new("source.bin").expect("source leaf"))
-            .expect("source capability");
-        let receipt = owner
-            .retain_file_move(test_file_move_obligation(
-                file,
-                domain.clone(),
-                "target.bin",
-                false,
-            ))
-            .expect("retain move");
-        drop((owner, domain, root));
+    fn live_pending_or_terminal_move_receipt_blocks_drain_until_claimed() {
+        for (case, terminal) in [("pending", false), ("terminal", true)] {
+            let temporary = crate::test_tempdir().expect("temporary root");
+            std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
+            std::fs::write(temporary.path().join("domain/source.bin"), b"source")
+                .expect("source file");
+            let session = acquire_test_root(temporary.path());
+            let root = session.root().expect("root capability");
+            let domain = root
+                .open_directory(&LeafName::new("domain").expect("domain leaf"))
+                .expect("domain capability");
+            let owner = domain.create_effect_owner().expect("effect owner");
+            let file = domain
+                .open_file(&LeafName::new("source.bin").expect("source leaf"))
+                .expect("source capability");
+            let receipt = owner
+                .retain_file_move(test_file_move_obligation(
+                    file,
+                    domain.clone(),
+                    "target.bin",
+                    false,
+                ))
+                .expect("retain move");
+            if terminal {
+                owner.settle().expect("produce terminal result");
+            }
+            drop((owner, domain, root));
 
-        let refusal = match session.revoke() {
-            RootRevokeOutcome::Refused(failure) => failure,
-            outcome => panic!("live pending receipt did not block revocation: {outcome:?}"),
-        };
-        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
-        let file = claim_no_effect(receipt);
-        assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
-        drop(file);
-        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn live_terminal_move_receipt_blocks_drain_until_claimed() {
-        let temporary = crate::test_tempdir().expect("temporary root");
-        std::fs::create_dir(temporary.path().join("domain")).expect("domain anchor");
-        std::fs::write(temporary.path().join("domain/source.bin"), b"source").expect("source file");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root capability");
-        let domain = root
-            .open_directory(&LeafName::new("domain").expect("domain leaf"))
-            .expect("domain capability");
-        let owner = domain.create_effect_owner().expect("effect owner");
-        let file = domain
-            .open_file(&LeafName::new("source.bin").expect("source leaf"))
-            .expect("source capability");
-        let receipt = owner
-            .retain_file_move(test_file_move_obligation(
-                file,
-                domain.clone(),
-                "target.bin",
-                false,
-            ))
-            .expect("retain move");
-        owner.settle().expect("produce terminal result");
-        drop((owner, domain, root));
-
-        let refusal = match session.revoke() {
-            RootRevokeOutcome::Refused(failure) => failure,
-            outcome => panic!("live terminal receipt did not block revocation: {outcome:?}"),
-        };
-        assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
-        let file = claim_no_effect(receipt);
-        assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
-        drop(file);
-        assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
+            let refusal = match session.revoke() {
+                RootRevokeOutcome::Refused(failure) => failure,
+                outcome => panic!("live {case} receipt did not block revocation: {outcome:?}"),
+            };
+            assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock, "{case}");
+            let file = claim_no_effect(receipt);
+            assert_eq!(
+                file.read_bounded(16).expect("source bytes"),
+                b"source",
+                "{case}"
+            );
+            drop(file);
+            assert!(
+                matches!(refusal.retry(), RootRevokeOutcome::Revoked),
+                "{case}"
+            );
+        }
     }
 
     #[test]

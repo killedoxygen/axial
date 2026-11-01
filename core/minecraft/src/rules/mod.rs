@@ -137,13 +137,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn os_version_rule_fails_when_actual_version_is_unknown() {
-        let env = Environment {
-            os_name: "windows".to_string(),
-            os_arch: "x86_64".to_string(),
-            os_version: String::new(),
-            features: HashMap::new(),
-        };
+    fn os_version_rule_requires_a_known_matching_version() {
         let rules = vec![Rule {
             action: "allow".to_string(),
             os: Some(OsRule {
@@ -153,28 +147,15 @@ mod tests {
             }),
             features: None,
         }];
+        for (os_version, allowed) in [("", false), ("10.0.22631", true)] {
+            let env = Environment {
+                os_name: "windows".to_string(),
+                os_arch: "x86_64".to_string(),
+                os_version: os_version.to_string(),
+                features: HashMap::new(),
+            };
 
-        assert!(!evaluate_rules(&rules, &env));
-    }
-
-    #[test]
-    fn os_version_rule_matches_known_version() {
-        let env = Environment {
-            os_name: "windows".to_string(),
-            os_arch: "x86_64".to_string(),
-            os_version: "10.0.22631".to_string(),
-            features: HashMap::new(),
-        };
-        let rules = vec![Rule {
-            action: "allow".to_string(),
-            os: Some(OsRule {
-                name: "windows".to_string(),
-                arch: String::new(),
-                version: "^10\\.".to_string(),
-            }),
-            features: None,
-        }];
-
-        assert!(evaluate_rules(&rules, &env));
+            assert_eq!(evaluate_rules(&rules, &env), allowed, "{os_version:?}");
+        }
     }
 }

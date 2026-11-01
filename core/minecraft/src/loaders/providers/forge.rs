@@ -167,58 +167,49 @@ mod tests {
     }
 
     #[test]
-    fn classifies_earliest_forge_as_legacy_archive() {
-        let (strategy, artifact_kind, install_source) =
-            forge_install_source("1.2.4", "2.0.0.68").expect("source");
-        assert_eq!(strategy, LoaderInstallStrategy::ForgeEarliestLegacy);
-        assert_eq!(artifact_kind, LoaderArtifactKind::LegacyArchive);
-        match install_source {
-            LoaderInstallSource::LegacyArchive { url } => {
-                assert!(url.ends_with("forge-1.2.4-2.0.0.68-client.zip"));
-            }
-            other => panic!("unexpected install source: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classifies_middle_legacy_forge_as_universal_archive() {
-        let (strategy, artifact_kind, install_source) =
-            forge_install_source("1.4.7", "6.6.2.534").expect("source");
-        assert_eq!(strategy, LoaderInstallStrategy::ForgeEarliestLegacy);
-        assert_eq!(artifact_kind, LoaderArtifactKind::LegacyArchive);
-        match install_source {
-            LoaderInstallSource::LegacyArchive { url } => {
-                assert!(url.ends_with("forge-1.4.7-6.6.2.534-universal.zip"));
-            }
-            other => panic!("unexpected install source: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classifies_legacy_installer_forge_correctly() {
-        let (strategy, artifact_kind, install_source) =
-            forge_install_source("1.6.4", "9.11.1.1345").expect("source");
-        assert_eq!(strategy, LoaderInstallStrategy::ForgeLegacyInstaller);
-        assert_eq!(artifact_kind, LoaderArtifactKind::InstallerJar);
-        match install_source {
-            LoaderInstallSource::InstallerJar { url } => {
-                assert!(url.ends_with("forge-1.6.4-9.11.1.1345-installer.jar"));
-            }
-            other => panic!("unexpected install source: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classifies_modern_forge_correctly() {
-        let (strategy, artifact_kind, install_source) =
-            forge_install_source("1.21.11", "61.1.5").expect("source");
-        assert_eq!(strategy, LoaderInstallStrategy::ForgeModern);
-        assert_eq!(artifact_kind, LoaderArtifactKind::InstallerJar);
-        match install_source {
-            LoaderInstallSource::InstallerJar { url } => {
-                assert!(url.ends_with("forge-1.21.11-61.1.5-installer.jar"));
-            }
-            other => panic!("unexpected install source: {other:?}"),
+    fn classifies_forge_install_sources_by_era() {
+        for (minecraft, forge, expected_strategy, expected_kind, suffix) in [
+            (
+                "1.2.4",
+                "2.0.0.68",
+                LoaderInstallStrategy::ForgeEarliestLegacy,
+                LoaderArtifactKind::LegacyArchive,
+                "forge-1.2.4-2.0.0.68-client.zip",
+            ),
+            (
+                "1.4.7",
+                "6.6.2.534",
+                LoaderInstallStrategy::ForgeEarliestLegacy,
+                LoaderArtifactKind::LegacyArchive,
+                "forge-1.4.7-6.6.2.534-universal.zip",
+            ),
+            (
+                "1.6.4",
+                "9.11.1.1345",
+                LoaderInstallStrategy::ForgeLegacyInstaller,
+                LoaderArtifactKind::InstallerJar,
+                "forge-1.6.4-9.11.1.1345-installer.jar",
+            ),
+            (
+                "1.21.11",
+                "61.1.5",
+                LoaderInstallStrategy::ForgeModern,
+                LoaderArtifactKind::InstallerJar,
+                "forge-1.21.11-61.1.5-installer.jar",
+            ),
+        ] {
+            let (strategy, artifact_kind, install_source) =
+                forge_install_source(minecraft, forge).expect("source");
+            assert_eq!(strategy, expected_strategy, "{suffix}");
+            assert_eq!(artifact_kind, expected_kind, "{suffix}");
+            let url = match (expected_kind, install_source) {
+                (LoaderArtifactKind::LegacyArchive, LoaderInstallSource::LegacyArchive { url })
+                | (LoaderArtifactKind::InstallerJar, LoaderInstallSource::InstallerJar { url }) => {
+                    url
+                }
+                (_, other) => panic!("{suffix}: unexpected install source: {other:?}"),
+            };
+            assert!(url.ends_with(suffix), "{suffix}: {url}");
         }
     }
 }

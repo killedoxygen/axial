@@ -3307,67 +3307,80 @@ mod tests {
     }
 
     #[test]
-    fn reverse_incompatibilities_honor_the_candidate_version() {
+    fn reverse_incompatibilities_match_the_exact_candidate_version() {
         let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let installed = ManifestEntry::managed(
-            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-            ProviderId::Modrinth,
-            "installed".to_string(),
-            "installed-v1".to_string(),
-            ContentKind::Mod,
-            &file("installed.jar", None),
-            vec![ContentDependency {
-                project_id: Some("candidate".to_string()),
-                version_id: Some("candidate-v1".to_string()),
-                kind: DependencyKind::Incompatible,
-            }],
-            Some("Installed".to_string()),
-        )
-        .expect("valid managed entry");
-        let mut manifest = ContentManifest::default();
-        manifest
-            .try_upsert(installed.clone())
-            .expect("installed manifest");
-        let candidate_v1 = version(
-            "candidate-v1",
-            ReleaseChannel::Release,
-            vec![file("candidate.jar", None)],
-        );
-        let candidate_v2 = version(
-            "candidate-v2",
-            ReleaseChannel::Release,
-            vec![file("candidate.jar", None)],
-        );
-
-        assert!(version_conflicts_with_installed(
-            &candidate_v1,
-            &candidate,
-            std::slice::from_ref(&installed),
-        ));
-        assert!(!version_conflicts_with_installed(
-            &candidate_v2,
-            &candidate,
-            std::slice::from_ref(&installed),
-        ));
-        assert_eq!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
+        for (case, project_id) in [
+            ("project and version", Some("candidate".to_string())),
+            ("version only", None),
+        ] {
+            let installed = ManifestEntry::managed(
+                CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+                ProviderId::Modrinth,
+                "installed".to_string(),
+                "installed-v1".to_string(),
+                ContentKind::Mod,
+                &file("installed.jar", None),
+                vec![ContentDependency {
+                    project_id,
+                    version_id: Some("candidate-v1".to_string()),
+                    kind: DependencyKind::Incompatible,
+                }],
+                Some("Installed".to_string()),
+            )
+            .expect("valid managed entry");
+            let mut manifest = ContentManifest::default();
+            manifest
+                .try_upsert(installed.clone())
+                .expect("installed manifest");
+            let candidate_v1 = version(
                 "candidate-v1",
-                &LiveManagedContent::from_entries(manifest.entries()),
-            )
-            .len(),
-            1
-        );
-        assert!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
+                ReleaseChannel::Release,
+                vec![file("candidate.jar", None)],
+            );
+            let candidate_v2 = version(
                 "candidate-v2",
-                &LiveManagedContent::from_entries(manifest.entries()),
-            )
-            .is_empty()
-        );
+                ReleaseChannel::Release,
+                vec![file("candidate.jar", None)],
+            );
+
+            assert!(
+                version_conflicts_with_installed(
+                    &candidate_v1,
+                    &candidate,
+                    std::slice::from_ref(&installed),
+                ),
+                "{case}"
+            );
+            assert!(
+                !version_conflicts_with_installed(
+                    &candidate_v2,
+                    &candidate,
+                    std::slice::from_ref(&installed),
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                installed_entries_incompatible_with(
+                    &manifest,
+                    &candidate,
+                    "candidate-v1",
+                    &LiveManagedContent::from_entries(manifest.entries()),
+                )
+                .len(),
+                1,
+                "{case}"
+            );
+            assert!(
+                installed_entries_incompatible_with(
+                    &manifest,
+                    &candidate,
+                    "candidate-v2",
+                    &LiveManagedContent::from_entries(manifest.entries()),
+                )
+                .is_empty(),
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -3423,70 +3436,6 @@ mod tests {
                 &installed,
             ));
         }
-    }
-
-    #[test]
-    fn version_only_reverse_incompatibilities_match_the_exact_candidate() {
-        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let installed = ManifestEntry::managed(
-            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-            ProviderId::Modrinth,
-            "installed".to_string(),
-            "installed-v1".to_string(),
-            ContentKind::Mod,
-            &file("installed.jar", None),
-            vec![ContentDependency {
-                project_id: None,
-                version_id: Some("candidate-v1".to_string()),
-                kind: DependencyKind::Incompatible,
-            }],
-            Some("Installed".to_string()),
-        )
-        .expect("valid managed entry");
-        let mut manifest = ContentManifest::default();
-        manifest
-            .try_upsert(installed.clone())
-            .expect("installed manifest");
-        let candidate_v1 = version(
-            "candidate-v1",
-            ReleaseChannel::Release,
-            vec![file("candidate.jar", None)],
-        );
-        let candidate_v2 = version(
-            "candidate-v2",
-            ReleaseChannel::Release,
-            vec![file("candidate.jar", None)],
-        );
-
-        assert!(version_conflicts_with_installed(
-            &candidate_v1,
-            &candidate,
-            std::slice::from_ref(&installed),
-        ));
-        assert!(!version_conflicts_with_installed(
-            &candidate_v2,
-            &candidate,
-            std::slice::from_ref(&installed),
-        ));
-        assert_eq!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
-                "candidate-v1",
-                &LiveManagedContent::from_entries(manifest.entries()),
-            )
-            .len(),
-            1
-        );
-        assert!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
-                "candidate-v2",
-                &LiveManagedContent::from_entries(manifest.entries()),
-            )
-            .is_empty()
-        );
     }
 
     #[test]
