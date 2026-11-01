@@ -8,6 +8,15 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+## [0.4.0-rc.3] - 2026-11-01
+
+### Distribution
+- Windows packages build again; source files keep LF line endings on every platform
+
+### Security
+- Builds use Node 26 LTS and pnpm 11.28.10, which fixes three pnpm advisories (GHSA-c59q-g84q-2gj5, GHSA-vq4v-j7r6-jq4m, GHSA-vx52-2968-3vc6)
+- Rust dependencies refreshed to their latest compatible releases
+
 ## [0.4.0-rc.2] - 2026-11-01
 
 ### Onboarding
