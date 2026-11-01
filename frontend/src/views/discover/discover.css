@@ -861,7 +861,6 @@
   gap: 8px;
   flex-wrap: wrap;
   padding: 12px 14px;
-  border-bottom: 1px solid var(--line);
 }
 .cp-content-version-bar-count {
   margin-left: auto;
@@ -889,17 +888,17 @@
 }
 .cp-content-version-head {
   padding: 8px 14px;
-  border-bottom: 1px solid var(--line);
   color: var(--text-mute);
   font-size: 11.5px;
   font-weight: 500;
 }
 .cp-content-version {
-  border-bottom: 1px solid var(--line);
+  margin: 0 4px;
+  border-radius: var(--r-sm);
   transition: background 120ms ease;
 }
 .cp-content-version:last-of-type {
-  border-bottom: none;
+  margin-bottom: 4px;
 }
 .cp-content-version:hover {
   background: var(--surface-2);

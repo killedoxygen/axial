@@ -43,6 +43,29 @@ export function versionFits(version: ContentVersion, kind: ContentKind, instance
   return version.loaders.includes(display.loader_key);
 }
 
+const CHANNEL_RANK: Record<ContentVersion['channel'], number> = { release: 2, beta: 1, alpha: 0 };
+
+/** The version an add would choose for this instance: the backend prefers releases, then the newest
+ * fitting version with one unambiguous file. Display only; the install plan remains authoritative. */
+export function installCandidate(
+  versions: ContentVersion[],
+  kind: ContentKind,
+  instance: EnrichedInstance | null,
+): ContentVersion | undefined {
+  const installable = (version: ContentVersion): boolean => {
+    const primaries = version.files.filter((file) => file.primary).length;
+    return primaries === 1 || (primaries === 0 && version.files.length === 1);
+  };
+  return versions
+    .filter((version) => installable(version) && versionFits(version, kind, instance))
+    .reduce<ContentVersion | undefined>((best, version) => {
+      if (!best) return version;
+      const rank = CHANNEL_RANK[version.channel] - CHANNEL_RANK[best.channel];
+      if (rank !== 0) return rank > 0 ? version : best;
+      return (version.published ?? '') > (best.published ?? '') ? version : best;
+    }, undefined);
+}
+
 export function compareMcDesc(a: string, b: string): number {
   const pa = a.split('.').map(Number);
   const pb = b.split('.').map(Number);

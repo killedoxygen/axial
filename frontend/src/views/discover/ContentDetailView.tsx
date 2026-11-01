@@ -20,11 +20,13 @@ import { ProjectBody, ExternalLink } from './markdown';
 import {
   compareMcDesc,
   ContentIcon,
+  installCandidate,
   InstanceTargetPicker,
   isAddable,
   KIND_NOUN,
   Spinner,
   tagLabel,
+  usesLoaderFilter,
   versionFits,
 } from './shared';
 
@@ -106,7 +108,7 @@ export function ContentDetailView(): JSX.Element {
 
   const gallery = detail.gallery ?? [];
   const versions = detail.versions ?? [];
-  const latest = versions[0];
+  const shownVersion = instance ? installCandidate(versions, detail.kind, instance) : versions[0];
   const tabs: Array<{ id: Tab; icon: IconName; label: string; count?: number }> = [
     { id: 'about', icon: 'info', label: 'About' },
   ];
@@ -155,10 +157,17 @@ export function ContentDetailView(): JSX.Element {
                 {formatAge(detail.updated)}
               </span>
             )}
-            {latest && (
-              <span class="cp-content-stat" title={`Latest version ${latest.version_number}`}>
+            {shownVersion && (
+              <span
+                class="cp-content-stat"
+                title={
+                  instance
+                    ? `${shownVersion.version_number} would be added to ${instance.name}`
+                    : `Latest version ${shownVersion.version_number}`
+                }
+              >
                 <Icon name="tag" size={13} />
-                {latest.version_number}
+                {shownVersion.version_number}
               </span>
             )}
           </div>
@@ -196,7 +205,9 @@ export function ContentDetailView(): JSX.Element {
 
       {activeTab === 'about' && <AboutPane detail={detail} />}
       {activeTab === 'gallery' && <GalleryPane detail={detail} />}
-      {activeTab === 'versions' && <VersionsPane detail={detail} instance={instance} flow={flow} />}
+      {activeTab === 'versions' && (
+        <VersionsPane key={instance?.id ?? ''} detail={detail} instance={instance} flow={flow} />
+      )}
 
       <InstallConflictSheet flow={flow} />
       <Tray />
@@ -486,9 +497,16 @@ function VersionsPane({
   const [busy, setBusy] = useState('');
   const [showAll, setShowAll] = useState(false);
   const [channel, setChannel] = useState<'' | ReleaseChannel>('');
-  const [mcFilter, setMcFilter] = useState('');
-  const [loaderFilter, setLoaderFilter] = useState('');
   const versions = detail.versions ?? [];
+  // A target instance narrows the list to what fits it; filters stay editable.
+  const [mcFilter, setMcFilter] = useState(() => {
+    const minecraft = instance?.version_display.minecraft_label ?? '';
+    return versions.some((version) => version.game_versions.includes(minecraft)) ? minecraft : '';
+  });
+  const [loaderFilter, setLoaderFilter] = useState(() => {
+    const loader = instance && usesLoaderFilter(detail.kind) ? instance.version_display.loader_key : '';
+    return versions.some((version) => version.loaders.includes(loader)) ? loader : '';
+  });
 
   const channelOptions = useMemo<SelectFieldOption<'' | ReleaseChannel>[]>(() => {
     const present = new Set(versions.map((version) => version.channel));
