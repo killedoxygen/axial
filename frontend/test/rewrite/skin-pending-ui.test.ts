@@ -668,7 +668,7 @@ for (const missingTarget of [false, true]) {
     const config = { value: { revision: 7, telemetry_enabled: false, discord_rpc_enabled: false, onboarding_done: false } };
     const showOnboardingOverlay = { value: true };
     let stateIndex = 0;
-    const initialStates: unknown[] = ['discord', 5, 'Player', 4, false];
+    const initialStates: unknown[] = ['style', 1, 'Player', false];
     const { Onboarding } = source<typeof import('../../src/views/onboarding/Onboarding')>(
       'views/onboarding/Onboarding.tsx',
       {
@@ -681,9 +681,9 @@ for (const missingTarget of [false, true]) {
           jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
           jsxs: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
         },
-        '../../ui/Atoms': { Input: 'Input' }, '../../ui/Slider': { Slider: 'Slider' },
+        '../../ui/Atoms': { Input: 'Input', Toggle: 'Toggle' },
         '../../ui/Icons': { Icon: 'Icon' }, '../../ui/MicrosoftMark': { MicrosoftMark: 'MicrosoftMark' },
-        '../settings/AccentEditor': {}, '../../shell/WindowControls': { WindowControls: 'WindowControls' },
+        '../settings/AccentEditor': { AccentField: 'AccentField', AccentModeToggle: 'AccentModeToggle' }, '../../shell/WindowControls': { WindowControls: 'WindowControls' },
         '../../state': { local: { lightness: 50 } },
         '../../music': { Music: { applyConfig() {} } }, '../../sound': { Sound: { ui() {} } },
         '../../api': { api: async (method: string, path: string, body: unknown) => {
@@ -698,7 +698,7 @@ for (const missingTarget of [false, true]) {
         '../../store': { config, systemInfo: { value: null } },
         '../../ui-state': { showOnboardingOverlay },
         '../../toast': { toast: (message: string) => notices.push(message) },
-        '../../player-name': {}, '../../player-skin': { refreshAccountSkin() {} }, '../../format': {},
+        '../../player-name': {}, '../../player-skin': { refreshAccountSkin() {} },
         '../../utils': { getMemoryRecommendation: () => ({ rec: 4 }), validateUsername: () => null, errMessage: String },
         '../../native': { hasNativeDesktopRuntime: () => false },
         '../accounts/useMicrosoftSignIn': { useMicrosoftSignIn: () => ({ busy: false }) },

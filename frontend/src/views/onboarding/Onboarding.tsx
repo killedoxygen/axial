@@ -1,12 +1,10 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Input } from '../../ui/Atoms';
-import { Slider } from '../../ui/Slider';
-import { Icon } from '../../ui/Icons';
+import { Input, Toggle } from '../../ui/Atoms';
+import { Icon, type IconName } from '../../ui/Icons';
 import { MicrosoftMark } from '../../ui/MicrosoftMark';
-import { AccentField, AccentModeToggle } from '../settings/AccentEditor';
+import { AccentField } from '../settings/AccentEditor';
 import { WindowControls } from '../../shell/WindowControls';
-import { local } from '../../state';
 import { Music } from '../../music';
 import { Sound } from '../../sound';
 import { api } from '../../api';
@@ -17,7 +15,6 @@ import { showOnboardingOverlay } from '../../ui-state';
 import { toast } from '../../toast';
 import { clampPlayerNameInput } from '../../player-name';
 import { refreshAccountSkin } from '../../player-skin';
-import { fmtMem } from '../../format';
 import { errMessage, getMemoryRecommendation, validateUsername } from '../../utils';
 import { hasNativeDesktopRuntime } from '../../native';
 import type { AuthStatusRecord } from '../accounts/types';
@@ -32,15 +29,11 @@ import {
   selectAccount,
 } from '../../machines/accounts';
 
-type Stage = 'name' | 'memory' | 'color' | 'music' | 'telemetry' | 'discord';
-const ORDER: Stage[] = ['name', 'memory', 'color', 'music', 'telemetry', 'discord'];
+type Stage = 'name' | 'style';
+const ORDER: Stage[] = ['name', 'style'];
 const STAGE_LABELS: Record<Stage, string> = {
-  name: 'Name',
-  memory: 'Memory',
-  color: 'Mood',
-  music: 'Sound',
-  telemetry: 'Stats',
-  discord: 'Activity',
+  name: 'You',
+  style: 'Style',
 };
 
 function statusOnlineReady(status: AuthStatusRecord | null): boolean {
@@ -146,11 +139,10 @@ export function Onboarding(): JSX.Element | null {
   const [stage, setStage] = useState<Stage>('name');
   const [maxReached, setMaxReached] = useState<number>(0);
   const [username, setUsername] = useState('');
-  const [memory, setMemory] = useState<number>(rec.rec);
-  const [musicEnabled, setMusicEnabled] = useState<boolean | null>(null);
-  const [telemetryEnabled, setTelemetryEnabled] = useState(config.value?.telemetry_enabled !== false);
+  const [musicEnabled, setMusicEnabled] = useState(false);
+  // Anonymous stats stay off until the player turns them on.
+  const [telemetryEnabled, setTelemetryEnabled] = useState(config.value?.telemetry_enabled === true);
   const [discordRpcEnabled, setDiscordRpcEnabled] = useState<boolean>(config.value?.discord_rpc_enabled !== false);
-  const [isWeirdo, setIsWeirdo] = useState<boolean>(local.lightness >= 50);
   const [saving, setSaving] = useState(false);
   const saveInFlight = useRef(false);
   const [dissolving, setDissolving] = useState(false);
@@ -170,7 +162,7 @@ export function Onboarding(): JSX.Element | null {
 
       const backendOnlineReady = statusOnlineReady(refreshedStatus);
       if (backendOnlineReady && nextUsername && validateUsername(nextUsername) === null && stage === 'name') {
-        setStage('memory');
+        setStage('style');
         setMaxReached((m) => Math.max(m, 1));
         Sound.ui('affirm');
       }
@@ -186,18 +178,8 @@ export function Onboarding(): JSX.Element | null {
   const nameValid = nameError === null;
   const showNameError = username.length > 0 && !nameValid;
 
-  const canAdvance: boolean =
-    stage === 'name'
-      ? nameValid && !microsoftLogin.busy
-      : stage === 'memory'
-        ? true
-        : stage === 'color'
-          ? true
-          : stage === 'music'
-            ? !saving && musicEnabled != null
-            : stage === 'telemetry'
-              ? true
-              : !saving;
+  const isLast = idx === ORDER.length - 1;
+  const canAdvance: boolean = stage === 'name' ? nameValid && !microsoftLogin.busy : !saving;
 
   const advance = (): void => {
     const nextIdx = idx + 1;
@@ -227,12 +209,12 @@ export function Onboarding(): JSX.Element | null {
       setStage('name');
       return;
     }
-    if (musicEnabled == null) return;
     saveInFlight.current = true;
     setSaving(true);
     try {
       const patch: Record<string, unknown> = {
-        max_memory_mb: Math.round(memory * 1024),
+        // Memory starts at the system recommendation and stays editable in Settings.
+        max_memory_mb: Math.round(rec.rec * 1024),
         music_enabled: musicEnabled,
         music_volume: 5,
         telemetry_enabled: telemetryEnabled,
@@ -311,7 +293,7 @@ export function Onboarding(): JSX.Element | null {
 
   const onCta = (): void => {
     if (!canAdvance) return;
-    if (stage === 'discord') void commit();
+    if (isLast) void commit();
     else advance();
   };
 
@@ -414,151 +396,65 @@ export function Onboarding(): JSX.Element | null {
         )}
       </div>
     );
-  } else if (stage === 'memory') {
-    headline = 'How much memory can Minecraft borrow?';
-    subline = (
-      <p class="cp-ob-subline">
-        Your system has about {totalGB} GB. {rec.rec} GB is a comfortable starting point.
-      </p>
-    );
-    widget = (
-      <div class="cp-ob-widget cp-ob-memory">
-        <Slider
-          value={memory}
-          min={1}
-          max={totalGB}
-          step={0.5}
-          recommended={[Math.max(2, rec.rec - 2), Math.min(totalGB, rec.rec + 2)]}
-          sound="memory"
-          onChange={setMemory}
-          ariaLabel="Max memory in gigabytes"
-        />
-        <div class="cp-ob-memory-summary" aria-live="polite">
-          <div class="cp-ob-memreading">{fmtMem(memory)}</div>
-          <div class="cp-ob-memory-note">Comfortable start: {rec.rec} GB</div>
-        </div>
-      </div>
-    );
-  } else if (stage === 'color') {
-    headline = 'Pick a mood.';
-    subline = (
-      <p class="cp-ob-subline">Drag anywhere, tap a preset, or flip the canvas. Everything learns your color.</p>
-    );
-    widget = (
-      <div class="cp-ob-widget">
-        <div class="cp-ob-mode-row">
-          <AccentModeToggle onChange={(m) => setIsWeirdo(m === 'light')} />
-          {isWeirdo && (
-            <span class="cp-ob-weirdo" aria-hidden="true">
-              Weirdo!
-            </span>
-          )}
-        </div>
-        <AccentField showPresets={false} />
-      </div>
-    );
-  } else if (stage === 'music') {
-    headline = 'Quiet, or a little atmosphere?';
-    subline = <p class="cp-ob-subline">Ambient music pauses itself when the game starts.</p>;
-    widget = (
-      <div class="cp-ob-widget">
-        <div class="cp-ob-pills">
-          <button
-            class="cp-ob-pill"
-            data-active={musicEnabled === true}
-            onClick={() => {
-              setMusicEnabled(true);
-              Sound.ui('affirm');
-            }}
-            type="button"
-          >
-            <Icon name="music" size={16} />
-            <span>Ambient music</span>
-          </button>
-          <button
-            class="cp-ob-pill"
-            data-active={musicEnabled === false}
-            onClick={() => {
-              setMusicEnabled(false);
-              Sound.ui('soft');
-            }}
-            type="button"
-          >
-            <Icon name="music-off" size={16} />
-            <span>Silent launcher</span>
-          </button>
-        </div>
-      </div>
-    );
-  } else if (stage === 'telemetry') {
-    headline = 'Mind if Axial keeps count?';
-    subline = (
-      <p class="cp-ob-subline">
-        Axial counts which features get used and whether launches succeed, always anonymously. Never your name, your
-        files, or the servers you join. Off means nothing is ever sent.
-      </p>
-    );
-    widget = (
-      <div class="cp-ob-widget">
-        <div class="cp-ob-pills">
-          <button
-            class="cp-ob-pill"
-            data-active={telemetryEnabled === true}
-            onClick={() => {
-              setTelemetryEnabled(true);
-              Sound.ui('affirm');
-            }}
-            type="button"
-          >
-            <Icon name="shield-person" size={16} />
-            <span>Anonymous stats</span>
-          </button>
-          <button
-            class="cp-ob-pill"
-            data-active={telemetryEnabled === false}
-            onClick={() => {
-              setTelemetryEnabled(false);
-              Sound.ui('soft');
-            }}
-            type="button"
-          >
-            <Icon name="circle-dashed" size={16} />
-            <span>Nothing sent</span>
-          </button>
-        </div>
-      </div>
-    );
   } else {
-    headline = 'Share launcher activity on Discord?';
-    subline = <p class="cp-ob-subline">Axial shares broad Minecraft activity, not instance names or server details.</p>;
+    headline = 'Make it yours.';
+    subline = <p class="cp-ob-subline">Pick a color for the launcher, then choose what runs in the background.</p>;
+    const preferences: {
+      key: string;
+      icon: IconName;
+      label: string;
+      detail: string;
+      on: boolean;
+      set: (on: boolean) => void;
+    }[] = [
+      {
+        key: 'music',
+        icon: 'music',
+        label: 'Ambient music',
+        detail: 'Pauses itself when the game starts.',
+        on: musicEnabled,
+        set: setMusicEnabled,
+      },
+      {
+        key: 'discord',
+        icon: 'activity',
+        label: 'Discord activity',
+        detail: 'Shows that you are playing, without instance or server names.',
+        on: discordRpcEnabled,
+        set: setDiscordRpcEnabled,
+      },
+      {
+        key: 'telemetry',
+        icon: 'shield-person',
+        label: 'Anonymous usage stats',
+        detail: 'Feature use and launch success. Never your name, files or servers.',
+        on: telemetryEnabled,
+        set: setTelemetryEnabled,
+      },
+    ];
     widget = (
       <div class="cp-ob-widget">
-        <div class="cp-ob-pills">
-          <button
-            class="cp-ob-pill"
-            data-active={discordRpcEnabled === true}
-            onClick={() => {
-              setDiscordRpcEnabled(true);
-              Sound.ui('affirm');
-            }}
-            type="button"
-          >
-            <Icon name="activity" size={16} />
-            <span>Discord activity</span>
-          </button>
-          <button
-            class="cp-ob-pill"
-            data-active={discordRpcEnabled === false}
-            onClick={() => {
-              setDiscordRpcEnabled(false);
-              Sound.ui('soft');
-            }}
-            type="button"
-          >
-            <Icon name="shield-check" size={16} />
-            <span>Private launcher</span>
-          </button>
-        </div>
+        <AccentField showPresets={false} />
+        <ul class="cp-ob-prefs">
+          {preferences.map((preference) => (
+            <li key={preference.key} class="cp-ob-pref">
+              <Icon name={preference.icon} size={16} />
+              <div class="cp-ob-pref-text">
+                <span class="cp-ob-pref-label">{preference.label}</span>
+                <span class="cp-ob-pref-detail">{preference.detail}</span>
+              </div>
+              <Toggle
+                on={preference.on}
+                ariaLabel={preference.label}
+                disabled={saving}
+                onChange={() => {
+                  preference.set(!preference.on);
+                  Sound.ui(preference.on ? 'soft' : 'affirm');
+                }}
+              />
+            </li>
+          ))}
+        </ul>
       </div>
     );
   }
@@ -602,10 +498,18 @@ export function Onboarding(): JSX.Element | null {
             class="cp-ob-navbtn"
             onClick={onCta}
             disabled={!canAdvance}
-            aria-label={stage === 'discord' ? 'Finish (Enter)' : 'Next step (Right arrow)'}
-            title={stage === 'discord' ? (saving ? 'Starting…' : 'Finish  ↵') : 'Next  →'}
+            data-finish={isLast}
+            aria-label={isLast ? 'Finish (Enter)' : 'Next step (Right arrow)'}
+            title={isLast ? (saving ? 'Starting…' : 'Finish  ↵') : 'Next  →'}
           >
-            <Icon name="chevron-right" size={18} stroke={2.2} />
+            {isLast ? (
+              <>
+                <span>{saving ? 'Starting…' : 'Start playing'}</span>
+                <Icon name="arrow-right" size={16} stroke={2.2} />
+              </>
+            ) : (
+              <Icon name="chevron-right" size={18} stroke={2.2} />
+            )}
           </button>
         </div>
         <div class="cp-ob-footnote">You can change any of this later in Settings.</div>

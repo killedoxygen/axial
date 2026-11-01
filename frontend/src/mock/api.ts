@@ -205,7 +205,8 @@ let configFixture: Config = {
   custom_hue: 140,
   custom_vibrancy: 100,
   lightness: 0,
-  onboarding_done: true,
+  // `?onboarding` opens first-run onboarding in the mock.
+  onboarding_done: !new URLSearchParams(globalThis.location?.search).has('onboarding'),
   telemetry_enabled: false,
   discord_rpc_enabled: true,
   discord_rpc_onboarding_seen: true,
