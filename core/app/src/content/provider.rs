@@ -393,16 +393,64 @@ pub(super) fn project_id_of(id: &CanonicalId) -> ContentResult<String> {
     Ok(project.to_string())
 }
 
+/// Modrinth's loader tags, which search results mix into their categories.
+const SEARCH_LOADER_TAGS: [&str; 29] = [
+    "babric",
+    "bta-babric",
+    "bukkit",
+    "bungeecord",
+    "canvas",
+    "datapack",
+    "fabric",
+    "folia",
+    "forge",
+    "iris",
+    "java-agent",
+    "legacy-fabric",
+    "liteloader",
+    "minecraft",
+    "modloader",
+    "neoforge",
+    "nilloader",
+    "optifine",
+    "ornithe",
+    "paper",
+    "purpur",
+    "quilt",
+    "rift",
+    "spigot",
+    "sponge",
+    "vanilla",
+    "velocity",
+    "waterfall",
+    "geyser",
+];
+
 pub(super) fn map_search_hit(hit: dto::SearchHit) -> ContentResult<CanonicalContent> {
     validate_provider_identity("project", &hit.project_id)?;
     let kind = kind_from_project_type(&hit.project_type).ok_or_else(|| {
         ContentError::ProviderMetadataInvalid("unknown content project type".to_string())
     })?;
+    // Search hits list loaders among their categories rather than separately.
+    let loaders = hit
+        .categories
+        .iter()
+        .chain(&hit.display_categories)
+        .filter(|tag| SEARCH_LOADER_TAGS.contains(&tag.as_str()))
+        .fold(Vec::new(), |mut loaders, tag| {
+            if !loaders.contains(tag) {
+                loaders.push(tag.clone());
+            }
+            loaders
+        });
     let categories = if hit.display_categories.is_empty() {
         hit.categories
     } else {
         hit.display_categories
-    };
+    }
+    .into_iter()
+    .filter(|tag| !SEARCH_LOADER_TAGS.contains(&tag.as_str()))
+    .collect();
     Ok(CanonicalContent {
         canonical_id: CanonicalId::for_project(ProviderId::Modrinth, &hit.project_id),
         kind,
@@ -417,7 +465,7 @@ pub(super) fn map_search_hit(hit: dto::SearchHit) -> ContentResult<CanonicalCont
         follows: hit.follows,
         categories,
         game_versions: hit.versions,
-        loaders: Vec::new(),
+        loaders,
         updated: hit.date_modified,
     })
 }
@@ -766,13 +814,14 @@ mod tests {
         query.offset = 40;
         query.limit = 1;
         let payload = json!({"hits":[{"project_id":"p1","title":"Name","project_type":"mod",
-            "categories":["fabric"],"display_categories":["optimization"],"icon_url":"",
+            "categories":["fabric","optimization"],"display_categories":["optimization","quilt"],"icon_url":"",
             "author":"Author","versions":["1.21.6"],"date_modified":"2026-09-01"}],
             "offset":40,"limit":1,"total_hits":100});
         let page =
             map_search_page(&query, serde_json::from_value(payload.clone()).unwrap()).unwrap();
         assert_eq!((page.offset, page.limit, page.total), (40, 1, 100));
         assert_eq!(page.items[0].categories, ["optimization"]);
+        assert_eq!(page.items[0].loaders, ["fabric", "quilt"]);
         assert_eq!(page.items[0].canonical_id.as_str(), "modrinth:p1");
         assert_eq!(page.items[0].icon_url, None);
         for (field, wrong) in [
