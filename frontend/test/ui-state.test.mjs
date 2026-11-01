@@ -203,52 +203,30 @@ test('explicit reset cancels a pending restore and forgets its position', () => 
   }
 });
 
-test('manual scrolling cancels a pending async restore', () => {
-  const view = new FakeView();
-  view.scrollHeight = 1_400;
-  const dom = installDom(view);
-  /** @type {ui.Route} */
-  const savedRoute = { name: 'discover', target: 'manual-scroll' };
+test('manual scrolling and focus movement cancel a pending async restore', () => {
+  for (const [event, target] of [['wheel', 'manual-scroll'], ['focusin', 'keyboard-focus']]) {
+    const view = new FakeView();
+    view.scrollHeight = 1_400;
+    const dom = installDom(view);
+    /** @type {ui.Route} */
+    const savedRoute = { name: 'discover', target };
 
-  try {
-    ui.route.value = savedRoute;
-    view.scrollTop = 600;
-    ui.navigate({ name: 'home' });
-    view.scrollHeight = 400;
-    ui.navigate(savedRoute);
-    ui.restoreViewScroll(ui.routeScrollKey(savedRoute));
+    try {
+      ui.route.value = savedRoute;
+      view.scrollTop = 600;
+      ui.navigate({ name: 'home' });
+      view.scrollHeight = 400;
+      ui.navigate(savedRoute);
+      ui.restoreViewScroll(ui.routeScrollKey(savedRoute));
 
-    view.emit('wheel');
-    view.scrollHeight = 1_200;
-    dom.flushResize();
-    assert.equal(view.scrollTop, 0);
-  } finally {
-    dom.restore();
-  }
-});
-
-test('focus movement cancels a pending async restore', () => {
-  const view = new FakeView();
-  view.scrollHeight = 1_400;
-  const dom = installDom(view);
-  /** @type {ui.Route} */
-  const savedRoute = { name: 'discover', target: 'keyboard-focus' };
-
-  try {
-    ui.route.value = savedRoute;
-    view.scrollTop = 600;
-    ui.navigate({ name: 'home' });
-    view.scrollHeight = 400;
-    ui.navigate(savedRoute);
-    ui.restoreViewScroll(ui.routeScrollKey(savedRoute));
-
-    view.emit('focusin');
-    view.scrollHeight = 1_200;
-    dom.flushResize();
-    assert.equal(view.scrollTop, 0);
-    assert.equal(dom.activeObserverCount(), 0);
-  } finally {
-    dom.restore();
+      view.emit(event);
+      view.scrollHeight = 1_200;
+      dom.flushResize();
+      assert.equal(view.scrollTop, 0, event);
+      assert.equal(dom.activeObserverCount(), 0, event);
+    } finally {
+      dom.restore();
+    }
   }
 });
 

@@ -606,102 +606,59 @@ test('repeated original settlement completes once while another instance is sele
   assert.deepEqual(h.sounds, ['launchSuccess']);
 });
 
-test('delayed live status cannot restore Playing after verified settlement while final logs are pending', async () => {
-  const h = await acceptedPlay();
-  h.poll();
-  await flush();
-  await flush();
-  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, true);
-  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
-  assert.equal(h.closed(), 0);
-
-  h.emit({ ...h.accepted, revision: 8 }, 'status');
-  const current = h.store.launchSessions.value['instance-1'];
-  assert.equal(
-    current.viewModel.playing,
-    false,
-    'a delayed higher live revision cannot undo authenticated terminal settlement',
-  );
-  assert.equal(current.viewModel.can_stop, false);
-  assert.equal(current.viewModel.process_live, false);
-  assert.equal(current.viewModel.terminal, true);
-  assert.equal(current.statusRevision, 7);
-  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
-  h.finalLogs.resolve({ entries: [] });
-  await flush();
-  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
-  assert.equal(h.closed(), 1);
-  assert.equal(h.lines.filter((line) => line.text === 'The game was stopped from the launcher.').length, 1);
-  assert.deepEqual(h.sounds, ['launchSuccess']);
-});
-
-test('a pending Stop response cannot undo verified settlement while final logs are pending', async () => {
-  const h = await acceptedPlay();
-  const reply = deferred<unknown>();
-  h.postKill(() => reply.promise);
-  const stopping = h.launch.killGame();
-  assert.equal(h.calls.filter((path) => path === `/launch/${h.sessionId}/kill`).length, 1);
-  h.poll();
-  await flush();
-  await flush();
-  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, true);
-  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
-
-  reply.resolve({
-    ...h.accepted,
-    revision: 8,
-    phase: 'stopping',
-    process_alive: true,
-    stop_allowed: true,
-    tree_settled: false,
-    output_drained: false,
-    view_model: { ...h.accepted.view_model, state_id: 'stopping', label: 'Stopping Minecraft', playing: false },
-  });
-  await stopping;
-  const current = h.store.launchSessions.value['instance-1'];
-  assert.equal(
-    current.viewModel.terminal,
-    true,
-    'a delayed Stop response cannot undo authenticated terminal settlement',
-  );
-  assert.equal(current.viewModel.process_live, false);
-  assert.equal(current.viewModel.can_stop, false);
-  assert.equal(current.statusRevision, 7);
-  assert.deepEqual(h.errors, []);
-  h.finalLogs.resolve({ entries: [] });
-  await flush();
-  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
-  assert.equal(h.closed(), 1);
-  assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
-});
-
-for (const failure of ['refused', 'response lost'] as const) {
-  test(`an obsolete Stop ${failure} cannot publish a warning after verified settlement`, async () => {
+test('delayed live status or Stop outcomes cannot undo verified settlement while final logs are pending', async () => {
+  for (const stale of ['live status', 'Stop response', 'Stop refused', 'Stop response lost'] as const) {
     const h = await acceptedPlay();
     const reply = deferred<unknown>();
     h.postKill(() => reply.promise);
-    const stopping = h.launch.killGame();
+    const stopping = stale === 'live status' ? undefined : h.launch.killGame();
+    const kills = (): number => h.calls.filter((path) => path === `/launch/${h.sessionId}/kill`).length;
+    assert.equal(kills(), stopping ? 1 : 0, stale);
     h.poll();
     await flush();
     await flush();
     const settled = h.store.launchSessions.value['instance-1'];
-    assert.equal(settled.viewModel.terminal, true);
-    if (failure === 'refused') {
+    assert.equal(settled.viewModel.terminal, true, stale);
+    assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1, stale);
+    assert.equal(h.closed(), 0, stale);
+
+    if (stale === 'live status') h.emit({ ...h.accepted, revision: 8 }, 'status');
+    else if (stale === 'Stop response') {
+      reply.resolve({
+        ...h.accepted,
+        revision: 8,
+        phase: 'stopping',
+        process_alive: true,
+        stop_allowed: true,
+        tree_settled: false,
+        output_drained: false,
+        view_model: { ...h.accepted.view_model, state_id: 'stopping', label: 'Stopping Minecraft', playing: false },
+      });
+    } else if (stale === 'Stop refused') {
       const path = `/launch/${h.sessionId}/kill`;
       const response = historicalStatusApi(404, { error: 'The instance was not found.', code: 'instance_not_found' }, path);
       await response.api('POST', path).catch(reply.reject);
     } else reply.reject(new Error('Stop response lost'));
     await stopping;
-    assert.equal(h.store.launchSessions.value['instance-1'], settled);
-    assert.deepEqual(h.errors, []);
-    assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+    const current = h.store.launchSessions.value['instance-1'];
+    if (stale === 'Stop refused' || stale === 'Stop response lost') assert.equal(current, settled, stale);
+    assert.equal(current.viewModel.terminal, true, `${stale}: a delayed reply cannot undo authenticated terminal settlement`);
+    assert.equal(current.viewModel.playing, false, stale);
+    assert.equal(current.viewModel.can_stop, false, stale);
+    assert.equal(current.viewModel.process_live, false, stale);
+    assert.equal(current.statusRevision, 7, stale);
+    assert.deepEqual(h.errors, [], stale);
+    assert.equal(kills(), stopping ? 1 : 0, stale);
+    assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1, stale);
     h.finalLogs.resolve({ entries: [] });
     await flush();
-    assert.equal(h.store.launchSessions.value['instance-1'], undefined);
-    assert.equal(h.closed(), 1);
-    assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1);
-  });
-}
+    assert.equal(h.store.launchSessions.value['instance-1'], undefined, stale);
+    assert.equal(h.closed(), 1, stale);
+    assert.equal(h.calls.filter((path) => path.endsWith('/logs')).length, 1, stale);
+    assert.equal(h.lines.filter((line) => line.text === 'The game was stopped from the launcher.').length, 1, stale);
+    assert.deepEqual(h.sounds, ['launchSuccess'], stale);
+  }
+});
 
 test('original final-log completion cannot clear a replacement launch or refresh its readiness', async () => {
   const h = await acceptedPlay();
@@ -780,33 +737,31 @@ test('concurrent duplicate adoption never creates a second connection or replace
   assert.equal(h.store.launchSessions.value['instance-1'].sessionId, 'session-1');
 });
 
-for (const [label, value] of [
-  ['malformed', { error: 'private provider detail' }],
-  ['mismatched identity', { ...status(), session_id: 'different-session' }],
-  ['invalid launch time', { ...status(), launched_at: 'invalid' }],
-  ['unsafe revision', { ...status(), revision: Number.MAX_SAFE_INTEGER + 1 }],
-] as const) {
-  test(`invalid external session response cannot publish controls: ${label}`, async () => {
+test('an invalid, terminal or unclassified external session read cannot publish controls', async () => {
+  const historical = '4772f752-5f75-48fb-a1f0-bb484f858ea0';
+  const refusal = (code: number, payload: unknown) => () =>
+    historicalStatusApi(code, payload).api('GET', `/launch/${historical}/status`);
+  for (const { label, read, session = 'session-1', visible = true } of [
+    { label: 'malformed', read: async () => ({ error: 'private provider detail' }) },
+    { label: 'mismatched identity', read: async () => ({ ...status(), session_id: 'different-session' }) },
+    { label: 'invalid launch time', read: async () => ({ ...status(), launched_at: 'invalid' }) },
+    { label: 'unsafe revision', read: async () => ({ ...status(), revision: Number.MAX_SAFE_INTEGER + 1 }) },
+    { label: 'already terminal', read: async () => status(2, true), visible: false },
+    { label: 'unclassified 404', read: refusal(404, { error: 'private provider detail' }), session: historical },
+    { label: 'other 404 code', read: refusal(404, { error: 'private provider detail', code: 'another_error' }), session: historical },
+    { label: 'typed 404 without message', read: refusal(404, { code: 'instance_not_found' }), session: historical },
+    { label: 'unavailable 503', read: refusal(503, { error: 'private provider detail', code: 'instance_not_found' }), session: historical },
+  ]) {
     const h = launchHarness(undefined, false);
     const sessions = h.store.launchSessions.value;
-    h.readStatus(async () => value);
-    await h.launch.adoptLaunchSession('session-1');
-    assert.equal(h.store.launchSessions.value, sessions);
-    assert.equal(h.connections(), 0);
-    assert.equal(h.errors.length, 1);
-    assert.doesNotMatch(h.errors[0], /private provider detail/);
-    assert.equal(h.clock.timeouts.size + h.clock.intervals.size, 0);
-  });
-}
-
-test('an already terminal external session is not resurrected or connected', async () => {
-  const h = launchHarness(undefined, false);
-  const sessions = h.store.launchSessions.value;
-  h.readStatus(async () => status(2, true));
-  await h.launch.adoptLaunchSession('session-1');
-  assert.equal(h.store.launchSessions.value, sessions);
-  assert.equal(h.connections(), 0);
-  assert.equal(h.errors.length, 0);
+    h.readStatus(read);
+    await h.launch.adoptLaunchSession(session);
+    assert.equal(h.store.launchSessions.value, sessions, label);
+    assert.equal(h.connections(), 0, label);
+    assert.equal(h.errors.length, visible ? 1 : 0, label);
+    for (const error of h.errors) assert.doesNotMatch(error, /private provider detail/, label);
+    assert.equal(h.clock.timeouts.size + h.clock.intervals.size, 0, label);
+  }
 });
 
 test('typed absence of a historical session is quiet and preserves any current game', async () => {
@@ -828,25 +783,6 @@ test('typed absence of a historical session is quiet and preserves any current g
   }
 });
 
-test('unclassified 404 and unavailable historical status remain visible safe failures', async () => {
-  for (const [code, payload] of [
-    [404, { error: 'private provider detail' }],
-    [404, { error: 'private provider detail', code: 'another_error' }],
-    [404, { code: 'instance_not_found' }],
-    [503, { error: 'private provider detail', code: 'instance_not_found' }],
-  ] as const) {
-    const h = launchHarness(undefined, false);
-    const sessions = h.store.launchSessions.value;
-    const response = historicalStatusApi(code, payload);
-    h.readStatus(() => response.api('GET', '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status'));
-    await h.launch.adoptLaunchSession('4772f752-5f75-48fb-a1f0-bb484f858ea0');
-    assert.equal(h.store.launchSessions.value, sessions);
-    assert.equal(h.connections(), 0);
-    assert.equal(h.errors.length, 1);
-    assert.doesNotMatch(h.errors[0], /private provider detail/);
-  }
-});
-
 test('late historical absence cannot clear or reconnect a newer live projection', async () => {
   const h = launchHarness();
   await flush();
@@ -865,18 +801,22 @@ test('late historical absence cannot clear or reconnect a newer live projection'
   assert.deepEqual(h.errors, []);
 });
 
-for (const change of [
-  'replacement session',
-  'session lifetime',
-  'preparation',
-  'preparation lifetime',
-  'instance removal',
-] as const) {
-  test(`a delayed external session read cannot overwrite a newer ${change}`, async () => {
+test('external adoption cannot overwrite, replace or strand a newer session or preparation', async () => {
+  for (const [timing, change] of [
+    ['delayed', 'replacement session'],
+    ['delayed', 'session lifetime'],
+    ['delayed', 'preparation'],
+    ['delayed', 'preparation lifetime'],
+    ['delayed', 'instance removal'],
+    ['failed', 'preparation lifetime'],
+    ['occupied', 'replacement session'],
+    ['occupied', 'preparation'],
+  ] as const) {
+    const label = `${timing} ${change}`;
     const h = launchHarness(undefined, false);
     const reply = deferred<unknown>();
-    h.readStatus(() => reply.promise);
-    const adoption = h.launch.adoptLaunchSession('session-1');
+    if (timing !== 'occupied') h.readStatus(() => reply.promise);
+    const adoption = timing === 'occupied' ? undefined : h.launch.adoptLaunchSession('session-1');
     if (change === 'replacement session' || change === 'session lifetime') {
       const replacement = statusContract.launchSessionsResponse({
         sessions: [{ ...status(), session_id: 'session-2' }],
@@ -889,43 +829,14 @@ for (const change of [
     } else h.store.instances.value = [];
     const sessions = h.store.launchSessions.value;
     const preparing = h.store.launchState.value;
-    reply.resolve(status());
-    await adoption;
-    assert.equal(h.store.launchSessions.value, sessions);
-    assert.equal(h.store.launchState.value, preparing);
-    assert.equal(h.connections(), 0);
-  });
-}
-
-test('external adoption cannot replace an existing session or strand same-instance preparation', async () => {
-  for (const occupied of ['session', 'preparation'] as const) {
-    const h = launchHarness(undefined, false);
-    if (occupied === 'session') {
-      const replacement = statusContract.launchSessionsResponse({
-        sessions: [{ ...status(), session_id: 'session-2' }],
-      });
-      h.actions.confirmLaunch('instance-1', replacement['instance-1']);
-    } else h.actions.startLaunch('instance-1');
-    const sessions = h.store.launchSessions.value;
-    const preparing = h.store.launchState.value;
-    await h.launch.adoptLaunchSession('session-1');
-    assert.equal(h.store.launchSessions.value, sessions);
-    assert.equal(h.store.launchState.value, preparing);
-    assert.equal(h.connections(), 0);
+    if (timing === 'failed') reply.reject(new Error('private provider detail'));
+    else reply.resolve(status());
+    await (adoption ?? h.launch.adoptLaunchSession('session-1'));
+    assert.equal(h.store.launchSessions.value, sessions, label);
+    assert.equal(h.store.launchState.value, preparing, label);
+    assert.equal(h.connections(), 0, label);
+    assert.deepEqual(h.errors, [], label);
   }
-});
-
-test('an obsolete external session read failure cannot surface after a preparation lifetime', async () => {
-  const h = launchHarness(undefined, false);
-  const reply = deferred<unknown>();
-  h.readStatus(() => reply.promise);
-  const adoption = h.launch.adoptLaunchSession('session-1');
-  h.actions.startLaunch('instance-1');
-  h.actions.endLaunchPrep();
-  reply.reject(new Error('private provider detail'));
-  await adoption;
-  assert.deepEqual(h.errors, []);
-  assert.equal(h.connections(), 0);
 });
 
 test('an interrupted durable launch stops recovery polling and prevents a fresh launch', async () => {
@@ -1032,50 +943,32 @@ test('final log timeout is bounded and a late reply cannot affect a replacement 
   assert.equal(harness.store.launchSessions.value['instance-1'].sessionId, 'session-2');
 });
 
-test('terminal readiness rechecks once after the launch reservation is released', async () => {
-  const harness = launchHarness();
-  let reads = 0;
-  harness.readInstance(async () => instance(++reads > 1));
-  harness.emit(status(2, true), 'status');
-  harness.finalLogs.resolve({ entries: [] });
-  await flush();
-  assert.equal(harness.store.launchSessions.value['instance-1'], undefined);
-  assert.equal(harness.store.instances.value[0].launch_action.label, 'Unavailable');
-  assert.equal([...harness.clock.timeouts.values()][0].delay, 250);
-  harness.clock.runTimeout();
-  await flush();
-  assert.equal(harness.store.instances.value[0].launch_action.label, 'Launch');
-  assert.equal(reads, 2);
-  assert.equal(harness.clock.timeouts.size, 0);
-});
-
-test('a backend refusal remains unavailable after the bounded settlement reads', async () => {
-  const harness = launchHarness();
-  harness.readInstance(async () => instance());
-  harness.emit(status(2, true), 'status');
-  harness.finalLogs.resolve({ entries: [] });
-  await flush();
-  harness.clock.runTimeout();
-  await flush();
-  assert.equal(harness.store.instances.value[0].launch_action.launchable, false);
-  assert.equal(harness.calls.filter((path) => path === '/instances/instance-1').length, 2);
-  assert.equal(harness.clock.timeouts.size, 0);
-});
-
-test('failed readiness reads surface an error without retaining an ended session or retrying forever', async () => {
-  const harness = launchHarness();
-  harness.readInstance(async () => { throw new Error('Offline'); });
-  harness.emit(status(2, true), 'status');
-  harness.finalLogs.resolve({ entries: [] });
-  await flush();
-  harness.clock.runTimeout();
-  await flush();
-  assert.equal(harness.store.launchSessions.value['instance-1'], undefined);
-  assert.equal(harness.store.instances.value[0].launch_action.launchable, false);
-  assert.equal(harness.closed(), 1);
-  assert.equal(harness.errors.length, 1);
-  assert.match(harness.errors[0], /Could not refresh launch availability/);
-  assert.equal(harness.clock.timeouts.size, 0);
+test('terminal readiness rechecks once after the launch reservation is released and settles truthfully', async () => {
+  for (const { label, read, launchable, errors } of [
+    { label: 'released reservation', read: (reads: number) => instance(reads > 1), launchable: true, errors: 0 },
+    { label: 'backend refusal', read: () => instance(), launchable: false, errors: 0 },
+    { label: 'read failure', read: (): EnrichedInstance => { throw new Error('Offline'); }, launchable: false, errors: 1 },
+  ]) {
+    const harness = launchHarness();
+    let reads = 0;
+    harness.readInstance(async () => read(++reads));
+    harness.emit(status(2, true), 'status');
+    harness.finalLogs.resolve({ entries: [] });
+    await flush();
+    assert.equal(harness.store.launchSessions.value['instance-1'], undefined, label);
+    assert.equal(harness.store.instances.value[0].launch_action.label, 'Unavailable', label);
+    assert.equal([...harness.clock.timeouts.values()][0].delay, 250, label);
+    harness.clock.runTimeout();
+    await flush();
+    assert.equal(harness.store.instances.value[0].launch_action.launchable, launchable, label);
+    assert.equal(harness.store.instances.value[0].launch_action.label, launchable ? 'Launch' : 'Unavailable', label);
+    assert.equal(reads, 2, label);
+    assert.equal(harness.calls.filter((path) => path === '/instances/instance-1').length, 2, label);
+    assert.equal(harness.closed(), 1, label);
+    assert.equal(harness.errors.length, errors, label);
+    for (const error of harness.errors) assert.match(error, /Could not refresh launch availability/, label);
+    assert.equal(harness.clock.timeouts.size, 0, label);
+  }
 });
 
 for (const change of ['edit', 'remove', 'session', 'config'] as const) {
@@ -1154,25 +1047,30 @@ function downloadsHarness(sharedStore?: {
   };
 }
 
-test('required initial hydration joins the stream projection without a duplicate instance or version read', async () => {
-  const h = downloadsHarness();
-  const snapshot = queue('first', 1, 0);
-  const queueReply = deferred<unknown>();
-  const versionsReply = deferred<unknown>();
-  h.read(async (path) => path === '/install/queue' ? queueReply.promise : path === '/versions'
-    ? versionsReply.promise : { instances: ['initial'], last_instance_id: 'initial' });
-  let ready = false;
-  const refresh = h.machine.refreshInstallQueue({ connectActive: true, requireInstalledState: true }).then(() => { ready = true; });
-  h.emit(snapshot);
-  await flush();
-  queueReply.resolve(snapshot);
-  await flush();
-  assert.equal(ready, false);
-  assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
-  versionsReply.resolve({ versions: ['initial'] });
-  await refresh;
-  assert.deepEqual(h.store.instances.value, ['initial']);
-  assert.equal(h.calls.filter((path) => path === '/versions').length, 1);
+test('required initial hydration joins the current stream projection without a duplicate instance or version read', async () => {
+  for (const initial of ['matching', 'superseded'] as const) {
+    const h = downloadsHarness();
+    const snapshot = queue('current', 1, 0);
+    const queueReply = deferred<unknown>();
+    const versionsReply = deferred<unknown>();
+    h.read(async (path) => path === '/install/queue' ? queueReply.promise : path === '/versions'
+      ? versionsReply.promise : { instances: ['current'], last_instance_id: null });
+    let ready = false;
+    const refresh = h.machine.refreshInstallQueue({ connectActive: true, requireInstalledState: true }).then(() => { ready = true; });
+    h.emit(snapshot);
+    await flush();
+    queueReply.resolve(initial === 'matching' ? snapshot : queue('old', 10, 9));
+    await flush();
+    assert.equal(ready, false, initial);
+    assert.equal(h.calls.filter((path) => path === '/instances').length, 1, initial);
+    versionsReply.resolve({ versions: ['current'] });
+    await refresh;
+    assert.equal(h.machine.downloadQueue.value.view_model.status_label, 'current', initial);
+    assert.deepEqual(h.store.versions.value, ['current'], initial);
+    assert.deepEqual(h.store.instances.value, ['current'], initial);
+    assert.equal(h.calls.filter((path) => path === '/instances').length, 1, initial);
+    assert.equal(h.calls.filter((path) => path === '/versions').length, 1, initial);
+  }
 });
 
 test('required hydration follows newer registry revisions and restarted epochs before reporting readiness', async () => {
@@ -1244,26 +1142,6 @@ test('new registry cursors drain the active read pair before reading only the la
     assert.equal(h.calls.length, 6, 'completed reads must release the next invalidation');
     assert.equal(active, 0);
   }
-});
-
-test('a superseded initial queue response still awaits the current stream registry projection', async () => {
-  const h = downloadsHarness();
-  const oldQueue = deferred<unknown>();
-  const currentVersions = deferred<unknown>();
-  h.read(async (path) => path === '/install/queue' ? oldQueue.promise : path === '/versions'
-    ? currentVersions.promise : { instances: ['current'], last_instance_id: null });
-  let ready = false;
-  const refresh = h.machine.refreshInstallQueue({ connectActive: true, requireInstalledState: true }).then(() => { ready = true; });
-  h.emit(queue('new', 1, 0));
-  await flush();
-  oldQueue.resolve(queue('old', 10, 9));
-  await flush();
-  assert.equal(ready, false);
-  currentVersions.resolve({ versions: ['current'] });
-  await refresh;
-  assert.equal(h.machine.downloadQueue.value.view_model.status_label, 'new');
-  assert.deepEqual(h.store.instances.value, ['current']);
-  assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
 });
 
 test('required hydration propagates a shared read failure and explicit retry bypasses background backoff', async () => {

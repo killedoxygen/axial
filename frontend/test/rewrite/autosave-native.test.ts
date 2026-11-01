@@ -524,6 +524,30 @@ function harness() {
   };
 }
 
+type Harness = ReturnType<typeof harness>;
+
+function settleOn(h: Harness, trigger: 'flush' | 'reload') {
+  if (trigger === 'flush') {
+    h.emit('flush');
+    return {
+      pending: () => assert.deepEqual(h.completions, [], trigger),
+      async settled() {
+        await tick();
+        assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }], trigger);
+      },
+    };
+  }
+  const reloading = h.owner.reloadApplication();
+  assert.equal(h.owner.reloadApplication(), reloading, 'a repeated Reload joins the pending request');
+  return {
+    pending: () => assert.equal(h.reloads(), 0, trigger),
+    async settled() {
+      assert.equal(await reloading, true, trigger);
+      assert.equal(h.reloads(), 1, trigger);
+    },
+  };
+}
+
 test('cold instance Java settings retain redacted selection and explicit edits', async (context) => {
   const component = 'java-runtime-delta';
   for (const scenario of ['untouched custom', 'clear custom', 'replace custom', 'inherit global custom', 'component'] as const) {
@@ -775,27 +799,50 @@ test('a refused older memory control restores the latest acknowledged heap, not 
   }
 });
 
-test('a refused queued launch preference restores the latest acknowledged value', async (context) => {
-  for (const { field, control, firstValue, secondValue, acknowledgedValue, label, debounce } of [
+test('a refused queued preference restores the latest acknowledged value', async (context) => {
+  const instanceField = (field: 'performance_mode' | 'extra_jvm_args') => ({
+    view: 'instance' as const,
+    stored: (h: Harness) => h.store.instances.value[0][field],
+    server: (h: Harness) => h.instance()[field],
+    revisions: [6, 7],
+    status: 409,
+  });
+  for (const { control, firstValue, secondValue, acknowledgedValue, label, debounce, commit, ...owner } of [
     {
-      field: 'performance_mode',
+      ...instanceField('performance_mode'),
       control: 'ChoicePills',
       firstValue: 'managed',
       secondValue: 'custom',
       acknowledgedValue: 'managed',
       label: 'launch profile',
       debounce: false,
+      commit: false,
     },
     {
-      field: 'extra_jvm_args',
+      ...instanceField('extra_jvm_args'),
       control: 'JvmArgsInput',
       firstValue: '-Daxial.first=true',
       secondValue: '-Daxial.second=true',
       acknowledgedValue: '',
       label: 'JVM arguments',
       debounce: true,
+      commit: false,
     },
-  ] as const) {
+    {
+      view: 'global' as const,
+      stored: (h: Harness) => h.store.config.value.java_path_override,
+      server: (h: Harness) => h.config().java_path_override,
+      revisions: [4, 5],
+      status: 400,
+      control: 'JavaPathField',
+      firstValue: '/fixture/acknowledged-java',
+      secondValue: '/fixture/refused-java',
+      acknowledgedValue: '/fixture/acknowledged-java',
+      label: 'runtime defaults',
+      debounce: false,
+      commit: true,
+    },
+  ]) {
     await context.test(label, async () => {
       const h = harness();
       const first = deferred<unknown>();
@@ -809,31 +856,39 @@ test('a refused queued launch preference restores the latest acknowledged value'
         if (h.writes.length === 2) return second.promise;
       });
       try {
-        h.render('instance');
-        await tick();
-        h.render('instance');
-        const before = h.store.instances.value[0][field];
-        const preference = h.control<{ onChange(value: string): void }>(control);
-        preference.onChange(firstValue);
-        if (debounce) h.timersRun();
+        h.render(owner.view);
+        if (owner.view === 'instance') {
+          await tick();
+          h.render(owner.view);
+        }
+        const before = owner.stored(h);
+        const preference = h.control<{ onChange(value: string): void; onCommit?(value: string): void }>(control);
+        const edit = (value: string): void => {
+          preference.onChange(value);
+          if (commit) preference.onCommit?.(value);
+          if (debounce) h.timersRun();
+        };
+        edit(firstValue);
         await tick();
         assert.equal(h.writes.length, 1);
-        assert.equal(h.store.instances.value[0][field], before, 'first acknowledgement remains held');
-        preference.onChange(secondValue);
-        if (debounce) h.timersRun();
+        assert.equal(owner.stored(h), before, 'first acknowledgement remains held');
+        edit(secondValue);
         first.resolve(firstResponse);
         await tick();
-        h.render('instance');
-        h.render('instance');
-        assert.equal(h.store.instances.value[0][field], acknowledgedValue);
-        second.reject(Object.assign(new Error('Fixture refusal'), { status: 409 }));
+        h.render(owner.view);
+        h.render(owner.view);
+        assert.equal(owner.stored(h), acknowledgedValue);
+        if (owner.view === 'global') assert.equal(h.control<{ value: string }>(control).value, acknowledgedValue);
+        second.reject(Object.assign(new Error('Fixture refusal'), { status: owner.status }));
         await tick();
-        h.render('instance');
+        h.render(owner.view);
         assert.equal(h.writes.length, 2, 'the refused edit must not replay');
-        assert.equal(h.instance()[field], firstValue);
-        assert.equal(h.store.instances.value[0][field], acknowledgedValue);
+        assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), owner.revisions);
+        assert.equal(owner.server(h), firstValue);
+        assert.equal(owner.stored(h), acknowledgedValue);
         assert.equal(h.control<{ value: string }>(control).value, acknowledgedValue);
-        assert.ok(h.notices.some((notice) => notice.includes(`Could not save ${label}: Fixture refusal`)));
+        assert.deepEqual(h.notices, ['Saved', `Could not save ${label}: Fixture refusal`]);
+        if (owner.view === 'global') assert.deepEqual(h.reads, ['/config']);
       } finally {
         first.resolve(firstResponse);
         second.resolve();
@@ -1125,212 +1180,166 @@ test('remounting settings replaces an abandoned read without letting its cleanup
   }
 });
 
-test('a refused queued global Java path retains the latest acknowledged path', async () => {
-  const h = harness();
-  const first = deferred<unknown>();
-  const second = deferred<void>();
-  let firstResponse: unknown;
-  h.respond(async (_path, value) => {
-    firstResponse = value;
-    return first.promise;
-  });
-  h.admit(() => {
-    if (h.writes.length === 2) return second.promise;
-  });
-  try {
+test('native flush and Reload join a held config reply and the next queued real control', async () => {
+  for (const trigger of ['flush', 'reload'] as const) {
+    const h = harness();
+    await h.hydrate();
     h.render('global');
-    const java = h.control<{ onChange(value: string): void; onCommit(value: string): void }>('JavaPathField');
-    java.onChange('/fixture/acknowledged-java');
-    java.onCommit('/fixture/acknowledged-java');
+    const first = deferred<unknown>();
+    const second = deferred<unknown>();
+    let firstResponse: unknown;
+    let secondResponse: unknown;
+    h.respond(async (_path, value) => {
+      if (h.writes.length === 1) {
+        firstResponse = value;
+        return first.promise;
+      }
+      secondResponse = value;
+      return second.promise;
+    });
+    h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
     await tick();
-    assert.equal(h.writes.length, 1);
-    assert.equal(h.store.config.value.java_path_override, '', 'first acknowledgement remains held');
-    java.onChange('/fixture/refused-java');
-    java.onCommit('/fixture/refused-java');
-    first.resolve(firstResponse);
-    await tick();
-    h.render('global');
-    h.render('global');
-    assert.equal(h.control<{ value: string }>('JavaPathField').value, '/fixture/acknowledged-java');
-    second.reject(Object.assign(new Error('Fixture refusal'), { status: 400 }));
-    await tick();
-    h.render('global');
-    assert.equal(h.config().java_path_override, '/fixture/acknowledged-java');
-    assert.equal(h.store.config.value.java_path_override, '/fixture/acknowledged-java');
-    assert.equal(h.control<{ value: string }>('JavaPathField').value, '/fixture/acknowledged-java');
-    assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), [4, 5]);
-    assert.deepEqual(h.reads, ['/config']);
-    assert.deepEqual(h.notices, ['Saved', 'Could not save runtime defaults: Fixture refusal']);
-  } finally {
-    first.resolve(firstResponse);
-    second.resolve();
-    await tick();
-    h.dispose();
-    await tick();
-  }
-});
-
-test('native flush joins a committed settings reply and the next queued real control before acknowledging', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.render('global');
-  const first = deferred<unknown>();
-  const second = deferred<unknown>();
-  let firstResponse: unknown;
-  let secondResponse: unknown;
-  h.respond(async (_path, value) => {
-    if (h.writes.length === 1) {
-      firstResponse = value;
-      return first.promise;
+    assert.equal(h.config().max_memory_mb, 5120, trigger);
+    h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
+    const settlement = settleOn(h, trigger);
+    try {
+      await tick();
+      settlement.pending();
+      assert.equal(h.writes.length, 1, trigger);
+      first.resolve(firstResponse);
+      await tick();
+      assert.equal(h.writes.length, 2, trigger);
+      settlement.pending();
+      second.resolve(secondResponse);
+      await settlement.settled();
+      assert.equal(h.config().window_width, 1000, trigger);
+      if (trigger === 'reload') await assert.rejects(h.autosave.saveConfigPatch({ window_width: 1600 }), /paused/);
+    } finally {
+      first.resolve(firstResponse);
+      second.resolve(secondResponse);
+      await tick();
+      h.dispose();
     }
-    secondResponse = value;
-    return second.promise;
-  });
-  h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
-  await tick();
-  assert.equal(h.config().max_memory_mb, 5120);
-  h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
-  h.emit('flush');
-  try {
-    await tick();
-    assert.deepEqual(h.completions, []);
-    assert.equal(h.writes.length, 1);
-    first.resolve(firstResponse);
-    await tick();
-    assert.equal(h.writes.length, 2);
-    assert.deepEqual(h.completions, []);
-    second.resolve(secondResponse);
-    await tick();
-    assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
-    assert.equal(h.config().window_width, 1000);
-  } finally {
-    first.resolve(firstResponse);
-    second.resolve(secondResponse);
-    await tick();
-    h.dispose();
   }
 });
 
-test('native flush submits the real instance JVM draft before its debounce and joins its receipt', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.render('instance');
-  await tick();
-  const reply = deferred<unknown>();
-  let response: unknown;
-  h.respond(async (_path, value) => {
-    response = value;
-    return reply.promise;
-  });
-  h.control<{ onChange(value: string): void }>('JvmArgsInput').onChange('-Daxial.fixture=true');
-  assert.equal(h.writes.length, 0);
-  h.emit('flush');
-  try {
+test('native flush and Reload submit the real instance and audio drafts before their debounce and join the receipt', async () => {
+  for (const trigger of ['flush', 'reload'] as const) {
+    for (const view of ['instance', 'audio'] as const) {
+      const label = `${trigger} ${view}`;
+      const h = harness();
+      await h.hydrate();
+      if (view === 'audio') h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
+      h.render(view);
+      await tick();
+      const reply = deferred<unknown>();
+      let response: unknown;
+      h.respond(async (_path, value) => {
+        response = value;
+        return reply.promise;
+      });
+      if (view === 'instance') h.control<{ onChange(value: string): void }>('JvmArgsInput').onChange('-Daxial.fixture=true');
+      else h.control<{ onChange(value: number): void }>('Slider').onChange(70);
+      assert.equal(h.writes.length, 0, label);
+      const settlement = settleOn(h, trigger);
+      try {
+        await tick();
+        assert.equal(h.writes.length, 1, label);
+        assert.equal(
+          view === 'instance' ? h.writes[0].patch.extra_jvm_args : h.writes[0].patch.music_volume,
+          view === 'instance' ? '-Daxial.fixture=true' : 70,
+          label,
+        );
+        settlement.pending();
+        reply.resolve(response);
+        await settlement.settled();
+        h.timersRun();
+        await tick();
+        assert.equal(h.writes.length, 1, label);
+      } finally {
+        reply.resolve(response);
+        h.dispose();
+        await tick();
+      }
+    }
+  }
+});
+
+test('native discard joins the sent write, parks the queued config or instance control, and resumes it once on release', async () => {
+  for (const { view, target, revision, width } of [
+    { view: 'global', target: (h: Harness) => h.config().window_width, revision: 5, width: 854 },
+    { view: 'instance', target: (h: Harness) => h.instance().window_width, revision: 7, width: undefined },
+  ] as const) {
+    const h = harness();
+    await h.hydrate();
+    h.render(view);
+    if (view === 'instance') await tick();
+    const reply = deferred<unknown>();
+    let response: unknown;
+    h.respond(async (_path, value) => {
+      if (h.writes.length === 1) {
+        response = value;
+        return reply.promise;
+      }
+      return value;
+    });
+    h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
     await tick();
-    assert.equal(h.writes.length, 1);
-    assert.equal(h.writes[0].patch.extra_jvm_args, '-Daxial.fixture=true');
-    assert.deepEqual(h.completions, []);
+    h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
+    h.emit('discard');
+    await tick();
+    assert.deepEqual(h.completions, [], view);
     reply.resolve(response);
     await tick();
-    assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
+    assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }], view);
+    assert.equal(h.writes.length, 1, view);
+    assert.equal(target(h), width, view);
+    h.emit('release');
+    await tick();
+    assert.equal(h.writes.length, 2, view);
+    assert.equal(h.writes[1].patch.expected_revision, revision, view);
+    assert.equal(target(h), 1000, view);
+    h.emit('release');
+    await tick();
+    assert.equal(h.writes.length, 2, view);
+    h.dispose();
+  }
+});
+
+test('native discard parks a debounced instance or audio draft and late edits until one release write', async () => {
+  for (const view of ['instance', 'audio'] as const) {
+    const h = harness();
+    await h.hydrate();
+    if (view === 'audio') h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
+    h.render(view);
+    const control = h.control<{ onChange(value: string | number): void }>(view === 'instance' ? 'JvmArgsInput' : 'Slider');
+    const pending = view === 'instance' ? '-Daxial.pending=true' : 70;
+    control.onChange(pending);
+    h.emit('discard');
+    await tick();
+    assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }], view);
     h.timersRun();
+    if (view === 'audio') {
+      await tick();
+      assert.equal(h.writes.length, 0, view);
+      assert.equal(h.music.volume, 70, view);
+    }
+    control.onChange(view === 'instance' ? '-Daxial.too-late=true' : 90);
+    // The instance draft is retained after its view unmounts; the slider stays mounted.
+    if (view === 'audio') assert.equal(h.music.volume, 70, view);
+    else h.dispose();
     await tick();
-    assert.equal(h.writes.length, 1);
-  } finally {
-    reply.resolve(response);
+    assert.equal(h.writes.length, 0, view);
+    h.emit('release');
+    await tick();
+    assert.equal(h.writes.length, 1, view);
+    assert.equal(view === 'instance' ? h.instance().extra_jvm_args : h.config().music_volume, pending, view);
+    h.timersRun();
+    h.emit('release');
+    await tick();
+    assert.equal(h.writes.length, 1, view);
     h.dispose();
-    await tick();
   }
-});
-
-test('native discard joins the sent config write, parks the queued control, and resumes it once on release', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.render('global');
-  const reply = deferred<unknown>();
-  let response: unknown;
-  h.respond(async (_path, value) => {
-    if (h.writes.length === 1) {
-      response = value;
-      return reply.promise;
-    }
-    return value;
-  });
-  h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
-  await tick();
-  h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
-  h.emit('discard');
-  await tick();
-  assert.deepEqual(h.completions, []);
-  reply.resolve(response);
-  await tick();
-  assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
-  assert.equal(h.writes.length, 1);
-  assert.equal(h.config().window_width, 854);
-  h.emit('release');
-  await tick();
-  assert.equal(h.writes.length, 2);
-  assert.equal(h.writes[1].patch.expected_revision, 5);
-  assert.equal(h.config().window_width, 1000);
-  h.emit('release');
-  await tick();
-  assert.equal(h.writes.length, 2);
-  h.dispose();
-});
-
-test('native discard retains an unmounted JVM draft without a timer write until release', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.render('instance');
-  const input = h.control<{ onChange(value: string): void }>('JvmArgsInput');
-  input.onChange('-Daxial.pending=true');
-  h.emit('discard');
-  await tick();
-  assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
-  h.timersRun();
-  input.onChange('-Daxial.too-late=true');
-  h.dispose();
-  await tick();
-  assert.equal(h.writes.length, 0);
-  h.emit('release');
-  await tick();
-  assert.equal(h.writes.length, 1);
-  assert.equal(h.instance().extra_jvm_args, '-Daxial.pending=true');
-  h.timersRun();
-  h.emit('release');
-  await tick();
-  assert.equal(h.writes.length, 1);
-});
-
-test('native discard also parks the existing instance target queue behind its sent write', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.render('instance');
-  await tick();
-  const reply = deferred<unknown>();
-  let response: unknown;
-  h.respond(async (_path, value) => {
-    if (h.writes.length === 1) {
-      response = value;
-      return reply.promise;
-    }
-    return value;
-  });
-  h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
-  await tick();
-  h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
-  h.emit('discard');
-  await tick();
-  assert.deepEqual(h.completions, []);
-  reply.resolve(response);
-  await tick();
-  assert.equal(h.writes.length, 1);
-  assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
-  h.emit('release');
-  await tick();
-  assert.equal(h.writes.length, 2);
-  assert.equal(h.instance().window_width, 1000);
-  h.dispose();
 });
 
 test('native flush reports an outstanding failed save but does not poison a later released attempt', async () => {
@@ -1658,142 +1667,6 @@ test("volume retargeting restarts the current fade deadline", async () => {
   assert.equal(h.player().paused, false);
   assert.equal(h.frames.size, 0);
 });
-
-test('native flush submits the real audio slider draft and joins the music settings receipt', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
-  h.render('audio');
-  const reply = deferred<unknown>();
-  let response: unknown;
-  h.respond(async (_path, value) => {
-    response = value;
-    return reply.promise;
-  });
-  h.control<{ onChange(value: number): void }>('Slider').onChange(70);
-  assert.equal(h.writes.length, 0);
-  h.emit('flush');
-  try {
-    await tick();
-    assert.equal(h.writes.length, 1);
-    assert.equal(h.writes[0].patch.music_volume, 70);
-    assert.deepEqual(h.completions, []);
-    reply.resolve(response);
-    await tick();
-    assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
-    h.timersRun();
-    await tick();
-    assert.equal(h.writes.length, 1);
-  } finally {
-    reply.resolve(response);
-    h.dispose();
-  }
-});
-
-test('native discard parks the music slider timer and late edits until release', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
-  h.render('audio');
-  const slider = h.control<{ onChange(value: number): void }>('Slider');
-  slider.onChange(70);
-  h.emit('discard');
-  await tick();
-  h.timersRun();
-  await tick();
-  assert.equal(h.writes.length, 0);
-  assert.equal(h.music.volume, 70);
-  slider.onChange(90);
-  assert.equal(h.music.volume, 70);
-  h.emit('release');
-  await tick();
-  assert.equal(h.writes.length, 1);
-  assert.equal(h.config().music_volume, 70);
-  h.timersRun();
-  await tick();
-  assert.equal(h.writes.length, 1);
-  h.dispose();
-});
-
-test('Reload joins the held config response and queued real control before replacing the renderer', async () => {
-  const h = harness();
-  await h.hydrate();
-  h.render('global');
-  const first = deferred<unknown>();
-  const second = deferred<unknown>();
-  let firstResponse: unknown;
-  let secondResponse: unknown;
-  h.respond(async (_path, value) => {
-    if (h.writes.length === 1) {
-      firstResponse = value;
-      return first.promise;
-    }
-    secondResponse = value;
-    return second.promise;
-  });
-  h.control<{ onCommit(low: number, high: number): void }>('MemoryField').onCommit(1, 5);
-  await tick();
-  h.control<{ onCommit(width: number, height: number): void }>('WindowField').onCommit(1000, 600);
-  const reloading = h.owner.reloadApplication();
-  assert.equal(h.owner.reloadApplication(), reloading);
-  try {
-    await tick();
-    assert.equal(h.reloads(), 0);
-    first.resolve(firstResponse);
-    await tick();
-    assert.equal(h.writes.length, 2);
-    assert.equal(h.reloads(), 0);
-    second.resolve(secondResponse);
-    assert.equal(await reloading, true);
-    assert.equal(h.reloads(), 1);
-    assert.equal(h.config().window_width, 1000);
-    await assert.rejects(h.autosave.saveConfigPatch({ window_width: 1600 }), /paused/);
-  } finally {
-    first.resolve(firstResponse);
-    second.resolve(secondResponse);
-    await tick();
-    h.dispose();
-  }
-});
-
-for (const view of ['instance', 'audio'] as const) {
-  test(`Reload flushes the real ${view} draft and waits for its receipt`, async () => {
-    const h = harness();
-    await h.hydrate();
-    if (view === 'audio') h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
-    h.render(view);
-    await tick();
-    const reply = deferred<unknown>();
-    let response: unknown;
-    h.respond(async (_path, value) => {
-      response = value;
-      return reply.promise;
-    });
-    if (view === 'instance')
-      h.control<{ onChange(value: string): void }>('JvmArgsInput').onChange('-Daxial.reload=true');
-    else h.control<{ onChange(value: number): void }>('Slider').onChange(70);
-    const reloading = h.owner.reloadApplication();
-    try {
-      await tick();
-      assert.equal(h.writes.length, 1);
-      assert.equal(h.reloads(), 0);
-      assert.equal(
-        view === 'instance' ? h.writes[0].patch.extra_jvm_args : h.writes[0].patch.music_volume,
-        view === 'instance' ? '-Daxial.reload=true' : 70,
-      );
-      reply.resolve(response);
-      assert.equal(await reloading, true);
-      assert.equal(h.reloads(), 1);
-      h.timersRun();
-      await tick();
-      assert.equal(h.writes.length, 1);
-    } finally {
-      reply.resolve(response);
-      h.dispose();
-      await tick();
-    }
-  });
-}
 
 test('a refused settings save prevents Reload and releases the real controls for an explicit retry', async () => {
   const h = harness();

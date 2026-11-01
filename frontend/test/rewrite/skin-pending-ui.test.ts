@@ -635,32 +635,23 @@ test('profile reset commands bind the confirmed account and selection', async ()
   }
 });
 
-test('manual profile save serializes its displayed account and selection with the profile options', async () => {
+test('automatic seeding and manual profile save serialize the displayed account and selection with the profile options', async () => {
   const h = harness();
   h.machine.setWardrobeContext(profileContext());
   await settle();
+  const assertSaved = (label: string): void => {
+    assert.equal(h.profileSaves.length, 1, label);
+    const { path, body } = h.profileSaves[0];
+    const url = new URL(path, 'http://skin-fixture.invalid');
+    assert.equal(url.pathname, '/skins/from-profile', label);
+    assert.equal(url.searchParams.get('expected_account_id'), accountA, label);
+    assert.equal(url.searchParams.get('expected_selection_revision'), '7', label);
+    assert.deepEqual(JSON.parse(body), { variant: 'classic', mark_current: true }, label);
+  };
+  assertSaved('automatic');
   h.profileSaves.length = 0;
   await h.machine.saveProfileSkinLocally();
-  assert.equal(h.profileSaves.length, 1);
-  const { path, body } = h.profileSaves[0];
-  const url = new URL(path, 'http://skin-fixture.invalid');
-  assert.equal(url.pathname, '/skins/from-profile');
-  assert.equal(url.searchParams.get('expected_account_id'), accountA);
-  assert.equal(url.searchParams.get('expected_selection_revision'), '7');
-  assert.deepEqual(JSON.parse(body), { variant: 'classic', mark_current: true });
-});
-
-test('automatic profile seeding serializes its displayed account and selection with the profile options', async () => {
-  const h = harness();
-  h.machine.setWardrobeContext(profileContext());
-  await settle();
-  assert.equal(h.profileSaves.length, 1);
-  const { path, body } = h.profileSaves[0];
-  const url = new URL(path, 'http://skin-fixture.invalid');
-  assert.equal(url.pathname, '/skins/from-profile');
-  assert.equal(url.searchParams.get('expected_account_id'), accountA);
-  assert.equal(url.searchParams.get('expected_selection_revision'), '7');
-  assert.deepEqual(JSON.parse(body), { variant: 'classic', mark_current: true });
+  assertSaved('manual');
 });
 
 for (const missingTarget of [false, true]) {
