@@ -1,6 +1,0 @@
-node_modules/
-pnpm-lock.yaml
-dist/
-dist.stage-*/
-dist.previous-*/
-static/sounds/**/*.json

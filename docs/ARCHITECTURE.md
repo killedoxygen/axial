@@ -14,7 +14,6 @@ Axial is one desktop process: a Tauri shell hosts the Preact interface, which ta
 | `frontend` | Preact interface. `frontend/src/generated` holds wire types generated from `core/app` (`task contracts:generate`). |
 | `acceptance` | Fixtures and fake providers used by integration tests. |
 | `scripts` | Build, release, dependency-policy and asset-provenance tooling. |
-| `legacy` | The previous implementation, kept for reference only. It is not a build dependency. |
 
 ## Key rules
 

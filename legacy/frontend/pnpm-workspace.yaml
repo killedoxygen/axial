@@ -1,7 +1,0 @@
-allowBuilds:
-  esbuild: true
-autoInstallPeers: false
-strictPeerDependencies: true
-peerDependencyRules:
-  ignoreMissing:
-    - react

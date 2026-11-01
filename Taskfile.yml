@@ -84,8 +84,3 @@ tasks:
         node scripts/cargo-target.mjs run -- cargo tauri dev --config
         '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://127.0.0.1:1420"}}'
         -- --locked
-  dev:legacy:
-    desc: Run the preserved application from its independent project root
-    dir: legacy
-    cmds:
-      - task dev

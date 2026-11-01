@@ -16,4 +16,4 @@ task check         # lint, contracts, frontend tests and a workspace check
 task test          # Rust test suite
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the layout and [docs/CONVENTIONS.md](docs/CONVENTIONS.md) before contributing. The previous implementation is kept for reference under `legacy/`.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the layout and [docs/CONVENTIONS.md](docs/CONVENTIONS.md) before contributing.

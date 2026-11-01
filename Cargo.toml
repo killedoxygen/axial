@@ -8,7 +8,6 @@ members = [
   "core/performance",
   "core/resource",
 ]
-exclude = ["legacy"]
 resolver = "3"
 
 [workspace.package]
