@@ -6,6 +6,32 @@ type InstallActions = Pick<typeof import('./actions'), 'addToInstance' | 'commit
 export interface InstallWorkflowSnapshot {
   busy: boolean;
   plan: ResolutionPlan | null;
+  /** Staged selections a plan without the unavailable ones would keep. */
+  installable: ContentSelection[];
+  staged: number;
+}
+
+/** Selections not blocked by an unavailable conflict, directly or through a
+ * required dependency. Empty when none or all would be blocked or a blocked
+ * project cannot be identified. */
+export function installableSelections(selections: ContentSelection[], plan: ResolutionPlan): ContentSelection[] {
+  const unavailable = plan.conflicts.filter((conflict) => conflict.kind === 'unavailable');
+  if (unavailable.length === 0 || unavailable.some((conflict) => !conflict.canonical_id)) return [];
+  const blocked = new Set(unavailable.map((conflict) => conflict.canonical_id!));
+  const items = new Map(plan.items.map((item) => [item.canonical_id, item]));
+  const isBlocked = (id: string, seen: Set<string>): boolean => {
+    if (blocked.has(id)) return true;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return (items.get(id)?.dependencies ?? []).some(
+      (dependency) =>
+        dependency.kind === 'required' &&
+        dependency.project_id !== undefined &&
+        isBlocked(`modrinth:${dependency.project_id}`, seen),
+    );
+  };
+  const kept = selections.filter((selection) => !isBlocked(selection.canonical_id, new Set()));
+  return kept.length === selections.length ? [] : kept;
 }
 
 /** Owns the pending confirmation, never the accepted backend operation. */
@@ -75,11 +101,27 @@ export function createInstallWorkflow(actions: InstallActions, onChange: () => v
     onChange();
   };
 
+  /** Plan again without the unavailable selections; the new plan decides. */
+  const installRest = async (): Promise<AddOutcome> => {
+    if (!pending || busy) return { status: 'failed' };
+    const staged = pending;
+    const rest = installableSelections(staged.selections, staged.plan);
+    if (rest.length === 0) return { status: 'failed' };
+    pending = null;
+    return add(rest, staged.label);
+  };
+
   return {
-    snapshot: (): InstallWorkflowSnapshot => ({ busy, plan: pending?.plan ?? null }),
+    snapshot: (): InstallWorkflowSnapshot => ({
+      busy,
+      plan: pending?.plan ?? null,
+      installable: pending ? installableSelections(pending.selections, pending.plan) : [],
+      staged: pending?.selections.length ?? 0,
+    }),
     setTarget,
     add,
     confirm,
+    installRest,
     cancel,
     dispose: reset,
   };

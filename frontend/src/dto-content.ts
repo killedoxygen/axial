@@ -7,6 +7,7 @@ import {
   dtoOptionalString,
   dtoRecord,
   dtoString,
+  isDtoRecord,
 } from './dto-contract';
 import type {
   CanonicalContent,
@@ -19,6 +20,7 @@ import type {
   InstanceSetupPlanResponse,
   ModpackFilesPlan,
   ModpackTarget,
+  RequiredRefusal,
   ResolutionPlan,
   SearchHit,
 } from './types-content';
@@ -158,6 +160,7 @@ export function resolutionPlanResponse(value: unknown): ResolutionPlan {
       const entry = dtoRecord(conflict, 'Content conflict');
       return {
         canonical_id: dtoOptionalString(entry.canonical_id, 'Content conflict id'),
+        title: dtoOptionalString(entry.title, 'Content conflict title'),
         kind: dtoEnum(entry.kind, 'Content conflict kind', ['unavailable', 'incompatible', 'existing_file'] as const),
         detail: dtoString(entry.detail, 'Content conflict detail'),
         path: dtoOptionalString(entry.path, 'Content conflict path'),
@@ -256,6 +259,9 @@ export function instanceContentResponse(value: unknown): InstanceContentResponse
         version_id: dtoString(entry.version_id, 'Instance content version'),
         filename: dtoString(entry.filename, 'Instance content filename'),
         enabled: dtoBoolean(entry.enabled, 'Instance content enabled'),
+        ...(entry.required_by === undefined
+          ? {}
+          : { required_by: strings(entry.required_by, 'Instance content dependents') }),
       };
     }),
     packs: dtoArray(record.packs ?? [], 'Instance modpacks').map((value) => {
@@ -272,6 +278,14 @@ export function instanceContentResponse(value: unknown): InstanceContentResponse
   };
 }
 
+function updatePack(value: unknown): { canonical_id: string; title?: string } {
+  const pack = dtoRecord(value, 'Content update pack');
+  return {
+    canonical_id: dtoString(pack.canonical_id, 'Content update pack id'),
+    title: dtoOptionalString(pack.title, 'Content update pack title'),
+  };
+}
+
 export function contentUpdatesResponse(value: unknown): ContentUpdatesResponse {
   const record = dtoRecord(value, 'Content updates');
   return {
@@ -284,6 +298,25 @@ export function contentUpdatesResponse(value: unknown): ContentUpdatesResponse {
         current_version_id: dtoString(entry.current_version_id, 'Content current version'),
         latest_version_id: dtoString(entry.latest_version_id, 'Content latest version'),
         latest_version_number: dtoString(entry.latest_version_number, 'Content latest version number'),
+        ...(entry.pack === undefined ? {} : { pack: updatePack(entry.pack) }),
+      };
+    }),
+  };
+}
+
+/** The structured refusal for disabling or removing content others need. */
+export function requiredRefusal(error: unknown): RequiredRefusal | null {
+  if (!isDtoRecord(error) || error.status !== 409 || !isDtoRecord(error.payload)) return null;
+  const record = error.payload;
+  if (record.required_by === undefined) return null;
+  return {
+    error: dtoString(record.error, 'Required content refusal'),
+    required_by: dtoArray(record.required_by, 'Required content').map((value) => {
+      const entry = dtoRecord(value, 'Required content entry');
+      const title = dtoOptionalString(entry.title, 'Required content title');
+      return {
+        canonical_id: dtoString(entry.canonical_id, 'Required content id'),
+        ...(title === undefined ? {} : { title }),
       };
     }),
   };

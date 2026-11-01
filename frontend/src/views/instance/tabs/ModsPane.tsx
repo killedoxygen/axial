@@ -26,6 +26,7 @@ import { useModImport } from '../components/mod-import';
 import { resourceMutationState } from '../bulk-actions';
 import {
   applyModUpdates,
+  bulkModUpdates,
   cachedModProvenance,
   deleteMods,
   fetchModProvenance,
@@ -139,6 +140,9 @@ export function ModsPane({
   );
   const filteredMods = filteredRows.map(({ mod }) => mod);
   const pendingUpdates = provenance ? [...provenance.updates.values()].filter((update) => update.kind === 'mod') : [];
+  const bulkUpdates = bulkModUpdates(pendingUpdates);
+  const packKept = pendingUpdates.length - bulkUpdates.length;
+  const packTitle = pendingUpdates.find((update) => update.pack)?.pack?.title ?? 'the modpack';
   const selection = useSelection(
     filteredMods,
     useCallback((mod: InstanceMod) => mod.name, []),
@@ -209,12 +213,18 @@ export function ModsPane({
           <Icon name="arrow-up" size={14} color="var(--accent)" />
           <span>
             {pendingUpdates.length} update{pendingUpdates.length === 1 ? '' : 's'} available
+            {packKept > 0 &&
+              `. ${bulkUpdates.length === 0 ? (packKept === 1 ? 'It' : 'All') : packKept} came with ${packTitle} and ${
+                packKept === 1 ? 'stays' : 'stay'
+              } with it`}
           </span>
-          <span class="cp-mods-updates-action">
-            <Button size="sm" disabled={busy} onClick={() => void applyModUpdates(inst, pendingUpdates)}>
-              Update all
-            </Button>
-          </span>
+          {bulkUpdates.length > 0 && (
+            <span class="cp-mods-updates-action">
+              <Button size="sm" disabled={busy} onClick={() => void applyModUpdates(inst, bulkUpdates)}>
+                {packKept > 0 ? `Update ${bulkUpdates.length}` : 'Update all'}
+              </Button>
+            </span>
+          )}
         </div>
       )}
       <ResourceStatus state={resources} onRetry={onRefresh} />

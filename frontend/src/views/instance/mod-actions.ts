@@ -1,7 +1,9 @@
 import { api } from '../../api';
 import { checkContentUpdates, installContent, listInstanceContent, uninstallContents } from '../../content';
+import { requiredRefusal } from '../../dto-content';
 import { applyInstallQueueResponse } from '../../machines/downloads';
 import { toast } from '../../toast';
+import { showChoice, showConfirm } from '../../ui/Dialog';
 import { navigate } from '../../ui-state';
 import { errMessage, modBaseName } from '../../utils';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
@@ -62,8 +64,24 @@ export async function fetchModProvenance(
   }
 }
 
-export async function applyModUpdates(inst: EnrichedInstance, updates: ContentUpdate[]): Promise<void> {
+/** Updates "Update all" applies. Modpack members stay coupled to their pack:
+ * a newer member can need a newer loader or pack-mate than the pack ships. */
+export function bulkModUpdates(updates: ContentUpdate[]): ContentUpdate[] {
+  return updates.filter((update) => !update.pack);
+}
+
+export async function applyModUpdates(inst: EnrichedInstance, requested: ContentUpdate[]): Promise<void> {
+  const updates = requested.length === 1 ? requested : bulkModUpdates(requested);
   if (updates.length === 0) return;
+  const member = updates.length === 1 ? updates[0]!.pack : undefined;
+  if (member) {
+    const name = updates[0]!.title ?? 'This mod';
+    const confirmed = await showConfirm(
+      "Updating it on its own may break the pack, and the pack's next update may replace it.",
+      { title: `${name} came with ${member.title ?? 'this modpack'}`, confirmText: 'Update anyway' },
+    );
+    if (!confirmed) return;
+  }
   await runResourceMutation(inst.id, 'Queue mod updates', async () => {
     const single = updates.length === 1 ? (updates[0].title ?? 'mod') : null;
     const label = single ? `Updating ${single}` : `Updating ${updates.length} mods`;
@@ -95,25 +113,64 @@ export async function applyModUpdates(inst: EnrichedInstance, updates: ContentUp
   });
 }
 
-export async function removeManagedMod(inst: EnrichedInstance, entry: InstanceContentEntry): Promise<void> {
-  await runResourceMutation(inst.id, 'Remove mod', async () => {
-    const confirmed = await confirmDeleteItems({
-      count: 1,
-      itemLabel: 'mod',
-      message: `Remove "${entry.title ?? entry.filename}" from this instance. This deletes the file and its install record.`,
-    });
-    if (!confirmed) return;
-    await queueManagedModRemoval(inst, entry, true);
-    toast('Mod removal queued');
-  });
+function contentName(entry: { title?: string; filename?: string; canonical_id: string }): string {
+  return entry.title ?? entry.filename ?? entry.canonical_id;
 }
 
-async function queueManagedModRemoval(
-  inst: EnrichedInstance,
-  entry: InstanceContentEntry,
-  showNotice: boolean,
-): Promise<void> {
-  await queueManagedModRemovals(inst, [entry], showNotice);
+function names(values: string[]): string {
+  if (values.length <= 1) return values[0] ?? '';
+  if (values.length > 3) return `${values.slice(0, 3).join(', ')} and ${values.length - 3} more`;
+  return `${values.slice(0, -1).join(', ')} and ${values[values.length - 1]}`;
+}
+
+/** Enabled content outside `removing` that needs it, from a fresh listing. */
+async function dependentsOf(inst: EnrichedInstance, removing: InstanceContentEntry[]): Promise<InstanceContentEntry[]> {
+  const listed = (await listInstanceContent(inst.id)).entries;
+  const ids = new Set(removing.map((entry) => entry.canonical_id));
+  const needed = new Set(
+    listed.filter((entry) => ids.has(entry.canonical_id)).flatMap((entry) => entry.required_by ?? []),
+  );
+  return listed.filter((entry) => needed.has(entry.canonical_id) && !ids.has(entry.canonical_id));
+}
+
+/** Ask to remove the content that needs `removing` along with it. Resolves to
+ * the extra entries to remove, or null when the person keeps everything. */
+async function confirmDependentRemoval(
+  removing: InstanceContentEntry[],
+  dependents: InstanceContentEntry[],
+): Promise<InstanceContentEntry[] | null> {
+  const target = removing.length === 1 ? contentName(removing[0]!) : `these ${removing.length} mods`;
+  const total = removing.length + dependents.length;
+  const choice = await showChoice<'all'>(
+    `${names(dependents.map(contentName))} ${dependents.length === 1 ? 'depends' : 'depend'} on it and will stop working.`,
+    [{ value: 'all', label: total === 2 ? 'Remove both' : `Remove all ${total}`, variant: 'danger' }],
+    {
+      title: `Other mods need ${target}`,
+      cancelText: removing.length === 1 ? `Keep ${contentName(removing[0]!)}` : 'Keep them',
+    },
+  );
+  return choice === 'all' ? dependents : null;
+}
+
+export async function removeManagedMod(inst: EnrichedInstance, entry: InstanceContentEntry): Promise<void> {
+  await runResourceMutation(inst.id, 'Remove mod', async () => {
+    const dependents = await dependentsOf(inst, [entry]);
+    let removing = [entry];
+    if (dependents.length > 0) {
+      const extra = await confirmDependentRemoval(removing, dependents);
+      if (!extra) return;
+      removing = [...removing, ...extra];
+    } else {
+      const confirmed = await confirmDeleteItems({
+        count: 1,
+        itemLabel: 'mod',
+        message: `Remove "${entry.title ?? entry.filename}" from this instance. This deletes the file and its install record.`,
+      });
+      if (!confirmed) return;
+    }
+    await queueManagedModRemovals(inst, removing, true);
+    toast(removing.length === 1 ? 'Mod removal queued' : `${removing.length} mod removals queued`);
+  });
 }
 
 async function queueManagedModRemovals(
@@ -128,11 +185,41 @@ async function queueManagedModRemovals(
   await applyInstallQueueResponse(queue, { showNotice, connectActive: true });
 }
 
-async function updateModEnabled(inst: EnrichedInstance, modName: string, enabled: boolean): Promise<void> {
+async function updateModEnabled(
+  inst: EnrichedInstance,
+  modName: string,
+  enabled: boolean,
+  withDependents = false,
+): Promise<void> {
   const res = await api('PUT', `/instances/${encodeURIComponent(inst.id)}/mods/${encodeURIComponent(modName)}`, {
     enabled,
+    ...(withDependents ? { with_dependents: true } : {}),
   });
   requireResourceCommandSuccess(res, 'Mod update');
+}
+
+/** Disable a mod; when others need it, offer to disable them too. Resolves
+ * false when the person keeps it enabled. */
+async function disableMod(inst: EnrichedInstance, mod: InstanceMod, title: string): Promise<boolean> {
+  try {
+    await updateModEnabled(inst, mod.name, false);
+    return true;
+  } catch (err) {
+    const refusal = requiredRefusal(err);
+    if (!refusal) throw err;
+    const dependents = refusal.required_by.map(contentName);
+    const total = dependents.length + 1;
+    const choice = await showChoice<'all'>(
+      `Disabling ${title} will break ${dependents.length === 1 ? dependents[0] : `${dependents.length} other mods`}. ${
+        total === 2 ? 'Disable both?' : `Disable all ${total}?`
+      }`,
+      [{ value: 'all', label: total === 2 ? 'Disable both' : `Disable all ${total}`, variant: 'primary' }],
+      { title: refusal.error.replace(/\.$/, '') },
+    );
+    if (choice !== 'all') return false;
+    await updateModEnabled(inst, mod.name, false, true);
+    return true;
+  }
 }
 
 async function removeMod(inst: EnrichedInstance, modName: string): Promise<void> {
@@ -142,12 +229,32 @@ async function removeMod(inst: EnrichedInstance, modName: string): Promise<void>
   );
 }
 
-export async function setModEnabled(inst: EnrichedInstance, mod: InstanceMod, onDone: () => void): Promise<void> {
+export async function setModEnabled(
+  inst: EnrichedInstance,
+  mod: InstanceMod,
+  onDone: () => void,
+  title = mod.name,
+): Promise<void> {
   await runResourceMutation(inst.id, mod.enabled ? 'Disable mod' : 'Enable mod', async () => {
-    await updateModEnabled(inst, mod.name, !mod.enabled);
+    if (mod.enabled) {
+      if (!(await disableMod(inst, mod, title))) return;
+    } else {
+      await updateModEnabled(inst, mod.name, true);
+    }
     toast(!mod.enabled ? 'Mod enabled' : 'Mod disabled');
     onDone();
   });
+}
+
+/** Disable dependents before what they need: a dependent's own dependents are
+ * a strict subset of its dependency's, so fewer dependents goes first. */
+async function disableOrder(inst: EnrichedInstance, mods: InstanceMod[]): Promise<InstanceMod[]> {
+  if (mods.length < 2) return mods;
+  const listed = await listInstanceContent(inst.id).catch(() => null);
+  if (!listed) return mods;
+  const dependents = new Map(listed.entries.map((entry) => [entry.filename, entry.required_by?.length ?? 0]));
+  const count = (mod: InstanceMod): number => dependents.get(modBaseName(mod.name)) ?? 0;
+  return [...mods].sort((left, right) => count(left) - count(right));
 }
 
 export async function setModsEnabled(
@@ -162,9 +269,10 @@ export async function setModsEnabled(
     toast(enabled ? 'Selected mods are already enabled' : 'Selected mods are already disabled', 'info');
     return;
   }
+  const ordered = enabled ? changed : await disableOrder(inst, changed);
   await runResourceMutation(inst.id, enabled ? 'Enable mods' : 'Disable mods', () =>
     runBulkMutation({
-      items: changed,
+      items: ordered,
       action: (mod) => updateModEnabled(inst, mod.name, enabled),
       success: (count) => (enabled ? `${count} mods enabled` : `${count} mods disabled`),
       partial: (done, total, err) => partialFailureMessage('Update', done, total, err),
@@ -188,16 +296,23 @@ export async function deleteMods(
       entry: managedEntries.get(modBaseName(mod.name)),
     }));
     const managedCount = removals.filter(({ entry }) => entry !== undefined).length;
-    const confirmed = await confirmDeleteItems({
-      count: mods.length,
-      itemLabel: 'mod',
-      message:
-        mods.length === 1
-          ? `Remove "${mods[0]!.name}" from this instance. This deletes the mod file${managedCount ? ' and its install record' : ''}.`
-          : `Remove ${mods.length} mods from this instance. Managed mods are safely removed from the install record too.`,
-    });
-    if (!confirmed) return;
-    const managed = removals.flatMap(({ entry }) => (entry ? [entry] : []));
+    let managed = removals.flatMap(({ entry }) => (entry ? [entry] : []));
+    const dependents = managed.length > 0 ? await dependentsOf(inst, managed) : [];
+    if (dependents.length > 0) {
+      const extra = await confirmDependentRemoval(managed, dependents);
+      if (!extra) return;
+      managed = [...managed, ...extra];
+    } else {
+      const confirmed = await confirmDeleteItems({
+        count: mods.length,
+        itemLabel: 'mod',
+        message:
+          mods.length === 1
+            ? `Remove "${mods[0]!.name}" from this instance. This deletes the mod file${managedCount ? ' and its install record' : ''}.`
+            : `Remove ${mods.length} mods from this instance. Managed mods are safely removed from the install record too.`,
+      });
+      if (!confirmed) return;
+    }
     const unmanaged = removals.flatMap(({ mod, entry }) => (entry ? [] : [mod]));
     let started = 0;
     try {
@@ -212,7 +327,7 @@ export async function deleteMods(
       toast(started === 1 ? 'Mod removal started' : `${started} mod removals started`);
     } catch (err) {
       onFailure?.();
-      throw new Error(partialFailureMessage('Removal request', started, mods.length, err));
+      throw new Error(partialFailureMessage('Removal request', started, managed.length + unmanaged.length, err));
     }
     onDone();
   });
@@ -238,7 +353,7 @@ export function modMenuItems(
   items.push({
     icon: mod.enabled ? 'stop' : 'play',
     label: mod.enabled ? 'Disable' : 'Enable',
-    onSelect: () => void setModEnabled(inst, mod, onRefresh),
+    onSelect: () => void setModEnabled(inst, mod, onRefresh, entry?.title),
   });
   if (entry) {
     items.push({

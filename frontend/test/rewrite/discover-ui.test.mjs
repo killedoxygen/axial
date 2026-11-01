@@ -400,7 +400,45 @@ test('late plan responses cannot restore confirmation after changing away and ba
   workflow.setTarget('instance-a');
   response.resolve({ status: 'needs-confirmation', plan: conflictPlan });
   assert.equal((await first).status, 'superseded');
-  assert.deepEqual(plain(workflow.snapshot()), { busy: false, plan: null });
+  assert.deepEqual(plain(workflow.snapshot()), { busy: false, plan: null, installable: [], staged: 0 });
+});
+
+test('install the rest re-plans without unavailable selections and what needs them', async () => {
+  /** @type {import('../../src/types-content').ContentSelection} */
+  const ok = { canonical_id: 'modrinth:ok', kind: 'mod' };
+  /** @type {import('../../src/types-content').ContentSelection} */
+  const gone = { canonical_id: 'modrinth:gone', kind: 'mod' };
+  /** @type {import('../../src/types-content').ContentSelection} */
+  const needsGone = { canonical_id: 'modrinth:needs', kind: 'mod' };
+  /** @param {string} id @param {string[]} requires @returns {import('../../src/types-content').PlanItem} */
+  const item = (id, requires) => ({
+    canonical_id: id, title: id, kind: 'mod', project_id: id.slice('modrinth:'.length), version_id: 'v',
+    version_number: '1', filename: `${id}.jar`, reason: 'selected', already_installed: false, update: false,
+    dependencies: requires.map((project_id) => ({ project_id, kind: 'required' })),
+  });
+  /** @type {import('../../src/types-content').ResolutionPlan} */
+  const partialPlan = {
+    loader: 'fabric', game_version: '1.21.1',
+    items: [item(ok.canonical_id, []), item(needsGone.canonical_id, ['gone'])],
+    conflicts: [{ canonical_id: gone.canonical_id, title: 'Gone', kind: 'unavailable', detail: 'No compatible version.' }],
+    total_download_bytes: 0,
+  };
+  /** @type {unknown[]} */
+  const planned = [];
+  const workflow = await workflowHarness({
+    addToInstance: async (_target, selections) => {
+      planned.push(plain(selections));
+      return planned.length === 1 ? { status: 'needs-confirmation', plan: partialPlan } : { status: 'queued' };
+    },
+    commitInstall: async () => ({ status: 'queued' }),
+  });
+  await workflow.add([ok, gone, needsGone], 'Three');
+  assert.deepEqual(plain(workflow.snapshot().installable), [ok]);
+  assert.equal(workflow.snapshot().staged, 3);
+  assert.equal((await workflow.installRest()).status, 'queued');
+  assert.deepEqual(planned, [[ok, gone, needsGone], [ok]]);
+  assert.equal(workflow.snapshot().plan, null);
+  assert.equal((await workflow.installRest()).status, 'failed');
 });
 
 test('same-turn duplicate adds and confirms submit once and preserve captured selections', async () => {

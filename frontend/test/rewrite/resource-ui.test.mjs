@@ -15,6 +15,7 @@ import { before, test } from 'node:test';
  * @property {unknown[][]} navigation
  * @property {(...args: ApiCall) => Promise<unknown>} api
  * @property {() => Promise<string | null>} choice
+ * @property {() => Promise<boolean>} confirm
  * @property {typeof import('../../src/ui/Dialog').prompt} prompt
  * @property {() => Promise<unknown>} list
  * @property {() => Promise<unknown>} updates
@@ -32,7 +33,7 @@ const dependencyRoot = resolve(dirname(esbuildPath), '../../');
 const boundaries = {
   api: `export const api = (...args) => io.api(...args); export const apiResourceUrl = path => 'https://local.invalid/api/v1' + path;`,
   toast: `export const toast = (...args) => io.notices.push(args);`,
-  Dialog: `export const prompt = (...args) => io.prompt(...args); export const showChoice = (...args) => io.choice(...args);`,
+  Dialog: `export const prompt = (...args) => io.prompt(...args); export const showChoice = (...args) => io.choice(...args); export const showConfirm = (...args) => io.confirm(...args);`,
   content: `export const listInstanceContent = (...args) => io.list(...args); export const checkContentUpdates = (...args) => io.updates(...args); export const installContent = (...args) => io.install(...args); export const uninstallContents = (...args) => io.uninstall(...args);`,
   downloads: `export const applyInstallQueueResponse = (...args) => io.queue(...args);`,
   'ui-state': `export const navigate = (...args) => io.navigation.push(args);`,
@@ -93,6 +94,7 @@ function setup(overrides = {}) {
       return { status: 'ok' };
     },
     choice: async () => 'delete',
+    confirm: async () => true,
     prompt: async () => null,
     list: async () => ({ entries: [] }),
     updates: async () => ({ updates: [] }),
@@ -410,6 +412,130 @@ test('failed mod update queue preserves accepted batch count without resubmittin
     [40, 5],
   );
   assert.match(mutationError(actions), /Queued 40 of 45.*Provider unavailable/);
+});
+
+/** @param {string} id @param {string} filename @param {string[]} [requiredBy] */
+function managed(id, filename, requiredBy) {
+  return {
+    canonical_id: id,
+    title: filename.replace(/\.jar$/, ''),
+    kind: /** @type {const} */ ('mod'),
+    provider: /** @type {const} */ ('modrinth'),
+    project_id: id,
+    version_id: 'current',
+    filename,
+    enabled: true,
+    ...(requiredBy ? { required_by: requiredBy } : {}),
+  };
+}
+
+test('disabling a mod others need offers to disable them together', async () => {
+  /** @type {unknown[][]} */
+  const choices = [];
+  const { actions, io } = setup({
+    api: async (...args) => {
+      io.calls.push(args);
+      if (io.calls.length === 1) {
+        throw Object.assign(new Error('Sodium Extra needs Sodium.'), {
+          name: 'ApiError',
+          status: 409,
+          payload: { error: 'Sodium Extra needs Sodium.', required_by: [{ canonical_id: 'modrinth:extra', title: 'Sodium Extra' }] },
+        });
+      }
+      return { status: 'ok' };
+    },
+    choice: async (...args) => {
+      choices.push(args);
+      return 'all';
+    },
+  });
+  let done = 0;
+  await actions.setModEnabled(instance, mod('sodium.jar'), () => done++, 'Sodium');
+  assert.deepEqual(io.calls, [
+    ['PUT', '/instances/instance%20A/mods/sodium.jar', { enabled: false }],
+    ['PUT', '/instances/instance%20A/mods/sodium.jar', { enabled: false, with_dependents: true }],
+  ]);
+  assert.equal(done, 1);
+  assert.match(String(choices[0]?.[0]), /Disabling Sodium will break Sodium Extra\. Disable both\?/);
+  assert.deepEqual(choices[0]?.[2], { title: 'Sodium Extra needs Sodium' });
+
+  const declined = setup({ api: io.api, choice: async () => null });
+  io.calls.length = 0;
+  await declined.actions.setModEnabled(instance, mod('sodium.jar'), () => done++, 'Sodium');
+  assert.equal(io.calls.length, 1);
+  assert.equal(done, 1);
+});
+
+test('bulk disable sends dependents before what they need', async () => {
+  const { actions, io } = setup({
+    list: async () => ({
+      entries: [managed('modrinth:sodium', 'sodium.jar', ['modrinth:extra']), managed('modrinth:extra', 'extra.jar')],
+    }),
+  });
+  await actions.setModsEnabled(instance, [mod('sodium.jar'), mod('extra.jar')], false, () => undefined);
+  assert.deepEqual(
+    io.calls.map((call) => call[1]),
+    ['/instances/instance%20A/mods/extra.jar', '/instances/instance%20A/mods/sodium.jar'],
+  );
+});
+
+test('removing a mod others need names them and removes them together only when confirmed', async () => {
+  /** @type {Parameters<ResourceIo['uninstall']>[]} */
+  const removals = [];
+  /** @type {unknown[][]} */
+  const choices = [];
+  const sodium = managed('modrinth:sodium', 'sodium.jar', ['modrinth:extra']);
+  const { actions } = setup({
+    list: async () => ({ entries: [sodium, managed('modrinth:extra', 'extra.jar')] }),
+    uninstall: async (...args) => {
+      removals.push(args);
+      return {};
+    },
+    choice: async (...args) => {
+      choices.push(args);
+      return choices.length === 1 ? 'all' : null;
+    },
+  });
+  await actions.removeManagedMod(instance, sodium);
+  assert.deepEqual(removals, [[instance.id, ['modrinth:sodium', 'modrinth:extra']]]);
+  assert.match(String(choices[0]?.[0]), /extra depends on it/);
+  assert.deepEqual(choices[0]?.[2], { title: 'Other mods need sodium', cancelText: 'Keep sodium' });
+  await actions.removeManagedMod(instance, sodium);
+  assert.equal(removals.length, 1);
+});
+
+test('update all leaves modpack members alone and a single member update asks first', async () => {
+  /** @type {ContentSelection[][]} */
+  const submissions = [];
+  let confirmed = false;
+  const { actions } = setup({
+    install: async (_id, items) => {
+      submissions.push(items);
+      return {};
+    },
+    confirm: async () => confirmed,
+  });
+  const update = (/** @type {string} */ id, /** @type {boolean} */ member) => ({
+    canonical_id: `modrinth:${id}`,
+    title: id,
+    kind: /** @type {const} */ ('mod'),
+    current_version_id: 'current',
+    latest_version_id: `${id}-next`,
+    latest_version_number: 'next',
+    ...(member ? { pack: { canonical_id: 'modrinth:pack', title: 'Pack' } } : {}),
+  });
+  assert.deepEqual(
+    actions.bulkModUpdates([update('own', false), update('member', true)]).map((item) => item.canonical_id),
+    ['modrinth:own'],
+  );
+  await actions.applyModUpdates(instance, [update('own', false), update('member', true)]);
+  await actions.applyModUpdates(instance, [update('member', true)]);
+  confirmed = true;
+  await actions.applyModUpdates(instance, [update('member', true)]);
+  assert.deepEqual(
+    submissions.map((items) => items.map((item) => item.canonical_id)),
+    [['modrinth:own'], ['modrinth:member']],
+  );
 });
 
 test('cache eviction cannot let a prior provenance request replace the next incarnation', () => {

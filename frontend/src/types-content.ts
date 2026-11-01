@@ -1,3 +1,4 @@
+export type { RequiredRefusal } from './generated/RequiredRefusal';
 export type ContentKind = 'mod' | 'modpack' | 'resource_pack' | 'shader_pack';
 export type ProviderId = 'modrinth';
 export type ReleaseChannel = 'release' | 'beta' | 'alpha';
@@ -106,6 +107,7 @@ export type ConflictKind = 'unavailable' | 'incompatible' | 'existing_file';
 
 export interface PlanConflict {
   canonical_id?: string;
+  title?: string;
   kind: ConflictKind;
   detail: string;
   /** Instance-relative file an `existing_file` replacement names. */
@@ -196,6 +198,8 @@ export interface InstanceContentEntry {
   version_id: string;
   filename: string;
   enabled: boolean;
+  /** Enabled content that needs this entry, directly or through each other. */
+  required_by?: string[];
 }
 
 /** Modpack provenance. Its paths mark which instance files the pack placed. */
@@ -220,6 +224,8 @@ export interface ContentUpdate {
   current_version_id: string;
   latest_version_id: string;
   latest_version_number: string;
+  /** The modpack that installed this file; bulk updates leave it alone. */
+  pack?: { canonical_id: string; title?: string };
 }
 
 export interface ContentUpdatesResponse {

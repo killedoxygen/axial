@@ -11,8 +11,11 @@ import { createInstallWorkflow } from './install-workflow';
 export interface InstallFlow {
   busy: boolean;
   plan: ResolutionPlan | null;
+  installable: ContentSelection[];
+  staged: number;
   add: (selections: ContentSelection[], label: string) => Promise<AddOutcome>;
   confirm: () => Promise<AddOutcome>;
+  installRest: () => Promise<AddOutcome>;
   cancel: () => void;
 }
 
@@ -28,7 +31,13 @@ export function useInstallFlow(instanceId: string | undefined): InstallFlow {
   active.setTarget(instanceId);
   useEffect(() => () => active.dispose(), [active]);
 
-  return { ...active.snapshot(), add: active.add, confirm: active.confirm, cancel: active.cancel };
+  return {
+    ...active.snapshot(),
+    add: active.add,
+    confirm: active.confirm,
+    installRest: active.installRest,
+    cancel: active.cancel,
+  };
 }
 
 export function InstallConflictSheet({
@@ -39,16 +48,18 @@ export function InstallConflictSheet({
   onQueued?: () => void;
 }): JSX.Element | null {
   if (!flow.plan) return null;
+  const queued = (outcome: AddOutcome): void => {
+    if (outcome.status === 'queued') onQueued?.();
+  };
   return (
     <ConflictSheet
       plan={flow.plan}
       busy={flow.busy}
+      skipped={flow.installable.length > 0 ? flow.staged - flow.installable.length : 0}
+      staged={flow.staged}
       onCancel={flow.cancel}
-      onConfirm={() =>
-        void flow.confirm().then((outcome) => {
-          if (outcome.status === 'queued') onQueued?.();
-        })
-      }
+      onConfirm={() => void flow.confirm().then(queued)}
+      onInstallRest={() => void flow.installRest().then(queued)}
     />
   );
 }
@@ -56,13 +67,19 @@ export function InstallConflictSheet({
 function ConflictSheet({
   plan,
   busy,
+  skipped,
+  staged,
   onCancel,
   onConfirm,
+  onInstallRest,
 }: {
   plan: ResolutionPlan;
   busy: boolean;
+  skipped: number;
+  staged: number;
   onCancel: () => void;
   onConfirm: () => void;
+  onInstallRest: () => void;
 }): JSX.Element {
   const toInstall = plan.items.filter((item) => !item.already_installed || item.update);
   const overridable =
@@ -70,30 +87,48 @@ function ConflictSheet({
     plan.conflicts.every((conflict) => conflict.kind === 'incompatible' || conflict.kind === 'existing_file');
   const replacing = plan.conflicts.filter((conflict) => conflict.kind === 'existing_file').length;
   const onlyReplacing = replacing > 0 && replacing === plan.conflicts.length;
+  const partial = skipped > 0;
+  const files = `${plural(toInstall.length, 'file', 'files')} would be installed${
+    plan.total_download_bytes > 0 ? ` (${formatBytes(plan.total_download_bytes)})` : ''
+  }.`;
   return (
     <Modal open onOpenChange={(next) => !next && onCancel()}>
       <ModalContent className="cp-discover-dialog" aria-label="Resolve conflicts">
-        <h2 class="cp-discover-dialog-title">{overridable ? 'This needs a decision' : 'This cannot be added here'}</h2>
+        <h2 class="cp-discover-dialog-title">
+          {overridable ? 'This needs a decision' : partial ? 'Some of this cannot be added here' : 'This cannot be added here'}
+        </h2>
         {plan.conflicts.map((conflict, index) => (
           <div key={index} class="cp-discover-conflict">
-            <Icon name="alert" size={13} /> {conflict.detail}
+            <Icon name="alert" size={13} />{' '}
+            {conflict.title ? (
+              <span>
+                <strong>{conflict.title}</strong>: {conflict.detail}
+              </span>
+            ) : (
+              conflict.detail
+            )}
           </div>
         ))}
         <p class="cp-discover-dialog-sub">
-          {!overridable
-            ? 'Nothing can be installed until this is resolved.'
-            : onlyReplacing
+          {overridable
+            ? onlyReplacing
               ? `Replacing overwrites ${plural(replacing, 'file', 'files')} in this instance.`
               : `Installing anyway may crash the game${
                   replacing > 0 ? ` and replaces ${plural(replacing, 'existing file', 'existing files')}` : ''
-                }. ${plural(toInstall.length, 'file', 'files')} would be installed${
-                  plan.total_download_bytes > 0 ? ` (${formatBytes(plan.total_download_bytes)})` : ''
-                }.`}
+                }. ${files}`
+            : partial
+              ? `${skipped} of ${staged} will be skipped. The rest can still be installed.`
+              : 'Nothing can be installed until this is resolved.'}
         </p>
         <div class="cp-discover-dialog-actions">
-          <Button variant={overridable ? 'ghost' : 'primary'} onClick={onCancel} disabled={busy}>
-            {overridable ? 'Cancel' : 'Close'}
+          <Button variant={overridable || partial ? 'ghost' : 'primary'} onClick={onCancel} disabled={busy}>
+            {overridable || partial ? 'Cancel' : 'Close'}
           </Button>
+          {partial && (
+            <Button onClick={onInstallRest} disabled={busy}>
+              Install the rest
+            </Button>
+          )}
           {overridable && (
             <Button variant={onlyReplacing ? 'danger' : 'primary'} onClick={onConfirm} disabled={busy}>
               {busy
