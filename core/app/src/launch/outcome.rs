@@ -104,6 +104,11 @@ impl SessionOutcome {
         {
             return "The game could not create a window because OpenGL is unavailable.";
         }
+        if self.reason == SessionExitReason::StartupFailed
+            && self.failure_class == Some(FailureClass::MissingDependency)
+        {
+            return "A mod needs another mod or loader version that isn't installed, so the game could not start.";
+        }
         match self.reason {
             SessionExitReason::SpawnFailed => "The game process could not be started.",
             SessionExitReason::CleanExit => "The game closed normally.",
@@ -145,11 +150,17 @@ pub fn classify_session_outcome(
             SessionOutcomeKind::Failed,
             SessionExitReason::StartupStalled,
         )
-    } else if facts.stop_requested {
+    } else if facts.stop_requested
+        && !(!evidence.boot_observed && failure_class == Some(FailureClass::MissingDependency))
+    {
         (
             SessionOutcomeKind::Stopped,
             SessionExitReason::LauncherStopped,
         )
+    } else if facts.stop_requested {
+        // Fabric keeps the JVM alive on its incompatible-mods dialog, so this
+        // stop ends a start that had already failed.
+        (SessionOutcomeKind::Failed, SessionExitReason::StartupFailed)
     } else if failure_class == Some(FailureClass::GraphicsUnavailable) {
         (SessionOutcomeKind::Failed, SessionExitReason::StartupFailed)
     } else if evidence.boot_observed && facts.exit_code == Some(0) && !abnormal {
@@ -475,9 +486,16 @@ fn contains_missing_dependency_failure(text: &str) -> bool {
         throwable_line_names(line, "net.minecraftforge.fml.common.missingmodsexception")
             || throwable_line_names(line, "cpw.mods.fml.common.missingmodsexception")
             || line == "missing or unsupported mandatory dependencies:"
+            // Fabric's resolver failure, also inside a log4j XML throwable.
+            || line.contains(
+                "net.fabricmc.loader.impl.formattedexception: some of your mods are incompatible",
+            )
             || (line.starts_with("- mod '")
-                && line.contains(" requires ")
-                && line.ends_with(", which is missing!"))
+                && ((line.contains(" requires ")
+                    && (line.ends_with(", which is missing!")
+                        || line.contains(", but only the wrong version is present: ")))
+                    || (line.contains(" is incompatible with ")
+                        && line.contains(", yet a conflicting version is present: "))))
     })
 }
 
@@ -555,6 +573,27 @@ mod tests {
         assert_eq!(classify_session_outcome(facts, &LaunchEvidence::default()).unwrap().reason, SessionExitReason::LauncherStopped);
         let facts = SessionExitFacts { stop_requested: false, ..facts };
         assert_eq!(classify_session_outcome(facts, &LaunchEvidence::default()).unwrap().reason, SessionExitReason::CrashedBeforeBoot);
+    }
+
+    #[test]
+    fn stopping_a_start_held_on_a_loader_dependency_error_is_a_failure() {
+        let mut evidence = LaunchEvidence::default();
+        for line in [
+            "<log4j:Message><![CDATA[Incompatible mods found!]]></log4j:Message>",
+            "<log4j:Throwable><![CDATA[net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible with the game or each other!",
+            "\t - Mod 'Nuit Interop' (nuit_interop) 1.0.0 requires version 1.0.0 of nuit, which is missing!",
+        ] {
+            evidence.observe_line(line);
+        }
+        let facts = SessionExitFacts { exit_code: None, signal: Some(15), stop_requested: true, was_running: true, ..exit_facts() };
+        let outcome = classify_session_outcome(facts, &evidence).unwrap();
+        assert_eq!(
+            (outcome.kind, outcome.reason, outcome.failure_class),
+            (SessionOutcomeKind::Failed, SessionExitReason::StartupFailed, Some(FailureClass::MissingDependency))
+        );
+        assert!(outcome.summary.starts_with("A mod needs another mod or loader version"));
+        let booted = LaunchEvidence { boot_observed: true, ..evidence };
+        assert_eq!(classify_session_outcome(facts, &booted).unwrap().reason, SessionExitReason::LauncherStopped);
     }
 
     #[test]
@@ -721,6 +760,10 @@ mod tests {
             "cpw.mods.fml.common.MissingModsException: missing mods",
             "Missing or unsupported mandatory dependencies:",
             "- Mod 'Example' requires library 1.0, which is missing!",
+            "\t - Mod 'Sodium Extra' (sodium-extra) 0.9.5 requires version 0.20.1 or later of mod 'Fabric Loader' (fabricloader), but only the wrong version is present: 0.19.3!",
+            "net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible with the game or each other!",
+            "<log4j:Throwable><![CDATA[net.fabricmc.loader.impl.FormattedException: Some of your mods are incompatible with the game or each other!",
+            "- Mod 'Sodium' (sodium) 0.8.13 is incompatible with any version before 0.8.7 of mod 'Sodium Extra' (sodium-extra), yet a conflicting version is present: 0.6.0!",
         ] {
             assert_eq!(
                 classify_startup_failure_text(output),
