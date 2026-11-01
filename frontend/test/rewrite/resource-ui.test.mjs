@@ -25,14 +25,7 @@ import { before, test } from 'node:test';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const require = createRequire(resolve(frontend, 'package.json'));
-let esbuildPath;
-try {
-  esbuildPath = require.resolve('esbuild');
-} catch {
-  // The rewrite initially has no installed dependency tree. Read the retained
-  // tool only; never write build output or dependency files into the baseline.
-  esbuildPath = require.resolve('../../../legacy/frontend/node_modules/esbuild');
-}
+const esbuildPath = require.resolve('esbuild');
 const { build } = /** @type {typeof import('esbuild')} */ (require(esbuildPath));
 const dependencyRoot = resolve(dirname(esbuildPath), '../../');
 /** @type {Record<string, string>} */

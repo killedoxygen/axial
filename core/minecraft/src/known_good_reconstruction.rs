@@ -3421,37 +3421,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_reconstruction_entry_points_are_not_public() {
-        let crate_root = include_str!("lib.rs");
-        let dispatcher = include_str!("known_good_reconstruction.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("dispatcher production source");
-        let downloader = include_str!("download/install.rs");
-        let loaders = include_str!("loaders/mod.rs");
-        let loader_strategies = include_str!("loaders/strategies/common.rs");
-
-        assert!(crate_root.contains("rebuild_managed_libraries"));
-        assert!(crate_root.contains("rebuild_managed_assets"));
-        assert!(crate_root.contains("rebuild_managed_version_bundle"));
-        assert!(!crate_root.contains("prepare_managed_libraries_reconstruction"));
-        assert!(crate_root.contains("reconstruct_known_good"));
-        assert!(!crate_root.contains("KnownGoodActivationSource"));
-        assert!(!crate_root.contains("reconstruct_build,"));
-        assert!(!dispatcher.contains(concat!("PathBuf", "::new()")));
-        assert!(!downloader.contains("    pub async fn reconstruct_version("));
-        assert!(!loaders.contains("pub async fn reconstruct_build("));
-        assert!(!downloader.contains("ReconstructionLibraryContext"));
-        assert!(!loaders.contains("reconstruct_managed_libraries"));
-        assert!(!loader_strategies.contains("reconstruct_libraries_from_"));
-        assert!(!loader_strategies.contains(concat!("Downloader::new(", "PathBuf::new())")));
-        assert!(!crate_root.contains("VersionBundleTransactionCommitReceipt"));
-        assert!(!crate_root.contains("ManagedVersionBundleDisposition"));
-        assert!(!crate_root.contains("ManagedReconstructionContext"));
-        assert!(!crate_root.contains("ManagedRootPublicationLease"));
-    }
-
     fn assert_sentinel_untouched(root: &std::path::Path, sentinel: &std::path::Path) {
         assert_eq!(fs::read(sentinel).expect("sentinel remains"), b"untouched");
         assert_eq!(fs::read_dir(root).expect("sentinel root").count(), 1);

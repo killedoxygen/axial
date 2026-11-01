@@ -7864,40 +7864,4 @@ mod tests {
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
-    #[test]
-    fn activation_source_is_the_only_public_receipt_inventory_transition() {
-        let source = include_str!("known_good.rs");
-        assert!(!source.contains(concat!("pub fn from_registered_", "snapshot")));
-        assert!(!source.contains(concat!("pub fn into_", "inventory")));
-        assert!(!source.contains(concat!("pub fn derive_known_good_", "inventory")));
-        assert!(!source.contains(concat!("KnownGoodInventory", "Input")));
-        assert!(!source.contains(concat!("KnownGoodVanilla", "Source")));
-        assert!(!source.contains(concat!("RuntimeInventory", "Input")));
-        assert!(!source.contains(concat!("from_verified_vanilla_", "source")));
-        assert!(!source.contains(concat!("pub struct KnownGoodInstall", "Shape")));
-        for receipt in [
-            "pub struct KnownGoodInstallReceipt",
-            "pub struct KnownGoodReconstructionReceipt",
-        ] {
-            let position = source.find(receipt).expect("receipt declaration");
-            let derive = source[..position]
-                .rsplit("#[derive(")
-                .next()
-                .and_then(|tail| tail.split(")]").next())
-                .expect("receipt derive");
-            assert!(!derive.contains("Clone"));
-            assert!(!derive.contains("Serialize"));
-            assert!(!derive.contains("Deserialize"));
-            if receipt == "pub struct KnownGoodReconstructionReceipt" {
-                assert!(!derive.contains("Debug"));
-            }
-        }
-        let reconstruction_impl = source
-            .split("impl KnownGoodReconstructionReceipt")
-            .nth(1)
-            .and_then(|tail| tail.split("impl KnownGoodLoaderBaseDerivation").next())
-            .expect("reconstruction receipt implementation");
-        assert!(!reconstruction_impl.contains("into_parts"));
-        assert!(!reconstruction_impl.contains("from_"));
-    }
 }

@@ -1,21 +1,12 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFile } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 
-// The replacement installs its own dependencies during composition. The
-// preserved toolchain may be read for an isolated, entirely in-memory check.
-/** @type {typeof import('esbuild').build} */
-let build;
-try {
-  ({ build } = createRequire(resolve(frontend, 'package.json'))('esbuild'));
-} catch (error) {
-  if (!(error instanceof Error) || !('code' in error) || error.code !== 'MODULE_NOT_FOUND') throw error;
-  ({ build } = createRequire(resolve(frontend, '../legacy/frontend/package.json'))('esbuild'));
-}
+/** @type {{ build: typeof import('esbuild').build }} */
+const { build } = createRequire(resolve(frontend, 'package.json'))('esbuild');
 
 const instanceFile = resolve(frontend, 'src/instance-create.ts');
 const seam = `
@@ -630,27 +621,4 @@ test('stale preferred build requires explicitly choosing the available older ins
   assert.equal(select(parsed.builds[0].selection_id), '');
   assert.equal(select(parsed.builds[1].selection_id), parsed.builds[1].selection_id);
   assert.equal(select(null), '');
-});
-
-test('create styling preserves the baseline except restored loader marks and their exact alignment', async () => {
-  for (const filename of ['create.css', 'loader-logos.tsx']) {
-    const [replacement, baseline] = await Promise.all([
-      readFile(resolve(frontend, 'src/views/create', filename), 'utf8'),
-      readFile(resolve(frontend, '../legacy/frontend/src/views/create', filename), 'utf8'),
-    ]);
-    const comparable =
-      filename === 'create.css'
-        ? replacement.replace(
-            ".cp-cr-loader-mark[data-loader='quilt'] {\n  translate: 2.1% 2.1%;\n}\n.cp-cr-loader-mark[data-loader='forge'] {\n  translate: 0 2.1%;\n}\n",
-            '',
-          )
-        : replacement
-            .replace('vanilla_icon.svg', 'loader-base.svg')
-            .replace('fabric_icon.svg', 'loader-grid.svg')
-            .replace('neoforge_icon.svg', 'loader-orbit.svg')
-            .replace('forge_icon.svg', 'loader-cross.svg')
-            .replace('quilt_icon.svg', 'loader-diamonds.svg')
-            .replace('      data-loader={loader}\n', '');
-    assert.equal(comparable, baseline);
-  }
 });

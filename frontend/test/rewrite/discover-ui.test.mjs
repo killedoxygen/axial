@@ -505,18 +505,3 @@ test('search remount shares a pending request and a forced retry wins over an ol
   assert.deepEqual(plain(state.results), searchPage('fresh', 1).items);
   assert.equal(state.loading, false);
 });
-
-test('discover presentation, filters and target bar retain the baseline source', async () => {
-  for (const file of ['DiscoverView.tsx', 'ContentDetailView.tsx', 'TargetBar.tsx', 'shared.tsx', 'markdown.tsx', 'discover.css']) {
-    const current = await readFile(resolve(sourceRoot, 'views/discover', file), 'utf8');
-    const baseline = await readFile(resolve(sourceRoot, '../../legacy/frontend/src/views/discover', file), 'utf8');
-    assert.equal(current, baseline, file);
-  }
-  const picker = await readFile(resolve(sourceRoot, 'views/discover/ModpackPicker.tsx'), 'utf8');
-  const baselinePicker = await readFile(resolve(sourceRoot, '../../legacy/frontend/src/views/discover/ModpackPicker.tsx'), 'utf8');
-  const markup = '  return (\n    <Modal';
-  const currentMarkup = picker.indexOf(markup);
-  const baselineMarkup = baselinePicker.indexOf(markup);
-  assert.ok(currentMarkup >= 0 && baselineMarkup >= 0);
-  assert.equal(picker.slice(currentMarkup), baselinePicker.slice(baselineMarkup));
-});

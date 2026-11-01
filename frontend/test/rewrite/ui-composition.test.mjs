@@ -40,12 +40,7 @@ import test from 'node:test';
 
 const frontendPath = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const frontendRoot = pathToFileURL(`${frontendPath}/`);
-let dependencyRequire = createRequire(new URL('package.json', frontendRoot));
-try {
-  dependencyRequire.resolve('typescript');
-} catch {
-  dependencyRequire = createRequire(new URL('../legacy/frontend/package.json', frontendRoot));
-}
+const dependencyRequire = createRequire(new URL('package.json', frontendRoot));
 const ts = /** @type {typeof import('typescript')} */ (dependencyRequire('typescript'));
 const jsxRuntime = /** @type {typeof import('preact/jsx-runtime')} */ (dependencyRequire('preact/jsx-runtime'));
 const signals = /** @type {typeof import('@preact/signals')} */ (dependencyRequire('@preact/signals'));

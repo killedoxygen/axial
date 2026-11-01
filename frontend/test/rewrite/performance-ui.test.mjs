@@ -20,11 +20,7 @@ import vm from 'node:vm';
  */
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const dependencies = createRequire(
-  existsSync(resolve(frontend, 'node_modules/esbuild'))
-    ? resolve(frontend, 'package.json')
-    : resolve(frontend, '../legacy/frontend/package.json'),
-);
+const dependencies = createRequire(resolve(frontend, 'package.json'));
 const { transformSync } = /** @type {typeof import('esbuild')} */ (dependencies('esbuild'));
 
 // Execute the real view functions and DTO decoders without a DOM or shared build
