@@ -8,6 +8,31 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+## [0.4.0-rc.2] - 2026-11-01
+
+### Onboarding
+- First run takes two steps: sign in with Microsoft or pick an offline name and look, then choose a color and what runs in the background, with the player's 3D character alongside
+- Memory starts at the system recommendation instead of being asked up front; anonymous stats stay off until turned on
+
+### Mods and content
+- Updates, disables and removals no longer leave an instance unable to start; Axial names the mods involved and offers to change them together
+- Mods installed by a modpack are kept out of Update all
+- Import .jar files into an instance and create instances from .mrpack files, by picking or dropping them
+- A hand-added file that matches a mod is adopted instead of blocking its install; a different file can be replaced on request
+- Installed mods show their icon, version, authors and modpack; new Resource packs and Shaders tabs
+- Downloads lists recent failures with what failed and in which instance
+
+### Performance
+- Installs and launches are faster: on macOS a fresh vanilla 1.20.1 install went from about 100 s to 41 s, Forge from 43 s to 29 s, and launching from 1.7 s to 0.8 s
+
+### Fixes
+- A lost OpenGL context on Minecraft 26.x reports graphics as unavailable instead of a generic crash
+- A saved custom Java path is shown again, the Mods pane refreshes after setup, and modpack set up honours the active version and loader filters
+- A start stopped by a loader's incompatible-mods screen is recorded as a failed start with the reason
+
+### Security
+- Updated tokio, libz-sys and p256 for RustSec advisories
+
 ### Release integrity
 - Releases are exposed only after their version, notes, complete platform asset set, and checksums agree
 
