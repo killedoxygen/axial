@@ -1,7 +1,7 @@
 {
   "bundle": {
     "targets": ["nsis"],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "windows": { "nsis": { "installMode": "currentUser" } }
   }
 }

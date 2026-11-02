@@ -1,7 +1,7 @@
 {
   "bundle": {
     "targets": ["appimage"],
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "linux": {
       "appimage": {
         "bundleMediaFramework": true

@@ -1,7 +1,7 @@
 name: Rewrite candidate artifacts
 
-# This workflow has no publisher, signing secrets, or installed-user mutations.
-# A separately authorized release supplies trust material and real native evidence.
+# Builds and signs update packages with the updater key; it publishes nothing.
+# Installed-machine evidence is supplied separately.
 on:
   workflow_dispatch:
     inputs:
@@ -123,6 +123,8 @@ jobs:
         env:
           CANDIDATE_TARGET: ${{ matrix.target }}
           CANDIDATE_OVERLAY: ${{ matrix.overlay }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           status=0
           cargo tauri build --target "$CANDIDATE_TARGET" --config "platform/tauri.$CANDIDATE_OVERLAY.json" --config '{"build":{"beforeBuildCommand":""}}' -- --locked > "$RUNNER_TEMP/package.log" 2>&1 || status=$?
@@ -134,8 +136,11 @@ jobs:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
           CANDIDATE_TARGET: ${{ matrix.target }}
           CANDIDATE_BINARY: ${{ matrix.binary }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           node scripts/release/package.mjs --platform "$CANDIDATE_PLATFORM" --source "$RUNNER_TEMP/rewrite-source/source.json" --binary "target/$CANDIDATE_TARGET/release/$CANDIDATE_BINARY" --bundle-root "target/$CANDIDATE_TARGET/release/bundle" --output "$RUNNER_TEMP/handoff"
+          cargo tauri signer sign "$RUNNER_TEMP/handoff/artifacts.json" > /dev/null
           node scripts/release/contract.mjs verify-artifacts --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/handoff" --platform "$CANDIDATE_PLATFORM"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -172,11 +177,12 @@ jobs:
       - name: Evaluate release readiness
         shell: bash
         run: |
+          sudo apt-get update > /dev/null && sudo apt-get install -y minisign > /dev/null
           mkdir "$RUNNER_TEMP/assets"
           for platform in linux-amd64 windows-amd64 macos-amd64 macos-arm64; do
             mv "$RUNNER_TEMP/downloads/rewrite-assets-$platform" "$RUNNER_TEMP/assets/$platform"
           done
-          node acceptance/native/verify.mjs --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --evidence acceptance/native/evidence > "$RUNNER_TEMP/readiness.json"
+          node acceptance/native/verify.mjs --source "$RUNNER_TEMP/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --evidence acceptance/native/evidence --public-key apps/desktop/updater.pub > "$RUNNER_TEMP/readiness.json"
       - name: Retain explicit readiness gaps
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

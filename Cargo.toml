@@ -11,10 +11,10 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0-rc.4"
+version = "0.4.0-rc.5"
 edition = "2024"
 license = "MIT"
-authors = ["Mateoltd"]
+authors = ["killedoxygen"]
 
 [workspace.dependencies]
 async-stream = "0.3.6"

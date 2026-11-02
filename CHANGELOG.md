@@ -8,6 +8,13 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+## [0.4.0-rc.5] - 2026-11-02
+
+### Distribution
+- Axial updates itself: update packages are signed and announced at updates.axial.run, so only the first install meets the operating system's warning
+- The macOS disk image shows how to open Axial the first time
+- Axial is available under the MIT license
+
 ## [0.4.0-rc.4] - 2026-11-02
 
 ### Onboarding
