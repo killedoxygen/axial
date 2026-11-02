@@ -82,6 +82,10 @@ jobs:
           status=0
           node scripts/cargo-target.mjs run -- cargo test -p axial-app -p axial-api -p axial-fs -p axial-minecraft -p axial-performance -p axial-resource --lib > "$RUNNER_TEMP/application-tests.log" 2>&1 || status=$?
           tail -n 70 "$RUNNER_TEMP/application-tests.log"
+          if [ "$status" -ne 0 ]; then
+            echo "--- test panics ---"
+            grep -A 6 "^thread '.*panicked at" "$RUNNER_TEMP/application-tests.log" | cut -c 1-2000 | head -n 200 || true
+          fi
           exit "$status"
       - name: Preserve failed core test output
         if: failure()
