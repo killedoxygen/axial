@@ -123,6 +123,8 @@ jobs:
         env:
           CANDIDATE_TARGET: ${{ matrix.target }}
           CANDIDATE_OVERLAY: ${{ matrix.overlay }}
+          # Lay out the DMG window in Finder; Tauri skips that step under CI by default.
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
