@@ -37,6 +37,10 @@ const INTERRUPTED_CLEANUP_PORT: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_PORT
 const INTERRUPTED_CLEANUP_TOKEN: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_TOKEN";
 const INTERRUPTED_CHILD_EXIT: i32 = 75;
 const EXTERNAL_CANARY: &[u8] = b"external user file survives launch and profile reopen";
+// Journey fixtures share this binary's process-wide physical-work owner, whose
+// installed-version inspection refuses rather than waits while every worker is
+// held. Each fixture holds this so one test's installs cannot refuse another's reads.
+static PROCESS_WORK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Copy, serde::Serialize)]
 pub(super) enum KillAckStage {
@@ -1451,6 +1455,7 @@ const PREPARED_ACTION: &str = "AXIAL_TEST_PREPARED_PERFORMANCE_ACTION";
 // Each case owns its profile, provider and crash child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_prepared_performance_resumes_or_rejects_without_blocking_startup() {
+    let _process_work = PROCESS_WORK.lock().await;
     for (case, queued, action, changed_graph) in [
         ("queued apply resumes", true, "apply", false),
         ("synchronous apply resumes", false, "apply", false),
@@ -1887,6 +1892,7 @@ async fn ping_fixture_channels(channels: &mut [tokio::net::TcpStream]) {
 // Each case owns its profile, provider and crash child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_interrupted_launch_preserves_quit_and_does_not_repeat_unknown_session() {
+    let _process_work = PROCESS_WORK.lock().await;
     for (case, benchmark, existing) in [
         ("managed library launch", false, false),
         ("external library launch", false, true),
@@ -2294,6 +2300,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
     use axial_app::storage::StorageError;
     use futures_util::FutureExt;
 
+    let _process_work = PROCESS_WORK.lock().await;
     const SUITE: &str = "live-stop-resume-suite";
     let mut temporary =
         Some(tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap());
@@ -2588,6 +2595,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
 
 #[test]
 fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
+    let _process_work = PROCESS_WORK.blocking_lock();
     let (runtime, _diagnostics) = benchmark_diagnostic_runtime();
     runtime.block_on(benchmark_driver_automatically_resumes_remaining_run_once());
 }
@@ -2927,6 +2935,7 @@ fn assert_observed_terminal(status: &Value, instance: &str, session: &str) {
 async fn real_observed_settlement_survives_report_failure_and_process_restart() {
     use std::process::Stdio;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -3092,6 +3101,7 @@ async fn observed_settlement_crash_helper() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -3244,6 +3254,7 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
 
 #[test]
 fn preflight_reports_publication_contention_without_waiting_or_launching() {
+    let _process_work = PROCESS_WORK.blocking_lock();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -3667,6 +3678,7 @@ async fn publication_preflight(retain_runtime: &mut bool) {
 async fn degraded_versions_block_preflight_and_play_without_repairing() {
     use futures_util::FutureExt;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -3883,6 +3895,7 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
 async fn degraded_versions_block_create_view_and_create_without_mutation() {
     use futures_util::FutureExt;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -4117,6 +4130,7 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
 async fn created_instance_survives_install_queue_refusal_and_reopen() {
     use futures_util::FutureExt;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -4629,6 +4643,7 @@ fn instance_list_refuses_input_scratch_pressure() {
 async fn preflight_reports_installed_file_damage_without_launching_or_repairing() {
     use std::os::unix::fs::MetadataExt;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -5140,6 +5155,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
 async fn preflight_reports_missing_java_override_without_launching() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -5466,6 +5482,7 @@ async fn preflight_reports_missing_java_override_without_launching() {
 
 #[test]
 fn real_offline_vanilla_install_launch_stop_and_restart() {
+    let _process_work = PROCESS_WORK.blocking_lock();
     for (case, existing) in [("managed library", false), ("external library", true)] {
         eprintln!("offline vanilla case: {case}");
         run_with_kill_capture(async {
@@ -5477,6 +5494,7 @@ fn real_offline_vanilla_install_launch_stop_and_restart() {
 
 #[test]
 fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
+    let _process_work = PROCESS_WORK.blocking_lock();
     run_with_kill_capture(async {
         missing_default_runtime_after_reopen().await;
         Ok(())
@@ -6167,6 +6185,7 @@ async fn offline_vanilla_journey(existing: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
@@ -6312,6 +6331,7 @@ async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
 
 #[test]
 fn real_playing_instance_edits_preserve_active_command_and_next_launch_settings() {
+    let _process_work = PROCESS_WORK.blocking_lock();
     run_with_kill_capture(playing_instance_edits());
 }
 
@@ -6604,6 +6624,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
 
 #[test]
 fn real_benchmark_mapping_survives_response_loss_and_restart() {
+    let _process_work = PROCESS_WORK.blocking_lock();
     let (runtime, _diagnostics) = benchmark_diagnostic_runtime();
     runtime.block_on(benchmark_mapping_survives_response_loss_and_restart());
 }
@@ -6990,6 +7011,7 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
     use futures_util::FutureExt;
     use std::io::Read;
 
+    let _process_work = PROCESS_WORK.lock().await;
     let mut temporary =
         Some(tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap());
     let profile = temporary.as_ref().unwrap().path().join("profile");
@@ -7620,6 +7642,7 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corrupted_client_cannot_publish_ready_installation() {
+    let _process_work = PROCESS_WORK.lock().await;
     let temporary =
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let profile = temporary.path().join("profile");
