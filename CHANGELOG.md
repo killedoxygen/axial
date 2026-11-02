@@ -8,7 +8,7 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
-## [0.4.0-rc.3] - 2026-11-01
+## [0.4.0-rc.4] - 2026-11-02
 
 ### Onboarding
 - First run takes two steps: sign in with Microsoft or pick an offline name and look, then choose a color and what runs in the background, with the player's 3D character alongside
@@ -17,7 +17,7 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 ### Mods and content
 - Updates, disables and removals no longer leave an instance unable to start; Axial names the mods involved and offers to change them together
 - Mods installed by a modpack are kept out of Update all
-- Import .jar files into an instance and create instances from .mrpack files, by picking or dropping them
+- Import .jar files into an instance and create instances from .mrpack files, by picking or dropping them, including packs not published on Modrinth
 - A hand-added file that matches a mod is adopted instead of blocking its install; a different file can be replaced on request
 - Installed mods show their icon, version, authors and modpack; new Resource packs and Shaders tabs
 - Downloads lists recent failures with what failed and in which instance
@@ -29,6 +29,7 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 - A lost OpenGL context on Minecraft 26.x reports graphics as unavailable instead of a generic crash
 - A saved custom Java path is shown again, the Mods pane refreshes after setup, and modpack set up honours the active version and loader filters
 - A start stopped by a loader's incompatible-mods screen is recorded as a failed start with the reason
+- Built-in shortcuts use Cmd instead of Ctrl on macOS, and shortcut hints show the platform's modifier symbols
 
 ### Security
 - Updated tokio, libz-sys and p256 for RustSec advisories
