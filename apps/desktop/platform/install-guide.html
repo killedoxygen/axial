@@ -1,0 +1,338 @@
+<!doctype html>
+<!-- The download page at updates.axial.run (publish.mjs fills #release) and, offline inside the macOS disk image, the first-open guide. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Download Axial</title>
+<style>
+  :root { --bg: #100D0A; --card: #1C1814; --text: #F3F4F2; --muted: #ADB0AC; --quiet: #868985; --accent: #A0D47C; }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
+  body { margin: 0; color: var(--text); font: 17px/1.55 Manrope, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  main { max-width: 600px; margin: 0 auto; padding: 72px 24px 96px; }
+  a { color: var(--muted); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .brand { display: flex; align-items: center; gap: 16px; }
+  .brand svg { width: 56px; height: 56px; flex: none; }
+  h1 { margin: 0; font-size: 40px; line-height: 1.1; font-weight: 700; letter-spacing: -0.01em; }
+  .lede { margin: 12px 0 0; font-size: 19px; color: var(--muted); }
+  .download { margin-top: 40px; }
+  .button { display: flex; align-items: center; justify-content: center; min-height: 56px; padding: 12px 20px; border-radius: 12px; background: var(--accent); color: var(--bg); font-weight: 700; text-align: center; text-decoration: none; }
+  .button:hover { background: #93C76F; text-decoration: none; }
+  .downloading .download .button { background: #2A2621; color: var(--muted); }
+  .quiet { margin: 12px 0 0; font-size: 14px; color: var(--quiet); }
+  .quiet a { text-decoration: underline; text-underline-offset: 2px; }
+  .retry { display: none; }
+  .downloading .retry { display: block; }
+  h2 { margin: 72px 0 0; font-size: 28px; line-height: 1.25; font-weight: 600; }
+  .when-done { display: none; }
+  .downloading .when-done { display: block; }
+  .downloading .when-waiting { display: none; }
+  .steps { display: none; counter-reset: step; }
+  .steps.shown { display: block; }
+  .step { margin-top: 48px; counter-increment: step; }
+  .step h3 { display: flex; align-items: center; gap: 14px; margin: 0; font-size: 20px; line-height: 1.3; font-weight: 600; }
+  .step h3::before { content: counter(step); flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--bg); font-size: 15px; font-weight: 700; }
+  .step p { margin: 10px 0 0 46px; color: var(--muted); }
+  .step .button { margin: 16px 0 0 46px; }
+  .step .quiet { margin-left: 46px; }
+  .mock { margin: 16px 0 0 46px; padding: 16px; border-radius: 14px; background: var(--card); }
+  .mock svg { display: block; width: 100%; height: auto; }
+  .mock + .mock { margin-top: 12px; }
+  .mock text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  .hl { fill: none; stroke: var(--accent); stroke-width: 3; }
+  .pointer { fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round; marker-end: url(#head); }
+  code { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); background: var(--card); padding: 2px 6px; border-radius: 6px; user-select: all; }
+  footer { margin-top: 80px; font-size: 14px; color: var(--quiet); }
+  footer p { margin: 8px 0 0; }
+  .offline .download, .offline [data-online], .offline h2, [data-offline] { display: none; }
+  .offline [data-offline] { display: block; }
+  @media (max-width: 520px) {
+    main { padding-top: 48px; }
+    h1 { font-size: 32px; }
+    .step p, .step .button, .step .quiet, .mock { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="axial" viewBox="0 0 500 500">
+      <rect width="500" height="500" rx="112.5" fill="#000"/>
+      <path fill="#D7FF00" d="M118 58h60a60 60 0 0160 60v60a84 84 0 0084 84h60a60 60 0 0160 60v60a60 60 0 01-60 60h-60a60 60 0 01-60-60v-60a84 84 0 00-84-84h-60a60 60 0 01-60-60v-60a60 60 0 0160-60zM362 376v28a14 14 0 0014 14h28a14 14 0 0014-14v-28a14 14 0 00-14-14h-28a14 14 0 00-14 14z"/>
+      <path fill="#D7FF00" d="M322 58h60a60 60 0 0160 60v60a60 60 0 01-60 60h-60a60 60 0 01-60-60v-60a60 60 0 0160-60zM118 262h60a60 60 0 0160 60v60a60 60 0 01-60 60h-60a60 60 0 01-60-60v-60a60 60 0 0160-60z"/>
+    </symbol>
+    <marker id="head" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#A0D47C"/>
+    </marker>
+  </defs>
+</svg>
+<main>
+  <header class="brand">
+    <svg aria-hidden="true"><use href="#axial"/></svg>
+    <h1 id="title">Axial</h1>
+  </header>
+  <p class="lede" id="lede">A free Minecraft launcher.</p>
+
+  <section class="download" id="download">
+    <a class="button" id="get" href="https://github.com/killedoxygen/axial/releases">Download Axial</a>
+    <p class="quiet retry">Didn’t start? <a id="again" href="#">Download again</a>.</p>
+    <p class="quiet" id="file"></p>
+    <p class="quiet" id="others"></p>
+    <p class="quiet">This is a pre-release. Start with a fresh profile; earlier Axial profiles aren’t imported.</p>
+  </section>
+
+  <h2><span class="when-waiting">What happens after you download</span><span class="when-done">Here’s exactly what you’ll see</span></h2>
+
+  <section class="steps" data-os="mac">
+    <div class="step" data-online>
+      <h3>Drag Axial into Applications</h3>
+      <p>Open the file you downloaded. In the window that appears, drag Axial onto the Applications folder.</p>
+      <div class="mock"><svg viewBox="0 0 520 220" role="img" aria-label="Disk image window: drag Axial onto Applications">
+        <rect x="20" y="10" width="480" height="200" rx="12" fill="#2C2C2E"/>
+        <circle cx="42" cy="30" r="6" fill="#FF5F57"/><circle cx="60" cy="30" r="6" fill="#FEBC2E"/><circle cx="78" cy="30" r="6" fill="#28C840"/>
+        <text x="260" y="34" text-anchor="middle" font-size="12" fill="#BDBDBD">Axial Rewrite</text>
+        <use href="#axial" x="98" y="66" width="88" height="88"/>
+        <text x="142" y="178" text-anchor="middle" font-size="12" fill="#EDEDED">Axial Rewrite</text>
+        <path d="M336 78a6 6 0 016-6h24l8 8h40a6 6 0 016 6v6h-84z" fill="#3F8FD9"/>
+        <rect x="336" y="88" width="84" height="62" rx="6" fill="#5AAEEF"/>
+        <path d="M367 136l11-30 11 30M371 126h14" fill="none" stroke="#2F7DC6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="378" y="178" text-anchor="middle" font-size="12" fill="#EDEDED">Applications</text>
+        <path class="pointer" d="M204 112H312"/>
+      </svg></div>
+    </div>
+    <div class="step">
+      <h3>Open Axial. macOS stops it the first time</h3>
+      <p>Open Axial from your Applications folder. macOS shows this message because Axial isn’t registered with Apple. Click <strong>Done</strong>, not Move to Trash.</p>
+      <p class="quiet" data-offline>Haven’t copied it yet? First drag Axial onto Applications in the window behind this one.</p>
+      <div class="mock"><svg viewBox="0 0 520 290" role="img" aria-label="Axial Rewrite Not Opened dialog; click Done">
+        <rect x="140" y="10" width="240" height="270" rx="16" fill="#2C2C2E"/>
+        <use href="#axial" x="230" y="30" width="60" height="60"/>
+        <text x="260" y="118" text-anchor="middle" font-size="13" font-weight="700" fill="#F2F2F2">“Axial Rewrite” Not Opened</text>
+        <text text-anchor="middle" font-size="11" fill="#BDBDBD"><tspan x="260" y="140">Apple could not verify “Axial Rewrite” is</tspan><tspan x="260" y="155">free of malware that may harm your Mac</tspan><tspan x="260" y="170">or compromise your privacy.</tspan></text>
+        <rect x="156" y="192" width="208" height="30" rx="8" fill="#0A84FF"/>
+        <text x="260" y="212" text-anchor="middle" font-size="12" font-weight="600" fill="#fff">Done</text>
+        <rect x="156" y="232" width="208" height="30" rx="8" fill="#48484A"/>
+        <text x="260" y="252" text-anchor="middle" font-size="12" fill="#EDEDED">Move to Trash</text>
+        <rect class="hl" x="150" y="186" width="220" height="42" rx="11"/>
+        <path class="pointer" d="M60 207H136"/>
+      </svg></div>
+    </div>
+    <div class="step">
+      <h3>Open Privacy &amp; Security</h3>
+      <p>This button takes you straight to the right page in System Settings.</p>
+      <a class="button" href="x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Security">Open Privacy &amp; Security</a>
+      <p class="quiet">Your browser asks first. Choose <strong>Allow</strong>.</p>
+      <div class="mock"><svg viewBox="0 0 520 170" role="img" aria-label="Browser asks to open System Settings; click Allow">
+        <rect x="100" y="10" width="320" height="150" rx="14" fill="#2C2C2E"/>
+        <text text-anchor="middle" font-size="13" font-weight="700" fill="#F2F2F2"><tspan x="260" y="50">Do you want to allow this page</tspan><tspan x="260" y="68">to open “System Settings”?</tspan></text>
+        <rect x="160" y="108" width="92" height="30" rx="8" fill="#48484A"/>
+        <text x="206" y="128" text-anchor="middle" font-size="12" fill="#EDEDED">Cancel</text>
+        <rect x="268" y="108" width="92" height="30" rx="8" fill="#0A84FF"/>
+        <text x="314" y="128" text-anchor="middle" font-size="12" font-weight="600" fill="#fff">Allow</text>
+        <rect class="hl" x="262" y="102" width="104" height="42" rx="11"/>
+        <path class="pointer" d="M460 123H376"/>
+      </svg></div>
+      <p class="quiet">Nothing opened? Open System Settings yourself and choose Privacy &amp; Security.</p>
+    </div>
+    <div class="step">
+      <h3>Scroll down and click Open Anyway</h3>
+      <p>Near the bottom, under Security, Axial is listed as blocked. Click <strong>Open Anyway</strong>, then confirm with Touch ID or your Mac’s password.</p>
+      <div class="mock"><svg viewBox="0 0 520 250" role="img" aria-label="Privacy and Security settings; click Open Anyway next to Axial Rewrite was blocked">
+        <rect x="10" y="10" width="500" height="230" rx="12" fill="#232325"/>
+        <path d="M22 10h118v230H22a12 12 0 01-12-12V22a12 12 0 0112-12z" fill="#2C2C2E"/>
+        <circle cx="30" cy="28" r="5" fill="#FF5F57"/><circle cx="46" cy="28" r="5" fill="#FEBC2E"/><circle cx="62" cy="28" r="5" fill="#28C840"/>
+        <text font-size="11" fill="#BDBDBD"><tspan x="26" y="66">Lock Screen</tspan><tspan x="26" y="92">Touch ID</tspan><tspan x="26" y="144">Desktop</tspan><tspan x="26" y="170">Displays</tspan></text>
+        <rect x="18" y="104" width="114" height="24" rx="6" fill="#0A84FF"/>
+        <text x="26" y="120" font-size="11" font-weight="600" fill="#fff">Privacy &amp; Security</text>
+        <text x="160" y="40" font-size="14" font-weight="700" fill="#F2F2F2">Privacy &amp; Security</text>
+        <text x="160" y="96" font-size="12" font-weight="700" fill="#EDEDED">Security</text>
+        <rect x="160" y="108" width="330" height="110" rx="10" fill="#2C2C2E"/>
+        <text x="174" y="134" font-size="11" fill="#BDBDBD">Allow applications from</text>
+        <text x="476" y="134" text-anchor="end" font-size="11" fill="#BDBDBD">App Store &amp; Known Developers</text>
+        <text font-size="11" fill="#EDEDED"><tspan x="174" y="174">“Axial Rewrite” was blocked to</tspan><tspan x="174" y="190">protect your Mac.</tspan></text>
+        <rect x="390" y="166" width="88" height="26" rx="7" fill="#5A5A5E"/>
+        <text x="434" y="183" text-anchor="middle" font-size="11" fill="#fff">Open Anyway</text>
+        <rect class="hl" x="384" y="160" width="100" height="38" rx="10"/>
+        <rect x="502" y="40" width="4" height="190" rx="2" fill="#2C2C2E"/><rect x="502" y="170" width="4" height="56" rx="2" fill="#6E6E73"/>
+      </svg></div>
+    </div>
+    <div class="step">
+      <h3>Click Open Anyway once more</h3>
+      <p>That’s it. Axial opens, keeps itself up to date, and macOS won’t ask again.</p>
+      <div class="mock"><svg viewBox="0 0 520 270" role="img" aria-label="Open Axial Rewrite dialog; click Open Anyway">
+        <rect x="140" y="10" width="240" height="250" rx="16" fill="#2C2C2E"/>
+        <use href="#axial" x="230" y="30" width="60" height="60"/>
+        <text x="260" y="118" text-anchor="middle" font-size="13" font-weight="700" fill="#F2F2F2">Open “Axial Rewrite”?</text>
+        <text text-anchor="middle" font-size="11" fill="#BDBDBD"><tspan x="260" y="140">Apple could not verify “Axial Rewrite”.</tspan><tspan x="260" y="155">Open it only if you trust where it</tspan><tspan x="260" y="170">came from.</tspan></text>
+        <rect x="156" y="192" width="208" height="26" rx="8" fill="#48484A"/>
+        <text x="260" y="210" text-anchor="middle" font-size="12" fill="#fff">Open Anyway</text>
+        <rect x="156" y="226" width="208" height="26" rx="8" fill="#0A84FF"/>
+        <text x="260" y="244" text-anchor="middle" font-size="12" font-weight="600" fill="#fff">Done</text>
+        <rect class="hl" x="150" y="186" width="220" height="38" rx="11"/>
+        <path class="pointer" d="M60 205H136"/>
+      </svg></div>
+    </div>
+  </section>
+
+  <section class="steps" data-os="win">
+    <div class="step">
+      <h3>Keep the download</h3>
+      <p>Your browser may say the installer isn’t commonly downloaded. In Edge, click <strong>⋯</strong> next to it, then <strong>Keep</strong>. Chrome just shows <strong>Keep</strong>.</p>
+      <div class="mock"><svg viewBox="0 0 520 190" role="img" aria-label="Edge downloads: open the menu and click Keep">
+        <rect x="20" y="10" width="480" height="170" rx="10" fill="#2B2B2B"/>
+        <text x="40" y="40" font-size="13" font-weight="700" fill="#F2F2F2">Downloads</text>
+        <rect x="40" y="58" width="22" height="28" rx="3" fill="#5A5A5E"/>
+        <text font-size="11"><tspan x="74" y="68" fill="#EDEDED">axial-rewrite-windows-…-setup.exe</tspan><tspan x="74" y="84" fill="#BDBDBD">isn’t commonly downloaded. Make sure you</tspan><tspan x="74" y="98" fill="#BDBDBD">trust it before you open it.</tspan></text>
+        <text x="330" y="74" font-size="16" fill="#EDEDED">⋯</text>
+        <rect x="320" y="58" width="34" height="26" rx="6" fill="none" stroke="#5A5A5E"/>
+        <rect x="330" y="92" width="150" height="80" rx="8" fill="#3A3A3C"/>
+        <text font-size="11" fill="#EDEDED"><tspan x="346" y="114">Delete</tspan><tspan x="346" y="140" font-weight="700">Keep</tspan><tspan x="346" y="164">Report as safe</tspan></text>
+        <rect class="hl" x="336" y="124" width="138" height="24" rx="6"/>
+      </svg></div>
+      <p>If Edge asks again, click <strong>Show more</strong>, then <strong>Keep anyway</strong>.</p>
+      <div class="mock"><svg viewBox="0 0 520 170" role="img" aria-label="Edge asks to make sure you trust the file: Show more, then Keep anyway">
+        <rect x="60" y="10" width="400" height="150" rx="10" fill="#2B2B2B"/>
+        <text font-size="12" fill="#F2F2F2" font-weight="700"><tspan x="80" y="40">Make sure you trust axial-rewrite-…-setup.exe</tspan><tspan x="80" y="56">before you open it</tspan></text>
+        <text x="80" y="86" font-size="11" fill="#BDBDBD">Show more ⌄</text>
+        <text x="80" y="112" font-size="11" font-weight="700" fill="#EDEDED">Keep anyway</text>
+        <rect class="hl" x="72" y="96" width="92" height="24" rx="6"/>
+        <rect x="300" y="122" width="70" height="26" rx="6" fill="#0A6CD0"/><text x="335" y="139" text-anchor="middle" font-size="11" fill="#fff">Delete</text>
+        <rect x="378" y="122" width="70" height="26" rx="6" fill="#48484A"/><text x="413" y="139" text-anchor="middle" font-size="11" fill="#fff">Cancel</text>
+      </svg></div>
+    </div>
+    <div class="step">
+      <h3>Tell Windows to run it</h3>
+      <p>Open the installer. Windows may show a blue warning because Axial isn’t signed with a paid certificate. Click <strong>More info</strong>, then <strong>Run anyway</strong>.</p>
+      <div class="mock"><svg viewBox="0 0 520 200" role="img" aria-label="Windows protected your PC: click More info, then Run anyway">
+        <rect x="10" y="10" width="245" height="180" fill="#0F5BA8"/>
+        <text font-size="15" fill="#fff"><tspan x="26" y="44">Windows protected</tspan><tspan x="26" y="64">your PC</tspan></text>
+        <text font-size="10" fill="#E6EEF7"><tspan x="26" y="92">Microsoft Defender SmartScreen</tspan><tspan x="26" y="106">prevented an unrecognized app</tspan><tspan x="26" y="120">from starting.</tspan></text>
+        <text x="26" y="146" font-size="11" font-weight="700" fill="#fff" text-decoration="underline">More info</text>
+        <rect class="hl" x="20" y="132" width="70" height="22" rx="5"/>
+        <rect x="265" y="10" width="245" height="180" fill="#0F5BA8"/>
+        <text font-size="15" fill="#fff"><tspan x="281" y="44">Windows protected</tspan><tspan x="281" y="64">your PC</tspan></text>
+        <text font-size="10" fill="#E6EEF7"><tspan x="281" y="92">App: axial-rewrite-…-setup.exe</tspan><tspan x="281" y="106">Publisher: Unknown publisher</tspan></text>
+        <rect x="281" y="150" width="104" height="26" fill="#0B4A8B" stroke="#fff"/><text x="333" y="167" text-anchor="middle" font-size="11" fill="#fff">Run anyway</text>
+        <rect x="393" y="150" width="104" height="26" fill="#0B4A8B" stroke="#fff"/><text x="445" y="167" text-anchor="middle" font-size="11" fill="#fff">Don’t run</text>
+        <rect class="hl" x="275" y="144" width="116" height="38" rx="5"/>
+      </svg></div>
+    </div>
+    <div class="step">
+      <h3>Click through the installer</h3>
+      <p>Click <strong>Next</strong>, then <strong>Install</strong>. Axial opens when it’s done and keeps itself up to date from then on.</p>
+      <div class="mock"><svg viewBox="0 0 520 190" role="img" aria-label="Axial Rewrite Setup: click Next">
+        <rect x="40" y="10" width="440" height="170" fill="#F0F0F0"/>
+        <rect x="40" y="10" width="440" height="26" fill="#FFFFFF"/>
+        <text x="52" y="28" font-size="11" fill="#222">Axial Rewrite Setup</text>
+        <use href="#axial" x="60" y="54" width="44" height="44"/>
+        <text font-size="13" font-weight="700" fill="#111"><tspan x="120" y="70">Welcome to Axial Rewrite Setup</tspan></text>
+        <text x="120" y="90" font-size="11" fill="#444">Setup will guide you through the installation.</text>
+        <rect x="300" y="140" width="80" height="26" fill="#E1E1E1" stroke="#0078D4"/><text x="340" y="157" text-anchor="middle" font-size="11" fill="#111">Next &gt;</text>
+        <rect x="390" y="140" width="76" height="26" fill="#E1E1E1" stroke="#ADADAD"/><text x="428" y="157" text-anchor="middle" font-size="11" fill="#111">Cancel</text>
+        <rect x="292" y="132" width="96" height="42" rx="6" fill="none" stroke="#100D0A" stroke-width="7"/>
+        <rect class="hl" x="292" y="132" width="96" height="42" rx="6"/>
+      </svg></div>
+    </div>
+  </section>
+
+  <section class="steps" data-os="linux">
+    <div class="step">
+      <h3>Allow it to run</h3>
+      <p>Right-click the AppImage you downloaded and choose <strong>Properties</strong>. Turn on <strong>Executable as Program</strong>, which some systems call “Allow executing file as program”.</p>
+      <div class="mock"><svg viewBox="0 0 520 170" role="img" aria-label="File properties: turn on Executable as Program">
+        <rect x="60" y="10" width="400" height="150" rx="12" fill="#2B2B2B"/>
+        <text x="260" y="38" text-anchor="middle" font-size="12" font-weight="700" fill="#F2F2F2">Properties</text>
+        <text font-size="11" fill="#BDBDBD"><tspan x="84" y="72">Name</tspan><tspan x="84" y="96">Type</tspan></text>
+        <text font-size="11" fill="#EDEDED"><tspan x="160" y="72">axial-rewrite-linux-…AppImage</tspan><tspan x="160" y="96">AppImage application</tspan></text>
+        <text x="84" y="132" font-size="12" fill="#EDEDED">Executable as Program</text>
+        <rect x="392" y="118" width="40" height="22" rx="11" fill="#A0D47C"/><circle cx="421" cy="129" r="8" fill="#fff"/>
+        <rect class="hl" x="74" y="110" width="368" height="38" rx="10"/>
+      </svg></div>
+    </div>
+    <div class="step">
+      <h3>Double-click the AppImage</h3>
+      <p>Axial starts and keeps itself up to date from then on.</p>
+      <p class="quiet">Nothing happens on Ubuntu 22.04 or newer? Install FUSE once with <code>sudo apt install libfuse2t64</code> (on 22.04: <code>libfuse2</code>), then try again.</p>
+    </div>
+  </section>
+
+  <footer>
+    <p>Why the warnings? Axial is free, and the certificates that silence them cost money every year. Every update is still signed by Axial and checked before it installs.</p>
+    <p data-online><a id="all" href="https://github.com/killedoxygen/axial/releases">All files and checksums</a> · <a href="https://github.com/killedoxygen/axial/issues">Still stuck? Ask on GitHub</a></p>
+  </footer>
+</main>
+<script id="release" type="application/json">null</script>
+<script>
+(() => {
+  const release = JSON.parse(document.getElementById("release").textContent);
+  const offline = location.protocol === "file:";
+  const body = document.body;
+  const params = new URLSearchParams(location.search);
+  const platform = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "").toLowerCase();
+  const agent = navigator.userAgent;
+  let os = params.get("os") || (/mac|iphone|ipad/.test(platform) || /Mac OS X/.test(agent) ? "mac"
+    : /win/.test(platform) || /Windows/.test(agent) ? "win"
+    : /linux|x11|cros/.test(platform) || /Linux|X11/.test(agent) ? "linux" : "mac");
+  let intel = params.get("arch") === "intel";
+  if (!params.has("arch")) {
+    try {
+      const gl = document.createElement("canvas").getContext("webgl");
+      const info = gl && gl.getExtension("WEBGL_debug_renderer_info");
+      intel = /intel|amd|radeon|nvidia/i.test(info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "");
+    } catch {}
+  }
+  const names = { mac: "Mac", win: "Windows", linux: "Linux" };
+  const key = () => os === "win" ? "windows-amd64" : os === "linux" ? "linux-amd64" : intel ? "macos-amd64" : "macos-arm64";
+  const link = (label, change) => {
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = label;
+    a.addEventListener("click", (event) => { event.preventDefault(); change(); render(); });
+    return a;
+  };
+
+  function render() {
+    for (const section of document.querySelectorAll(".steps")) section.classList.toggle("shown", section.dataset.os === os);
+    if (offline || !release) return;
+    const file = release.downloads[key()];
+    const get = document.getElementById("get");
+    get.href = file.url;
+    get.textContent = body.classList.contains("downloading") ? "Downloading… check your browser’s downloads"
+      : os === "mac" ? `Download for Mac (${intel ? "Intel" : "Apple silicon"})` : `Download for ${names[os]}`;
+    document.getElementById("again").href = file.url;
+    document.getElementById("file").textContent = `Axial ${release.version} · ${file.name} · ${Math.round(file.bytes / 1e6)} MB`;
+    const others = document.getElementById("others");
+    others.replaceChildren();
+    if (os === "mac") {
+      others.append(intel ? "Mac with Apple silicon (M1 or newer)? " : "Older Mac with an Intel processor? ",
+        link(intel ? "Get that version" : "Get the Intel version", () => { intel = !intel; }), ". ");
+    }
+    others.append("Not on " + (os === "mac" ? "a Mac" : names[os]) + "? ");
+    Object.keys(names).filter((other) => other !== os).forEach((other, index) => {
+      if (index) others.append(" · ");
+      others.append(link(names[other], () => { os = other; }));
+    });
+  }
+
+  if (offline) {
+    os = "mac";
+    body.classList.add("offline");
+    document.title = "Finish opening Axial";
+    document.getElementById("title").textContent = "Finish opening Axial";
+    document.getElementById("lede").textContent = "macOS needs your OK the first time. Here’s exactly what to click.";
+  } else if (release) {
+    document.getElementById("all").href = release.page;
+    document.getElementById("get").addEventListener("click", () => {
+      body.classList.add("downloading");
+      render();
+      setTimeout(() => document.querySelector("h2").scrollIntoView({ behavior: "smooth" }), 400);
+    });
+  }
+  render();
+})();
+</script>
+</body>
+</html>

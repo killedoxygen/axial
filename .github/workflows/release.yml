@@ -123,14 +123,20 @@ jobs:
         env:
           CANDIDATE_TARGET: ${{ matrix.target }}
           CANDIDATE_OVERLAY: ${{ matrix.overlay }}
-          # Lay out the DMG window in Finder; Tauri skips that step under CI by default.
-          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           status=0
           cargo tauri build --target "$CANDIDATE_TARGET" --config "platform/tauri.$CANDIDATE_OVERLAY.json" --config '{"build":{"beforeBuildCommand":""}}' -- --locked > "$RUNNER_TEMP/package.log" 2>&1 || status=$?
           tail -n 80 "$RUNNER_TEMP/package.log"
+          exit "$status"
+      - name: Add the first-open guide to the disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          status=0
+          scripts/release/dmg.sh "target/${{ matrix.target }}/release/bundle" > "$RUNNER_TEMP/dmg.log" 2>&1 || status=$?
+          tail -n 40 "$RUNNER_TEMP/dmg.log"
           exit "$status"
       - name: Collect complete package handoff
         shell: bash

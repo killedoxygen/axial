@@ -12,7 +12,8 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ### Distribution
 - Axial updates itself: update packages are signed and announced at updates.axial.run, so only the first install meets the operating system's warning
-- The macOS disk image shows how to open Axial the first time
+- The download page at updates.axial.run picks the right file for the computer and shows, with pictures, exactly what to click when macOS, Windows or the browser warns
+- The macOS disk image carries the same guide, and its button opens Privacy & Security directly
 - Axial is available under the MIT license
 
 ## [0.4.0-rc.4] - 2026-11-02

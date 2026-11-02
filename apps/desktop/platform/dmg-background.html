@@ -1,20 +1,25 @@
 <!doctype html>
-<!-- Source for dmg-background.tiff: render at 660x400 @1x and @2x, then join with tiffutil -cathidpicheck. -->
+<!-- Source for dmg-background.tiff: render at 720x540 @1x and @2x, then join with tiffutil -cathidpicheck.
+     Icon centres come from scripts/release/dmg.sh. Finder draws icon labels in black on a picture background,
+     in Dark Mode too, so each label sits on a light plate. -->
 <meta charset="utf-8">
 <style>
   @font-face { font-family: Manrope; src: url('../../../frontend/static/fonts/Manrope-latin.woff2') format('woff2-variations'); font-weight: 200 800; }
-  html, body { margin: 0; width: 660px; height: 400px; background: #100D0A; overflow: hidden; }
+  html, body { margin: 0; width: 720px; height: 540px; background: #100D0A; overflow: hidden; }
   body { position: relative; font-family: Manrope, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
   svg { position: absolute; left: 0; top: 0; }
-  .steps { position: absolute; left: 40px; top: 300px; font-size: 13px; line-height: 20px; color: #ADB0AC; }
-  .steps strong { display: block; color: #F3F4F2; font-weight: 600; }
-  .steps em { font-style: normal; color: #A0D47C; font-weight: 600; }
+  h1 { position: absolute; left: 48px; top: 34px; margin: 0; font-size: 26px; line-height: 34px; font-weight: 600; color: #F3F4F2; }
+  .lede { position: absolute; left: 48px; top: 70px; margin: 0; font-size: 15px; line-height: 22px; color: #ADB0AC; }
+  .help { position: absolute; left: 256px; top: 352px; width: 400px; margin: 0; font-size: 15px; line-height: 22px; color: #ADB0AC; }
+  .help strong { display: block; color: #F3F4F2; font-weight: 600; }
 </style>
-<svg width="660" height="400" aria-hidden="true">
-  <path d="M262 165H398M388 157l10 8-10 8" fill="none" stroke="#868985" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+<svg width="720" height="540" aria-hidden="true">
+  <path d="M252 180H458" fill="none" stroke="#A0D47C" stroke-width="3" stroke-linecap="round"/>
+  <path d="M456 172l14 8-14 8z" fill="#A0D47C" stroke="#A0D47C" stroke-width="2" stroke-linejoin="round"/>
+  <rect x="98" y="251" width="140" height="26" rx="8" fill="#DCD8D0"/>
+  <rect x="482" y="251" width="140" height="26" rx="8" fill="#DCD8D0"/>
+  <rect x="78" y="443" width="180" height="26" rx="8" fill="#DCD8D0"/>
 </svg>
-<div class="steps">
-  <strong>Opening for the first time?</strong>
-  macOS will say it couldn’t verify Axial. Click Done, then:<br>
-  System Settings&nbsp;&nbsp;›&nbsp;&nbsp;Privacy &amp; Security&nbsp;&nbsp;›&nbsp;&nbsp;scroll down&nbsp;&nbsp;›&nbsp;&nbsp;<em>Open Anyway</em>
-</div>
+<h1>Install Axial</h1>
+<p class="lede">Drag Axial onto Applications, then open it from there.</p>
+<p class="help"><strong>Mac says Axial can’t be opened?</strong>Double-click the guide on the left. It shows exactly what to click, and it’s only needed once.</p>

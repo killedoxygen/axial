@@ -51,7 +51,7 @@ jobs:
         run: |
           sudo apt-get update > /dev/null && sudo apt-get install -y minisign > /dev/null
           node -e 'const s=require(process.argv[1]); if (s.tag !== process.env.CANDIDATE_TAG || s.source_sha !== process.argv[2]) process.exit(1)' "$RUNNER_TEMP/downloads/rewrite-source/source.json" "$(git rev-parse HEAD)"
-          node scripts/release/publish.mjs --source "$RUNNER_TEMP/downloads/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --public-key apps/desktop/updater.pub --changelog CHANGELOG.md --output "$RUNNER_TEMP/publish"
+          node scripts/release/publish.mjs --source "$RUNNER_TEMP/downloads/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --public-key apps/desktop/updater.pub --changelog CHANGELOG.md --guide apps/desktop/platform/install-guide.html --output "$RUNNER_TEMP/publish"
       - name: Create the pre-release
         env:
           GH_TOKEN: ${{ github.token }}
