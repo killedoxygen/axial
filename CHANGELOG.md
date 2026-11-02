@@ -41,6 +41,7 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ### Distribution
 - Source files keep LF line endings on every platform, so Windows packages build from the same checked bytes
+- macOS apps are signed ad hoc as a whole bundle, so macOS offers Open Anyway instead of reporting a downloaded app as damaged
 
 ## [0.4.0-rc.1] - 2026-10-11
 

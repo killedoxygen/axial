@@ -1,6 +1,9 @@
 {
   "bundle": {
     "targets": ["app", "dmg"],
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }
