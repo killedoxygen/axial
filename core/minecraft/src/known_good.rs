@@ -1237,7 +1237,7 @@ pub(crate) fn managed_version_bundle_client_fixture_parts_for_test(
     version_id: &str,
     client_bytes: &[u8],
 ) -> Result<ManagedVersionBundleFixtureParts, DownloadError> {
-    const LOG_ID: &str = "managed-version-bundle.xml";
+    const LOG_ID: &str = "guardian-version-bundle.xml";
     const LOG_BYTES: &[u8] = b"<Configuration/>";
     let client_sha1 = format!("{:x}", Sha1::digest(client_bytes));
     let mut version_json = serde_json::json!({

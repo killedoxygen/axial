@@ -4756,7 +4756,7 @@ mod settlement_tests {
         for canonical in [
             format!("versions/{VERSION_ID}/{VERSION_ID}.json"),
             format!("versions/{VERSION_ID}/{VERSION_ID}.jar"),
-            "assets/log_configs/managed-version-bundle.xml".to_string(),
+            "assets/log_configs/guardian-version-bundle.xml".to_string(),
         ] {
             assert!(
                 !temporary.path().join(canonical).exists(),
