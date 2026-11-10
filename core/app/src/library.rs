@@ -1207,9 +1207,7 @@ impl LibraryLifecycle {
         session
             .as_ref()
             .ok_or(LibraryError::Closed)?
-            .interrupted_reset(
-                &axial_fs::LeafName::new(".axial-rewrite-profile").expect("fixed profile marker"),
-            )
+            .interrupted_reset(&crate::profile::marker_name())
             .map_err(LibraryError::Files)
     }
 

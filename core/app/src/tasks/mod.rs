@@ -15,3 +15,21 @@ pub use owner::{
     OwnerBusy, OwnerSnapshot, ShutdownError, ShutdownReceipt, SpawnError, TaskHandle, TaskId,
     TaskJoinError, TaskOwner,
 };
+
+const SETTLE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Retry one owned settlement until it succeeds. A failed attempt leaves the
+/// caller's owners retained; nothing is released as if it had settled.
+pub async fn retry_until_settled<T, E, F>(what: &'static str, mut attempt: impl FnMut() -> F) -> T
+where
+    E: std::fmt::Display,
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    loop {
+        match attempt().await {
+            Ok(value) => return value,
+            Err(error) => tracing::warn!(%error, "{what} remains unsettled; retrying"),
+        }
+        tokio::time::sleep(SETTLE_RETRY).await;
+    }
+}

@@ -13,6 +13,7 @@ pub mod media;
 pub mod music;
 pub mod network;
 pub mod performance;
+pub mod profile;
 pub mod public;
 pub mod resources;
 pub mod runtime;
