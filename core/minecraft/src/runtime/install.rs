@@ -100,7 +100,6 @@ pub(crate) enum RuntimeTreeVerificationReason {
     CanonicalReuse,
     PublicationPostPromotion,
     CachedSourceMatch,
-    EnsureSourceMatch,
     ReceiptRevalidation,
 }
 
@@ -112,7 +111,6 @@ pub(crate) struct RuntimeTreeVerificationCounts {
     pub(crate) canonical_reuse: usize,
     pub(crate) publication_post_promotion: usize,
     pub(crate) cached_source_match: usize,
-    pub(crate) ensure_source_match: usize,
     pub(crate) receipt_revalidation: usize,
 }
 
@@ -124,18 +122,16 @@ impl RuntimeTreeVerificationCounts {
             + self.canonical_reuse
             + self.publication_post_promotion
             + self.cached_source_match
-            + self.ensure_source_match
             + self.receipt_revalidation
     }
 
-    pub(crate) fn reason_vector(self) -> [usize; 7] {
+    pub(crate) fn reason_vector(self) -> [usize; 6] {
         [
             self.stage_post_materialization,
             self.publication_pre_promotion,
             self.canonical_reuse,
             self.publication_post_promotion,
             self.cached_source_match,
-            self.ensure_source_match,
             self.receipt_revalidation,
         ]
     }
@@ -153,7 +149,6 @@ impl RuntimeTreeVerificationCounts {
                 &mut self.publication_post_promotion
             }
             RuntimeTreeVerificationReason::CachedSourceMatch => &mut self.cached_source_match,
-            RuntimeTreeVerificationReason::EnsureSourceMatch => &mut self.ensure_source_match,
             RuntimeTreeVerificationReason::ReceiptRevalidation => &mut self.receipt_revalidation,
         };
         *count += 1;
@@ -543,6 +538,7 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
     ))
 }
 
+#[cfg(test)]
 pub(crate) async fn stage_managed_runtime(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
@@ -783,6 +779,7 @@ pub(crate) async fn discard_staged_managed_runtime(
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))
 }
 
+#[cfg(test)]
 pub(crate) async fn publish_staged_managed_runtime(
     staged: StagedManagedRuntime,
 ) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {

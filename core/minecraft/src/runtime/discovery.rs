@@ -1,10 +1,7 @@
 use super::cancellation::runtime_cancellation_channel;
-use super::file_download::runtime_filesystem_path;
-#[cfg(test)]
-use super::layout::java_executable;
 use super::layout::{
     ManagedRuntimeCache, ManagedRuntimeComponent, managed_runtime_executable_present,
-    managed_runtime_executable_ready, runtime_executable_ready, runtime_java_relative_path,
+    managed_runtime_executable_ready, runtime_java_relative_path,
 };
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, MAX_RUNTIME_MANIFEST_BYTES,
@@ -14,11 +11,10 @@ use super::model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
-use super::probe::{JavaRuntimeProbeValidation, probe_java_runtime_receipt};
 use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
 use crate::portable_path::PortableRelativePath;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedRuntimeMarkerState {
@@ -75,32 +71,6 @@ pub fn list_java_runtimes(cache: &ManagedRuntimeCache) -> Vec<JavaRuntimeResult>
             source: record.source.as_str().to_string(),
         })
         .collect()
-}
-
-pub fn runtime_component_executable_present_without_probe(
-    cache: &ManagedRuntimeCache,
-    component: &str,
-) -> bool {
-    cache
-        .admit_component(component)
-        .ok()
-        .flatten()
-        .is_some_and(|component| component.executable_present())
-}
-
-pub fn runtime_component_structurally_ready_without_probe(
-    cache: &ManagedRuntimeCache,
-    component: &str,
-) -> bool {
-    cache
-        .admit_component(component)
-        .ok()
-        .flatten()
-        .is_some_and(|component| component.structurally_ready())
-}
-
-pub fn runtime_executable_ready_without_probe(java_exe: &Path) -> bool {
-    runtime_executable_ready(java_exe)
 }
 
 pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
@@ -161,9 +131,7 @@ impl ManagedRuntimeCache {
 }
 
 impl ManagedRuntimeComponent {
-    pub fn launch_receipt(
-        &self,
-    ) -> std::io::Result<super::layout::ManagedRuntimeLaunchReceipt> {
+    pub fn launch_receipt(&self) -> std::io::Result<super::layout::ManagedRuntimeLaunchReceipt> {
         self.validate_projection()?;
         if !self.structurally_ready() {
             return Err(std::io::Error::other(
@@ -372,13 +340,6 @@ pub(super) fn resolve_component_runtime(
     resolve_axial_cached_runtime(cache, component, required_major)
 }
 
-pub(super) fn resolve_managed_runtime(
-    cache: &ManagedRuntimeCache,
-    component: &RuntimeId,
-) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    resolve_component_runtime(cache, component, 0)
-}
-
 pub(super) fn resolve_axial_cached_runtime(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
@@ -438,85 +399,6 @@ fn inspect_axial_cached_runtime(
         install_state: state,
         root_dir: authority.root_path().to_string_lossy().to_string(),
     }))
-}
-
-pub(super) struct ResolvedOverrideRuntime {
-    pub(super) record: RuntimeRecord,
-    pub(super) probe_usage: super::model::RuntimeProbeUsage,
-}
-
-pub(super) fn resolve_override_runtime(
-    path: &Path,
-    preferred_component: &RuntimeId,
-    receipt: Option<JavaRuntimeProbeValidation>,
-) -> Result<ResolvedOverrideRuntime, JavaRuntimeLookupError> {
-    if !runtime_filesystem_path(path).as_ref().is_file() {
-        return Err(JavaRuntimeLookupError::NotFound {
-            component: "external-java-override".to_string(),
-            major: 0,
-        });
-    }
-
-    let receipt_supplied = receipt.is_some();
-    let (info, probe_usage) = match receipt {
-        Some(receipt) if receipt.matches_path(path).unwrap_or(false) => (
-            receipt.into_info(),
-            super::model::RuntimeProbeUsage {
-                spawn_count: 0,
-                source: super::model::RuntimeProbeSource::Receipt,
-            },
-        ),
-        _ => {
-            let receipt = probe_java_runtime_receipt(path, Some(preferred_component.as_str()))?;
-            (
-                receipt.into_info(),
-                super::model::RuntimeProbeUsage {
-                    spawn_count: 1,
-                    source: if receipt_supplied {
-                        super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
-                    } else {
-                        super::model::RuntimeProbeSource::Fresh
-                    },
-                },
-            )
-        }
-    };
-    let canonical_path = PathBuf::from(&info.path);
-    Ok(ResolvedOverrideRuntime {
-        record: RuntimeRecord {
-            id: preferred_component.clone(),
-            java_path: info.path.clone(),
-            info,
-            source: RuntimeSource::ExternalOverride,
-            install_state: RuntimeInstallState::Ready,
-            root_dir: canonical_path
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or_else(|| Path::new(""))
-                .to_string_lossy()
-                .to_string(),
-        },
-        probe_usage,
-    })
-}
-#[cfg(test)]
-pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
-    let ready_marker = runtime_root.join(".axial-ready");
-
-    if runtime_filesystem_path(&ready_marker).as_ref().is_file()
-        && runtime_filesystem_path(&runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE))
-            .as_ref()
-            .is_file()
-        && runtime_executable_ready(&java_executable(runtime_root))
-    {
-        return RuntimeInstallState::Ready;
-    }
-    if runtime_filesystem_path(&ready_marker).as_ref().exists()
-        || runtime_filesystem_path(runtime_root).as_ref().exists()
-    {
-        return RuntimeInstallState::Broken;
-    }
-    RuntimeInstallState::Missing
 }
 
 #[cfg(test)]

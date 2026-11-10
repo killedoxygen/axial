@@ -1,17 +1,16 @@
 use super::file_download::component_manifest_link_target_path;
 use super::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
-    ComponentManifestFile, JavaRuntimeInfo, JavaRuntimeLookupError, MachOArm64Compatibility,
-    ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeRebuildError,
-    RosettaRuntimeDecision, RuntimeDownloadActual, RuntimeDownloadEvidence,
-    RuntimeDownloadIntegrityError, RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId,
-    RuntimeInstallState, RuntimeManifest, RuntimeMaterializationCancellation, RuntimeRecord,
-    RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind, RuntimeSourceReceipt,
-    acquire_runtime_source_for_test, authenticated_runtime_source_from_manifest_for_test,
+    ComponentManifestFile, JavaRuntimeLookupError, MachOArm64Compatibility, ManagedRuntimeCache,
+    ManagedRuntimeComponent, ManagedRuntimeRebuildError, RosettaRuntimeDecision,
+    RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
+    RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId, RuntimeManifest,
+    RuntimeMaterializationCancellation, RuntimeSourceFailure, RuntimeSourceFailureKind,
+    RuntimeSourceReceipt, acquire_runtime_source_for_test,
+    authenticated_runtime_source_from_manifest_for_test,
     block_runtime_before_publication_claim_for_test, block_runtime_decompression_for_test,
     block_runtime_publication_for_test, component_manifest_destination,
-    component_manifest_proof_bytes, detect_distribution, detect_runtime_state,
-    discard_staged_managed_runtime, ensure_runtime_with_events,
+    component_manifest_proof_bytes, detect_distribution, discard_staged_managed_runtime,
     fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
     install_runtime_manifest_files, java_executable, java_executable_for_os,
     materialize_missing_runtime_source, materialize_preferred_runtime_source,
@@ -22,18 +21,15 @@ use super::{
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
     publish_staged_managed_runtime_with_rotation_failure_for_test,
-    rebuild_managed_runtime_component_from_source,
     register_runtime_tree_verification_counts_for_test, rosetta_requirement_for_managed_runtime,
     runtime_cancellation_channel, runtime_file_download_concurrency_for,
     runtime_materialization_control, runtime_os_arch_for,
-    runtime_publication_lock_available_for_test, runtime_record_matches_source_for_test,
-    runtime_source_url_is_secure_for_test, runtime_windows_verbatim_path_string,
-    select_runtime_manifest, stage_managed_runtime, stage_managed_runtime_until_cancelled,
-    take_runtime_tree_verification_counts_for_test, validate_ephemeral_processor_manifest_for_test,
-    validate_runtime_file_source_urls_for_test, verify_runtime_download,
+    runtime_publication_lock_available_for_test, runtime_source_url_is_secure_for_test,
+    runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
+    stage_managed_runtime_until_cancelled, take_runtime_tree_verification_counts_for_test,
+    validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
+    verify_runtime_download,
 };
-#[cfg(feature = "test-support")]
-use super::{ManagedRuntimeMutationRefused, ensure_runtime_with_persisted_manifest_for_test};
 use crate::JavaVersion;
 use serde::Deserialize;
 use sha1::{Digest as _, Sha1};
@@ -48,18 +44,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-
-#[cfg(feature = "test-support")]
-struct RuntimeMutationPermitProbe {
-    active: Arc<AtomicUsize>,
-}
-
-#[cfg(feature = "test-support")]
-impl Drop for RuntimeMutationPermitProbe {
-    fn drop(&mut self) {
-        assert_eq!(self.active.swap(0, Ordering::SeqCst), 1);
-    }
-}
 
 fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
     RuntimeDownloadEvidence {
@@ -912,44 +896,6 @@ async fn runtime_source_receipt_preserves_verified_authored_bytes() {
 }
 
 #[tokio::test]
-async fn ready_managed_runtime_matches_the_full_authenticated_source() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    let source = runtime_source_receipt_fixture(&component, &root, b"authenticated java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
-    let verified = publish_staged_managed_runtime(staged)
-        .await
-        .expect("managed runtime publish")
-        .into_verified_runtime(&cache, &component, 8)
-        .expect("verified managed runtime");
-    let (_resolved, source) = verified.into_parts();
-    let runtime = RuntimeRecord {
-        id: component,
-        java_path: java_executable(&root).to_string_lossy().into_owned(),
-        info: JavaRuntimeInfo {
-            id: "jre-legacy".to_string(),
-            major: 8,
-            update: 0,
-            distribution: "test".to_string(),
-            path: java_executable(&root).to_string_lossy().into_owned(),
-        },
-        source: RuntimeSource::Managed,
-        install_state: RuntimeInstallState::Ready,
-        root_dir: root.to_string_lossy().into_owned(),
-    };
-
-    assert!(runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
-    fs::write(java_executable(&root), b"tampered java").expect("tamper runtime file");
-    make_executable(&java_executable(&root));
-    assert!(!runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
-}
-
-#[tokio::test]
 async fn missing_runtime_source_preserves_canonical_and_sidecar_conflicts() {
     for conflict in ["canonical", "staging", "quarantine"] {
         let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
@@ -1457,7 +1403,7 @@ fn missing_runtime_source_preserves_conflicts_after_publication_claim() {
 }
 
 #[tokio::test]
-async fn authenticated_empty_runtime_file_stages_verifies_and_rebuilds() {
+async fn authenticated_empty_runtime_file_stages_and_verifies() {
     for compressed in [false, true] {
         let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let component = RuntimeId::from("jre-legacy");
@@ -1534,9 +1480,8 @@ async fn authenticated_empty_runtime_file_stages_verifies_and_rebuilds() {
             .expect("publish verified empty file")
             .into_verified_runtime(&cache, &component, 8)
             .expect("verified runtime tree");
-        let (runtime, source) = verified.into_parts();
+        drop(verified);
         assert!(admit_runtime_component(&cache, component.as_str()).contents_verified());
-        assert!(runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
         assert_eq!(java_requests.load(Ordering::SeqCst), 1);
         assert_eq!(
             compressed_requests.load(Ordering::SeqCst),
@@ -1550,21 +1495,6 @@ async fn authenticated_empty_runtime_file_stages_verifies_and_rebuilds() {
 
         fs::write(root.join(empty_path), b"unexpected bytes").expect("tamper empty runtime file");
         assert!(!admit_runtime_component(&cache, component.as_str()).contents_verified());
-        assert!(!runtime_record_matches_source_for_test(&cache, &runtime, &source).await);
-        let rebuilt =
-            rebuild_managed_runtime_component_from_source(&cache, &component, source, &mut |_| {})
-                .await
-                .expect("rebuild exact empty file from authenticated source");
-        assert!(rebuilt.revalidate(&cache, &component).await);
-        assert_eq!(fs::read(root.join(empty_path)).unwrap(), b"");
-        assert_eq!(fs::read(java_executable(&root)).unwrap(), java_bytes);
-        assert!(admit_runtime_component(&cache, component.as_str()).contents_verified());
-        assert_eq!(java_requests.load(Ordering::SeqCst), 2);
-        assert_eq!(empty_requests.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            compressed_requests.load(Ordering::SeqCst),
-            2 * usize::from(compressed)
-        );
     }
 }
 
@@ -1683,7 +1613,7 @@ async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_f
     .expect("cached runtime materialization");
     assert!(cached_result.is_some());
     let cached_counts = take_runtime_tree_verification_counts_for_test(&cached_root);
-    assert_eq!(cached_counts.reason_vector(), [0, 0, 0, 0, 1, 0, 0]);
+    assert_eq!(cached_counts.reason_vector(), [0, 0, 0, 0, 1, 0]);
     assert_eq!(cached_counts.total(), 1);
 
     let fresh = ManagedRuntimeCache::isolated_for_test().expect("fresh runtime cache");
@@ -1707,7 +1637,7 @@ async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_f
     .expect("fresh runtime materialization");
     assert!(fresh_result.is_some());
     let fresh_counts = take_runtime_tree_verification_counts_for_test(&fresh_root);
-    assert_eq!(fresh_counts.reason_vector(), [1, 1, 0, 1, 0, 0, 0]);
+    assert_eq!(fresh_counts.reason_vector(), [1, 1, 0, 1, 0, 0]);
     assert_eq!(fresh_counts.total(), 3);
 }
 
@@ -1744,7 +1674,7 @@ async fn managed_runtime_publication_scan_budgets_cover_reuse_and_replacement() 
         .await
         .expect("exact canonical reuse");
     let reuse_counts = take_runtime_tree_verification_counts_for_test(&reuse_root);
-    assert_eq!(reuse_counts.reason_vector(), [1, 1, 1, 0, 0, 0, 0]);
+    assert_eq!(reuse_counts.reason_vector(), [1, 1, 1, 0, 0, 0]);
     assert_eq!(reuse_counts.total(), 3);
     drop(reuse_receipt);
 
@@ -1780,31 +1710,9 @@ async fn managed_runtime_publication_scan_budgets_cover_reuse_and_replacement() 
         .await
         .expect("mismatching canonical replacement");
     let replacement_counts = take_runtime_tree_verification_counts_for_test(&replacement_root);
-    assert_eq!(replacement_counts.reason_vector(), [1, 1, 1, 1, 0, 0, 0]);
+    assert_eq!(replacement_counts.reason_vector(), [1, 1, 1, 1, 0, 0]);
     assert_eq!(replacement_counts.total(), 4);
     drop(replacement_receipt);
-}
-
-#[tokio::test]
-async fn guardian_runtime_rebuild_scan_budget_is_five_with_two_simulated_state_boundaries() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("runtime root");
-    let source = runtime_source_receipt_fixture(&component, &root, b"guardian java").await;
-    register_runtime_tree_verification_counts_for_test(&root);
-
-    let receipt =
-        rebuild_managed_runtime_component_from_source(&cache, &component, source, &mut |_| {})
-            .await
-            .expect("Guardian runtime rebuild");
-    assert!(receipt.revalidate(&cache, &component).await);
-    assert!(receipt.revalidate(&cache, &component).await);
-
-    let counts = take_runtime_tree_verification_counts_for_test(&root);
-    assert_eq!(counts.reason_vector(), [1, 1, 0, 1, 0, 0, 2]);
-    assert_eq!(counts.total(), 5);
 }
 
 #[tokio::test]
@@ -2212,21 +2120,6 @@ async fn managed_runtime_cache_root_is_stable_across_task_migration() {
 }
 
 #[test]
-fn managed_runtime_requires_ready_marker_even_when_java_exists() {
-    let root = unique_temp_root("axial-managed-runtime-ready-marker-test");
-    write_runtime_executable_fixture(&root);
-
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Broken);
-
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Broken);
-    write_runtime_manifest_proof_for_java(&root);
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn structural_runtime_discovery_does_not_parse_incomplete_manifest_proof() {
     for (case, proof) in [
         ("empty manifest", &br#"{"files":{}}"#[..]),
@@ -2244,11 +2137,6 @@ fn structural_runtime_discovery_does_not_parse_incomplete_manifest_proof() {
         fs::write(root.join(".axial-runtime-manifest.json"), proof)
             .expect("incomplete runtime manifest proof");
 
-        assert_eq!(
-            detect_runtime_state(&root),
-            RuntimeInstallState::Ready,
-            "{case}"
-        );
         assert!(
             !admit_runtime_component(&cache, "java-runtime-delta").contents_verified(),
             "{case}"
@@ -2265,13 +2153,11 @@ fn explicit_full_runtime_verifier_detects_same_root_content_drift() {
     write_runtime_executable_fixture(&root);
     write_runtime_manifest_proof_for_java(&root);
     fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
 
     fs::write(java_executable(&root), b"changed java").expect("modify java");
     make_executable(&java_executable(&root));
 
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(!admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
 }
 
@@ -2288,11 +2174,9 @@ fn explicit_full_runtime_verifier_detects_manifest_link_drift() {
     write_runtime_manifest_proof_for_java_and_link(&root);
     fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
 
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
 
     fs::remove_file(link).expect("remove runtime symlink");
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(!admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
 }
 
@@ -2670,7 +2554,6 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
         .await
         .expect("fallback runtime publish");
 
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(root.join(".axial-runtime-manifest.json").is_file());
     assert!(
         !events
@@ -3394,59 +3277,6 @@ async fn assert_managed_manifest_rejection_preserves_state(
     assert!(!root.with_file_name("jre-legacy.quarantine").exists());
 }
 
-#[cfg(feature = "test-support")]
-#[tokio::test]
-async fn sealed_runtime_fixture_replaces_only_active_runtime_projection() {
-    use crate::known_good::{
-        KnownGoodArtifactKind, KnownGoodInventory, KnownGoodRoot, TestKnownGoodEntry,
-        TestKnownGoodIntegrity, TestKnownGoodRoot,
-    };
-
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let active = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
-        root: TestKnownGoodRoot::Versions,
-        path: "fixture/fixture.json".to_string(),
-        kind: KnownGoodArtifactKind::VersionMetadata,
-        integrity: TestKnownGoodIntegrity::File { size: 1 },
-    }])
-    .expect("active known-good fixture");
-    let receipt = super::rebuild_managed_runtime_fixture_for_test(&cache, component.clone())
-        .await
-        .expect("sealed runtime rebuild fixture");
-
-    let merged = receipt
-        .replace_known_good_runtime_projection(&active)
-        .expect("replace sealed runtime projection");
-
-    assert!(receipt.matches_known_good_inventory(&merged));
-    assert!(merged.entries().iter().any(|entry| {
-        matches!(entry.root(), KnownGoodRoot::Versions)
-            && entry.path().as_str() == "fixture/fixture.json"
-    }));
-    assert!(merged.entries().iter().any(|entry| matches!(
-        entry.root(),
-        KnownGoodRoot::ManagedRuntime { component: observed }
-            if observed.as_str() == component.as_str()
-    )));
-
-    let foreign_active = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
-        root: TestKnownGoodRoot::ManagedRuntime {
-            component: "java-runtime-gamma".to_string(),
-        },
-        path: "bin/java".to_string(),
-        kind: KnownGoodArtifactKind::RuntimeExecutable,
-        integrity: TestKnownGoodIntegrity::File { size: 1 },
-    }])
-    .expect("foreign active Runtime projection fixture");
-    assert!(
-        receipt
-            .replace_known_good_runtime_projection(&foreign_active)
-            .is_err(),
-        "a sealed receipt must not retain a foreign active Runtime projection"
-    );
-}
-
 #[test]
 fn java_executable_uses_platform_runtime_layouts() {
     let root = PathBuf::from("runtime-root");
@@ -3467,20 +3297,6 @@ fn java_executable_uses_platform_runtime_layouts() {
             .join("bin")
             .join("java")
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn runtime_with_non_executable_java_is_broken() {
-    let root = unique_temp_root("axial-runtime-non-executable-test");
-    let java = java_executable(&root);
-    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
-    fs::write(&java, b"java").expect("java file");
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Broken);
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3758,185 +3574,9 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
     let _ = fs::remove_dir_all(root);
 }
 
-#[cfg(feature = "test-support")]
-#[tokio::test]
-async fn ready_managed_runtime_paths_reuse_structural_install_without_source_refresh() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = test_runtime_component();
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime root");
-    let java_bytes = b"ready managed java";
-    let manifest = persisted_java_manifest(&root, "https://example.invalid/java", java_bytes);
-    write_persisted_runtime_source(&root, &manifest);
-    let java = java_executable(&root);
-    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
-    fs::write(&java, java_bytes).expect("java fixture");
-    make_executable(&java);
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-    fs::write(
-        root.join(".axial-runtime-manifest.json"),
-        b"provider refresh must not run",
-    )
-    .expect("replace persisted source proof after structural admission");
-    let admissions = AtomicUsize::new(0);
-
-    for requested_override in ["", component.as_str()] {
-        let mut events = Vec::new();
-        let ensured = ensure_runtime_with_persisted_manifest_for_test(
-            &cache,
-            &JavaVersion {
-                component: component.as_str().to_string(),
-                major_version: 21,
-            },
-            requested_override,
-            false,
-            None,
-            || {
-                admissions.fetch_add(1, Ordering::SeqCst);
-                Ok::<(), ManagedRuntimeMutationRefused>(())
-            },
-            |event| events.push(event),
-        )
-        .await
-        .expect("ready runtime ensure");
-
-        assert_eq!(admissions.load(Ordering::SeqCst), 0);
-        assert_eq!(ensured.effective.install_state, RuntimeInstallState::Ready);
-        assert!(ensured.managed_launch.is_some());
-        assert_eq!(
-            events,
-            vec![RuntimeEnsureEvent::ManagedRuntimeReady {
-                component: component.as_str().to_string(),
-            }]
-        );
-    }
-}
-
-#[cfg(feature = "test-support")]
-#[tokio::test]
-async fn missing_managed_runtime_admits_once_and_holds_permit_through_ready() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = test_runtime_component();
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime root");
-    let java_bytes = b"installed managed java".to_vec();
-    let java_url = serve_runtime_download(java_bytes.clone()).await;
-    let manifest = persisted_java_manifest(&root, &java_url, &java_bytes);
-    write_persisted_runtime_source(&root, &manifest);
-    let admissions = Arc::new(AtomicUsize::new(0));
-    let active = Arc::new(AtomicUsize::new(0));
-    let admission_count = Arc::clone(&admissions);
-    let admitted_active = Arc::clone(&active);
-    let observed_active = Arc::clone(&active);
-    let mut events = Vec::new();
-
-    let ensured = ensure_runtime_with_persisted_manifest_for_test(
-        &cache,
-        &JavaVersion {
-            component: component.as_str().to_string(),
-            major_version: 21,
-        },
-        "",
-        false,
-        None,
-        move || {
-            assert_eq!(admission_count.fetch_add(1, Ordering::SeqCst), 0);
-            assert_eq!(admitted_active.swap(1, Ordering::SeqCst), 0);
-            Ok(RuntimeMutationPermitProbe {
-                active: admitted_active,
-            })
-        },
-        |event| {
-            assert_eq!(observed_active.load(Ordering::SeqCst), 1);
-            events.push(event);
-        },
-    )
-    .await
-    .expect("missing runtime install");
-
-    assert_eq!(admissions.load(Ordering::SeqCst), 1);
-    assert_eq!(active.load(Ordering::SeqCst), 0);
-    assert_eq!(ensured.effective.install_state, RuntimeInstallState::Ready);
-    assert_eq!(
-        fs::read(java_executable(&root)).expect("installed java"),
-        java_bytes
-    );
-    assert!(matches!(
-        events.first(),
-        Some(RuntimeEnsureEvent::DownloadingManagedRuntime { component: observed })
-            if observed == component.as_str()
-    ));
-    assert!(matches!(
-        events.last(),
-        Some(RuntimeEnsureEvent::ManagedRuntimeReady { component: observed })
-            if observed == component.as_str()
-    ));
-}
-
-#[cfg(feature = "test-support")]
-#[tokio::test]
-async fn refused_managed_runtime_admission_has_no_install_effects() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = test_runtime_component();
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime root");
-    let java_bytes = b"must not download";
-    let manifest = persisted_java_manifest(&root, "http://127.0.0.1:9/java", java_bytes);
-    write_persisted_runtime_source(&root, &manifest);
-    let original_proof = component_manifest_proof_bytes(&manifest).expect("manifest proof");
-    let mut original_cache_entries = fs::read_dir(cache.root())
-        .expect("runtime cache entries before refusal")
-        .map(|entry| entry.expect("runtime cache entry").file_name())
-        .collect::<Vec<_>>();
-    original_cache_entries.sort();
-    let admissions = AtomicUsize::new(0);
-    let mut events = Vec::new();
-
-    let error = ensure_runtime_with_persisted_manifest_for_test(
-        &cache,
-        &JavaVersion {
-            component: component.as_str().to_string(),
-            major_version: 21,
-        },
-        "",
-        false,
-        None,
-        || {
-            admissions.fetch_add(1, Ordering::SeqCst);
-            Err::<(), _>(ManagedRuntimeMutationRefused)
-        },
-        |event| events.push(event),
-    )
-    .await
-    .expect_err("mutation refusal must stop runtime install");
-
-    assert!(matches!(
-        error,
-        JavaRuntimeLookupError::ManagedMutationRefused
-    ));
-    assert_eq!(admissions.load(Ordering::SeqCst), 1);
-    assert!(events.is_empty());
-    assert!(!java_executable(&root).exists());
-    assert!(!root.join(".axial-ready").exists());
-    assert_eq!(
-        fs::read(root.join(".axial-runtime-manifest.json")).expect("preserved proof"),
-        original_proof
-    );
-    let mut cache_entries = fs::read_dir(cache.root())
-        .expect("runtime cache entries")
-        .map(|entry| entry.expect("runtime cache entry").file_name())
-        .collect::<Vec<_>>();
-    cache_entries.sort();
-    assert_eq!(cache_entries, original_cache_entries);
-}
-
 #[test]
 fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
     let root = Path::new("/tmp/axial-runtime-future-size");
-    let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let file = downloadable_manifest_file(
         "https://example.test/runtime.bin",
         8,
@@ -3969,46 +3609,6 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
         spawned_bytes < 4096,
         "spawned runtime manifest file install future should stay small: {spawned_bytes} bytes"
     );
-    let ensure_bytes = std::mem::size_of_val(&ensure_runtime_with_events(
-        &runtime_cache,
-        &JavaVersion {
-            component: "java-runtime-delta".to_string(),
-            major_version: 21,
-        },
-        "",
-        false,
-        None,
-        || Ok(()),
-        |_| {},
-    ));
-    assert!(
-        ensure_bytes < 4096,
-        "managed-runtime ensure future should stay small: {ensure_bytes} bytes"
-    );
-}
-
-#[cfg(feature = "test-support")]
-fn persisted_java_manifest(root: &Path, url: &str, java_bytes: &[u8]) -> ComponentManifest {
-    let relative_java = java_executable(root)
-        .strip_prefix(root)
-        .expect("java under managed runtime root")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let mut file = downloadable_manifest_file(url, java_bytes.len() as u64, &sha1_hex(java_bytes));
-    file.executable = true;
-    ComponentManifest {
-        files: HashMap::from([(relative_java, file)]),
-    }
-}
-
-#[cfg(feature = "test-support")]
-fn write_persisted_runtime_source(root: &Path, manifest: &ComponentManifest) {
-    fs::create_dir_all(root).expect("managed runtime root");
-    fs::write(
-        root.join(".axial-runtime-manifest.json"),
-        component_manifest_proof_bytes(manifest).expect("canonical runtime manifest proof"),
-    )
-    .expect("persisted runtime source");
 }
 
 fn unique_temp_root(label: &str) -> PathBuf {

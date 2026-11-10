@@ -199,13 +199,6 @@ pub enum VersionScanIssueKind {
     LoaderIdentityMalformed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedVersion {
-    pub id: String,
-    #[serde(default)]
-    pub inherits_from: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct VersionStub {
     #[serde(default)]
@@ -222,14 +215,6 @@ struct VersionStub {
     java_version: Option<JavaVersion>,
     #[serde(default)]
     downloads: Downloads,
-}
-
-pub fn scan_versions(operation: &ManagedLibraryOperation) -> io::Result<Vec<VersionEntry>> {
-    scan_versions_report(operation).map(|report| report.versions)
-}
-
-pub fn scan_versions_report(operation: &ManagedLibraryOperation) -> io::Result<VersionScanReport> {
-    scan_versions_snapshot(operation).map(|snapshot| snapshot.report)
 }
 
 pub fn scan_versions_snapshot(
@@ -1002,8 +987,9 @@ mod tests {
         .await
         .expect("writer admission");
 
-        let error =
-            super::scan_versions_report(&operation).expect_err("active writer must deny scan");
+        let Err(error) = super::scan_versions_snapshot(&operation) else {
+            panic!("active writer must deny scan");
+        };
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         drop(writer);
@@ -1230,13 +1216,13 @@ mod tests {
     fn scan_versions(path: &Path) -> std::io::Result<Vec<crate::types::VersionEntry>> {
         let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
         let operation = root.try_acquire()?;
-        super::scan_versions(&operation)
+        super::scan_versions_snapshot(&operation).map(|snapshot| snapshot.report.versions)
     }
 
     fn scan_versions_report(path: &Path) -> std::io::Result<super::VersionScanReport> {
         let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
         let operation = root.try_acquire()?;
-        super::scan_versions_report(&operation)
+        super::scan_versions_snapshot(&operation).map(|snapshot| snapshot.report)
     }
 
     fn scan_versions_snapshot(path: &Path) -> std::io::Result<super::VersionScanSnapshot> {

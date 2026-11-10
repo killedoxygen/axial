@@ -10,7 +10,6 @@ use crate::download::{
 };
 use crate::managed_fs::ManagedDir;
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
-use std::borrow::Cow;
 use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -513,30 +512,31 @@ pub(super) fn bounded_manifest_file_label(relative_path: &str) -> String {
     }
 }
 
-pub(super) fn runtime_filesystem_path(path: &Path) -> Cow<'_, Path> {
+#[cfg(test)]
+pub(super) fn runtime_filesystem_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     #[cfg(windows)]
     {
         return windows_runtime_filesystem_path(path);
     }
     #[cfg(not(windows))]
     {
-        Cow::Borrowed(path)
+        std::borrow::Cow::Borrowed(path)
     }
 }
 
-#[cfg(windows)]
-fn windows_runtime_filesystem_path(path: &Path) -> Cow<'_, Path> {
+#[cfg(all(windows, test))]
+fn windows_runtime_filesystem_path(path: &Path) -> std::borrow::Cow<'_, Path> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
     };
-    Cow::Owned(PathBuf::from(runtime_windows_verbatim_path_string(
+    std::borrow::Cow::Owned(PathBuf::from(runtime_windows_verbatim_path_string(
         absolute.to_string_lossy().as_ref(),
     )))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub(super) fn runtime_windows_verbatim_path_string(path: &str) -> String {
     let normalized = path.replace('/', "\\");
     if normalized.starts_with(r"\\?\")

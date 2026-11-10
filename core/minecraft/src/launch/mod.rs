@@ -1,8 +1,7 @@
-use crate::paths::{libraries_dir, versions_dir};
+use crate::paths::libraries_dir;
 use crate::rules::{Environment, Rule, evaluate_rules, is_native_library};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -312,132 +311,6 @@ impl std::fmt::Debug for LaunchVars {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum LaunchModelError {
-    #[error("reading version {version_id}: {source}")]
-    ReadVersion {
-        version_id: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("parsing version {version_id}: {source}")]
-    ParseVersion {
-        version_id: String,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("loading parent {parent_id} for {child_id}: {source}")]
-    LoadParent {
-        child_id: String,
-        parent_id: String,
-        #[source]
-        source: Box<LaunchModelError>,
-    },
-    #[error("inheritsFrom chain too deep (>10) for {version_id}")]
-    InheritanceTooDeep { version_id: String },
-    #[error("materialized loader profile identity is invalid for {version_id}")]
-    InvalidMaterializedProfile { version_id: String },
-}
-
-pub fn load_version_json(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
-    let path = versions_dir(mc_dir)
-        .join(version_id)
-        .join(format!("{version_id}.json"));
-    let data = fs::read_to_string(&path).map_err(|source| LaunchModelError::ReadVersion {
-        version_id: version_id.to_string(),
-        source,
-    })?;
-    let mut version: VersionJson =
-        serde_json::from_str(&data).map_err(|source| LaunchModelError::ParseVersion {
-            version_id: version_id.to_string(),
-            source,
-        })?;
-
-    normalize_asset_index(&mut version);
-
-    Ok(version)
-}
-
-pub fn resolve_version(mc_dir: &Path, version_id: &str) -> Result<VersionJson, LaunchModelError> {
-    let version = load_version_json(mc_dir, version_id)?;
-    let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(version_id);
-    if version.inherits_from.is_empty() && !version.materialized && !reserved_loader_id {
-        return Ok(finalize_effective_version(version));
-    }
-    resolve_inheritance(mc_dir, version, version_id, 0)
-}
-
-/// Resolve the existing inheritance algorithm using only admitted, bounded file reads.
-/// Callers that retain a command for later spawning must retain their own bundle read guard.
-pub fn resolve_version_managed(
-    operation: &crate::managed_path::ManagedLibraryOperation,
-    version_id: &str,
-) -> Result<VersionJson, LaunchModelError> {
-    let read_guard =
-        crate::version::VersionBundleReadGuard::acquire(operation).map_err(|source| {
-            LaunchModelError::ReadVersion {
-                version_id: version_id.into(),
-                source,
-            }
-        })?;
-    let mut load = |id: &str| -> Result<VersionJson, LaunchModelError> {
-        let read_error = |source| LaunchModelError::ReadVersion {
-            version_id: id.into(),
-            source,
-        };
-        crate::portable_path::PortableFileName::new_exact(id).map_err(|_| {
-            read_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid version identity",
-            ))
-        })?;
-        let relative = crate::portable_path::PortableRelativePath::new_exact(&format!(
-            "versions/{id}/{id}.json"
-        ))
-        .map_err(|_| {
-            read_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid version metadata path",
-            ))
-        })?;
-        let file = operation
-            .observe_file(&relative)
-            .map_err(read_error)?
-            .ok_or_else(|| {
-                read_error(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "version metadata missing",
-                ))
-            })?;
-        let bytes = file
-            .read_bounded(crate::known_good::MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64)
-            .map_err(read_error)?;
-        let mut version: VersionJson =
-            serde_json::from_slice(&bytes).map_err(|source| LaunchModelError::ParseVersion {
-                version_id: id.into(),
-                source,
-            })?;
-        if version.id != id {
-            return Err(read_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "version metadata identity mismatch",
-            )));
-        }
-        normalize_asset_index(&mut version);
-        read_guard.revalidate().map_err(read_error)?;
-        Ok(version)
-    };
-    let version = load(version_id)?;
-    let resolved = resolve_inheritance_with(&mut load, version, version_id, 0)?;
-    read_guard
-        .revalidate()
-        .map_err(|source| LaunchModelError::ReadVersion {
-            version_id: version_id.into(),
-            source,
-        })?;
-    Ok(resolved)
-}
-
 pub fn resolve_libraries(
     version: &VersionJson,
     mc_dir: &Path,
@@ -690,125 +563,6 @@ impl LaunchVars {
     }
 }
 
-pub fn client_jar_path(
-    mc_dir: &Path,
-    version: &VersionJson,
-    requested_version_id: &str,
-) -> PathBuf {
-    let version_id = if version.id.is_empty() {
-        requested_version_id
-    } else {
-        version.id.as_str()
-    };
-    versions_dir(mc_dir)
-        .join(version_id)
-        .join(format!("{version_id}.jar"))
-}
-
-fn resolve_inheritance(
-    mc_dir: &Path,
-    child: VersionJson,
-    expected_version_id: &str,
-    depth: usize,
-) -> Result<VersionJson, LaunchModelError> {
-    resolve_inheritance_with(
-        &mut |id| load_version_json(mc_dir, id),
-        child,
-        expected_version_id,
-        depth,
-    )
-}
-
-fn resolve_inheritance_with(
-    load: &mut impl FnMut(&str) -> Result<VersionJson, LaunchModelError>,
-    child: VersionJson,
-    expected_version_id: &str,
-    depth: usize,
-) -> Result<VersionJson, LaunchModelError> {
-    if depth > 10 {
-        return Err(LaunchModelError::InheritanceTooDeep {
-            version_id: child.id.clone(),
-        });
-    }
-
-    let reserved_loader_id =
-        crate::loaders::api::is_reserved_installed_loader_id(expected_version_id);
-    if child.materialized || reserved_loader_id {
-        if crate::loaders::validate_materialized_loader_profile(
-            expected_version_id,
-            &child.id,
-            &child.inherits_from,
-            child.materialized,
-        )
-        .is_err()
-        {
-            return Err(LaunchModelError::InvalidMaterializedProfile {
-                version_id: child.id,
-            });
-        }
-        let mut materialized = child;
-        materialized.inherits_from.clear();
-        materialized.materialized = false;
-        return Ok(finalize_effective_version(materialized));
-    }
-
-    if child.inherits_from.is_empty() {
-        return Ok(finalize_effective_version(child));
-    }
-
-    let parent_id = child.inherits_from.clone();
-    let mut parent = load(&parent_id).map_err(|source| LaunchModelError::LoadParent {
-        child_id: child.id.clone(),
-        parent_id: parent_id.clone(),
-        source: Box::new(source),
-    })?;
-    if parent.materialized || !parent.inherits_from.is_empty() {
-        parent = resolve_inheritance_with(load, parent, &parent_id, depth + 1)?;
-    }
-
-    Ok(finalize_effective_version(merge_versions(&parent, &child)))
-}
-
-fn merge_versions(parent: &VersionJson, child: &VersionJson) -> VersionJson {
-    let (arguments, minecraft_arguments) = merge_arguments(parent, child);
-    let mut merged = VersionJson {
-        id: child.id.clone(),
-        inherits_from: String::new(),
-        materialized: false,
-        kind: non_empty(&child.kind, &parent.kind),
-        main_class: non_empty(&child.main_class, &parent.main_class),
-        minimum_launcher_version: if child.minimum_launcher_version != 0 {
-            child.minimum_launcher_version
-        } else {
-            parent.minimum_launcher_version
-        },
-        compliance_level: if child.compliance_level != 0 {
-            child.compliance_level
-        } else {
-            parent.compliance_level
-        },
-        release_time: non_empty(&child.release_time, &parent.release_time),
-        time: non_empty(&child.time, &parent.time),
-        arguments,
-        minecraft_arguments,
-        asset_index: if !child.asset_index.id.is_empty() {
-            child.asset_index.clone()
-        } else {
-            parent.asset_index.clone()
-        },
-        assets: non_empty(&child.assets, &parent.assets),
-        downloads: merge_downloads(&parent.downloads, &child.downloads),
-        java_version: merge_java_version(parent, child),
-        libraries: Vec::new(),
-        logging: child.logging.clone().or_else(|| parent.logging.clone()),
-    };
-
-    merged.libraries = merge_libraries_prefer_first(&child.libraries, &parent.libraries);
-    normalize_asset_index(&mut merged);
-
-    merged
-}
-
 pub fn merge_libraries_prefer_first(preferred: &[Library], fallback: &[Library]) -> Vec<Library> {
     let mut seen = HashSet::new();
     let mut unconditional_seen = HashSet::new();
@@ -856,90 +610,6 @@ pub(crate) fn library_merge_key(name: &str) -> String {
         key.push_str(classifier);
     }
     key
-}
-
-fn merge_arguments(
-    parent: &VersionJson,
-    child: &VersionJson,
-) -> (Option<ArgumentsSection>, String) {
-    let uses_modern_arguments = parent.arguments.is_some() || child.arguments.is_some();
-    if !uses_modern_arguments {
-        return (
-            None,
-            if child.minecraft_arguments.is_empty() {
-                parent.minecraft_arguments.clone()
-            } else {
-                child.minecraft_arguments.clone()
-            },
-        );
-    }
-
-    let mut arguments = ArgumentsSection::default();
-    arguments
-        .game
-        .extend(legacy_arguments_as_modern(&parent.minecraft_arguments));
-    if let Some(parent_args) = &parent.arguments {
-        arguments.game.extend(parent_args.game.clone());
-        arguments.jvm.extend(parent_args.jvm.clone());
-    }
-    arguments
-        .game
-        .extend(legacy_arguments_as_modern(&child.minecraft_arguments));
-    if let Some(child_args) = &child.arguments {
-        arguments.game.extend(child_args.game.clone());
-        arguments.jvm.extend(child_args.jvm.clone());
-    }
-
-    (Some(arguments), String::new())
-}
-
-fn legacy_arguments_as_modern(arguments: &str) -> Vec<Argument> {
-    arguments
-        .split_whitespace()
-        .map(|value| Argument {
-            rules: Vec::new(),
-            value: vec![value.to_string()],
-        })
-        .collect()
-}
-
-fn merge_downloads(parent: &Downloads, child: &Downloads) -> Downloads {
-    Downloads {
-        client: child.client.clone().or_else(|| parent.client.clone()),
-        server: child.server.clone().or_else(|| parent.server.clone()),
-        client_mappings: child
-            .client_mappings
-            .clone()
-            .or_else(|| parent.client_mappings.clone()),
-        server_mappings: child
-            .server_mappings
-            .clone()
-            .or_else(|| parent.server_mappings.clone()),
-    }
-}
-
-fn merge_java_version(parent: &VersionJson, child: &VersionJson) -> JavaVersion {
-    if has_declared_java_version(&child.java_version) {
-        return effective_java_version_for(&child.id, &child.kind, &child.java_version);
-    }
-    parent.java_version.clone()
-}
-
-fn has_declared_java_version(java_version: &JavaVersion) -> bool {
-    !java_version.component.trim().is_empty() || java_version.major_version > 0
-}
-
-fn finalize_effective_version(mut version: VersionJson) -> VersionJson {
-    normalize_asset_index(&mut version);
-    version.java_version =
-        effective_java_version_for(&version.id, &version.kind, &version.java_version);
-    version
-}
-
-fn normalize_asset_index(version: &mut VersionJson) {
-    if version.asset_index.id.is_empty() && !version.assets.is_empty() {
-        version.asset_index.id = version.assets.clone();
-    }
 }
 
 pub fn effective_java_version_for(
@@ -1257,19 +927,25 @@ pub fn maven_to_path(coordinate: &str) -> PathBuf {
         .join(filename)
 }
 
-fn non_empty(preferred: &str, fallback: &str) -> String {
-    if preferred.is_empty() {
-        fallback.to_string()
-    } else {
-        preferred.to_string()
+/// Reads one installed fixture version without inheritance resolution.
+#[cfg(test)]
+pub(crate) fn resolve_version(mc_dir: &Path, version_id: &str) -> std::io::Result<VersionJson> {
+    let path = crate::paths::versions_dir(mc_dir)
+        .join(version_id)
+        .join(format!("{version_id}.json"));
+    let mut version: VersionJson = serde_json::from_slice(&std::fs::read(path)?)?;
+    if version.asset_index.id.is_empty() && !version.assets.is_empty() {
+        version.asset_index.id = version.assets.clone();
     }
+    version.java_version =
+        effective_java_version_for(&version.id, &version.kind, &version.java_version);
+    Ok(version)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rules::{Environment, OsRule, Rule, default_environment};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn classpath_preserves_entry_order_and_uses_exact_path_identity() {
@@ -1541,297 +1217,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_version_inherits_java_and_arguments() {
-        let temp_root = temp_root("inherits-java-and-arguments");
-        let versions_dir = temp_root.join("versions");
-        fs::create_dir_all(versions_dir.join("base")).expect("base dir");
-        fs::create_dir_all(versions_dir.join("child")).expect("child dir");
-
-        fs::write(
-            versions_dir.join("base").join("base.json"),
-            serde_json::json!({
-                "id": "base",
-                "type": "release",
-                "mainClass": "net.minecraft.client.main.Main",
-                "arguments": {
-                    "game": ["--base"],
-                    "jvm": ["-Dbase=true"]
-                },
-                "assetIndex": { "id": "1.20.1" },
-                "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
-                "libraries": []
-            })
-            .to_string(),
-        )
-        .expect("write base");
-        fs::write(
-            versions_dir.join("child").join("child.json"),
-            serde_json::json!({
-                "id": "child",
-                "inheritsFrom": "base",
-                "type": "release",
-                "arguments": {
-                    "game": ["--child"],
-                    "jvm": ["-Dchild=true"]
-                },
-                "libraries": []
-            })
-            .to_string(),
-        )
-        .expect("write child");
-
-        let resolved = resolve_version(&temp_root, "child").expect("resolve inherited version");
-        assert_eq!(resolved.java_version.major_version, 17);
-        assert_eq!(resolved.asset_index.id, "1.20.1");
-        let arguments = resolved.arguments.expect("merged arguments");
-        assert_eq!(arguments.jvm.len(), 2);
-        assert_eq!(arguments.game.len(), 2);
-
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-
-    #[test]
-    fn inherited_materialized_parent_without_canonical_identity_is_rejected() {
-        let temp_root = temp_root("materialized-parent-without-canonical-identity");
-        write_version_json(
-            &temp_root,
-            "materialized-parent",
-            serde_json::json!({
-                "id": "materialized-parent",
-                "axialMaterialized": true,
-                "type": "release",
-                "mainClass": "untrusted.Main",
-                "libraries": []
-            }),
-        );
-        write_version_json(
-            &temp_root,
-            "child",
-            serde_json::json!({
-                "id": "child",
-                "inheritsFrom": "materialized-parent",
-                "type": "release",
-                "libraries": []
-            }),
-        );
-
-        assert!(matches!(
-            resolve_version(&temp_root, "child"),
-            Err(LaunchModelError::InvalidMaterializedProfile { version_id })
-                if version_id == "materialized-parent"
-        ));
-
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-
-    #[test]
-    fn canonical_materialized_loader_profile_resolves_without_a_sidecar() {
-        let temp_root = temp_root("canonical-materialized-loader");
-        let version_id = crate::loaders::installed_version_id_for(
-            crate::loaders::LoaderComponentId::Fabric,
-            "1.21.5",
-            "0.16.14",
-        )
-        .expect("canonical loader id");
-        write_version_json(
-            &temp_root,
-            &version_id,
-            serde_json::json!({
-                "id": version_id,
-                "inheritsFrom": "1.21.5",
-                "axialMaterialized": true,
-                "type": "release",
-                "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
-                "libraries": []
-            }),
-        );
-
-        let resolved = resolve_version(&temp_root, &version_id).expect("resolve loader profile");
-        assert_eq!(resolved.id, version_id);
-        assert!(resolved.inherits_from.is_empty());
-        assert!(!resolved.materialized);
-
-        let _ = fs::remove_dir_all(temp_root);
-    }
-
-    #[test]
-    fn canonical_loader_id_without_materialized_marker_is_rejected() {
-        let temp_root = temp_root("canonical-loader-without-marker");
-        let version_id = crate::loaders::installed_version_id_for(
-            crate::loaders::LoaderComponentId::Quilt,
-            "1.21.5",
-            "0.29.2",
-        )
-        .expect("canonical loader id");
-        write_version_json(
-            &temp_root,
-            &version_id,
-            serde_json::json!({
-                "id": version_id,
-                "inheritsFrom": "1.21.5",
-                "type": "release",
-                "libraries": []
-            }),
-        );
-
-        assert!(matches!(
-            resolve_version(&temp_root, &version_id),
-            Err(LaunchModelError::InvalidMaterializedProfile { .. })
-        ));
-
-        let _ = fs::remove_dir_all(temp_root);
-    }
-
-    #[test]
-    fn malformed_reserved_loader_id_without_marker_or_parent_is_rejected() {
-        let temp_root = temp_root("malformed-reserved-loader-id");
-        let version_id = "loader-v2-malformed";
-        write_version_json(
-            &temp_root,
-            version_id,
-            serde_json::json!({
-                "id": version_id,
-                "type": "release",
-                "libraries": []
-            }),
-        );
-
-        assert!(matches!(
-            resolve_version(&temp_root, version_id),
-            Err(LaunchModelError::InvalidMaterializedProfile { .. })
-        ));
-
-        let _ = fs::remove_dir_all(temp_root);
-    }
-
-    #[test]
     fn missing_java_version_infers_java8_for_legacy_releases() {
-        let temp_root = temp_root("legacy-java-inference");
-        write_version_json(
-            &temp_root,
-            "1.8.9",
-            serde_json::json!({
-                "id": "1.8.9",
-                "type": "release",
-                "mainClass": "net.minecraft.client.main.Main",
-                "libraries": []
-            }),
-        );
-        write_version_json(
-            &temp_root,
-            "1.12.2",
-            serde_json::json!({
-                "id": "1.12.2",
-                "type": "release",
-                "mainClass": "net.minecraft.client.main.Main",
-                "libraries": []
-            }),
-        );
-
         for version_id in ["1.8.9", "1.12.2"] {
-            let resolved = resolve_version(&temp_root, version_id).expect("resolve version");
-            assert_eq!(resolved.java_version.component, JAVA_RUNTIME_LEGACY);
-            assert_eq!(resolved.java_version.major_version, 8);
+            let java = effective_java_version_for(version_id, "release", &JavaVersion::default());
+            assert_eq!(java.component, JAVA_RUNTIME_LEGACY);
+            assert_eq!(java.major_version, 8);
         }
-
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-
-    #[test]
-    fn inherited_child_client_download_prefers_child_artifact() {
-        let temp_root = temp_root("child-client-download");
-        write_version_json(
-            &temp_root,
-            "base",
-            serde_json::json!({
-                "id": "base",
-                "type": "release",
-                "mainClass": "net.minecraft.client.main.Main",
-                "assetIndex": { "id": "base-assets" },
-                "downloads": {
-                    "client": { "url": "https://example.invalid/base.jar" }
-                },
-                "javaVersion": { "component": "java-runtime-gamma", "majorVersion": 17 },
-                "libraries": []
-            }),
-        );
-        write_version_json(
-            &temp_root,
-            "child",
-            serde_json::json!({
-                "id": "child",
-                "inheritsFrom": "base",
-                "type": "release",
-                "downloads": {
-                    "client": { "url": "https://example.invalid/child.jar" }
-                },
-                "libraries": []
-            }),
-        );
-
-        let resolved = resolve_version(&temp_root, "child").expect("resolve inherited version");
-
-        assert_eq!(
-            resolved
-                .downloads
-                .client
-                .as_ref()
-                .map(|entry| entry.url.as_str()),
-            Some("https://example.invalid/child.jar")
-        );
-
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-
-    #[test]
-    fn mixed_legacy_and_modern_arguments_keep_legacy_game_args() {
-        let temp_root = temp_root("mixed-legacy-modern-arguments");
-        write_version_json(
-            &temp_root,
-            "base",
-            serde_json::json!({
-                "id": "base",
-                "type": "release",
-                "mainClass": "net.minecraft.client.main.Main",
-                "minecraftArguments": "--username ${auth_player_name} --version ${version_name}",
-                "assetIndex": { "id": "legacy-assets" },
-                "javaVersion": { "component": "jre-legacy", "majorVersion": 8 },
-                "libraries": []
-            }),
-        );
-        write_version_json(
-            &temp_root,
-            "child",
-            serde_json::json!({
-                "id": "child",
-                "inheritsFrom": "base",
-                "type": "release",
-                "arguments": {
-                    "game": ["--tweakClass", "com.example.Tweaker"],
-                    "jvm": ["-Dchild=true"]
-                },
-                "libraries": []
-            }),
-        );
-
-        let resolved = resolve_version(&temp_root, "child").expect("resolve inherited version");
-        let mut vars = default_launch_vars();
-        vars.version_name = resolved.id.clone();
-        let (_jvm_args, game_args) = resolve_arguments(&resolved, &default_environment(), &vars);
-
-        assert_eq!(
-            game_args,
-            vec![
-                "--username".to_string(),
-                "Player".to_string(),
-                "--version".to_string(),
-                "child".to_string(),
-                "--tweakClass".to_string(),
-                "com.example.Tweaker".to_string(),
-            ]
-        );
-
-        let _ = fs::remove_dir_all(&temp_root);
     }
 
     fn default_version() -> VersionJson {
@@ -1886,26 +1277,6 @@ mod tests {
             resolution_height: String::new(),
             game_assets: String::new(),
         }
-    }
-
-    fn temp_root(name: &str) -> PathBuf {
-        crate::test_temp_root().join(format!(
-            "axial-launch-{name}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
-    }
-
-    fn write_version_json(root: &Path, version_id: &str, value: serde_json::Value) {
-        let version_dir = root.join("versions").join(version_id);
-        fs::create_dir_all(&version_dir).expect("version dir");
-        fs::write(
-            version_dir.join(format!("{version_id}.json")),
-            value.to_string(),
-        )
-        .expect("version json");
     }
 
     #[test]

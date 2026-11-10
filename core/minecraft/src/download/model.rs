@@ -1165,44 +1165,6 @@ pub enum SelectedDownloadArtifactKind {
     LogConfig,
 }
 
-#[derive(Debug)]
-pub struct ExecutionDownloadError {
-    pub kind: ExecutionDownloadFactKind,
-    pub facts: Vec<ExecutionDownloadFact>,
-    pub(super) error: DownloadError,
-}
-
-impl std::fmt::Display for ExecutionDownloadError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "download execution failed for {} ({:?})",
-            self.facts
-                .last()
-                .map(|fact| fact.target.as_str())
-                .unwrap_or("artifact"),
-            self.kind
-        )
-    }
-}
-
-impl std::error::Error for ExecutionDownloadError {}
-
-impl ExecutionDownloadError {
-    pub fn io_error_kind(&self) -> Option<io::ErrorKind> {
-        match &self.error {
-            DownloadError::FileOperation(error) => Some(error.kind()),
-            _ => None,
-        }
-    }
-
-    pub fn into_download_error(self) -> DownloadError {
-        let Self { kind, facts, error } = self;
-        let _fact_report = (kind, facts);
-        error
-    }
-}
-
 pub(super) fn progress(
     phase: &str,
     current: i32,

@@ -34,32 +34,6 @@ pub struct JavaRuntimeProbeReceipt {
     info: JavaRuntimeInfo,
 }
 
-pub(super) struct JavaRuntimeProbeValidation {
-    fingerprint: JavaExecutableTargetFingerprint,
-    info: JavaRuntimeInfo,
-}
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct JavaRuntimeProbeSnapshot(JavaExecutableSnapshotState);
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-enum JavaExecutableSnapshotState {
-    Missing(PathBuf),
-    Present(JavaExecutableTargetFingerprint),
-}
-
-pub struct JavaRuntimeProbeResolution {
-    pub major: u32,
-    pub update: u32,
-    pub receipt: JavaRuntimeProbeReceipt,
-    pub usage: super::model::RuntimeProbeUsage,
-}
-
-pub struct JavaRuntimeProbeResolutionError {
-    pub error: JavaRuntimeLookupError,
-    pub usage: super::model::RuntimeProbeUsage,
-}
-
 impl JavaRuntimeProbeReceipt {
     pub(crate) fn revalidate_cli_executable(&self) -> Result<PathBuf, JavaRuntimeLookupError> {
         let current = fingerprint_java_targets(&self.fingerprint.requested_path)?;
@@ -71,25 +45,8 @@ impl JavaRuntimeProbeReceipt {
         Ok(self.fingerprint.selected_executable_path.clone())
     }
 
-    pub(super) fn into_info(self) -> JavaRuntimeInfo {
-        self.info
-    }
-
-    pub(super) fn validation(&self) -> JavaRuntimeProbeValidation {
-        JavaRuntimeProbeValidation {
-            fingerprint: self.fingerprint.clone(),
-            info: self.info.clone(),
-        }
-    }
-}
-
-impl JavaRuntimeProbeValidation {
-    pub(super) fn matches_path(&self, java_path: &Path) -> Result<bool, JavaRuntimeLookupError> {
-        Ok(fingerprint_java_targets(java_path)? == self.fingerprint)
-    }
-
-    pub(super) fn into_info(self) -> JavaRuntimeInfo {
-        self.info
+    pub(super) fn major(&self) -> u32 {
+        self.info.major
     }
 }
 
@@ -148,122 +105,6 @@ pub fn probe_java_runtime_receipt(
     Ok(JavaRuntimeProbeReceipt {
         fingerprint: after,
         info,
-    })
-}
-
-pub fn snapshot_java_runtime(
-    java_path: &Path,
-) -> Result<JavaRuntimeProbeSnapshot, JavaRuntimeLookupError> {
-    let requested_path = absolute_java_path(java_path)?;
-    if !requested_path.exists() {
-        return Ok(JavaRuntimeProbeSnapshot(
-            JavaExecutableSnapshotState::Missing(requested_path),
-        ));
-    }
-    Ok(JavaRuntimeProbeSnapshot(
-        JavaExecutableSnapshotState::Present(fingerprint_java_targets(&requested_path)?),
-    ))
-}
-
-pub fn resolve_java_runtime_probe(
-    snapshot: JavaRuntimeProbeSnapshot,
-    receipt: Option<JavaRuntimeProbeReceipt>,
-    id_hint: Option<&str>,
-) -> Result<JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError> {
-    let receipt_supplied = receipt.is_some();
-    let java_path = match &snapshot.0 {
-        JavaExecutableSnapshotState::Missing(_path) => {
-            return Err(JavaRuntimeProbeResolutionError {
-                error: JavaRuntimeLookupError::NotFound {
-                    component: "external-java-override".to_string(),
-                    major: 0,
-                },
-                usage: super::model::RuntimeProbeUsage::default(),
-            });
-        }
-        JavaExecutableSnapshotState::Present(fingerprint) => fingerprint.requested_path.clone(),
-    };
-    let receipt_matches = receipt.as_ref().is_some_and(|receipt| {
-        matches!(
-            &snapshot.0,
-            JavaExecutableSnapshotState::Present(fingerprint)
-                if receipt.fingerprint == *fingerprint
-        )
-    });
-    if receipt_matches {
-        let receipt = receipt.expect("matching receipt");
-        return Ok(JavaRuntimeProbeResolution {
-            major: receipt.info.major,
-            update: receipt.info.update,
-            receipt,
-            usage: super::model::RuntimeProbeUsage {
-                spawn_count: 0,
-                source: super::model::RuntimeProbeSource::Receipt,
-            },
-        });
-    }
-
-    let before =
-        fingerprint_java_targets(&java_path).map_err(|error| JavaRuntimeProbeResolutionError {
-            error,
-            usage: super::model::RuntimeProbeUsage::default(),
-        })?;
-    let info = probe_java_runtime_info(&java_path, id_hint).map_err(|error| {
-        JavaRuntimeProbeResolutionError {
-            error,
-            usage: super::model::RuntimeProbeUsage {
-                spawn_count: 1,
-                source: if receipt_supplied {
-                    super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
-                } else {
-                    super::model::RuntimeProbeSource::Fresh
-                },
-            },
-        }
-    })?;
-    let after =
-        fingerprint_java_targets(&java_path).map_err(|error| JavaRuntimeProbeResolutionError {
-            error,
-            usage: super::model::RuntimeProbeUsage {
-                spawn_count: 1,
-                source: if receipt_supplied {
-                    super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
-                } else {
-                    super::model::RuntimeProbeSource::Fresh
-                },
-            },
-        })?;
-    if before != after {
-        return Err(JavaRuntimeProbeResolutionError {
-            error: JavaRuntimeLookupError::Probe(
-                "java executable changed while it was being probed".to_string(),
-            ),
-            usage: super::model::RuntimeProbeUsage {
-                spawn_count: 1,
-                source: if receipt_supplied {
-                    super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
-                } else {
-                    super::model::RuntimeProbeSource::Fresh
-                },
-            },
-        });
-    }
-    let receipt = JavaRuntimeProbeReceipt {
-        fingerprint: after,
-        info,
-    };
-    Ok(JavaRuntimeProbeResolution {
-        major: receipt.info.major,
-        update: receipt.info.update,
-        receipt,
-        usage: super::model::RuntimeProbeUsage {
-            spawn_count: 1,
-            source: if receipt_supplied {
-                super::model::RuntimeProbeSource::FreshAfterReceiptMismatch
-            } else {
-                super::model::RuntimeProbeSource::Fresh
-            },
-        },
     })
 }
 
@@ -538,12 +379,7 @@ pub(super) fn detect_distribution(text: &str) -> String {
 mod tests {
     use super::parse_java_version;
     #[cfg(unix)]
-    use super::{
-        command_output_with_timeout, probe_java_runtime_receipt, resolve_java_runtime_probe,
-        snapshot_java_runtime,
-    };
-    #[cfg(unix)]
-    use crate::runtime::RuntimeProbeSource;
+    use super::{command_output_with_timeout, probe_java_runtime_receipt};
     use std::fs;
     #[cfg(unix)]
     use std::process::Command;
@@ -696,7 +532,7 @@ Security settings summary:
 
     #[cfg(unix)]
     #[test]
-    fn receipt_binds_the_requested_alias_and_symlink_target() {
+    fn receipt_revalidation_refuses_a_retargeted_alias() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = crate::test_temp_root().join(format!(
@@ -717,30 +553,7 @@ Security settings summary:
             fs::set_permissions(path, permissions).expect("fake java permissions");
         }
         let first_alias = root.join("java-alias-a");
-        let second_alias = root.join("java-alias-b");
         symlink(&first, &first_alias).expect("first alias");
-        symlink(&first, &second_alias).expect("second alias");
-
-        let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
-        let resolution = resolve_java_runtime_probe(
-            snapshot_java_runtime(&first_alias).expect("matching snapshot"),
-            Some(receipt),
-            None,
-        )
-        .unwrap_or_else(|_| panic!("matching receipt resolution"));
-        assert_eq!(resolution.usage.source, RuntimeProbeSource::Receipt);
-
-        let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
-        let resolution = resolve_java_runtime_probe(
-            snapshot_java_runtime(&second_alias).expect("different alias snapshot"),
-            Some(receipt),
-            None,
-        )
-        .unwrap_or_else(|_| panic!("different alias resolution"));
-        assert_eq!(
-            resolution.usage.source,
-            RuntimeProbeSource::FreshAfterReceiptMismatch
-        );
 
         let receipt = probe_java_runtime_receipt(&first_alias, None).expect("probe receipt");
         assert_eq!(
@@ -752,18 +565,6 @@ Security settings summary:
         fs::remove_file(&first_alias).expect("remove old alias");
         symlink(&second, &first_alias).expect("retarget alias");
         assert!(receipt.revalidate_cli_executable().is_err());
-        let resolution = resolve_java_runtime_probe(
-            snapshot_java_runtime(&first_alias).expect("retargeted alias snapshot"),
-            Some(receipt),
-            None,
-        );
-        assert_eq!(
-            resolution
-                .unwrap_or_else(|_| panic!("retargeted alias resolution"))
-                .usage
-                .source,
-            RuntimeProbeSource::FreshAfterReceiptMismatch
-        );
         let _ = fs::remove_dir_all(root);
     }
 }

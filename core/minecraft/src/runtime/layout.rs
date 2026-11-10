@@ -1,4 +1,3 @@
-use super::file_download::runtime_filesystem_path;
 use crate::loaders::types::LoaderError;
 use crate::managed_fs::{ManagedDir, ManagedExecutableGuard};
 use crate::portable_path::PortableRelativePath;
@@ -460,40 +459,6 @@ pub(super) fn java_executable_for_os(runtime_root: &Path, target_os: &str) -> Pa
             .join("bin")
             .join("java"),
         _ => runtime_root.join("bin").join("java"),
-    }
-}
-
-pub(super) fn runtime_executable_ready(java_exe: &Path) -> bool {
-    if !runtime_filesystem_path(java_exe).as_ref().is_file() {
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        runtime_filesystem_path(java_exe)
-            .as_ref()
-            .metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-
-    #[cfg(windows)]
-    {
-        let runtime_root = java_exe
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        return runtime_config_candidates(&runtime_root)
-            .into_iter()
-            .any(|candidate| runtime_filesystem_path(&candidate).as_ref().is_file());
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        true
     }
 }
 

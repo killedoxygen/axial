@@ -17,29 +17,16 @@ mod rosetta;
 
 pub use discovery::{
     ManagedRuntimeMarkerState, is_known_runtime_component, list_java_runtimes,
-    parse_runtime_override, preferred_runtime_component,
-    runtime_component_executable_present_without_probe,
-    runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
-    runtime_requirement,
+    parse_runtime_override, preferred_runtime_component, runtime_requirement,
 };
-#[cfg(feature = "test-support")]
-pub use ensure::{
-    ManagedRuntimeRebuildFixture, ensure_runtime_with_persisted_manifest_for_test,
-    persist_managed_runtime_source_fixture_for_test,
-    prepare_managed_runtime_rebuild_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
-    rebuild_managed_runtime_prepared_fixture_for_test,
-};
+#[cfg(test)]
+pub(crate) use ensure::block_runtime_before_publication_claim_for_test;
 pub(crate) use ensure::{ProcessorRuntime, materialize_ephemeral_processor_runtime};
 pub use ensure::{
     RuntimeMaterializationCancelHandle, RuntimeMaterializationCancellation,
     RuntimeMaterializationTaskControl, materialize_missing_runtime_source,
     materialize_preferred_runtime_source, runtime_materialization_control,
 };
-#[cfg(test)]
-pub(crate) use ensure::{
-    block_runtime_before_publication_claim_for_test, rebuild_managed_runtime_component_from_source,
-};
-pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 #[cfg(test)]
 pub(crate) use install::block_runtime_publication_for_test;
 #[cfg(any(test, feature = "test-support"))]
@@ -63,18 +50,10 @@ pub use model::{
     RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
     RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
-pub use probe::{
-    JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError,
-    JavaRuntimeProbeSnapshot, probe_java_runtime_receipt, resolve_java_runtime_probe,
-    snapshot_java_runtime,
-};
+pub use probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 
 #[cfg(test)]
 use cancellation::runtime_cancellation_channel;
-#[cfg(test)]
-use discovery::detect_runtime_state;
-#[cfg(test)]
-use ensure::runtime_record_matches_source_for_test;
 #[cfg(test)]
 use file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
