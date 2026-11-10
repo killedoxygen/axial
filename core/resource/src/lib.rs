@@ -733,7 +733,6 @@ struct PhysicalWorkLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::{Condvar, Mutex};
     use std::time::{Duration, Instant};
 

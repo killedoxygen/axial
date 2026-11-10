@@ -370,27 +370,6 @@ export async function openExternalURL(url: string): Promise<void> {
   window.open(externalUrl.href, '_blank', 'noopener,noreferrer');
 }
 
-export async function startNativeInstallEvents(installId: string): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('start_install_events', { installId });
-  return true;
-}
-
-export async function startNativeLoaderInstallEvents(installId: string): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('start_loader_install_events', { installId });
-  return true;
-}
-
-export async function startNativeLaunchEvents(sessionId: string): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('start_launch_events', { sessionId });
-  return true;
-}
-
 export async function windowMinimize(): Promise<boolean> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return false;
