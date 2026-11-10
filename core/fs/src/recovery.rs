@@ -5,7 +5,6 @@ use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::io;
-use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
 
 const RECOVERY_SLOT_COUNT: usize = 64;
@@ -349,8 +348,8 @@ impl RecoveryRecord {
         }
         ensure(
             !self.destination_parent.is_empty()
-                || portable_name_key(self.destination_leaf.as_str())
-                    != portable_name_key(ROOT_LEASE_NAME),
+                || platform::portable_key(self.destination_leaf.as_str())
+                    != platform::portable_key(ROOT_LEASE_NAME),
         )?;
         let footprint = footprint_keys(self);
         ensure(footprint.iter().collect::<BTreeSet<_>>().len() == footprint.len())?;
@@ -978,7 +977,7 @@ fn validate_lane_slots(
     Ok(())
 }
 
-fn footprint_keys(record: &RecoveryRecord) -> Vec<String> {
+fn footprint_keys(record: &RecoveryRecord) -> Vec<Vec<u8>> {
     let mut footprint = vec![coordinate_key(
         &record.destination_parent,
         &recovery_stage_leaf(record.operation_id),
@@ -1220,18 +1219,17 @@ fn windows_device_name(value: &str) -> bool {
             || basename[..index].eq_ignore_ascii_case("LPT"))
 }
 
-fn coordinate_key(parent: &[RecoveryName], leaf: &RecoveryName) -> String {
-    let spelling = parent
-        .iter()
-        .chain([leaf])
-        .map(RecoveryName::as_str)
-        .collect::<Vec<_>>()
-        .join("/");
-    spelling.case_fold().nfc().collect()
-}
-
-fn portable_name_key(name: &str) -> String {
-    name.case_fold().nfc().collect()
+/// Joins portable component keys; `/` is a starter that folds to itself, so the
+/// joined key matches exactly when every component is a portable alias.
+fn coordinate_key(parent: &[RecoveryName], leaf: &RecoveryName) -> Vec<u8> {
+    let mut key = Vec::new();
+    for (index, name) in parent.iter().chain([leaf]).enumerate() {
+        if index != 0 {
+            key.push(b'/');
+        }
+        key.extend(platform::portable_key(name.as_str()));
+    }
+    key
 }
 
 #[cfg(test)]

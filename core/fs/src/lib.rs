@@ -95,7 +95,7 @@ pub fn leaf_names_equivalent(first: &OsStr, second: &OsStr) -> bool {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-pub struct LeafNameEquivalenceKey(Vec<u8>);
+pub(crate) struct LeafNameEquivalenceKey(Vec<u8>);
 
 impl Borrow<[u8]> for LeafNameEquivalenceKey {
     fn borrow(&self) -> &[u8] {
@@ -107,7 +107,7 @@ impl_redacted_debug!(LeafNameEquivalenceKey);
 
 /// Returns the small set of lookup keys needed to find every name that the
 /// platform or the portable spelling rules can consider equivalent.
-pub fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<LeafNameEquivalenceKey> {
+pub(crate) fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<LeafNameEquivalenceKey> {
     platform::leaf_name_equivalence_keys(name)
         .into_iter()
         .map(LeafNameEquivalenceKey)
@@ -21690,15 +21690,37 @@ mod tests {
 
     #[test]
     fn leaf_name_equivalence_covers_case_folding_and_normalization() {
+        let bounded_portable_key = |name: &OsStr| {
+            let mut portable = Vec::with_capacity(platform::MAX_EQUIVALENCE_KEY_BYTES);
+            let mut native = Vec::with_capacity(platform::MAX_EQUIVALENCE_KEY_BYTES);
+            let mut normalization = Vec::with_capacity(platform::MAX_EQUIVALENCE_KEY_BYTES);
+            assert!(
+                platform::fill_leaf_name_equivalence_keys(
+                    name,
+                    &mut portable,
+                    &mut native,
+                    &mut normalization,
+                )
+                .expect("bounded equivalence keys")
+            );
+            LeafNameEquivalenceKey(portable)
+        };
         let equivalent = |first: &OsStr, second: &OsStr| {
             assert!(platform::leaf_names_equal(first, second));
             let first_keys = leaf_name_equivalence_keys(first);
             let second_keys = leaf_name_equivalence_keys(second);
             assert!(first_keys.iter().any(|key| second_keys.contains(key)));
+            assert_eq!(first_keys[0], bounded_portable_key(first));
+            assert_eq!(bounded_portable_key(first), bounded_portable_key(second));
         };
         equivalent(OsStr::new("state.json"), OsStr::new("STATE.JSON"));
         equivalent(OsStr::new("Stra\u{00df}e"), OsStr::new("STRASSE"));
         equivalent(OsStr::new("\u{00e9}"), OsStr::new("E\u{0301}"));
+        equivalent(
+            OsStr::new("a\u{0323}\u{0301}"),
+            OsStr::new("A\u{0301}\u{0323}"),
+        );
+        equivalent(OsStr::new("\u{1e09}"), OsStr::new("C\u{0327}\u{0301}"));
         assert!(!platform::leaf_names_equal(
             OsStr::new("state.json"),
             OsStr::new("other.json"),

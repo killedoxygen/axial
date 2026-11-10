@@ -5,7 +5,6 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
 use unicode_casefold::UnicodeCaseFold;
-use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::{canonical_combining_class, decompose_canonical};
 
 use crate::recovery::RECOVERY_CONTROL_BYTES;
@@ -418,16 +417,72 @@ pub(crate) enum ParkDirectoryError {
     AppliedUnverified(io::Error),
 }
 
+/// Bytes allotted to one equivalence key of a bounded leaf name.
+pub(crate) const MAX_EQUIVALENCE_KEY_BYTES: usize = 1 + crate::MAX_LEAF_UNITS * 16;
+
+/// Appends the one portable leaf-name equivalence key: full case folding followed by
+/// canonical decomposition. Two names are portable aliases exactly when their keys
+/// are equal. `bounded` keeps the key and scratch within their reserved capacity and
+/// fails rather than allocating.
+pub(crate) fn write_portable_key(
+    name: &str,
+    key: &mut Vec<u8>,
+    normalization: &mut Vec<(u8, char)>,
+    bounded: bool,
+) -> io::Result<()> {
+    normalization.clear();
+    let mut exhausted = false;
+    'folded: for character in name.case_fold() {
+        decompose_canonical(character, |decomposed| {
+            if bounded && normalization.len() == normalization.capacity() {
+                exhausted = true;
+                return;
+            }
+            let class = canonical_combining_class(decomposed);
+            normalization.push((class, decomposed));
+            if class == 0 {
+                return;
+            }
+            let mut index = normalization.len() - 1;
+            while index > 0 && normalization[index - 1].0 > class {
+                normalization.swap(index - 1, index);
+                index -= 1;
+            }
+        });
+        if exhausted {
+            break 'folded;
+        }
+    }
+    if exhausted {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    for (_, character) in normalization.iter().copied() {
+        let mut encoded = [0_u8; 4];
+        let bytes = character.encode_utf8(&mut encoded).as_bytes();
+        if bounded {
+            extend_preallocated_key(key, bytes)?;
+        } else {
+            key.extend_from_slice(bytes);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn portable_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::new();
+    write_portable_key(name, &mut key, &mut Vec::new(), false)
+        .expect("unbounded portable key cannot exhaust its capacity");
+    key
+}
+
 pub(crate) fn leaf_names_equal(first: &OsStr, second: &OsStr) -> bool {
     if first == second {
         return true;
     }
-    if let (Some(first), Some(second)) = (first.to_str(), second.to_str()) {
-        let first = first.case_fold().collect::<String>();
-        let second = second.case_fold().collect::<String>();
-        if first.nfc().eq(second.nfc()) {
-            return true;
-        }
+    if let (Some(first), Some(second)) = (first.to_str(), second.to_str())
+        && portable_key(first) == portable_key(second)
+    {
+        return true;
     }
     native::leaf_names_equal_native(first, second)
 }
@@ -435,9 +490,9 @@ pub(crate) fn leaf_names_equal(first: &OsStr, second: &OsStr) -> bool {
 pub(crate) fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<Vec<u8>> {
     let mut keys = Vec::with_capacity(2);
     if let Some(name) = name.to_str() {
-        let folded = name.case_fold().collect::<String>();
         let mut key = vec![b'p'];
-        key.extend(folded.nfd().collect::<String>().as_bytes());
+        write_portable_key(name, &mut key, &mut Vec::new(), false)
+            .expect("unbounded portable key cannot exhaust its capacity");
         keys.push(key);
     }
     let native = native::leaf_name_native_key(name);
@@ -447,6 +502,8 @@ pub(crate) fn leaf_name_equivalence_keys(name: &OsStr) -> Vec<Vec<u8>> {
     keys
 }
 
+/// Fills both lookup keys for `name` within their reserved capacity. Returns whether
+/// the name has a portable key.
 pub(crate) fn fill_leaf_name_equivalence_keys(
     name: &OsStr,
     portable: &mut Vec<u8>,
@@ -455,38 +512,9 @@ pub(crate) fn fill_leaf_name_equivalence_keys(
 ) -> io::Result<bool> {
     portable.clear();
     native.clear();
-    normalization.clear();
     let has_portable = if let Some(name) = name.to_str() {
         extend_preallocated_key(portable, b"p")?;
-        let mut normalization_exhausted = false;
-        'folded: for character in name.case_fold() {
-            decompose_canonical(character, |decomposed| {
-                if normalization.len() == normalization.capacity() {
-                    normalization_exhausted = true;
-                    return;
-                }
-                let class = canonical_combining_class(decomposed);
-                normalization.push((class, decomposed));
-                if class == 0 {
-                    return;
-                }
-                let mut index = normalization.len() - 1;
-                while index > 0 && normalization[index - 1].0 > class {
-                    normalization.swap(index - 1, index);
-                    index -= 1;
-                }
-            });
-            if normalization_exhausted {
-                break 'folded;
-            }
-        }
-        if normalization_exhausted {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        for (_, character) in normalization.iter().copied() {
-            let mut encoded = [0_u8; 4];
-            extend_preallocated_key(portable, character.encode_utf8(&mut encoded).as_bytes())?;
-        }
+        write_portable_key(name, portable, normalization, true)?;
         true
     } else {
         false

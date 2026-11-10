@@ -1,8 +1,8 @@
 use crate::{
     AUTHORITY_DRAINING, AUTHORITY_LIVE, CapabilityAuthority, CapabilityOperation, Directory,
     EntryKind, FileCapability, LeafName, LeafNameEquivalenceKey, MAX_DIRECTORY_LIST_ENTRIES,
-    MAX_LEAF_UNITS, MAX_OUTSTANDING_EFFECTS, leaf_name_equivalence_keys, leaf_names_equivalent,
-    platform, stale_capability,
+    MAX_OUTSTANDING_EFFECTS, leaf_name_equivalence_keys, leaf_names_equivalent, platform,
+    stale_capability,
 };
 #[cfg(target_os = "linux")]
 use crate::{AUTHORITY_QUIESCING, terminal_effect_settlement_admits};
@@ -29,7 +29,6 @@ use platform::{
 
 // Unicode folding and canonical decomposition can expand one admitted input
 // unit into several UTF-8 scalars.
-const MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES: usize = 1 + MAX_LEAF_UNITS * 16;
 const MAX_DESTINATION_INVENTORY_SCANS: usize = 8;
 #[cfg(test)]
 std::thread_local! {
@@ -1494,13 +1493,13 @@ fn validate_destination_batch_with_operation(
     let mut native_key = Vec::new();
     let mut normalization = Vec::new();
     portable_key
-        .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+        .try_reserve_exact(platform::MAX_EQUIVALENCE_KEY_BYTES)
         .map_err(|_| io::Error::other("portable leaf proof capacity is exhausted"))?;
     native_key
-        .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+        .try_reserve_exact(platform::MAX_EQUIVALENCE_KEY_BYTES)
         .map_err(|_| io::Error::other("native leaf proof capacity is exhausted"))?;
     normalization
-        .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+        .try_reserve_exact(platform::MAX_EQUIVALENCE_KEY_BYTES)
         .map_err(|_| io::Error::other("leaf normalization capacity is exhausted"))?;
     let mut inventory = DestinationBatchInventory {
         expected_exact: &expected_exact,
@@ -2006,13 +2005,13 @@ impl TransientPublicationBatch {
         if classifications.try_reserve_exact(stages.len()).is_err()
             || inventory_exact.try_reserve_exact(stages.len()).is_err()
             || portable_key
-                .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+                .try_reserve_exact(platform::MAX_EQUIVALENCE_KEY_BYTES)
                 .is_err()
             || native_key
-                .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+                .try_reserve_exact(platform::MAX_EQUIVALENCE_KEY_BYTES)
                 .is_err()
             || normalization
-                .try_reserve_exact(MAX_TRANSIENT_EQUIVALENCE_KEY_BYTES)
+                .try_reserve_exact(platform::MAX_EQUIVALENCE_KEY_BYTES)
                 .is_err()
             || directory_buffer_exhausted
             || classified.try_reserve_exact(stages.len()).is_err()
