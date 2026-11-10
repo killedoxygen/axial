@@ -2478,10 +2478,7 @@ pub(crate) fn seal_reconstructed_installer_source(
 ) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
     let (base, base_client_source, record, input, resolved_version, version_bytes, child_client) =
         authority.consume_for_sealing();
-    let (source, library_declarations, local_library_sources) = input.into_parts();
-    if !local_library_sources.is_empty() {
-        return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
-    }
+    let (source, library_declarations) = input.into_parts();
     if !source.matches_record(&record) {
         return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
     }
@@ -3321,64 +3318,6 @@ fn add_runtime(
         builder.insert(entry)?;
     }
     Ok(())
-}
-
-pub(crate) fn runtime_inventory_from_source(
-    source: &RuntimeSourceReceipt,
-) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
-    let mut builder = InventoryBuilder::default();
-    add_runtime(
-        &mut builder,
-        source.component(),
-        source.bytes(),
-        &ExpectedIntegrity {
-            size: Some(source.expected_size()),
-            sha1: Some(source.expected_sha1().to_string()),
-        },
-    )?;
-    Ok(builder.finish())
-}
-
-pub(crate) fn replace_runtime_projection(
-    active: &KnownGoodInventory,
-    runtime_only: KnownGoodInventory,
-    component: &RuntimeId,
-) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
-    if runtime_only.entries.iter().any(|entry| {
-        !matches!(
-            &entry.root,
-            KnownGoodRoot::ManagedRuntime { component: observed }
-                if observed.as_str() == component.as_str()
-        )
-    }) {
-        return Err(KnownGoodInventoryError::RuntimeIdentityMismatch);
-    }
-    if active.entries.iter().any(|entry| {
-        matches!(
-            &entry.root,
-            KnownGoodRoot::ManagedRuntime { component: observed }
-                if observed.as_str() != component.as_str()
-        )
-    }) {
-        return Err(KnownGoodInventoryError::RuntimeIdentityMismatch);
-    }
-    let mut builder = InventoryBuilder::default();
-    for (inventory_ordinal, entry) in active
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| !matches!(entry.root, KnownGoodRoot::ManagedRuntime { .. }))
-    {
-        builder.insert_preserving_standalone_leaf_repair_source(
-            active,
-            inventory_ordinal,
-            entry.clone(),
-        )?;
-    }
-    for entry in runtime_only.entries {
-        builder.insert(entry)?;
-    }
-    Ok(builder.finish())
 }
 
 fn validate_runtime_path_tree(entries: &[KnownGoodEntry]) -> Result<(), KnownGoodInventoryError> {
@@ -6447,51 +6386,6 @@ mod tests {
             asset_contract.bind_standalone_leaf_repair_source(0),
             Err(KnownGoodRepairSourceError::ContractMismatch)
         ));
-    }
-
-    #[test]
-    fn runtime_projection_replacement_preserves_retained_leaf_sources() {
-        let active = fixture(false).derive().expect("active inventory");
-        let original_ordinal = active
-            .entries()
-            .iter()
-            .position(|entry| entry.path().as_str() == "com/mojang/strict/1.0/strict-1.0.jar")
-            .expect("library ordinal");
-        let original_provider = active
-            .bind_standalone_leaf_repair_source(original_ordinal)
-            .expect("active source")
-            .provider_url()
-            .to_string();
-        let mut runtime = InventoryBuilder::default();
-        runtime
-            .insert(KnownGoodEntry {
-                root: runtime_root(),
-                path: KnownGoodRelativePath::new("bin/java").expect("runtime path"),
-                kind: KnownGoodArtifactKind::RuntimeExecutable,
-                integrity: KnownGoodIntegrity::Sha1 {
-                    digest: Sha1Digest::from_metadata(SHA_C).expect("runtime digest"),
-                    size: 30,
-                },
-            })
-            .expect("replacement runtime");
-        let replaced = replace_runtime_projection(
-            &active,
-            runtime.finish(),
-            &RuntimeId::from("java-runtime-delta"),
-        )
-        .expect("runtime projection replacement");
-        let replaced_ordinal = replaced
-            .entries()
-            .iter()
-            .position(|entry| entry.path().as_str() == "com/mojang/strict/1.0/strict-1.0.jar")
-            .expect("retained library ordinal");
-        assert_eq!(
-            replaced
-                .bind_standalone_leaf_repair_source(replaced_ordinal)
-                .expect("retained source")
-                .provider_url(),
-            original_provider
-        );
     }
 
     #[test]

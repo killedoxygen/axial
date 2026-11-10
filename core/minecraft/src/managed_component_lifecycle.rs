@@ -27,9 +27,7 @@ use crate::managed_component_table::{
     ComponentTableBuilder, ComponentTableError, ComponentTableRow, ComponentTableSummary,
     ManagedComponentArtifactKind, ManagedComponentKind,
 };
-use crate::managed_fs::{
-    ManagedDir, ManagedFileIdentity, ManagedLibraryOperation, ManagedPassiveFileRevision,
-};
+use crate::managed_fs::{ManagedDir, ManagedFileIdentity, ManagedPassiveFileRevision};
 use crate::managed_publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
     run_publication_blocking,
@@ -38,7 +36,6 @@ use crate::portable_path::PortableRelativePath;
 use futures_util::StreamExt as _;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::path::Path;
 use std::time::Duration;
 
 const COMPONENT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
@@ -167,86 +164,18 @@ struct ComponentProjectionRow {
 }
 
 pub(crate) struct ManagedComponentCommittedReceipt {
-    component: ManagedComponentKind,
-    projection: Vec<ComponentProjectionRow>,
-    lease: ManagedRootPublicationLease,
-}
-
-pub(crate) struct ManagedComponentRolledBackReceipt {
-    component: ManagedComponentKind,
-    projection: Vec<ComponentProjectionRow>,
-    effect: crate::managed_component_publication::ComponentRollbackEffect,
     lease: ManagedRootPublicationLease,
 }
 
 pub(crate) enum ManagedComponentLifecycleOutcome {
     Committed(ManagedComponentCommittedReceipt),
-    RolledBack(ManagedComponentRolledBackReceipt),
+    RolledBack,
 }
 
 impl ManagedComponentCommittedReceipt {
-    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
-        projection_rows(self.component, projection).is_ok_and(|rows| rows == self.projection)
-    }
-
-    pub(crate) async fn revalidate(&self) -> bool {
-        revalidate_component_projection(&self.lease, self.component, &self.projection).await
-    }
-
-    pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
-        receipt_matches_root(&self.lease, expected).await
-    }
-
-    pub(crate) fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
-        receipt_matches_managed_library(&self.lease, expected)
-    }
-
     pub(crate) fn into_lease(self) -> ManagedRootPublicationLease {
         self.lease
     }
-}
-
-impl ManagedComponentRolledBackReceipt {
-    pub(crate) fn rollback_effect(
-        &self,
-    ) -> crate::managed_component_publication::ComponentRollbackEffect {
-        self.effect
-    }
-
-    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
-        projection_rows(self.component, projection).is_ok_and(|rows| rows == self.projection)
-    }
-
-    pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
-        receipt_matches_root(&self.lease, expected).await
-    }
-
-    pub(crate) fn matches_managed_library(&self, expected: &ManagedLibraryOperation) -> bool {
-        receipt_matches_managed_library(&self.lease, expected)
-    }
-}
-
-fn receipt_matches_managed_library(
-    lease: &ManagedRootPublicationLease,
-    expected: &ManagedLibraryOperation,
-) -> bool {
-    lease.revalidate().is_ok()
-        && lease.root().shares_managed_library_operation(expected)
-        && lease.revalidate().is_ok()
-}
-
-async fn receipt_matches_root(lease: &ManagedRootPublicationLease, expected: &Path) -> bool {
-    if lease.revalidate().is_err() {
-        return false;
-    }
-    let expected = expected.to_path_buf();
-    let root = lease.root().clone();
-    let matches = run_publication_blocking(move || {
-        root.revalidate()?;
-        Ok::<_, LoaderError>(ManagedDir::open_root(&expected)?.identity()? == root.identity()?)
-    })
-    .await;
-    matches!(matches, Ok(Ok(true))) && lease.revalidate().is_ok()
 }
 
 struct SparseSourceCounts {
@@ -363,7 +292,7 @@ where
     S: RetainedComponentPublicationSource + 'static,
 {
     let lease = settle_prior_component_transaction(lease, component).await?;
-    let (lease, projection, planned, sources, source_counts) =
+    let (lease, _, planned, sources, source_counts) =
         plan_component_publication(lease, projection, component, sources).await?;
     if planned.all_exact {
         if source_counts.required != 0 || sources.len() != source_counts.supplied_exact {
@@ -380,11 +309,7 @@ where
         let lease =
             revalidate_exact_component_projection(lease, component, planned.table_rows).await?;
         return Ok(ManagedComponentLifecycleOutcome::Committed(
-            ManagedComponentCommittedReceipt {
-                component,
-                projection,
-                lease,
-            },
+            ManagedComponentCommittedReceipt { lease },
         ));
     }
     let candidate = prepare_component_intent_from_plan(
@@ -413,20 +338,11 @@ where
     .await?;
     match settled {
         ComponentSettledOutcome::Committed(lease) => Ok(
-            ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt {
-                component,
-                projection,
-                lease,
-            }),
+            ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt { lease }),
         ),
-        ComponentSettledOutcome::RolledBack { lease, effect } => Ok(
-            ManagedComponentLifecycleOutcome::RolledBack(ManagedComponentRolledBackReceipt {
-                component,
-                projection,
-                effect,
-                lease,
-            }),
-        ),
+        ComponentSettledOutcome::RolledBack { .. } => {
+            Ok(ManagedComponentLifecycleOutcome::RolledBack)
+        }
     }
 }
 
@@ -1070,42 +986,6 @@ async fn revalidate_exact_component_projection(
     .await??;
     lease.revalidate()?;
     Ok(lease)
-}
-
-async fn revalidate_component_projection(
-    lease: &ManagedRootPublicationLease,
-    component: ManagedComponentKind,
-    projection: &[ComponentProjectionRow],
-) -> bool {
-    if lease.revalidate().is_err() {
-        return false;
-    }
-    let root = lease.root().clone();
-    let projection = projection.to_vec();
-    let exact = run_publication_blocking(move || {
-        root.revalidate()?;
-        let exact = root.observe_validated(
-            || {
-                let mut parents = ComponentCanonicalParents::default();
-                for row in projection {
-                    let planned = parents.plan(&root, component, &row.path)?;
-                    let ComponentCanonicalObservation::Regular(observed) = planned.observe()?
-                    else {
-                        return Ok::<_, ComponentEffectsError>(false);
-                    };
-                    if observed.size() != row.size || observed.sha1() != row.sha1 {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            },
-            ComponentEffectsError::from,
-        )?;
-        root.revalidate()?;
-        Ok::<_, ComponentEffectsError>(exact)
-    })
-    .await;
-    matches!(exact, Ok(Ok(true))) && lease.revalidate().is_ok()
 }
 
 fn validate_sparse_source_coverage<S>(
@@ -1791,7 +1671,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            ManagedComponentLifecycleOutcome::RolledBack(_)
+            ManagedComponentLifecycleOutcome::RolledBack
         ));
         assert!(!temporary.path().join("libraries").exists());
         assert!(faults.execution.is_none());
@@ -1832,7 +1712,7 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            ManagedComponentLifecycleOutcome::RolledBack(_)
+            ManagedComponentLifecycleOutcome::RolledBack
         ));
         assert!(!temporary.path().join("libraries").exists());
         assert!(faults.execution.is_none());

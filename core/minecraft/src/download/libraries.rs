@@ -17,7 +17,7 @@ use crate::launch::{Library, maven_to_path};
 use crate::managed_blocking::ManagedBlockingWorkers;
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
+use crate::managed_fs::ManagedLibraryOperation;
 use crate::paths::libraries_dir;
 use crate::portable_path::PortableRelativePath;
 use crate::rules::{Environment, evaluate_rules};
@@ -97,21 +97,6 @@ impl ExactLibraryCacheAdmission {
     ) -> Result<Self, DownloadError> {
         Ok(Self {
             cache: ManagedComponentExactCache::bind_with_workers(
-                managed_root,
-                ManagedComponentKind::Libraries,
-                workers,
-            )
-            .await
-            .map_err(cache_admission_error)?,
-        })
-    }
-
-    pub(crate) async fn bind_guarded_with_workers(
-        managed_root: ManagedDir,
-        workers: ManagedBlockingWorkers,
-    ) -> Result<Self, DownloadError> {
-        Ok(Self {
-            cache: ManagedComponentExactCache::bind_guarded_with_workers(
                 managed_root,
                 ManagedComponentKind::Libraries,
                 workers,

@@ -119,6 +119,7 @@ impl ManagedRootPublicationLease {
             .ok_or(ManagedPublicationError::ReadBusy)
     }
 
+    #[cfg(test)]
     pub(crate) async fn try_acquire(
         root: ManagedDir,
     ) -> Result<Option<Self>, ManagedPublicationError> {

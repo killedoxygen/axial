@@ -2563,7 +2563,7 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
 }
 
 #[tokio::test]
-async fn behavior_contract_runtime_failure_receipt_retains_exact_inventory_proof() {
+async fn behavior_contract_runtime_failure_receipt_restores_the_canonical_runtime() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
     let root = cache
@@ -2572,8 +2572,6 @@ async fn behavior_contract_runtime_failure_receipt_retains_exact_inventory_proof
     fs::create_dir(&root).expect("canonical runtime root");
     fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
     let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let inventory = crate::known_good::runtime_inventory_from_source(&source)
-        .expect("authenticated Runtime inventory");
     let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
         .await
         .expect("managed runtime stage");
@@ -2588,7 +2586,6 @@ async fn behavior_contract_runtime_failure_receipt_retains_exact_inventory_proof
     };
     assert_eq!(effect.component(), &component);
     assert!(effect.matches_cache(&cache));
-    assert!(effect.matches_known_good_inventory(&inventory));
     assert!(effect.quarantine_obligation().is_none());
     assert_eq!(
         fs::read(root.join("sentinel")).expect("restored sentinel"),

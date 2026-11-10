@@ -7,10 +7,6 @@ use super::model::{
     ExpectedIntegrity,
 };
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
-use crate::known_good::{
-    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedComponentProjection,
-    ManagedKnownGoodComponent,
-};
 use crate::loaders::types::LoaderError;
 #[cfg(test)]
 use crate::managed_blocking::ManagedBlockingAttemptGuard;
@@ -32,11 +28,10 @@ use crate::managed_component_source_spool::{
 use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
-use crate::portable_path::{PortablePathKey, PortableRelativePath};
+use crate::portable_path::PortableRelativePath;
 use axial_resource::{PhysicalScratchPermit, PhysicalWorkOwner, process_physical_work};
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -249,6 +244,7 @@ impl LibrarySourcePool {
             .map_err(managed_blocking_download_error)?
     }
 
+    #[cfg(test)]
     pub(super) async fn retain_authenticated_local_source(
         &self,
         source: AuthenticatedLocalLibraryBytes,
@@ -366,57 +362,6 @@ pub(crate) struct AuthenticatedLocalLibraryBytes {
     observed_sha1: [u8; 20],
 }
 
-pub(crate) struct AuthenticatedLibraryCacheProof {
-    relative_path: PortableRelativePath,
-    kind: LibraryComponentSourceKind,
-    observed_size: u64,
-    observed_sha1: [u8; 20],
-}
-
-#[derive(Default)]
-pub(crate) struct AuthenticatedLibraryCacheProofSet {
-    proofs: BTreeMap<PortableRelativePath, AuthenticatedLibraryCacheProof>,
-    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
-}
-
-impl AuthenticatedLibraryCacheProofSet {
-    pub(crate) fn insert(
-        &mut self,
-        proof: AuthenticatedLibraryCacheProof,
-    ) -> Result<(), DownloadError> {
-        let path = proof.relative_path.clone();
-        let portable = path.key();
-        if self
-            .portable_paths
-            .get(&portable)
-            .is_some_and(|existing| existing != &path)
-        {
-            return Err(source_integrity_error(
-                "duplicates an authenticated cache-proof identity",
-            ));
-        }
-        self.portable_paths.insert(portable, path.clone());
-        self.proofs.insert(path, proof);
-        Ok(())
-    }
-}
-
-impl AuthenticatedLibraryCacheProof {
-    pub(crate) fn new(
-        relative_path: PortableRelativePath,
-        kind: LibraryComponentSourceKind,
-        observed_size: u64,
-        observed_sha1: [u8; 20],
-    ) -> Self {
-        Self {
-            relative_path,
-            kind,
-            observed_size,
-            observed_sha1,
-        }
-    }
-}
-
 impl AuthenticatedLocalLibraryBytes {
     pub(crate) fn new(
         relative_path: PortableRelativePath,
@@ -457,181 +402,6 @@ impl AuthenticatedLocalLibraryBytes {
             self.observed_size,
             self.observed_sha1,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn relative_path(&self) -> &PortableRelativePath {
-        &self.relative_path
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct RetainedLibrarySourceSet {
-    sources: BTreeMap<PortableRelativePath, RetainedLibraryComponentSource>,
-    portable_paths: BTreeMap<PortablePathKey, PortableRelativePath>,
-    retained_bytes: u64,
-}
-
-impl RetainedLibrarySourceSet {
-    pub(crate) fn new() -> Self {
-        Self {
-            sources: BTreeMap::new(),
-            portable_paths: BTreeMap::new(),
-            retained_bytes: 0,
-        }
-    }
-
-    pub(crate) fn insert(
-        &mut self,
-        source: RetainedLibraryComponentSource,
-    ) -> Result<(), DownloadError> {
-        self.admit(source, false)
-    }
-
-    fn admit(
-        &mut self,
-        source: RetainedLibraryComponentSource,
-        replace_exact_path: bool,
-    ) -> Result<(), DownloadError> {
-        let path = source.relative_path().clone();
-        let portable = path.key();
-        if (!replace_exact_path && self.sources.contains_key(&path))
-            || self
-                .portable_paths
-                .get(&portable)
-                .is_some_and(|existing| existing != &path)
-        {
-            return Err(source_integrity_error(
-                "duplicates a retained source identity",
-            ));
-        }
-        let replaced_bytes = if replace_exact_path {
-            self.sources
-                .get(&path)
-                .map_or(0, RetainedLibraryComponentSource::observed_size)
-        } else {
-            0
-        };
-        let retained_bytes = self
-            .retained_bytes
-            .checked_sub(replaced_bytes)
-            .and_then(|bytes| bytes.checked_add(source.observed_size()))
-            .filter(|bytes| *bytes <= MAX_TIER2_AGGREGATE_BYTES)
-            .ok_or_else(|| source_integrity_error("exceeds the retained aggregate limit"))?;
-        self.portable_paths.insert(portable, path.clone());
-        self.sources.insert(path, source);
-        self.retained_bytes = retained_bytes;
-        Ok(())
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) -> Result<(), DownloadError> {
-        for source in other.sources.into_values() {
-            self.admit(source, true)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reconcile_projection(
-        &mut self,
-        projection: &ManagedComponentProjection<'_>,
-    ) -> Result<(), DownloadError> {
-        self.reconcile_sparse_projection(projection, AuthenticatedLibraryCacheProofSet::default())
-    }
-
-    pub(crate) fn reconcile_sparse_projection(
-        &mut self,
-        projection: &ManagedComponentProjection<'_>,
-        mut cache_proofs: AuthenticatedLibraryCacheProofSet,
-    ) -> Result<(), DownloadError> {
-        if projection.component() != ManagedKnownGoodComponent::Libraries {
-            return Err(source_integrity_error(
-                "is bound to a non-library projection",
-            ));
-        }
-        let mut reconciled = BTreeMap::new();
-        let mut portable_paths = BTreeMap::new();
-        let mut retained_bytes = 0_u64;
-        for projected in projection.entries().iter().copied() {
-            let entry = projected.entry();
-            if entry.root() != &KnownGoodRoot::Libraries {
-                return Err(source_integrity_error("has a non-library projection root"));
-            }
-            let path = PortableRelativePath::new(entry.path().as_str())
-                .map_err(|_| source_integrity_error("has an invalid projection path"))?;
-            let portable = path.key();
-            if portable_paths.insert(portable, path.clone()).is_some() {
-                return Err(source_integrity_error(
-                    "duplicates a portable projection identity",
-                ));
-            }
-            let expected_kind = match entry.kind() {
-                KnownGoodArtifactKind::Library => LibraryComponentSourceKind::Library,
-                KnownGoodArtifactKind::NativeLibrary => LibraryComponentSourceKind::NativeLibrary,
-                _ => return Err(source_integrity_error("has a non-library projection kind")),
-            };
-            let (expected_sha1, expected_size) = match entry.integrity() {
-                KnownGoodIntegrity::Sha1 { digest, size }
-                | KnownGoodIntegrity::ExactBytes { digest, size } => (digest.to_bytes(), *size),
-                KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
-                    return Err(source_integrity_error(
-                        "has a non-file projection integrity",
-                    ));
-                }
-            };
-            let source = self.sources.remove(&path);
-            let proof = cache_proofs.proofs.remove(&path);
-            match (source, proof) {
-                (Some(source), _)
-                    if source.source_kind() == expected_kind
-                        && source.observed_size() == expected_size
-                        && source.observed_sha1() == expected_sha1 =>
-                {
-                    retained_bytes = retained_bytes
-                        .checked_add(source.observed_size())
-                        .filter(|bytes| *bytes <= MAX_TIER2_AGGREGATE_BYTES)
-                        .ok_or_else(|| {
-                            source_integrity_error("exceeds the retained aggregate limit")
-                        })?;
-                    reconciled.insert(path, source);
-                }
-                (_, Some(proof))
-                    if proof.kind == expected_kind
-                        && proof.observed_size == expected_size
-                        && proof.observed_sha1 == expected_sha1 => {}
-                (Some(_), _) => {
-                    return Err(source_integrity_error(
-                        "does not match its final projection row",
-                    ));
-                }
-                (None, Some(_)) => {
-                    return Err(source_integrity_error(
-                        "has a cache proof that does not match its final projection row",
-                    ));
-                }
-                (None, None) => {
-                    return Err(source_integrity_error("is missing a projected source"));
-                }
-            }
-        }
-        self.sources = reconciled;
-        self.portable_paths = portable_paths;
-        self.retained_bytes = retained_bytes;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.sources.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_bytes(&self) -> u64 {
-        self.retained_bytes
-    }
-
-    pub(crate) fn into_sources(self) -> Vec<RetainedLibraryComponentSource> {
-        self.sources.into_values().collect()
     }
 }
 
@@ -801,6 +571,7 @@ impl RetainedLibraryComponentSource {
         })
     }
 
+    #[cfg(test)]
     fn from_authenticated_local_allocation(
         allocation: RetainedComponentSourceAllocation,
         relative_path: PortableRelativePath,
@@ -2253,168 +2024,6 @@ mod tests {
         assert_eq!(replay_size, size);
         assert_eq!(replay_sha1, sha1);
         assert_eq!(pool.retained_available_bytes(), 0);
-    }
-
-    #[test]
-    fn retained_library_source_set_rejects_portable_aliases_and_aggregate_overflow() {
-        let source = |path: &str, size: u64| {
-            RetainedLibraryComponentSource::from_test_identity(
-                PortableRelativePath::new(path).unwrap(),
-                false,
-                "https://example.invalid/library.jar".to_string(),
-                ExpectedIntegrity::default(),
-                size,
-                [1; 20],
-            )
-        };
-
-        let mut aliases = RetainedLibrarySourceSet::new();
-        aliases
-            .insert(source("Example/shared/1/shared-1.jar", 1))
-            .expect("first portable identity");
-        assert!(
-            aliases
-                .insert(source("example/shared/1/shared-1.jar", 1))
-                .is_err()
-        );
-
-        let mut aggregate = RetainedLibrarySourceSet::new();
-        aggregate
-            .insert(source(
-                "example/aggregate/1/aggregate-1.jar",
-                MAX_TIER2_AGGREGATE_BYTES,
-            ))
-            .expect("aggregate limit boundary");
-        assert!(
-            aggregate
-                .insert(source("example/overflow/1/overflow-1.jar", 1))
-                .is_err()
-        );
-
-        let overlay_path = "example/overlay/1/overlay-1.jar";
-        let mut base = RetainedLibrarySourceSet::new();
-        base.insert(source(overlay_path, 7)).unwrap();
-        let mut child = RetainedLibrarySourceSet::new();
-        child
-            .insert(RetainedLibraryComponentSource::from_test_identity(
-                PortableRelativePath::new(overlay_path).unwrap(),
-                false,
-                "https://example.invalid/child.jar".to_string(),
-                ExpectedIntegrity::default(),
-                9,
-                [2; 20],
-            ))
-            .unwrap();
-        base.merge(child).expect("child overlay source");
-        let sources = base.into_sources();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].observed_size(), 9);
-        assert_eq!(sources[0].observed_sha1(), [2; 20]);
-    }
-
-    #[test]
-    fn retained_library_source_set_reconciles_child_overlays_to_final_projection() {
-        let library_path = "example/final/1/final-1.jar";
-        let native_path = "example/native/1/native-1-natives.jar";
-        let authority = crate::known_good::PendingKnownGoodInstallAuthority::component_for_test([
-            (
-                KnownGoodRoot::Libraries,
-                library_path.to_string(),
-                KnownGoodArtifactKind::Library,
-                [1; 20],
-                7,
-            ),
-            (
-                KnownGoodRoot::Libraries,
-                native_path.to_string(),
-                KnownGoodArtifactKind::NativeLibrary,
-                [2; 20],
-                9,
-            ),
-        ]);
-        let projection = authority
-            .component_projection(ManagedKnownGoodComponent::Libraries)
-            .expect("final Libraries projection");
-        let source = |path: &str, native: bool, size: u64, sha1: [u8; 20]| {
-            RetainedLibraryComponentSource::from_test_identity(
-                PortableRelativePath::new(path).unwrap(),
-                native,
-                "https://example.invalid/library.jar".to_string(),
-                ExpectedIntegrity::default(),
-                size,
-                sha1,
-            )
-        };
-        let mut sources = RetainedLibrarySourceSet::new();
-        sources
-            .insert(source("example/stale/1/stale-1.jar", false, 5, [3; 20]))
-            .unwrap();
-        sources
-            .insert(source(library_path, false, 7, [1; 20]))
-            .unwrap();
-        sources
-            .insert(source(native_path, true, 9, [2; 20]))
-            .unwrap();
-
-        sources
-            .reconcile_projection(&projection)
-            .expect("complete final source projection");
-        let sources = sources.into_sources();
-        assert_eq!(sources.len(), 2);
-        assert!(
-            sources
-                .iter()
-                .all(|source| source.relative_path().as_str() != "example/stale/1/stale-1.jar")
-        );
-
-        let mut incomplete = RetainedLibrarySourceSet::new();
-        incomplete
-            .insert(source(library_path, false, 7, [1; 20]))
-            .unwrap();
-        assert!(incomplete.reconcile_projection(&projection).is_err());
-    }
-
-    #[test]
-    fn sparse_reconciliation_prefers_matching_overlay_cache_proof_over_stale_base_source() {
-        let path = "example/overlay/1/overlay-1.jar";
-        let authority =
-            crate::known_good::PendingKnownGoodInstallAuthority::component_for_test([(
-                KnownGoodRoot::Libraries,
-                path.to_string(),
-                KnownGoodArtifactKind::Library,
-                [2; 20],
-                9,
-            )]);
-        let projection = authority
-            .component_projection(ManagedKnownGoodComponent::Libraries)
-            .expect("final Libraries projection");
-        let relative_path = PortableRelativePath::new(path).unwrap();
-        let mut sources = RetainedLibrarySourceSet::new();
-        sources
-            .insert(RetainedLibraryComponentSource::from_test_identity(
-                relative_path.clone(),
-                false,
-                "https://example.invalid/base.jar".to_string(),
-                ExpectedIntegrity::default(),
-                7,
-                [1; 20],
-            ))
-            .unwrap();
-        let mut cache_proofs = AuthenticatedLibraryCacheProofSet::default();
-        cache_proofs
-            .insert(AuthenticatedLibraryCacheProof::new(
-                relative_path,
-                LibraryComponentSourceKind::Library,
-                9,
-                [2; 20],
-            ))
-            .unwrap();
-
-        sources
-            .reconcile_sparse_projection(&projection, cache_proofs)
-            .expect("matching final overlay cache proof");
-
-        assert!(sources.into_sources().is_empty());
     }
 
     #[tokio::test]

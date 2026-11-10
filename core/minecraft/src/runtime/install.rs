@@ -25,10 +25,6 @@ use super::model::{
     JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId, RuntimeRecord, RuntimeSourceFailure,
     RuntimeSourceFailureKind,
 };
-use crate::known_good::{
-    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRoot,
-    known_good_link_target_matches,
-};
 use crate::managed_fs::{ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents};
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
@@ -193,7 +189,6 @@ impl std::fmt::Debug for ManagedRuntimeFailureReceipt {
 pub struct ManagedRuntimeFailureReceipt {
     cache: ManagedRuntimeCache,
     component: RuntimeId,
-    source: Option<Box<RuntimeSourceReceipt>>,
     cause: JavaRuntimeLookupError,
     quarantine: Option<ManagedRuntimeQuarantineObligation>,
     _publication_lease: ManagedRuntimePublicationLease,
@@ -252,12 +247,6 @@ impl ManagedRuntimeFailureReceipt {
     pub fn quarantine_obligation(&self) -> Option<&ManagedRuntimeQuarantineObligation> {
         self.quarantine.as_ref()
     }
-
-    pub fn matches_known_good_inventory(&self, inventory: &KnownGoodInventory) -> bool {
-        self.source.as_ref().is_some_and(|source| {
-            runtime_source_matches_known_good_inventory(&self.component, source.as_ref(), inventory)
-        })
-    }
 }
 
 impl ManagedRuntimeCommitReceipt {
@@ -271,24 +260,6 @@ impl ManagedRuntimeCommitReceipt {
 
     pub fn quarantine_obligation(&self) -> Option<&ManagedRuntimeQuarantineObligation> {
         self.quarantine.as_ref()
-    }
-
-    pub fn matches_known_good_inventory(&self, inventory: &KnownGoodInventory) -> bool {
-        self.source.as_ref().is_some_and(|source| {
-            runtime_source_matches_known_good_inventory(&self.component, source, inventory)
-        })
-    }
-
-    pub fn replace_known_good_runtime_projection(
-        &self,
-        active: &KnownGoodInventory,
-    ) -> Result<KnownGoodInventory, crate::known_good::KnownGoodInventoryError> {
-        let source = self
-            .source
-            .as_ref()
-            .ok_or(crate::known_good::KnownGoodInventoryError::RuntimeIdentityMismatch)?;
-        let runtime_only = crate::known_good::runtime_inventory_from_source(source)?;
-        crate::known_good::replace_runtime_projection(active, runtime_only, &self.component)
     }
 
     pub async fn revalidate(
@@ -371,7 +342,6 @@ impl ManagedRuntimeCommitReceipt {
         ManagedRuntimeRebuildError::Effect(Box::new(ManagedRuntimeFailureReceipt {
             cache: self.cache,
             component: self.component,
-            source: self.source.map(Box::new),
             cause,
             quarantine: self.quarantine,
             _publication_lease: self._publication_lease,
@@ -988,7 +958,6 @@ async fn publish_staged_managed_runtime_inner(
                 return Err(classify_managed_runtime_publish_failure(
                     &mut staged,
                     failure == ManagedDirectoryMoveFailure::MoveAttempted,
-                    source,
                     JavaRuntimeLookupError::Install(format!(
                         "managed runtime quarantine restoration failed: {failure:?}"
                     )),
@@ -1015,7 +984,6 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
-                source,
                 JavaRuntimeLookupError::Install(format!(
                     "managed runtime quarantine rotation failed: {error}"
                 )),
@@ -1043,7 +1011,6 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started || error == ManagedDirectoryMoveFailure::MoveAttempted,
-                source,
                 JavaRuntimeLookupError::Install(format!(
                     "managed runtime canonical displacement failed: {error:?}"
                 )),
@@ -1096,7 +1063,6 @@ async fn publish_staged_managed_runtime_inner(
                 return Err(classify_managed_runtime_publish_failure(
                     &mut staged,
                     publication_effect_started,
-                    source,
                     JavaRuntimeLookupError::Install(
                         "runtime promotion and canonical restoration both failed".to_string(),
                     ),
@@ -1106,7 +1072,6 @@ async fn publish_staged_managed_runtime_inner(
                 &mut staged,
                 publication_effect_started
                     || promotion_error == ManagedDirectoryMoveFailure::MoveAttempted,
-                source,
                 JavaRuntimeLookupError::Install(format!("{promotion_error:?}")),
             ));
         }
@@ -1131,7 +1096,6 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
-                source,
                 JavaRuntimeLookupError::Install(
                     "published runtime failed verification and could not be isolated".to_string(),
                 ),
@@ -1157,7 +1121,6 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
-                source,
                 JavaRuntimeLookupError::Install(
                     "runtime postcondition and canonical restoration both failed".to_string(),
                 ),
@@ -1166,7 +1129,6 @@ async fn publish_staged_managed_runtime_inner(
         return Err(classify_managed_runtime_publish_failure(
             &mut staged,
             publication_effect_started,
-            source,
             JavaRuntimeLookupError::Install(
                 "published runtime failed exact postcondition verification".to_string(),
             ),
@@ -1186,7 +1148,6 @@ async fn publish_staged_managed_runtime_inner(
         return Err(classify_managed_runtime_publish_failure(
             &mut staged,
             publication_effect_started,
-            source,
             JavaRuntimeLookupError::Install(format!(
                 "managed runtime quarantine finalization failed: {error}"
             )),
@@ -1222,7 +1183,6 @@ fn finalize_runtime_quarantine(
 fn classify_managed_runtime_publish_failure(
     staged: &mut StagedManagedRuntime,
     publication_effect_started: bool,
-    source: RuntimeSourceReceipt,
     cause: JavaRuntimeLookupError,
 ) -> ManagedRuntimeRebuildError {
     if !publication_effect_started {
@@ -1231,7 +1191,6 @@ fn classify_managed_runtime_publish_failure(
     ManagedRuntimeRebuildError::Effect(Box::new(ManagedRuntimeFailureReceipt {
         cache: staged.cache.clone(),
         component: staged.component.clone(),
-        source: Some(Box::new(source)),
         cause,
         quarantine: (staged.replace_existing
             && observe_runtime_child(
@@ -1863,179 +1822,6 @@ fn runtime_manifest_path_prefixes(
         ));
     }
     Some(prefixes)
-}
-
-enum KnownGoodRuntimeExpectation {
-    ExactBytes {
-        kind: KnownGoodArtifactKind,
-        digest: String,
-        size: u64,
-    },
-    File {
-        kind: KnownGoodArtifactKind,
-        digest: String,
-        size: u64,
-    },
-    Directory,
-    Link {
-        kind: KnownGoodArtifactKind,
-        target: String,
-    },
-}
-
-fn runtime_source_matches_known_good_inventory(
-    component: &RuntimeId,
-    source: &RuntimeSourceReceipt,
-    inventory: &KnownGoodInventory,
-) -> bool {
-    if source.component() != component {
-        return false;
-    }
-    let Ok(proof) = component_manifest_proof_bytes(source.manifest()) else {
-        return false;
-    };
-    let mut expected = HashMap::new();
-    if expected
-        .insert(
-            COMPONENT_MANIFEST_PROOF_FILE.to_string(),
-            exact_known_good_expectation(KnownGoodArtifactKind::RuntimeManifestProof, &proof),
-        )
-        .is_some()
-        || expected
-            .insert(
-                ".axial-ready".to_string(),
-                exact_known_good_expectation(KnownGoodArtifactKind::RuntimeReadyMarker, b"ready"),
-            )
-            .is_some()
-    {
-        return false;
-    }
-
-    let plan = plan_runtime_manifest_files(source.manifest().files.clone());
-    if !plan.other_entries.is_empty() || plan.file_entries.is_empty() {
-        return false;
-    }
-    for (path, _) in plan.directory_entries {
-        if expected
-            .insert(path, KnownGoodRuntimeExpectation::Directory)
-            .is_some()
-        {
-            return false;
-        }
-    }
-    let java_path = super::layout::runtime_java_relative_path();
-    let mut saw_java = false;
-    for (path, file) in plan.file_entries {
-        let Some(raw) = file.downloads.and_then(|downloads| downloads.raw) else {
-            return false;
-        };
-        let (Some(size), Some(digest)) = (raw.size, raw.sha1) else {
-            return false;
-        };
-        if !runtime_sha1_is_valid(&digest) {
-            return false;
-        }
-        let kind = if path == java_path {
-            saw_java = true;
-            KnownGoodArtifactKind::RuntimeExecutable
-        } else {
-            KnownGoodArtifactKind::RuntimeFile
-        };
-        if expected
-            .insert(
-                path,
-                KnownGoodRuntimeExpectation::File {
-                    kind,
-                    digest: digest.to_ascii_lowercase(),
-                    size,
-                },
-            )
-            .is_some()
-        {
-            return false;
-        }
-    }
-    for (path, file) in plan.link_entries {
-        let Some(target) = file.target else {
-            return false;
-        };
-        let kind = if path == java_path {
-            saw_java = true;
-            KnownGoodArtifactKind::RuntimeExecutable
-        } else {
-            KnownGoodArtifactKind::RuntimeLink
-        };
-        if expected
-            .insert(path, KnownGoodRuntimeExpectation::Link { kind, target })
-            .is_some()
-        {
-            return false;
-        }
-    }
-    if !saw_java {
-        return false;
-    }
-
-    for entry in inventory.entries() {
-        let KnownGoodRoot::ManagedRuntime {
-            component: inventory_component,
-        } = entry.root()
-        else {
-            continue;
-        };
-        if inventory_component.as_str() != component.as_str() {
-            return false;
-        }
-        let Some(expectation) = expected.remove(entry.path().as_str()) else {
-            return false;
-        };
-        if !known_good_runtime_entry_matches(entry, &expectation) {
-            return false;
-        }
-    }
-    expected.is_empty()
-}
-
-fn exact_known_good_expectation(
-    kind: KnownGoodArtifactKind,
-    bytes: &[u8],
-) -> KnownGoodRuntimeExpectation {
-    let mut hasher = Sha1::new();
-    hasher.update(bytes);
-    KnownGoodRuntimeExpectation::ExactBytes {
-        kind,
-        digest: format!("{:x}", hasher.finalize()),
-        size: bytes.len() as u64,
-    }
-}
-
-fn known_good_runtime_entry_matches(
-    entry: &crate::known_good::KnownGoodEntry,
-    expected: &KnownGoodRuntimeExpectation,
-) -> bool {
-    match (expected, entry.integrity()) {
-        (
-            KnownGoodRuntimeExpectation::ExactBytes { kind, digest, size },
-            KnownGoodIntegrity::ExactBytes {
-                digest: actual_digest,
-                size: actual_size,
-            },
-        ) => entry.kind() == *kind && actual_digest.as_str() == digest && actual_size == size,
-        (
-            KnownGoodRuntimeExpectation::File { kind, digest, size },
-            KnownGoodIntegrity::Sha1 {
-                digest: actual_digest,
-                size: actual_size,
-            },
-        ) => entry.kind() == *kind && actual_digest.as_str() == digest && actual_size == size,
-        (KnownGoodRuntimeExpectation::Directory, KnownGoodIntegrity::Directory) => {
-            entry.kind() == KnownGoodArtifactKind::RuntimeDirectory
-        }
-        (KnownGoodRuntimeExpectation::Link { kind, target }, KnownGoodIntegrity::LinkTarget(_)) => {
-            entry.kind() == *kind && known_good_link_target_matches(entry, Path::new(target))
-        }
-        _ => false,
-    }
 }
 
 fn runtime_sidecar_path(install_root: &Path, suffix: &str) -> PathBuf {

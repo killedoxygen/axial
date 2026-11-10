@@ -2057,7 +2057,6 @@ impl Downloader {
             Some(RetainedAssetsAcquisition {
                 asset_index_source,
                 sources,
-                cache_proofs: _,
             }) => (Some(asset_index_source), sources),
             None => (None, RetainedAssetSourceSet::new()),
         };
@@ -3659,7 +3658,7 @@ async fn publish_managed_projection_sequence(
         .map_err(|_| ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Assets))?
     {
         ManagedComponentLifecycleOutcome::Committed(receipt) => receipt.into_lease(),
-        ManagedComponentLifecycleOutcome::RolledBack(_) => {
+        ManagedComponentLifecycleOutcome::RolledBack => {
             return Ok(ManagedProjectionSequenceOutcome::RolledBack(
                 ManagedKnownGoodComponent::Assets,
             ));
@@ -3700,7 +3699,7 @@ async fn publish_managed_projection_sequence(
         ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Libraries)
     })? {
         ManagedComponentLifecycleOutcome::Committed(receipt) => receipt.into_lease(),
-        ManagedComponentLifecycleOutcome::RolledBack(_) => {
+        ManagedComponentLifecycleOutcome::RolledBack => {
             return Ok(ManagedProjectionSequenceOutcome::RolledBack(
                 ManagedKnownGoodComponent::Libraries,
             ));

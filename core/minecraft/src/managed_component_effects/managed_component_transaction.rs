@@ -69,6 +69,7 @@ pub(crate) enum ComponentSettledOutcome {
     Committed(ManagedRootPublicationLease),
     RolledBack {
         lease: ManagedRootPublicationLease,
+        #[cfg(test)]
         effect: ComponentRollbackEffect,
     },
 }
@@ -3306,6 +3307,7 @@ fn component_settled_outcome(
         ComponentTerminalOutcome::Committed => ComponentSettledOutcome::Committed(lease),
         ComponentTerminalOutcome::RolledBack => ComponentSettledOutcome::RolledBack {
             lease,
+            #[cfg(test)]
             effect: outcome.effect,
         },
     }

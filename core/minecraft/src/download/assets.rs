@@ -1,7 +1,4 @@
-use super::asset_source::{
-    AssetSourcePool, AuthenticatedAssetCacheProof, AuthenticatedAssetCacheProofSet,
-    RetainedAssetSourceSet,
-};
+use super::asset_source::{AssetSourcePool, RetainedAssetSourceSet};
 use super::client::asset_download_concurrency;
 use super::facts::selected_download_source_label;
 use super::libraries::decode_sha1;
@@ -57,7 +54,6 @@ impl Drop for AssetDownloadPipeline {
 pub(super) struct RetainedAssetsAcquisition {
     pub(super) asset_index_source: AuthenticatedSelectedArtifactSource,
     pub(super) sources: RetainedAssetSourceSet,
-    pub(super) cache_proofs: AuthenticatedAssetCacheProofSet,
 }
 
 pub(super) struct PreparedAssetDownloadPipeline {
@@ -310,15 +306,7 @@ where
                 .map_err(asset_cache_error)?
                 == Some(job.expected_sha1)
             {
-                return Ok::<_, DownloadError>((
-                    job.expected_size,
-                    None,
-                    Some(AuthenticatedAssetCacheProof::new(
-                        job.relative_path,
-                        job.expected_size,
-                        job.expected_sha1,
-                    )),
-                ));
+                return Ok::<_, DownloadError>((job.expected_size, None));
             }
             let permit = source_pool.reserve(job.expected_size).await?;
             let url = format!("{asset_object_base_url}/{}/{}", &job.hash[..2], job.hash);
@@ -345,20 +333,16 @@ where
             let retained = source_pool
                 .retain_object(&source, job.relative_path, permit)
                 .await?;
-            Ok((job.expected_size, Some(retained), None))
+            Ok((job.expected_size, Some(retained)))
         }
     }))
     .buffer_unordered(asset_download_concurrency());
     let mut sources = RetainedAssetSourceSet::new();
     sources.insert(index_source)?;
-    let mut cache_proofs = AuthenticatedAssetCacheProofSet::default();
     while let Some(result) = asset_downloads.next().await {
-        let (bytes, source, cache_proof) = result?;
+        let (bytes, source) = result?;
         if let Some(source) = source {
             sources.insert(source)?;
-        }
-        if let Some(cache_proof) = cache_proof {
-            cache_proofs.insert(cache_proof)?;
         }
         plan.add_done(bytes);
         completed_jobs += 1;
@@ -370,7 +354,6 @@ where
     Ok(RetainedAssetsAcquisition {
         asset_index_source,
         sources,
-        cache_proofs,
     })
 }
 

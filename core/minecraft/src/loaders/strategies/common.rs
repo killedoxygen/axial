@@ -516,7 +516,7 @@ async fn reconstruct_installer_authority_with_downloader(
             .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
         let input = result
             .continuation
-            .into_observed_reconstruction_receipt_input(result.outputs, false)
+            .into_observed_reconstruction_receipt_input(result.outputs)
             .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
         (base, base_client_source, input)
     } else {
@@ -529,7 +529,7 @@ async fn reconstruct_installer_authority_with_downloader(
             ));
         };
         let input = continuation
-            .into_reconstruction_receipt_input(false)
+            .into_reconstruction_receipt_input()
             .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
         let base = downloader
             .reconstruct_version_with_client_source(&plan.record.minecraft_version, context)
