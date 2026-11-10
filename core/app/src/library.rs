@@ -12,10 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axial_fs::{
-    AbsoluteDirectoryOutsideRootAdmission, AdmittedRootSession,
-    AdmittedRootSessionAcquireObligation, AdmittedRootSessionAcquireOutcome, Directory,
-    RootRevokeOutcome, RootSession, RootSessionAcquireObligation, RootSessionAcquireOutcome,
-    RootSessionError,
+    AbsoluteDirectoryOutsideRootAdmission, Directory, RootRevokeOutcome, RootSession,
+    RootSessionAcquireObligation, RootSessionAcquireOutcome, RootSessionError,
 };
 use axial_minecraft::managed_path::{ManagedLibraryOperation, ManagedLibraryRoot};
 use serde::Deserialize;
@@ -193,7 +191,7 @@ struct State {
     revision: u64,
     current: Option<Arc<Generation>>,
     retiring: Vec<Arc<Generation>>,
-    unresolved_admission: Option<AdmittedRootSessionAcquireObligation>,
+    unresolved_admission: Option<RootSessionAcquireObligation>,
 }
 
 struct Generation {
@@ -213,7 +211,7 @@ enum GenerationRoot {
 }
 
 enum ExternalState {
-    Live(AdmittedRootSession),
+    Live(RootSession),
     Retiring(RootRevokeOutcome),
     Retired,
 }
@@ -1415,11 +1413,11 @@ impl LibrarySwitch {
             }
         };
         let session = match admission.acquire_root_session()? {
-            AdmittedRootSessionAcquireOutcome::Acquired(session) => session,
-            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            RootSessionAcquireOutcome::NoEffect(error) => {
                 return Err(LibraryError::Root(error));
             }
-            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
                 lock(&self.owner.inner.state).unresolved_admission = Some(obligation);
                 return Err(LibraryError::AdmissionUnresolved);
             }

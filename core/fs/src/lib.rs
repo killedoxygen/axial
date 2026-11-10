@@ -2099,140 +2099,6 @@ pub enum AbsoluteDirectoryOutsideRootAdmission {
     Unavailable(io::Error),
 }
 
-#[must_use = "admitted root acquisition effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum AdmittedRootSessionAcquireOutcome {
-    Acquired(AdmittedRootSession),
-    NoEffect(RootSessionError),
-    AppliedUnverified(AdmittedRootSessionAcquireObligation),
-}
-
-#[must_use = "admitted root acquisition obligation must be reconciled, cleaned up, or preserved"]
-pub struct AdmittedRootSessionAcquireObligation {
-    admission: Arc<AdmittedAbsoluteDirectoryInner>,
-    obligation: Option<RootSessionAcquireObligation>,
-}
-
-pub struct AdmittedRootSession {
-    admission: Arc<AdmittedAbsoluteDirectoryInner>,
-    session: RootSession,
-}
-
-impl_redacted_debug!(AdmittedRootSessionAcquireObligation);
-impl_redacted_debug!(AdmittedRootSession);
-
-impl AdmittedRootSessionAcquireObligation {
-    pub fn error(&self) -> &RootSessionError {
-        self.obligation
-            .as_ref()
-            .expect("admitted root acquisition retains its obligation")
-            .error()
-    }
-
-    pub fn reconcile(mut self) -> AdmittedRootSessionAcquireOutcome {
-        let obligation = self
-            .obligation
-            .take()
-            .expect("admitted root acquisition retains its obligation");
-        match obligation.reconcile() {
-            RootSessionAcquireOutcome::Acquired(session) => {
-                AdmittedRootSessionAcquireOutcome::Acquired(AdmittedRootSession {
-                    admission: Arc::clone(&self.admission),
-                    session,
-                })
-            }
-            RootSessionAcquireOutcome::NoEffect(error) => {
-                AdmittedRootSessionAcquireOutcome::NoEffect(error)
-            }
-            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
-                self.obligation = Some(obligation);
-                AdmittedRootSessionAcquireOutcome::AppliedUnverified(self)
-            }
-        }
-    }
-
-    pub fn cleanup(mut self) -> Result<(), Self> {
-        let obligation = self
-            .obligation
-            .take()
-            .expect("admitted root acquisition retains its obligation");
-        match obligation.cleanup() {
-            Ok(()) => Ok(()),
-            Err(obligation) => {
-                self.obligation = Some(obligation);
-                Err(self)
-            }
-        }
-    }
-
-    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
-        let obligation = self
-            .obligation
-            .take()
-            .expect("admitted root acquisition retains its obligation");
-        match obligation.acknowledge_preserved() {
-            Ok(()) => Ok(()),
-            Err(obligation) => {
-                self.obligation = Some(obligation);
-                Err(self)
-            }
-        }
-    }
-}
-
-impl Drop for AdmittedRootSessionAcquireObligation {
-    fn drop(&mut self) {
-        if self.obligation.is_some() {
-            std::process::abort();
-        }
-    }
-}
-
-impl AdmittedRootSession {
-    /// Close admission and drain this exact root before releasing its session.
-    pub fn revoke(self) -> RootRevokeOutcome {
-        self.session.revoke()
-    }
-
-    pub fn identity(&self) -> DirectoryIdentity {
-        self.session.identity()
-    }
-
-    pub fn root(&self) -> io::Result<Directory> {
-        self.validate_retained_authority()?;
-        let root = self.session.root()?;
-        self.validate_retained_authority()?;
-        Ok(root)
-    }
-
-    pub fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
-        self.validate_retained_authority()?;
-        let directory = self.session.admit_absolute_directory(path)?;
-        self.validate_retained_authority()?;
-        Ok(directory)
-    }
-
-    pub fn validate_retained_authority(&self) -> io::Result<()> {
-        self.session.validate_retained_authority()?;
-        let admitted_identity =
-            platform::directory_identity(self.admission.directory.inner.handle())?;
-        if admitted_identity != self.admission.directory.inner.identity.physical
-            || self
-                .admission
-                .directory
-                .inner
-                .identity
-                .filesystem_identity()
-                != self.session.identity().filesystem_identity()
-        {
-            return Err(identity_changed(
-                "admitted root session changed physical identity",
-            ));
-        }
-        Ok(())
-    }
-}
-
 struct AcquiredRoot {
     lease: platform::LeaseHandle,
     replay: Option<recovery_runtime::RecoveryReplay>,
@@ -2245,6 +2111,7 @@ pub struct RootSessionAcquireObligation {
     lease: Option<platform::LeaseAcquisitionObligation>,
     acquired: Option<Box<AcquiredRoot>>,
     process_image: Option<platform::ProcessImageAncestry>,
+    admission: Option<Arc<AdmittedAbsoluteDirectoryInner>>,
 }
 
 impl_redacted_debug!(RootSessionAcquireObligation);
@@ -2255,6 +2122,21 @@ impl RootSessionAcquireObligation {
     }
 
     pub fn reconcile(mut self) -> RootSessionAcquireOutcome {
+        let admission = self.admission.take();
+        match self.reconcile_construction() {
+            RootSessionAcquireOutcome::Acquired(mut session) => {
+                session.admission = admission;
+                RootSessionAcquireOutcome::Acquired(session)
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(mut obligation) => {
+                obligation.admission = admission;
+                RootSessionAcquireOutcome::AppliedUnverified(obligation)
+            }
+            outcome @ RootSessionAcquireOutcome::NoEffect(_) => outcome,
+        }
+    }
+
+    fn reconcile_construction(mut self) -> RootSessionAcquireOutcome {
         let construction = self
             .construction
             .take()
@@ -7761,7 +7643,7 @@ impl AdmittedAbsoluteDirectory {
         Ok(self.inner.directory.identity()?.filesystem_identity())
     }
 
-    pub fn acquire_root_session(&self) -> io::Result<AdmittedRootSessionAcquireOutcome> {
+    pub fn acquire_root_session(&self) -> io::Result<RootSessionAcquireOutcome> {
         self.revalidate()?;
         let ancestry = self
             .inner
@@ -7771,23 +7653,15 @@ impl AdmittedAbsoluteDirectory {
             .ok_or_else(|| io::Error::other("absolute directory admission lost its ancestry"))?;
         Ok(
             match RootSession::acquire_absolute_directory_guard(ancestry) {
-                RootSessionAcquireOutcome::Acquired(session) => {
-                    AdmittedRootSessionAcquireOutcome::Acquired(AdmittedRootSession {
-                        admission: Arc::clone(&self.inner),
-                        session,
-                    })
+                RootSessionAcquireOutcome::Acquired(mut session) => {
+                    session.admission = Some(Arc::clone(&self.inner));
+                    RootSessionAcquireOutcome::Acquired(session)
                 }
-                RootSessionAcquireOutcome::NoEffect(error) => {
-                    AdmittedRootSessionAcquireOutcome::NoEffect(error)
+                RootSessionAcquireOutcome::AppliedUnverified(mut obligation) => {
+                    obligation.admission = Some(Arc::clone(&self.inner));
+                    RootSessionAcquireOutcome::AppliedUnverified(obligation)
                 }
-                RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
-                    AdmittedRootSessionAcquireOutcome::AppliedUnverified(
-                        AdmittedRootSessionAcquireObligation {
-                            admission: Arc::clone(&self.inner),
-                            obligation: Some(obligation),
-                        },
-                    )
-                }
+                outcome @ RootSessionAcquireOutcome::NoEffect(_) => outcome,
             },
         )
     }
@@ -13200,6 +13074,9 @@ impl Write for StagedWriter<'_> {
 pub struct RootSession {
     root_identity: DirectoryIdentity,
     authority: Arc<CapabilityAuthority>,
+    /// The absolute directory admission this root was acquired through, revalidated
+    /// around every root and directory admission.
+    admission: Option<Arc<AdmittedAbsoluteDirectoryInner>>,
 }
 
 struct SessionDrainRecoveryState {
@@ -13458,6 +13335,7 @@ impl RootSession {
                             lease: None,
                             acquired: None,
                             process_image: Some(process_image),
+                            admission: None,
                         })
                     }
                     None => RootSessionAcquireOutcome::NoEffect(RootSessionError::Open(error)),
@@ -13489,17 +13367,32 @@ impl RootSession {
     }
 
     pub fn root(&self) -> io::Result<Directory> {
+        self.validate_admission()?;
         let operation = self.authority.enter()?;
-        Ok(Directory::from_handle(
+        let root = Directory::from_handle(
             platform::clone_root(&self.authority.root)?,
             self.root_identity,
             Arc::downgrade(&self.authority),
             None,
-        ))
-        .and_then(|root| {
-            root.validate(&operation)?;
-            Ok(root)
-        })
+        );
+        root.validate(&operation)?;
+        self.validate_admission()?;
+        Ok(root)
+    }
+
+    fn validate_admission(&self) -> io::Result<()> {
+        let Some(admission) = &self.admission else {
+            return Ok(());
+        };
+        let admitted = &admission.directory.inner.identity;
+        if platform::directory_identity(admission.directory.inner.handle())? != admitted.physical
+            || admitted.filesystem_identity() != self.root_identity.filesystem_identity()
+        {
+            return Err(identity_changed(
+                "admitted root session changed physical identity",
+            ));
+        }
+        Ok(())
     }
 
     pub fn admit_absolute_directory_authority(
@@ -13547,11 +13440,13 @@ impl RootSession {
                 "external directory is not absolute",
             ));
         }
+        self.validate_admission()?;
         let operation = self.authority.enter()?;
         let ancestry: platform::AbsoluteDirectoryGuard =
             platform::open_absolute_directory_guard(path)?;
         let directory = Directory::from_absolute_guard(ancestry, &self.authority);
         directory.validate(&operation)?;
+        self.validate_admission()?;
         Ok(directory)
     }
 
@@ -13564,7 +13459,8 @@ impl RootSession {
 
     pub fn validate_retained_authority(&self) -> io::Result<()> {
         platform::validate_lease(&self.authority.lease)?;
-        platform::validate_root_handle(&self.authority.root)
+        platform::validate_root_handle(&self.authority.root)?;
+        self.validate_admission()
     }
 
     pub fn revoke(self) -> RootRevokeOutcome {
@@ -13615,6 +13511,7 @@ fn try_acquire_lease_and_finish_root(
                     lease: None,
                     acquired: None,
                     process_image: Some(process_image),
+                    admission: None,
                 })
             } else {
                 RootSessionAcquireOutcome::NoEffect(RootSessionError::Open(error))
@@ -13630,6 +13527,7 @@ fn try_acquire_lease_and_finish_root(
                 lease: None,
                 acquired: None,
                 process_image: Some(process_image),
+                admission: None,
             });
         }
     };
@@ -13646,6 +13544,7 @@ fn try_acquire_lease_and_finish_root(
                     lease: None,
                     acquired: None,
                     process_image: Some(process_image),
+                    admission: None,
                 })
             } else {
                 RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
@@ -13659,6 +13558,7 @@ fn try_acquire_lease_and_finish_root(
                     lease: None,
                     acquired: None,
                     process_image: Some(process_image),
+                    admission: None,
                 })
             } else {
                 RootSessionAcquireOutcome::NoEffect(RootSessionError::Lease(error))
@@ -13673,6 +13573,7 @@ fn try_acquire_lease_and_finish_root(
                 lease: Some(lease),
                 acquired: None,
                 process_image: Some(process_image),
+                admission: None,
             });
         }
     };
@@ -13697,6 +13598,7 @@ fn finish_root_session(
                     replay: None,
                 })),
                 process_image: Some(process_image),
+                admission: None,
             });
         }
     };
@@ -13709,6 +13611,7 @@ fn finish_root_session(
                 lease: None,
                 acquired: Some(Box::new(AcquiredRoot { lease, replay })),
                 process_image: Some(process_image),
+                admission: None,
             });
         }
     };
@@ -13728,6 +13631,7 @@ fn finish_root_session_with_recovery(
     let mut session_nonce = [0_u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut session_nonce);
     RootSessionAcquireOutcome::Acquired(RootSession {
+        admission: None,
         root_identity: DirectoryIdentity {
             session: session_nonce,
             physical: identity,
@@ -16994,11 +16898,11 @@ mod tests {
             .acquire_root_session()
             .expect("start admitted root acquisition")
         {
-            AdmittedRootSessionAcquireOutcome::Acquired(session) => session,
-            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            RootSessionAcquireOutcome::NoEffect(error) => {
                 panic!("admitted root acquisition failed: {error}")
             }
-            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
                 let error = obligation.error().to_string();
                 assert!(
                     obligation.cleanup().is_ok(),
@@ -21597,11 +21501,11 @@ mod tests {
             .admit_absolute_directory_authority(&library)
             .expect("library admission");
         let detached = match admitted.acquire_root_session().expect("acquire library") {
-            AdmittedRootSessionAcquireOutcome::Acquired(session) => session,
-            AdmittedRootSessionAcquireOutcome::NoEffect(error) => {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            RootSessionAcquireOutcome::NoEffect(error) => {
                 panic!("library acquisition: {error}")
             }
-            AdmittedRootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
                 let error = obligation.error().to_string();
                 assert!(obligation.cleanup().is_ok());
                 panic!("unverified library acquisition: {error}");
