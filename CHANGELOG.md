@@ -8,6 +8,9 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+### Look
+- New logo: an axolotl, in the app, the icons and the download page; it takes the accent color you pick
+
 ## [0.4.0-rc.5] - 2026-11-02
 
 ### Distribution

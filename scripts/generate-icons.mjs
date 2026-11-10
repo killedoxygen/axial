@@ -55,7 +55,7 @@ const exactBrandKeys = Object.freeze({
   ],
   background: ["fill", "height", "radius", "width", "x", "y"],
   colors: ["development", "interface", "release"],
-  paths: ["bottom_left", "ribbon", "top_right"],
+  paths: ["face", "left_gills", "right_gills"],
 });
 
 export class AssetGenerationError extends Error {
@@ -123,7 +123,7 @@ export function parseBrandManifest(source) {
   exactKeys(brand.background, exactBrandKeys.background, "background");
   exactKeys(brand.colors, exactBrandKeys.colors, "colors");
   exactKeys(brand.paths, exactBrandKeys.paths, "paths");
-  if (brand.schema_version !== 1)
+  if (brand.schema_version !== 2)
     fail("invalid_brand_manifest", "unsupported schema version");
   if (
     !Number.isSafeInteger(brand.design_revision) ||
@@ -173,18 +173,21 @@ function escapeAttribute(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
 }
 
+// The plate, when drawn, sets the icon bounds so the mark keeps its margin inside it.
 export function renderBrandSvg(brand, color, includeBackground) {
-  const [x, y, width, height] = brand.view_box;
   const background = brand.background;
+  const [x, y, width, height] = includeBackground
+    ? [background.x, background.y, background.width, background.height]
+    : brand.view_box;
   const nodes = includeBackground
     ? [
-        `<rect x="${background.x}" y="${background.y}" width="${background.width}" height="${background.height}" rx="${background.radius}" fill="${background.fill}"/>`,
+        `<rect x="${x}" y="${y}" width="${width}" height="${height}" rx="${background.radius}" fill="${background.fill}"/>`,
       ]
     : [];
   nodes.push(
-    `<path fill="${color}" fill-rule="evenodd" d="${escapeAttribute(brand.paths.ribbon)}"/>`,
-    `<path fill="${color}" d="${escapeAttribute(brand.paths.top_right)}"/>`,
-    `<path fill="${color}" d="${escapeAttribute(brand.paths.bottom_left)}"/>`,
+    `<path fill="${color}" fill-rule="evenodd" d="${escapeAttribute(brand.paths.face)}"/>`,
+    `<path fill="${color}" d="${escapeAttribute(brand.paths.left_gills)}"/>`,
+    `<path fill="${color}" d="${escapeAttribute(brand.paths.right_gills)}"/>`,
   );
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${x} ${y} ${width} ${height}" width="${width}" height="${height}">${nodes.join("")}</svg>\n`;
 }

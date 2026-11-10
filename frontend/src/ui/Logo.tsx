@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 
 import brandMark from '../../../assets/brand-mark.json';
 
-export type LogoMotion = 'none' | 'loose' | 'assembly';
+export type LogoMotion = 'none' | 'assembly';
 
 const viewBox = brandMark.view_box.join(' ');
 
@@ -35,14 +35,14 @@ export function Logo({
         ...style,
       }}
     >
-      <g class="cp-mark-ribbon">
-        <path fill={brandMark.colors.interface} fillRule="evenodd" d={brandMark.paths.ribbon} />
+      <g class="cp-mark-left">
+        <path fill={brandMark.colors.interface} d={brandMark.paths.left_gills} />
       </g>
-      <g class="cp-mark-tr">
-        <path fill={brandMark.colors.interface} d={brandMark.paths.top_right} />
+      <g class="cp-mark-right">
+        <path fill={brandMark.colors.interface} d={brandMark.paths.right_gills} />
       </g>
-      <g class="cp-mark-bl">
-        <path fill={brandMark.colors.interface} d={brandMark.paths.bottom_left} />
+      <g class="cp-mark-face">
+        <path fill={brandMark.colors.interface} fillRule="evenodd" d={brandMark.paths.face} />
       </g>
     </svg>
   );

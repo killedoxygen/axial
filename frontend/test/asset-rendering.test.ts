@@ -79,10 +79,10 @@ test('Logo projects every path and viewBox directly from the sole brand manifest
   });
   assert.deepEqual(
     paths.map((path) => (path.props as LooseProps).d),
-    [brandMark.paths.ribbon, brandMark.paths.top_right, brandMark.paths.bottom_left],
+    [brandMark.paths.left_gills, brandMark.paths.right_gills, brandMark.paths.face],
   );
   assert.ok(paths.every((path) => (path.props as LooseProps).fill === brandMark.colors.interface));
-  assert.equal((paths[0].props as LooseProps).fillRule, 'evenodd');
+  assert.equal((paths[2].props as LooseProps).fillRule, 'evenodd');
 });
 
 test('all LoaderKey values retain their original assets and alignment in create and instance glyphs', async () => {

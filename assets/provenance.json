@@ -6,7 +6,7 @@
       "source": {
         "kind": "repository-owned",
         "locator": "repository://assets/brand-mark.json",
-        "revision": "brand-mark-v1"
+        "revision": "brand-mark-v2"
       },
       "rights": {
         "basis": "repository-owned",
@@ -22,7 +22,7 @@
         {
           "path": "apps/desktop/icons/dev/icon.ico",
           "mode": "100644",
-          "sha256": "1277ed71cf8017ab5ad0f0ad1cb87da4433564e93bf19b978fe9e8aa5d219254",
+          "sha256": "fc2972150eeb011541811e5caada03e053da0ffb802ad91e738b7883231a5041",
           "generator": "tauri-cli-brand-mark-v1",
           "locator": null,
           "upstream_sha256": null
@@ -30,7 +30,7 @@
         {
           "path": "apps/desktop/icons/dev/icon.png",
           "mode": "100644",
-          "sha256": "7be3c0f124ba0b352b53aca7b19fb6f12a6322cc56c1f9f0f1daef708a94954e",
+          "sha256": "b1543f198ecae903eb8c8ced3dd6afbe1d9d831d72d108d9598fcad07d21b643",
           "generator": "tauri-cli-brand-mark-v1",
           "locator": null,
           "upstream_sha256": null
@@ -38,7 +38,7 @@
         {
           "path": "apps/desktop/icons/icon.ico",
           "mode": "100644",
-          "sha256": "4237c507be79f18cef672f4ed9adde22ff5513cb36ef36b264a9ccdc61f9a864",
+          "sha256": "226aaf40828689a86c6de35151f2ce3635f4b2fa8b35fa0535d22919b27f1824",
           "generator": "tauri-cli-brand-mark-v1",
           "locator": null,
           "upstream_sha256": null
@@ -46,7 +46,7 @@
         {
           "path": "apps/desktop/icons/icon.png",
           "mode": "100644",
-          "sha256": "88c17d7e98353f93809c2e0c68649823945b521f3cec25f46f9950833221ed7f",
+          "sha256": "0b51423e6ceff7c484ed4b1ec2b61a9a51ae129a27f6ad60f493c444b05342ad",
           "generator": "tauri-cli-brand-mark-v1",
           "locator": null,
           "upstream_sha256": null
@@ -54,7 +54,7 @@
         {
           "path": "assets/brand-mark.json",
           "mode": "100644",
-          "sha256": "36b39630e3be2d12c2675882653c0187ad2bc55f052309e70f23577c130a7356",
+          "sha256": "ce0f802cae93a1ed6cc1f3602672a8acaa3b44bc949eac83a461225cddd401db",
           "generator": null,
           "locator": null,
           "upstream_sha256": null
@@ -62,7 +62,7 @@
         {
           "path": "frontend/static/favicon.png",
           "mode": "100644",
-          "sha256": "94c392eb05af8b5c523611b1d928cf2f7f09746789cba540c6d2c571056c0af1",
+          "sha256": "e0691f8cc2255d9e92da482f4b1abb468bb89b46cdbcdfbaf79d690489368d52",
           "generator": "tauri-cli-brand-mark-v1",
           "locator": null,
           "upstream_sha256": null
@@ -74,7 +74,7 @@
       "source": {
         "kind": "repository-owned",
         "locator": "repository://apps/desktop/icons/macos",
-        "revision": "approved-icns-v1"
+        "revision": "approved-icns-v2"
       },
       "rights": {
         "basis": "repository-owned",
@@ -90,7 +90,7 @@
         {
           "path": "apps/desktop/icons/dev/macos/icon.icns",
           "mode": "100644",
-          "sha256": "22b617a8456b2e66cdd86534bfff7e0397e55b99628ff608554b5325036e8ded",
+          "sha256": "0d050cb26ee61419213a6ed110fca7c03c5bc7aa5a768c77c0d13798414061f9",
           "generator": null,
           "locator": null,
           "upstream_sha256": null
@@ -98,7 +98,7 @@
         {
           "path": "apps/desktop/icons/macos/icon.icns",
           "mode": "100644",
-          "sha256": "d7ad79218775f390c90d4568c8ad361cf619a0bd39e4e6b8ed0dc309303ab081",
+          "sha256": "a7b9515f578419ec482c1db67875d5382d1ee1c4914ccad75dc9cc34b4efd164",
           "generator": null,
           "locator": null,
           "upstream_sha256": null

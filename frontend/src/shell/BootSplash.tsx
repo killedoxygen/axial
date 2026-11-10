@@ -19,18 +19,18 @@ function progressSegment(progress: number, start: number, end: number): number {
   return clamp01((progress - start) / (end - start));
 }
 
+// The face stays opaque so the gill roots beneath it never show through while they fade in.
 function bootLogoStyle(progress: number): BootLogoStyle {
-  const assemblyRibbon = progressSegment(progress, 0, 35);
-  const assemblyTr = progressSegment(progress, 14, 58);
-  const assemblyBl = progressSegment(progress, 24, 72);
+  const face = progressSegment(progress, 0, 35);
+  const left = progressSegment(progress, 14, 58);
+  const right = progressSegment(progress, 24, 72);
 
   return {
-    '--cp-mark-assembly-ribbon-opacity': String(assemblyRibbon),
-    '--cp-mark-assembly-ribbon-scale': String(0.9 + assemblyRibbon * 0.1),
-    '--cp-mark-assembly-tr-opacity': String(assemblyTr),
-    '--cp-mark-assembly-tr-scale': String(0.72 + assemblyTr * 0.28),
-    '--cp-mark-assembly-bl-opacity': String(assemblyBl),
-    '--cp-mark-assembly-bl-scale': String(0.72 + assemblyBl * 0.28),
+    '--cp-mark-assembly-face-scale': String(0.9 + face * 0.1),
+    '--cp-mark-assembly-left-opacity': String(left),
+    '--cp-mark-assembly-left-scale': String(0.8 + left * 0.2),
+    '--cp-mark-assembly-right-opacity': String(right),
+    '--cp-mark-assembly-right-scale': String(0.8 + right * 0.2),
   };
 }
 
