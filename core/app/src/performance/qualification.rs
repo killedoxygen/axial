@@ -11,7 +11,6 @@ use super::proofs::{
 use axial_minecraft::loaders::{LoaderComponentId, api::decode_installed_version_id};
 use serde_json::{Value, json};
 
-pub const FAMILY_C_QUALIFICATION_PROOF_SCAN_LIMIT: usize = 100;
 pub const FAMILY_C_QUALIFICATION_SCHEMA: &str =
     "axial.launch.benchmark.qualification.family_c_1_12_2";
 pub const FAMILY_C_QUALIFICATION_SCHEMA_VERSION: u32 = 1;

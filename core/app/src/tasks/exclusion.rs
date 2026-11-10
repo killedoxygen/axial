@@ -156,7 +156,6 @@ impl Exclusions {
             reservation: Arc::new(Reservation {
                 held: Arc::clone(&self.held),
                 keys,
-                access,
             }),
         })
     }
@@ -169,7 +168,6 @@ fn valid_identity(value: &str) -> bool {
 struct Reservation {
     held: Arc<Mutex<BTreeMap<Key, Held>>>,
     keys: BTreeSet<Key>,
-    access: ArtifactAccess,
 }
 
 impl Drop for Reservation {
@@ -196,35 +194,6 @@ pub struct ExclusionLease {
 impl ExclusionLease {
     pub fn belongs_to(&self, exclusions: &Exclusions) -> bool {
         Arc::ptr_eq(&self.reservation.held, &exclusions.held)
-    }
-
-    pub fn covers_target(&self, target: &str) -> bool {
-        self.reservation
-            .keys
-            .contains(&Key::Target(target.to_owned()))
-    }
-
-    /// Covers artifact use; this alone does not grant mutation authority.
-    pub fn covers_artifact(&self, artifact: &ArtifactKey) -> bool {
-        self.reservation
-            .keys
-            .contains(&Key::Artifact(artifact.clone()))
-    }
-
-    pub fn covers_artifact_write(&self, artifact: &ArtifactKey) -> bool {
-        matches!(self.reservation.access, ArtifactAccess::Write) && self.covers_artifact(artifact)
-    }
-
-    pub fn target_count(&self) -> usize {
-        self.reservation
-            .keys
-            .iter()
-            .filter(|key| matches!(key, Key::Target(_)))
-            .count()
-    }
-
-    pub fn artifact_count(&self) -> usize {
-        self.reservation.keys.len() - self.target_count()
     }
 }
 
@@ -276,8 +245,6 @@ mod tests {
         let lease = exclusions
             .try_acquire(["b", "a", "a"], [ArtifactKey::new("root", "runtime")])
             .unwrap();
-        assert_eq!(lease.target_count(), 2);
-        assert_eq!(lease.artifact_count(), 1);
         let receipt = lease.clone();
         drop(lease);
         assert!(matches!(
@@ -303,20 +270,16 @@ mod tests {
     }
 
     #[test]
-    fn coverage_rejects_mismatched_target_root_artifact_and_owner() {
+    fn lease_belongs_only_to_its_owner() {
         let exclusions = Exclusions::new();
-        let runtime = ArtifactKey::new("physical-root", "java-21");
         let lease = exclusions
-            .try_acquire(["instance-a"], [runtime.clone()])
+            .try_acquire(
+                ["instance-a"],
+                [ArtifactKey::new("physical-root", "java-21")],
+            )
             .unwrap();
         assert!(lease.belongs_to(&exclusions.clone()));
         assert!(!lease.belongs_to(&Exclusions::new()));
-        assert!(lease.covers_target("instance-a"));
-        assert!(!lease.covers_target("instance-b"));
-        assert!(lease.covers_artifact(&runtime));
-        assert!(lease.covers_artifact_write(&runtime));
-        assert!(!lease.covers_artifact(&ArtifactKey::new("other-root", "java-21")));
-        assert!(!lease.covers_artifact(&ArtifactKey::new("physical-root", "java-17")));
     }
 
     #[test]
@@ -329,8 +292,6 @@ mod tests {
         let second = exclusions
             .try_acquire_read_artifacts(["instance-b"], [artifacts.clone()])
             .unwrap();
-        assert!(first.covers_artifact(&artifacts));
-        assert!(!first.covers_artifact_write(&artifacts));
         assert!(matches!(
             exclusions.try_acquire_read_artifacts(["instance-a"], []),
             Err(ExclusionError::Busy)
@@ -395,7 +356,6 @@ mod tests {
         let first = exclusions
             .try_acquire_read_artifacts(["instance-a"], [artifacts.clone(), artifacts.clone()])
             .unwrap();
-        assert_eq!(first.artifact_count(), 1);
         let receipt = first.clone();
         let last_receipt = receipt.clone();
         let second = exclusions

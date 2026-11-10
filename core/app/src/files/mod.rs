@@ -13,9 +13,7 @@ pub(crate) use portable::PortableFileName;
 pub(crate) use portable::{PortableFileName as PortableName, PortableRelativePath as ScopedPath};
 
 use crate::library::GenerationPin;
-use axial_fs::{
-    Directory, DirectoryIdentity, DirectoryRevision, FileCapability, FileRevision, LeafName,
-};
+use axial_fs::{Directory, DirectoryRevision, FileCapability, FileRevision, LeafName};
 use std::io;
 
 /// A native result and the physical library generation needed to settle it.
@@ -37,13 +35,6 @@ impl<T> Retained<T> {
 
     pub(crate) fn value(&self) -> &T {
         &self.value
-    }
-    pub(crate) fn pin(&self) -> &GenerationPin {
-        &self.pin
-    }
-
-    pub(crate) fn map<U>(self, operation: impl FnOnce(T) -> U) -> Retained<U> {
-        Retained::new(operation(self.value), self.pin)
     }
 }
 
@@ -92,9 +83,6 @@ impl ScopedDirectory {
             .project_from(&root.directory, &self.pin.read_projection()?)
     }
 
-    pub(crate) fn identity(&self) -> io::Result<DirectoryIdentity> {
-        self.directory.identity()
-    }
     pub(crate) fn revision(&self) -> io::Result<DirectoryRevision> {
         self.directory.revision()
     }
@@ -245,9 +233,6 @@ impl ScopedFile {
     pub(crate) fn capability(&self) -> &FileCapability {
         &self.file
     }
-    pub(crate) fn pin(&self) -> &GenerationPin {
-        &self.pin
-    }
     pub(crate) fn revision(&self) -> io::Result<FileRevision> {
         self.file.revision()
     }
@@ -351,27 +336,6 @@ impl StagedFile {
         Ok(self.written)
     }
 
-    /// Open exactly one retained writer for a streaming producer. Its caller
-    /// owns byte bounds and calls finish before sealing the stage.
-    pub(crate) fn writer(&mut self) -> io::Result<axial_fs::StagedWriter<'_>> {
-        if self.started {
-            return Err(invalid("stage payload is already written"));
-        }
-        self.started = true;
-        self.stage.writer()
-    }
-
-    pub(crate) fn write_bounded(&mut self, bytes: &[u8], limit: u64) -> io::Result<()> {
-        if self
-            .written
-            .checked_add(bytes.len() as u64)
-            .is_none_or(|n| n > limit)
-        {
-            return Err(invalid("stage exceeds its byte bound"));
-        }
-        self.write_all(bytes)
-    }
-
     pub(crate) fn seal(self) -> Result<SealedFile, StageSealFailure> {
         match self.stage.seal() {
             Ok(stage) => Ok(SealedFile {
@@ -404,9 +368,6 @@ pub(crate) struct StageSealFailure {
 }
 
 impl StageSealFailure {
-    pub(crate) fn error(&self) -> &io::Error {
-        self.error.error()
-    }
     pub(crate) fn into_staged(self) -> StagedFile {
         StagedFile {
             stage: self.error.into_staged(),
@@ -436,9 +397,6 @@ impl SealedFile {
             ),
             self.parent.pin,
         )
-    }
-    pub(crate) fn discard(self) -> Retained<axial_fs::StageDiscardOutcome> {
-        Retained::new(self.stage.discard(), self.parent.pin)
     }
 }
 

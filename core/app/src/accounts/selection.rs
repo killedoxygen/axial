@@ -121,9 +121,6 @@ impl CapturedAccount {
     pub fn credential_revision(&self) -> u64 {
         self.record.credential_revision
     }
-    pub fn is_selected(&self) -> bool {
-        self.selected_account_id.as_ref() == Some(&self.record.account_id)
-    }
 
     pub(super) fn validate(&self, snapshot: &AccountSnapshot) -> Result<(), AccountError> {
         if self.selection_revision != snapshot.selection_revision

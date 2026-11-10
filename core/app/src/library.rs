@@ -775,7 +775,7 @@ impl GenerationPin {
         self.generation.directory()
     }
 
-    pub fn files(&self) -> io::Result<ScopedDirectory> {
+    pub(crate) fn files(&self) -> io::Result<ScopedDirectory> {
         ScopedDirectory::from_admitted(self.generation.directory()?, self.clone())
     }
 
@@ -900,7 +900,7 @@ impl fmt::Debug for LibraryLifecycle {
 
 impl LibraryLifecycle {
     /// Open an isolated application root. Production composition should use
-    /// `from_root_session` with the identity loaded from library metadata.
+    /// `open_with_id` with the identity loaded from library metadata.
     pub fn open(path: &Path) -> LibraryOpenOutcome {
         Self::open_with_id(path, LibraryId::new())
     }
@@ -915,10 +915,6 @@ impl LibraryLifecycle {
                 LibraryOpenOutcome::Unresolved(obligation)
             }
         }
-    }
-
-    pub fn from_root_session(session: RootSession, managed_library_id: LibraryId) -> Self {
-        Self::construct(session, managed_library_id, None)
     }
 
     pub fn from_root_session_at(
@@ -1148,19 +1144,6 @@ impl LibraryLifecycle {
         })
     }
 
-    /// Release only the root-acquisition effects of a selection that never
-    /// committed. Native cleanup retains the exact obligation on ambiguity.
-    pub fn cleanup_failed_admission(&self) -> Result<(), LibraryError> {
-        let mut state = lock(&self.inner.state);
-        if let Some(obligation) = state.unresolved_admission.take() {
-            if let Err(obligation) = obligation.cleanup() {
-                state.unresolved_admission = Some(obligation);
-                return Err(LibraryError::AdmissionUnresolved);
-            }
-        }
-        Ok(())
-    }
-
     /// Irreversible admission closure. Existing pins remain usable until their
     /// operations settle; an updater/reset must not force their revocation.
     pub fn close_admission(&self) {
@@ -1217,13 +1200,6 @@ impl LibraryLifecycle {
         })
         .await
         .map_err(|_| LibraryError::DrainTimeout)
-    }
-
-    /// Called only after application-owned tasks and metadata connections have
-    /// joined/closed. The returned native outcome owns reset settlement; this
-    /// function neither clears files nor guesses how to settle recovery.
-    pub fn begin_root_reset(&self) -> Result<axial_fs::ResetStartOutcome, LibraryError> {
-        Ok(self.take_reset_session()?.begin_reset())
     }
 
     /// A replayed reset fence blocks metadata/services but grants no deletion
@@ -1466,12 +1442,6 @@ impl LibrarySwitch {
         Ok(())
     }
 
-    pub fn prepared(&self) -> Option<GenerationSnapshot> {
-        self.prepared
-            .as_ref()
-            .map(|generation| generation.snapshot())
-    }
-
     /// Call only after durable selection persistence. A changed physical root
     /// after persistence leaves admission unavailable, never silently reverting
     /// to a library that no longer matches the saved selection.
@@ -1557,6 +1527,16 @@ mod tests {
 
     fn temporary() -> tempfile::TempDir {
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
+    fn clear_application_root(owner: &LibraryLifecycle, root: &Path) {
+        std::fs::write(root.join("reset-anchor"), b"reset").unwrap();
+        let mut reset = axial_fs::PendingRootReset::new(
+            owner.take_reset_session().unwrap(),
+            axial_fs::LeafName::new("reset-anchor").unwrap(),
+            b"reset".to_vec(),
+        );
+        reset.try_clear().unwrap();
     }
 
     fn open(path: &Path) -> LibraryLifecycle {
@@ -1805,14 +1785,7 @@ mod tests {
         let managed_id = owner.snapshot().current.unwrap().library_id;
         owner.restore_startup_selection(managed_id).unwrap();
         owner.close_admission();
-        let authority = match owner.begin_root_reset().unwrap() {
-            axial_fs::ResetStartOutcome::Ready(authority) => authority,
-            outcome => panic!("unexpected reset outcome: {outcome:?}"),
-        };
-        match authority.clear_root() {
-            axial_fs::RootClearOutcome::Cleared(receipt) => assert!(receipt.release().is_ok()),
-            outcome => panic!("unexpected clear outcome: {outcome:?}"),
-        }
+        clear_application_root(&owner, application.path());
         assert!(!application.path().join("library.json").exists());
         assert_eq!(
             std::fs::read(external.path().join("user-file.txt")).unwrap(),
@@ -1878,7 +1851,7 @@ mod tests {
         let escaped = owner.admit().unwrap();
         owner.close_admission();
         assert!(matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         ));
         assert!(matches!(
@@ -1892,14 +1865,7 @@ mod tests {
         escaped.revalidate().unwrap();
         drop(escaped);
         owner.wait_for_pins(Duration::from_secs(1)).await.unwrap();
-        let authority = match owner.begin_root_reset().unwrap() {
-            axial_fs::ResetStartOutcome::Ready(authority) => authority,
-            outcome => panic!("unexpected reset outcome: {outcome:?}"),
-        };
-        match authority.clear_root() {
-            axial_fs::RootClearOutcome::Cleared(receipt) => assert!(receipt.release().is_ok()),
-            outcome => panic!("unexpected clear outcome: {outcome:?}"),
-        }
+        clear_application_root(&owner, directory.path());
         assert!(!directory.path().join("valuable.txt").exists());
     }
 
@@ -1971,7 +1937,7 @@ mod tests {
         drop((operation, pin));
         owner.close_admission();
         assert!(matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         ));
         escaped.revalidate().unwrap();
@@ -2017,7 +1983,7 @@ mod tests {
         revoke(&independent);
         owner.close_admission();
         assert!(matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         ));
         drop(escaped);
@@ -2085,7 +2051,7 @@ mod tests {
         cache.settle().unwrap();
         owner.try_preserve().unwrap();
         assert!(matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         ));
         cache.settle().unwrap();
@@ -2107,7 +2073,7 @@ mod tests {
         drop(pin);
         owner.close_admission();
         assert!(matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         ));
         std::fs::rename(&path, selection.path().join("original.png")).unwrap();
@@ -2143,7 +2109,7 @@ mod tests {
         drop(pin);
         owner.close_admission();
         let reset_refused = matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         );
         let png = native_export_png();
@@ -2248,7 +2214,7 @@ mod tests {
         ));
         owner.close_admission();
         let reset_refused = matches!(
-            owner.begin_root_reset(),
+            owner.take_reset_session(),
             Err(LibraryError::RetirementPending)
         );
         assert!(matches!(

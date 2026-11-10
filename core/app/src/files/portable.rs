@@ -1,5 +1,3 @@
-use std::path::{Component, Path};
-
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
@@ -15,7 +13,6 @@ const MANAGED_CONTENT_PREFIXES: [&str; 3] =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortablePathError {
-    NonUtf8,
     Unsafe,
 }
 
@@ -83,27 +80,6 @@ impl PortableRelativePath {
             return Err(PortablePathError::Unsafe);
         }
         Ok(path)
-    }
-
-    pub(crate) fn from_path(path: &Path) -> Result<Self, PortablePathError> {
-        let mut names = Vec::new();
-        for component in path.components() {
-            let Component::Normal(name) = component else {
-                return Err(PortablePathError::Unsafe);
-            };
-            let name = name.to_str().ok_or(PortablePathError::NonUtf8)?;
-            names.push(PortableFileName::new(name)?);
-        }
-        if names.is_empty() {
-            return Err(PortablePathError::Unsafe);
-        }
-        let spelling = names
-            .into_iter()
-            .map(|name| name.0)
-            .collect::<Vec<_>>()
-            .join("/");
-        validate_relative_path_bound(&spelling)?;
-        Ok(Self(spelling))
     }
 
     pub(crate) fn as_str(&self) -> &str {

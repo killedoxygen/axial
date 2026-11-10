@@ -1,9 +1,8 @@
+pub use super::common::neoforge_to_minecraft_version;
 use super::common::{
     NEOFORGE_MAVEN_META, fetch_text, infer_loader_build_metadata, is_prerelease_loader_version,
-    neoforge_install_source, parse_maven_versions,
-    provider_installed_version_id,
+    neoforge_install_source, parse_maven_versions, provider_installed_version_id,
 };
-pub use super::common::neoforge_to_minecraft_version;
 use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::build_id_for;
 use crate::loaders::types::{
@@ -95,7 +94,11 @@ pub fn parse_builds_from_maven_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_game_versions_from_maven_metadata;
+    use super::{parse_builds_from_maven_metadata, parse_game_versions_from_maven_metadata};
+    use crate::loaders::api::parse_build_id;
+    use crate::loaders::types::{
+        LoaderArtifactKind, LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy,
+    };
 
     #[test]
     fn game_versions_are_unstable_when_only_beta_builds_exist() {
@@ -119,5 +122,50 @@ mod tests {
 
         assert_eq!(only_beta.stable_hint, Some(false));
         assert_eq!(has_stable.stable_hint, Some(true));
+    }
+
+    #[test]
+    fn builds_keep_exact_installer_artifacts_for_the_selected_target_only() {
+        let xml = "<metadata><versions>\
+             <version>21.5.73</version>\
+             <version>21.5.74-beta</version>\
+             <version>21.4.10</version>\
+             </versions></metadata>";
+        let index = parse_builds_from_maven_metadata("1.21.5", xml).expect("catalog");
+        assert_eq!(index.component_id, LoaderComponentId::NeoForge);
+        let builds = index
+            .builds
+            .iter()
+            .map(|build| build.loader_version.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(builds, vec!["21.5.74-beta", "21.5.73"]);
+        for build in &index.builds {
+            assert_eq!(build.minecraft_version, "1.21.5");
+            assert_eq!(build.strategy, LoaderInstallStrategy::NeoForgeModern);
+            assert_eq!(build.artifact_kind, LoaderArtifactKind::InstallerJar);
+            let version = &build.loader_version;
+            assert_eq!(
+                build.install_source,
+                LoaderInstallSource::InstallerJar {
+                    url: format!(
+                        "https://maven.neoforged.net/releases/net/neoforged/neoforge/{version}/neoforge-{version}-installer.jar"
+                    )
+                }
+            );
+            assert_eq!(
+                parse_build_id(&build.build_id),
+                Some((
+                    LoaderComponentId::NeoForge,
+                    "1.21.5".to_string(),
+                    version.clone()
+                ))
+            );
+        }
+        assert!(
+            parse_builds_from_maven_metadata("1.21.6", xml)
+                .expect("catalog")
+                .builds
+                .is_empty()
+        );
     }
 }

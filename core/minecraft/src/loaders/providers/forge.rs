@@ -168,48 +168,96 @@ mod tests {
 
     #[test]
     fn classifies_forge_install_sources_by_era() {
+        use LoaderArtifactKind::{InstallerJar, LegacyArchive};
+        use LoaderInstallStrategy::{ForgeEarliestLegacy, ForgeLegacyInstaller, ForgeModern};
         for (minecraft, forge, expected_strategy, expected_kind, suffix) in [
+            (
+                "1.1",
+                "1.3.4.29",
+                ForgeEarliestLegacy,
+                LegacyArchive,
+                "client.zip",
+            ),
             (
                 "1.2.4",
                 "2.0.0.68",
-                LoaderInstallStrategy::ForgeEarliestLegacy,
-                LoaderArtifactKind::LegacyArchive,
-                "forge-1.2.4-2.0.0.68-client.zip",
+                ForgeEarliestLegacy,
+                LegacyArchive,
+                "client.zip",
+            ),
+            (
+                "1.3.2",
+                "4.3.5.318",
+                ForgeEarliestLegacy,
+                LegacyArchive,
+                "universal.zip",
             ),
             (
                 "1.4.7",
                 "6.6.2.534",
-                LoaderInstallStrategy::ForgeEarliestLegacy,
-                LoaderArtifactKind::LegacyArchive,
-                "forge-1.4.7-6.6.2.534-universal.zip",
+                ForgeEarliestLegacy,
+                LegacyArchive,
+                "universal.zip",
+            ),
+            (
+                "1.5.2",
+                "7.8.1.738",
+                ForgeLegacyInstaller,
+                InstallerJar,
+                "installer.jar",
             ),
             (
                 "1.6.4",
                 "9.11.1.1345",
-                LoaderInstallStrategy::ForgeLegacyInstaller,
-                LoaderArtifactKind::InstallerJar,
-                "forge-1.6.4-9.11.1.1345-installer.jar",
+                ForgeLegacyInstaller,
+                InstallerJar,
+                "installer.jar",
             ),
+            (
+                "1.7.10_pre4",
+                "10.12.2.1149-prerelease",
+                ForgeLegacyInstaller,
+                InstallerJar,
+                "installer.jar",
+            ),
+            (
+                "1.12.2",
+                "14.23.5.2859",
+                ForgeLegacyInstaller,
+                InstallerJar,
+                "installer.jar",
+            ),
+            ("1.13", "25.0.0", ForgeModern, InstallerJar, "installer.jar"),
             (
                 "1.21.11",
                 "61.1.5",
-                LoaderInstallStrategy::ForgeModern,
-                LoaderArtifactKind::InstallerJar,
-                "forge-1.21.11-61.1.5-installer.jar",
+                ForgeModern,
+                InstallerJar,
+                "installer.jar",
+            ),
+            (
+                "26.2-rc-1",
+                "65.0.0",
+                ForgeModern,
+                InstallerJar,
+                "installer.jar",
             ),
         ] {
             let (strategy, artifact_kind, install_source) =
                 forge_install_source(minecraft, forge).expect("source");
-            assert_eq!(strategy, expected_strategy, "{suffix}");
-            assert_eq!(artifact_kind, expected_kind, "{suffix}");
+            assert_eq!(strategy, expected_strategy, "{minecraft}");
+            assert_eq!(artifact_kind, expected_kind, "{minecraft}");
             let url = match (expected_kind, install_source) {
-                (LoaderArtifactKind::LegacyArchive, LoaderInstallSource::LegacyArchive { url })
-                | (LoaderArtifactKind::InstallerJar, LoaderInstallSource::InstallerJar { url }) => {
-                    url
-                }
-                (_, other) => panic!("{suffix}: unexpected install source: {other:?}"),
+                (LegacyArchive, LoaderInstallSource::LegacyArchive { url })
+                | (InstallerJar, LoaderInstallSource::InstallerJar { url }) => url,
+                (_, other) => panic!("{minecraft}: unexpected install source: {other:?}"),
             };
-            assert!(url.ends_with(suffix), "{suffix}: {url}");
+            assert_eq!(
+                url,
+                format!(
+                    "https://maven.minecraftforge.net/net/minecraftforge/forge/{minecraft}-{forge}/forge-{minecraft}-{forge}-{suffix}"
+                )
+            );
         }
     }
 }

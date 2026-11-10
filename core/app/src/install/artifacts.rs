@@ -2083,13 +2083,6 @@ pub async fn inspect_install_receipt(
     classify_receipt(receipt, outcome)
 }
 
-pub async fn resume_install_receipt(
-    receipt: KnownGoodInstallReceipt,
-    recovery: ManagedInstallDurableRecovery,
-) -> InstallReceiptState {
-    classify_receipt(receipt, recovery.retry().await)
-}
-
 fn classify_receipt(
     receipt: KnownGoodInstallReceipt,
     outcome: ManagedInstallDurableOutcome,
@@ -2150,13 +2143,6 @@ pub async fn inspect_loader_base_commit(
     )
     .await;
     classify_base(commit, outcome)
-}
-
-pub async fn resume_loader_base_commit(
-    commit: LoaderInstallBaseCommit,
-    recovery: ManagedInstallDurableRecovery,
-) -> LoaderBaseState {
-    classify_base(commit, recovery.retry().await)
 }
 
 fn classify_base(

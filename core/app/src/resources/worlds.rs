@@ -28,20 +28,6 @@ pub struct RenameWorldRequest {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WorldBackupResponse {
-    pub status: String,
-    pub backup: String,
-    pub location: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WorldCommandResponse {
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
 /// Bounded icon bytes for the media adapter. This is not a filesystem projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorldIcon {
@@ -72,19 +58,6 @@ pub enum WorldError {
     SettlementRequired,
     #[error("world icon not found")]
     IconNotFound,
-}
-
-impl WorldError {
-    pub fn status_code(self) -> u16 {
-        match self {
-            Self::InvalidName => 400,
-            Self::NotFound | Self::IconNotFound => 404,
-            Self::AlreadyExists | Self::Busy | Self::Changed | Self::SettlementRequired => 409,
-            Self::Capacity => 413,
-            Self::UnsupportedEntry => 422,
-            Self::Io => 500,
-        }
-    }
 }
 
 pub(crate) fn world_name(value: &str) -> Result<PortableFileName, WorldError> {
@@ -298,17 +271,5 @@ mod tests {
         ] {
             assert_eq!(world_name(name), Err(WorldError::InvalidName), "{name:?}");
         }
-    }
-
-    #[test]
-    fn delete_response_omits_rename_only_field() {
-        let result = WorldCommandResponse {
-            status: "ok".into(),
-            name: None,
-        };
-        assert_eq!(
-            serde_json::to_value(result).unwrap(),
-            serde_json::json!({"status":"ok"})
-        );
     }
 }

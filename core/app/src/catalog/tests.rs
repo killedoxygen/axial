@@ -154,12 +154,6 @@ fn catalog_futures_keep_provider_state_off_the_callers_stack() {
     let authority = ManagedLibraryTestAuthority::open(root.path()).unwrap();
     let catalog = Catalog::new(client());
     let cancel = CancellationToken::new();
-    let descriptor = VersionDescriptor::new(
-        decode_manifest(&manifest(&[("1.21.11", "release")]))
-            .unwrap()
-            .versions
-            .remove(0),
-    );
     let mut loaders = Vec::new();
     let sizes = [
         (
@@ -173,10 +167,6 @@ fn catalog_futures_keep_provider_state_off_the_callers_stack() {
                 "1.21.11",
                 &cancel,
             )),
-        ),
-        (
-            "fetch_version",
-            std::mem::size_of_val(&catalog.fetch_version(&descriptor, &cancel)),
         ),
         (
             "enrich_loader_versions",
@@ -498,25 +488,4 @@ async fn publication_in_progress_refuses_scan_and_missing_versions_is_empty() {
             .state_id,
         "empty"
     );
-}
-
-#[test]
-fn metadata_json_must_match_the_selected_identity() {
-    let descriptor = VersionDescriptor::new(
-        decode_manifest(&manifest(&[("1.21.5", "release")]))
-            .unwrap()
-            .versions
-            .remove(0),
-    );
-    assert!(decode_version(&descriptor, br#"{"id":"1.21.5"}"#).is_ok());
-    for bytes in [
-        br#"{"id":"other"}"#.as_slice(),
-        br#"{"id":"1.21.5","inheritsFrom":"../outside"}"#,
-        br#"{"id":"1.21.5","axialMaterialized":true}"#,
-    ] {
-        assert_eq!(
-            decode_version(&descriptor, bytes),
-            Err(CatalogError::Malformed)
-        );
-    }
 }

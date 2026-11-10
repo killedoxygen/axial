@@ -1641,7 +1641,7 @@ mod tests {
         assert!(!library.collect_retired());
         library.close_admission();
         assert!(matches!(
-            library.begin_root_reset(),
+            library.take_reset_session(),
             Err(crate::library::LibraryError::RetirementPending)
         ));
         read.validate_current().unwrap();

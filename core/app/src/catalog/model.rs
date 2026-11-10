@@ -9,7 +9,6 @@ use thiserror::Error;
 use url::Url;
 
 pub const MAX_MANIFEST_BYTES: usize = 8 << 20;
-pub const MAX_VERSION_BYTES: usize = 8 << 20;
 const MAX_MANIFEST_ENTRIES: usize = 16_384;
 
 /// Closed, safe failure labels. Provider text and local paths are never public copy.
@@ -84,14 +83,6 @@ pub struct VersionDescriptor {
 impl VersionDescriptor {
     pub fn id(&self) -> &str {
         &self.entry.id
-    }
-
-    pub fn metadata_url(&self) -> &str {
-        &self.entry.url
-    }
-
-    pub fn metadata_sha1(&self) -> &str {
-        &self.entry.sha1
     }
 
     pub(crate) fn new(entry: ManifestEntry) -> Self {

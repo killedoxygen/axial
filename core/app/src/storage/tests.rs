@@ -175,10 +175,17 @@ fn unmarked_nonempty_database_is_not_adopted() {
     let path = directory.path().join("unmarked.sqlite3");
     {
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("CREATE TABLE user_data (value TEXT); INSERT INTO user_data VALUES ('preserved');").unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE user_data (value TEXT); INSERT INTO user_data VALUES ('preserved');",
+            )
+            .unwrap();
     }
     let original = std::fs::read(&path).unwrap();
-    assert!(matches!(MetadataStore::open(&path), Err(StorageError::WrongApplication)));
+    assert!(matches!(
+        MetadataStore::open(&path),
+        Err(StorageError::WrongApplication)
+    ));
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
@@ -302,7 +309,6 @@ fn process_crash_recovery_distinguishes_committed_and_uncommitted_rows() {
             })
             .unwrap();
         assert_eq!(count, i64::from(committed));
-        reopened.check_integrity().unwrap();
     }
 }
 

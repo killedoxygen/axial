@@ -27,17 +27,6 @@ pub struct RenameScreenshotRequest {
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RenameScreenshotResponse {
-    pub status: &'static str,
-    pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct DeleteScreenshotResponse {
-    pub status: &'static str,
-}
-
 /// An adapter must send `content_type` and `X-Content-Type-Options: nosniff`.
 #[derive(Debug)]
 pub struct ScreenshotMedia {
@@ -70,19 +59,6 @@ pub enum ScreenshotError {
     Read,
     #[error("Could not update screenshot files. Check instance folder permissions and try again.")]
     Write,
-}
-
-impl ScreenshotError {
-    pub fn status_code(self) -> u16 {
-        match self {
-            Self::InvalidName | Self::FileTypeChange => 400,
-            Self::NotFound => 404,
-            Self::AlreadyExists | Self::Changed | Self::Pending => 409,
-            Self::TooLarge | Self::ScanLimit => 413,
-            Self::UnsupportedEntry => 422,
-            Self::Read | Self::Write => 500,
-        }
-    }
 }
 
 // The caller first validates the complete portable leaf name. MIME selection
@@ -235,25 +211,5 @@ mod tests {
                 "modified_at": "2026-05-31T12:00:00+00:00"
             })
         );
-        assert_eq!(
-            serde_json::to_value(RenameScreenshotResponse {
-                status: "ok",
-                name: "renamed.png".into()
-            })
-            .unwrap(),
-            serde_json::json!({"status":"ok", "name":"renamed.png"})
-        );
-    }
-
-    #[test]
-    fn bounded_failures_distinguish_conflict_missing_input_and_io() {
-        assert_eq!(ScreenshotError::NotFound.status_code(), 404);
-        assert_eq!(ScreenshotError::AlreadyExists.status_code(), 409);
-        assert_eq!(ScreenshotError::Changed.status_code(), 409);
-        assert_eq!(ScreenshotError::InvalidName.status_code(), 400);
-        assert_eq!(ScreenshotError::TooLarge.status_code(), 413);
-        assert_eq!(ScreenshotError::UnsupportedEntry.status_code(), 422);
-        assert_eq!(ScreenshotError::Read.status_code(), 500);
-        assert_eq!(ScreenshotError::Write.status_code(), 500);
     }
 }

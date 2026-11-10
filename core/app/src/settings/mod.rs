@@ -172,13 +172,6 @@ impl SettingsStore {
             .read(|connection| Ok(required_document(connection)?.config))
     }
 
-    /// Read launch preferences inside an owning feature's metadata transaction.
-    pub(crate) fn current_in_transaction(
-        transaction: &rusqlite::Transaction<'_>,
-    ) -> Result<ConfigView, SettingsError> {
-        Ok(required_document(transaction)?.config)
-    }
-
     /// A cooperating owner may project its authoritative fields under the same
     /// metadata read lock without a nested store access.
     pub fn current_with_projection(

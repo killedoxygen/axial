@@ -70,10 +70,10 @@ impl From<rusqlite::Error> for StorageError {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct StorageLimits {
-    pub busy_timeout: Duration,
-    pub execution_timeout: Duration,
-    pub max_vm_instructions: u64,
+pub(crate) struct StorageLimits {
+    pub(crate) busy_timeout: Duration,
+    pub(crate) execution_timeout: Duration,
+    pub(crate) max_vm_instructions: u64,
 }
 
 impl Default for StorageLimits {
@@ -109,7 +109,10 @@ impl MetadataStore {
         Self::open_with_limits(path, StorageLimits::default())
     }
 
-    pub fn open_with_limits(path: impl AsRef<Path>, limits: StorageLimits) -> StorageResult<Self> {
+    pub(crate) fn open_with_limits(
+        path: impl AsRef<Path>,
+        limits: StorageLimits,
+    ) -> StorageResult<Self> {
         Self::validate_limits(limits)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
@@ -123,7 +126,7 @@ impl MetadataStore {
         Self::in_memory_with_limits(StorageLimits::default())
     }
 
-    pub fn in_memory_with_limits(limits: StorageLimits) -> StorageResult<Self> {
+    pub(crate) fn in_memory_with_limits(limits: StorageLimits) -> StorageResult<Self> {
         Self::validate_limits(limits)?;
         Self::initialize(Connection::open_in_memory()?, limits, true)
     }
@@ -327,17 +330,6 @@ impl MetadataStore {
             }
             Ok(())
         })
-    }
-
-    /// Diagnostic check does not repair or silently reopen mutation admission.
-    pub fn check_integrity(&self) -> StorageResult<()> {
-        let connection = self.lock()?;
-        let _budget = ExecutionBudget::new(&connection, self.limits);
-        let result = verify_integrity(&connection);
-        if result.is_err() {
-            self.mutation_closed.store(true, Ordering::Release);
-        }
-        result
     }
 
     fn check_after_failed_callback(&self, connection: &Connection) {

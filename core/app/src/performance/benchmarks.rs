@@ -368,20 +368,6 @@ pub fn benchmark_suite_run_id(mode: &str, run_index: usize, run: BenchmarkSuiteR
     bounded_descriptor_token(&identity, "benchmark")
 }
 
-pub fn benchmark_suite_run_descriptor(
-    mode: &str,
-    run_index: usize,
-    run: BenchmarkSuiteRunSpec,
-) -> serde_json::Value {
-    serde_json::json!({
-        "run_index": run_index,
-        "profile": run.profile,
-        "run_type": run.run_type,
-        "target_id": run.target_id,
-        "benchmark_id": benchmark_suite_run_id(mode, run_index, run),
-    })
-}
-
 pub fn benchmark_suite_manifest_run_inputs(
     mode: &str,
     plan: &[BenchmarkSuiteRunSpec],
@@ -1576,15 +1562,6 @@ impl BenchmarkService {
         drop(lease);
         self.run_driver(driver.clone(), input)?;
         Ok(driver)
-    }
-
-    pub fn can_resume_driver(&self, id: &str) -> Result<bool, BenchmarkError> {
-        let driver = self.driver(id)?;
-        Ok(self
-            .resume_actions(&[driver])?
-            .get(id)
-            .copied()
-            .unwrap_or(false))
     }
 
     /// One bounded projection shares driver activity. These hints never

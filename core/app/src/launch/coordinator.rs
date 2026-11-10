@@ -1677,9 +1677,7 @@ pub(super) fn physical_work_error(error: axial_resource::PhysicalWorkError) -> L
         PhysicalWorkError::ScratchLimit
         | PhysicalWorkError::WorkerLimit
         | PhysicalWorkError::Unavailable => LaunchError::AtCapacity,
-        PhysicalWorkError::Deadline | PhysicalWorkError::TaskStopped => {
-            LaunchError::PreparationFailed
-        }
+        PhysicalWorkError::TaskStopped => LaunchError::PreparationFailed,
     }
 }
 
@@ -2336,6 +2334,7 @@ impl LaunchIntents {
         }
     }
 
+    #[cfg(test)]
     fn reserve(&self, request: &LaunchRequest) -> Result<ReservedIntent, LaunchError> {
         self.reserve_context(request, None)
     }

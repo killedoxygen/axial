@@ -41,18 +41,6 @@ pub struct UpdateModRequest {
     pub with_dependents: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct UpdateModResponse {
-    pub status: &'static str,
-    pub name: String,
-    pub enabled: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub struct DeleteModResponse {
-    pub status: &'static str,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 pub struct ModImportResponse {
     /// Filenames added to the instance's mods folder.
@@ -98,7 +86,10 @@ impl ModImportError {
 }
 
 /// An enabled `.jar` selector whose bytes are a readable zip archive.
-pub fn validate_import(name: &str, bytes: &[u8]) -> Result<PortableFileName, ModImportError> {
+pub(crate) fn validate_import(
+    name: &str,
+    bytes: &[u8],
+) -> Result<PortableFileName, ModImportError> {
     let portable = listed_mod_name(name)
         .filter(|name| name.key().as_str().ends_with(".jar"))
         .filter(|name| !managed_content_name_is_reserved(name))
@@ -146,24 +137,6 @@ pub enum ModFilesError {
     Write,
 }
 
-impl ModFilesError {
-    pub fn status_code(self) -> u16 {
-        match self {
-            Self::InvalidName => 400,
-            Self::InstanceNotFound | Self::NotFound => 404,
-            Self::Busy
-            | Self::AlreadyExists
-            | Self::Changed
-            | Self::Managed
-            | Self::SettlementRequired => 409,
-            Self::ScanLimit => 413,
-            Self::UnsupportedEntry => 422,
-            Self::Unavailable => 503,
-            Self::Read | Self::Write => 500,
-        }
-    }
-}
-
 /// Lists only the fixed `mods` resource directory below a scoped game root.
 /// The caller retains its registered-instance admission during this read.
 pub(crate) fn list_mods(game: &ScopedDirectory) -> Result<Vec<InstanceModInfo>, ModFilesError> {
@@ -197,7 +170,7 @@ pub(crate) fn list_mods(game: &ScopedDirectory) -> Result<Vec<InstanceModInfo>, 
             modified_at: revision
                 .modified_at_ns()
                 .ok()
-                .map(format_timestamp)
+                .map(super::timestamp)
                 .unwrap_or_default(),
             enabled: false,
         });
@@ -213,19 +186,6 @@ fn read_error(error: io::Error) -> ModFilesError {
         }
         _ => ModFilesError::Read,
     }
-}
-
-fn format_timestamp(nanoseconds: u64) -> String {
-    let seconds = i64::try_from(nanoseconds / 1_000_000_000).ok();
-    seconds
-        .and_then(|seconds| {
-            chrono::DateTime::<chrono::Utc>::from_timestamp(
-                seconds,
-                (nanoseconds % 1_000_000_000) as u32,
-            )
-        })
-        .map(|timestamp| timestamp.to_rfc3339())
-        .unwrap_or_default()
 }
 
 /// Validate the client's selector. A valid selector still grants no file access.

@@ -44,10 +44,6 @@ impl Credentials {
         })
     }
 
-    pub(crate) fn microsoft_access_token(&self) -> &str {
-        &self.microsoft_access_token
-    }
-
     pub(crate) fn microsoft_refresh_token(&self) -> Option<&str> {
         self.microsoft_refresh_token.as_deref()
     }

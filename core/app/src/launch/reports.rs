@@ -955,7 +955,6 @@ fn scenario_id_for_performance_mode(performance_mode: &str) -> &'static str {
 }
 
 pub const MAX_CRASH_ARTIFACT_BYTES: usize = 512 * 1024;
-pub const CRASH_ARTIFACT_EXIT_CORRELATION_WINDOW_MS: u64 = 15_000;
 const MAX_LINES: usize = 4_096;
 const MAX_LINE_BYTES: usize = 4_096;
 const MAX_SUSPECTED_MODS: usize = 8;

@@ -284,21 +284,6 @@ impl AccountDirectory {
         CapturedAccount::new(&snapshot, id.as_str())
     }
 
-    pub fn invalidate_microsoft(
-        &self,
-        capture: &CapturedAccount,
-    ) -> Result<AccountSnapshot, AccountError> {
-        if capture.kind() != AccountKind::Microsoft {
-            return Err(AccountError::NotMicrosoft);
-        }
-        self.mutate(|snapshot, _| {
-            capture.validate(snapshot)?;
-            let index = position(snapshot, capture.identity())?;
-            remove_identity(snapshot, index);
-            Ok(())
-        })
-    }
-
     /// Logout/removal targets the captured account even if another identity has
     /// been selected while the secure store acknowledges deletion.
     pub fn remove_microsoft(

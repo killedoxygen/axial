@@ -3734,7 +3734,6 @@ fn kind(request: &InstallQueueRequest) -> &'static str {
 pub(crate) mod tests {
     use super::*;
     use crate::library::LibraryOpenOutcome;
-    use serde_json::Value;
 
     #[test]
     fn local_pack_ids_are_admitted_only_as_exact_archive_hashes_for_pack_actions() {

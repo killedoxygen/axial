@@ -35,12 +35,6 @@ impl DirectoryParkReceipt {
     pub(crate) fn source_name(&self) -> &str {
         &self.source_name
     }
-    pub(crate) fn park_name(&self) -> &str {
-        &self.park_name
-    }
-    pub(crate) fn source_receipt(&self) -> &str {
-        &self.source
-    }
     pub(crate) fn matches_source_receipt(&self, expected: &str) -> bool {
         self.source == expected
     }

@@ -185,20 +185,6 @@ impl fmt::Debug for ValidatedLaunchCommand {
 pub enum LaunchPlanError {
     #[error("The selected library changed. Refresh the instance before launching.")]
     LibraryChanged,
-    #[error("The selected version is invalid.")]
-    InvalidVersion,
-    #[error(
-        "Installed version metadata is missing or invalid. Install this version before launching."
-    )]
-    VersionUnavailable,
-    #[error("Parent version metadata is missing. Install the base version before launching.")]
-    ParentUnavailable,
-    #[error("The game directory is unavailable.")]
-    GameDirectoryUnavailable,
-    #[error("Game files are missing. Install this version before launching.")]
-    ArtifactMissing,
-    #[error("Game file integrity could not be verified. Install this version before launching.")]
-    ArtifactInvalid,
     #[error("Game files changed during preparation. Try launching again.")]
     ArtifactChanged,
     #[error("Native libraries have not been prepared. Finish installation before launching.")]

@@ -124,11 +124,6 @@ impl ExpectedComposition {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerformanceRollbackListResponse {
-    pub snapshots: Vec<RollbackSnapshotSummary>,
-}
-
 pub(crate) fn select_snapshot<'a>(
     snapshots: &'a [RollbackSnapshotSummary],
     requested: Option<&str>,

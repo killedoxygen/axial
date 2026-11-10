@@ -490,19 +490,13 @@ struct RedirectUri {
 struct OAuthTokenResponse {
     access_token: String,
     refresh_token: Option<String>,
-    id_token: Option<String>,
-    token_type: Option<String>,
     expires_in: u64,
-    scope: Option<String>,
 }
 
 struct OAuthToken {
     access_token: String,
     refresh_token: Option<String>,
-    id_token: Option<String>,
-    token_type: Option<String>,
     expires_in: u64,
-    scope: Option<String>,
     current_date: DateTime<Utc>,
 }
 
@@ -518,7 +512,6 @@ struct SisuAuthorize {
 #[derive(Debug, Deserialize)]
 struct MinecraftTokenResponse {
     access_token: String,
-    token_type: Option<String>,
     expires_in: Option<u64>,
 }
 
@@ -637,10 +630,7 @@ async fn oauth_token(code: &str, verifier: &str) -> Result<OAuthToken, Microsoft
     Ok(OAuthToken {
         access_token: body.access_token,
         refresh_token: body.refresh_token,
-        id_token: body.id_token,
-        token_type: body.token_type,
         expires_in: body.expires_in,
-        scope: body.scope,
         current_date,
     })
 }
@@ -668,10 +658,7 @@ async fn oauth_refresh(refresh_token: &str) -> Result<OAuthToken, MicrosoftAuthE
     Ok(OAuthToken {
         access_token: body.access_token,
         refresh_token: body.refresh_token,
-        id_token: body.id_token,
-        token_type: body.token_type,
         expires_in: body.expires_in,
-        scope: body.scope,
         current_date,
     })
 }

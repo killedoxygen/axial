@@ -9,7 +9,6 @@ pub mod install;
 pub mod instances;
 pub mod launch;
 pub mod library;
-pub mod loaders;
 pub mod media;
 pub mod music;
 pub mod network;

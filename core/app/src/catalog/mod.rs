@@ -13,16 +13,15 @@ pub use model::{
 };
 
 use crate::network::{
-    Checksum, DownloadError, DownloadRequest, DownloadedBytes, HashAlgorithm, IntegrityPolicy,
-    OriginPolicy, ProviderClient, ResponseLimits, UnhashedReason,
+    DownloadError, DownloadRequest, DownloadedBytes, IntegrityPolicy, OriginPolicy, ProviderClient,
+    ResponseLimits, UnhashedReason,
 };
 use crate::tasks::CancellationToken;
 use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::{
-    LoaderGameVersion, VersionJson, VersionManifest, enrich_loader_game_versions,
-    manifest_release_references,
+    LoaderGameVersion, VersionManifest, enrich_loader_game_versions, manifest_release_references,
 };
-use model::{MAX_MANIFEST_BYTES, MAX_VERSION_BYTES, decode_manifest, snapshot_from};
+use model::{MAX_MANIFEST_BYTES, decode_manifest, snapshot_from};
 use std::collections::HashMap;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
@@ -97,29 +96,6 @@ impl Catalog {
             .find(|entry| entry.id == id)
             .map(VersionDescriptor::new)
             .ok_or(CatalogError::UnknownVersion)
-    }
-
-    pub async fn fetch_version(
-        &self,
-        descriptor: &VersionDescriptor,
-        cancel: &CancellationToken,
-    ) -> Result<VersionJson, CatalogError> {
-        let checksum = Checksum::from_hex(HashAlgorithm::Sha1, descriptor.metadata_sha1())
-            .map_err(|_| CatalogError::Malformed)?;
-        let source = (descriptor.metadata_url().to_owned(), metadata_origins()?);
-        #[cfg(test)]
-        let source = self.source_fixture.clone().unwrap_or(source);
-        let request = DownloadRequest::get(
-            source.0,
-            source.1,
-            ResponseLimits::new(MAX_VERSION_BYTES as u64, MAX_VERSION_BYTES as u64),
-            IntegrityPolicy::Checksum {
-                checksum,
-                expected_size: None,
-            },
-        );
-        let bytes = self.fetch_with_retries(request, cancel).await?;
-        decode_version(descriptor, bytes.bytes())
     }
 
     /// Loader providers own stable hints and build availability; Minecraft interpretation and
@@ -296,21 +272,6 @@ async fn read_cache(
     })
     .await
     .map_err(|_| CatalogError::Unavailable)?
-}
-
-fn decode_version(
-    descriptor: &VersionDescriptor,
-    bytes: &[u8],
-) -> Result<VersionJson, CatalogError> {
-    if bytes.len() > MAX_VERSION_BYTES {
-        return Err(CatalogError::Malformed);
-    }
-    let version: VersionJson =
-        serde_json::from_slice(bytes).map_err(|_| CatalogError::Malformed)?;
-    if version.id != descriptor.id() || version.materialized || !version.inherits_from.is_empty() {
-        return Err(CatalogError::Malformed);
-    }
-    Ok(version)
 }
 
 #[cfg(test)]

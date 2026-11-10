@@ -1086,7 +1086,7 @@ mod tests {
                 &PortableName::new_exact(&format!("deleted-{operation}")).unwrap(),
             )
             .unwrap();
-        let parked = source.with_file_name(plan.receipt().park_name());
+        let parked = source.with_file_name(format!("deleted-{operation}"));
         let journal = DeletionJournal {
             registry: service.registry().clone(),
         };

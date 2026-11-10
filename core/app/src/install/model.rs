@@ -4,17 +4,6 @@ use axial_minecraft::{DownloadProgress, LoaderComponentId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallVersionStartRequest {
-    pub version_id: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LoaderInstallStartRequest {
-    pub component_id: LoaderComponentId,
-    pub build_id: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallStartResponse {
     pub install_id: String,
     pub operation_id: OperationId,

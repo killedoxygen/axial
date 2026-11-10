@@ -493,24 +493,6 @@ impl AuthService {
         Ok(snapshot)
     }
 
-    pub async fn logout_selected(&self) -> Result<AccountSnapshot, AuthError> {
-        let snapshot = self.directory.snapshot()?;
-        let Some(account) = snapshot.active_account() else {
-            return Ok(snapshot);
-        };
-        if account.kind != AccountKind::Microsoft {
-            return Ok(snapshot);
-        }
-        self.remove_account(
-            account.account_id.to_string(),
-            AccountPreconditions {
-                expected_selection_revision: Some(snapshot.selection_revision),
-                expected_account_revision: Some(account.account_revision),
-            },
-        )
-        .await
-    }
-
     /// Retained /auth/logout semantics clear all Microsoft identities while
     /// leaving offline identities available, including when one is selected.
     pub async fn logout(&self) -> Result<AccountSnapshot, AuthError> {

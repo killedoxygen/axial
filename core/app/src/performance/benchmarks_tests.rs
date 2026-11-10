@@ -10,6 +10,11 @@ fn open_storage(path: &std::path::Path) -> Arc<MetadataStore> {
     storage
 }
 
+fn can_resume(service: &BenchmarkService, id: &str) -> bool {
+    let driver = service.driver(id).unwrap();
+    service.resume_actions(&[driver]).unwrap()[id]
+}
+
 fn service(root: &std::path::Path, storage: Arc<MetadataStore>) -> BenchmarkService {
     service_with_directories(root, storage).0
 }
@@ -343,7 +348,7 @@ async fn graceful_driver_shutdown_stops_and_joins_before_reopen() {
     assert_eq!(reopened.driver(&accepted.id).unwrap(), stopped);
     assert_eq!(reopened.suite(&accepted.suite_id).unwrap(), Some(suite));
     assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
-    assert!(reopened.can_resume_driver(&accepted.id).unwrap());
+    assert!(can_resume(&reopened, &accepted.id));
     assert!(reopened.tasks.status().is_idle());
     storage
         .read(|db| -> Result<(), StorageError> {
@@ -398,13 +403,13 @@ async fn current_driver_history_reopens_and_resumes_the_same_driver() {
             Some(suite.clone())
         );
         assert_eq!(reopened.resume_interrupted_drivers().unwrap(), 0);
-        assert!(reopened.can_resume_driver(&driver.id).unwrap());
+        assert!(can_resume(&reopened, &driver.id));
         let resumed = reopened.resume_driver(&driver.id).unwrap();
         assert_eq!(resumed.id, driver.id);
         assert_eq!(resumed.suite_id, suite.suite_id);
         assert_eq!(resumed.state, "running");
         assert_eq!(resumed.error, None);
-        assert!(!reopened.can_resume_driver(&driver.id).unwrap());
+        assert!(!can_resume(&reopened, &driver.id));
         assert!(matches!(
             reopened.resume_driver(&driver.id),
             Err(BenchmarkError::Busy)
@@ -583,7 +588,7 @@ async fn automatic_restart_limit_is_durable_across_two_reopens() {
         assert_eq!(reopened.driver(&limited.id).unwrap(), limited);
         assert!(reopened.tasks.status().is_idle());
         assert!(reopened.sessions.sessions().is_empty());
-        assert!(reopened.can_resume_driver(&limited.id).unwrap());
+        assert!(can_resume(&reopened, &limited.id));
     }
 }
 

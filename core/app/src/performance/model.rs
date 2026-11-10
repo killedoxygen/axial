@@ -48,14 +48,6 @@ pub enum PerformanceCommand {
     RefreshPerformanceRules,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RollbackState {
-    NotApplicable,
-    Unavailable,
-    Available,
-    Applied,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PerformancePlanSummaryViewModel {
     pub state_id: String,
@@ -106,34 +98,6 @@ pub struct PerformanceManagedArtifactSummary {
     pub source_provider: ManagedArtifactProvider,
     pub role: ManagedArtifactRole,
     pub size: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PerformanceInstanceDisplay {
-    pub memory: PerformanceMemoryDisplay,
-    pub runtime: PerformanceRuntimeDisplay,
-    pub mode: PerformanceModeDisplay,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PerformanceMemoryDisplay {
-    pub min_gb: f32,
-    pub max_gb: f32,
-    pub label: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PerformanceRuntimeDisplay {
-    pub detected: bool,
-    pub label: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PerformanceModeDisplay {
-    pub mode: String,
-    pub label: String,
-    pub source: String,
-    pub source_label: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
