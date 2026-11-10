@@ -1,16 +1,11 @@
 #[cfg(any(test, feature = "test-support"))]
-use crate::download::AssetSourcePool;
-use crate::download::library_source::{
-    AuthenticatedLibraryCacheProofSet, RetainedLibraryComponentSource, RetainedLibrarySourceSet,
-};
+use crate::download::DownloadError;
+use crate::download::library_source::RetainedLibraryComponentSource;
 use crate::download::{
-    ASSET_OBJECT_BASE_URL, AuthenticatedAssetCacheProofSet, AuthenticatedSelectedArtifactSource,
-    AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleSource, DownloadError,
+    ASSET_OBJECT_BASE_URL, AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources,
     ExpectedIntegrity, LibraryArtifactPlan, ManagedInstallActivationContractId,
     ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
-    RetainedAssetComponentSource, RetainedAssetSourceSet,
-    RetainedVersionBundleReconstructionSources, SelectedDownloadArtifactKind,
-    library_artifact_plans_for, parse_asset_index,
+    SelectedDownloadArtifactKind, library_artifact_plans_for, parse_asset_index,
 };
 use crate::known_good_libraries::{SealedExactLibraryDeclarations, SealedLibraryKind};
 use crate::launch::{Library, VersionJson, effective_java_version_for};
@@ -20,9 +15,6 @@ use crate::loaders::{
     LoaderInstallStrategy, VerifiedInstallerClientBytes, VerifiedInstallerReceiptSource,
     compose_loader_version,
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::managed_component_table::ManagedComponentArtifactKind;
-use crate::managed_fs::ManagedDir;
 #[cfg(test)]
 use crate::manifest::ManifestEntry;
 use crate::portable_path::{
@@ -1222,605 +1214,6 @@ pub struct KnownGoodReconstructionReceipt {
     authenticated: AuthenticatedKnownGoodReceipt,
 }
 
-pub(crate) struct RetainedKnownGoodReconstruction {
-    receipt: KnownGoodReconstructionReceipt,
-    library_sources: RetainedLibrarySourceSet,
-    version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
-}
-
-pub(crate) struct ManagedVersionBundleReconstruction {
-    projection: VersionBundleProjectionAuthority,
-    managed_root: ManagedDir,
-    source: AuthenticatedVersionBundleSource,
-}
-
-pub(crate) enum VersionBundleProjectionAuthority {
-    Reconstructed(Box<KnownGoodReconstructionReceipt>),
-    Registered {
-        version_id: KnownGoodId,
-        inventory: Arc<KnownGoodInventory>,
-        activation_contract_id: ManagedInstallActivationContractId,
-    },
-}
-
-pub(crate) struct ManagedLibrariesReconstruction {
-    reconstruction: RetainedKnownGoodReconstruction,
-    managed_root: ManagedDir,
-    #[cfg(test)]
-    library_entry_count: usize,
-    #[cfg(test)]
-    expected_content_byte_count: u64,
-}
-
-pub(crate) struct ManagedAssetsReconstruction {
-    reconstruction: RetainedKnownGoodReconstruction,
-    managed_root: ManagedDir,
-    asset_sources: RetainedAssetSourceSet,
-    #[cfg(test)]
-    asset_entry_count: usize,
-    #[cfg(test)]
-    expected_content_byte_count: u64,
-}
-
-impl RetainedKnownGoodReconstruction {
-    pub(crate) fn require_game_libraries(
-        mut self,
-        requirements: &crate::loaders::game_libraries::Requirements,
-    ) -> Result<Self, KnownGoodInventoryError> {
-        self.receipt
-            .authenticated
-            .require_game_libraries(requirements)?;
-        Ok(self)
-    }
-
-    pub(crate) fn new(
-        receipt: KnownGoodReconstructionReceipt,
-        library_sources: RetainedLibrarySourceSet,
-        version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
-    ) -> Self {
-        Self {
-            receipt,
-            library_sources,
-            version_bundle_sources,
-        }
-    }
-
-    pub(crate) fn receipt(&self) -> &KnownGoodReconstructionReceipt {
-        &self.receipt
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        KnownGoodReconstructionReceipt,
-        RetainedLibrarySourceSet,
-        Option<RetainedVersionBundleReconstructionSources>,
-    ) {
-        (
-            self.receipt,
-            self.library_sources,
-            self.version_bundle_sources,
-        )
-    }
-
-    pub(crate) fn discard_sources(self) -> KnownGoodReconstructionReceipt {
-        self.receipt
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_version_bundle_sources_match_projection(&self) -> bool {
-        let Ok(projection) = self
-            .receipt
-            .component_projection(ManagedKnownGoodComponent::VersionBundle)
-        else {
-            return false;
-        };
-        self.version_bundle_sources
-            .as_ref()
-            .is_some_and(|sources| sources.matches_projection(&projection))
-    }
-
-    pub(crate) fn bind_managed_version_bundle(
-        self,
-        managed_root: ManagedDir,
-    ) -> Result<ManagedVersionBundleReconstruction, DownloadError> {
-        let (receipt, _library_sources, version_bundle_sources) = self.into_parts();
-        let projection = receipt
-            .component_projection(ManagedKnownGoodComponent::VersionBundle)
-            .map_err(|_| {
-                DownloadError::Integrity(
-                    "reconstructed VersionBundle projection is invalid".to_string(),
-                )
-            })?;
-        let sources = version_bundle_sources.ok_or_else(|| {
-            DownloadError::Integrity(
-                "VersionBundle reconstruction did not retain exact final sources".to_string(),
-            )
-        })?;
-        let source = AuthenticatedVersionBundleSource::from_reconstruction_projection(
-            receipt.version_id().to_string(),
-            &projection,
-            sources,
-        )?;
-        Ok(ManagedVersionBundleReconstruction {
-            projection: VersionBundleProjectionAuthority::Reconstructed(Box::new(receipt)),
-            managed_root,
-            source,
-        })
-    }
-
-    pub(crate) fn bind_managed_libraries(
-        mut self,
-        managed_root: ManagedDir,
-        cache_proofs: AuthenticatedLibraryCacheProofSet,
-    ) -> Result<ManagedLibrariesReconstruction, DownloadError> {
-        let projection = self
-            .receipt
-            .authenticated
-            .inventory
-            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
-            .map_err(|_| {
-                DownloadError::Integrity(
-                    "reconstructed Libraries projection is invalid".to_string(),
-                )
-            })?;
-        self.library_sources
-            .reconcile_sparse_projection(&projection, cache_proofs)?;
-        Ok(ManagedLibrariesReconstruction {
-            #[cfg(test)]
-            library_entry_count: projection.entry_count(),
-            #[cfg(test)]
-            expected_content_byte_count: projection.expected_content_byte_count(),
-            reconstruction: self,
-            managed_root,
-        })
-    }
-
-    pub(crate) fn bind_managed_assets(
-        self,
-        managed_root: ManagedDir,
-        mut asset_sources: RetainedAssetSourceSet,
-        cache_proofs: AuthenticatedAssetCacheProofSet,
-    ) -> Result<ManagedAssetsReconstruction, DownloadError> {
-        let projection = self
-            .receipt
-            .authenticated
-            .inventory
-            .managed_component_projection(ManagedKnownGoodComponent::Assets)
-            .map_err(|_| {
-                DownloadError::Integrity("reconstructed Assets projection is invalid".to_string())
-            })?;
-        asset_sources.reconcile_sparse_projection(&projection, cache_proofs)?;
-        Ok(ManagedAssetsReconstruction {
-            #[cfg(test)]
-            asset_entry_count: projection.entry_count(),
-            #[cfg(test)]
-            expected_content_byte_count: projection.expected_content_byte_count(),
-            reconstruction: self,
-            managed_root,
-            asset_sources,
-        })
-    }
-}
-
-impl ManagedVersionBundleReconstruction {
-    pub(crate) fn from_registered(
-        managed_root: ManagedDir,
-        version_id: &str,
-        inventory: Arc<KnownGoodInventory>,
-        activation_contract_id: ManagedInstallActivationContractId,
-        source: AuthenticatedVersionBundleSource,
-    ) -> Result<Self, DownloadError> {
-        let version_id = KnownGoodId::new(version_id).map_err(|_| {
-            DownloadError::Integrity("registered VersionBundle identity is invalid".to_string())
-        })?;
-        let projection = inventory
-            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-            .map_err(|_| {
-                DownloadError::Integrity(
-                    "registered VersionBundle projection is invalid".to_string(),
-                )
-            })?;
-        if !source.matches_projection(&projection) || source.version_id() != version_id.as_str() {
-            return Err(DownloadError::Integrity(
-                "registered VersionBundle source does not match its projection".to_string(),
-            ));
-        }
-        Ok(Self {
-            projection: VersionBundleProjectionAuthority::Registered {
-                version_id,
-                inventory,
-                activation_contract_id,
-            },
-            managed_root,
-            source,
-        })
-    }
-
-    pub(crate) fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
-        self.projection.matches_known_good_inventory(expected)
-    }
-
-    pub(crate) fn activation_contract_id(
-        &self,
-    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
-        self.projection.activation_contract_id()
-    }
-
-    pub(crate) fn into_effect_parts(
-        self,
-    ) -> (
-        ManagedDir,
-        VersionBundleProjectionAuthority,
-        AuthenticatedVersionBundleSource,
-    ) {
-        (self.managed_root, self.projection, self.source)
-    }
-}
-
-impl VersionBundleProjectionAuthority {
-    pub(crate) fn version_id(&self) -> &str {
-        match self {
-            Self::Reconstructed(receipt) => receipt.version_id(),
-            Self::Registered { version_id, .. } => version_id.as_str(),
-        }
-    }
-
-    pub(crate) fn component_projection(
-        &self,
-    ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
-        match self {
-            Self::Reconstructed(receipt) => {
-                receipt.component_projection(ManagedKnownGoodComponent::VersionBundle)
-            }
-            Self::Registered { inventory, .. } => {
-                inventory.managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-            }
-        }
-    }
-
-    pub(crate) fn activation_contract_id(
-        &self,
-    ) -> Result<ManagedInstallActivationContractId, KnownGoodActivationContractError> {
-        match self {
-            Self::Reconstructed(receipt) => receipt.activation_contract_id(),
-            Self::Registered {
-                activation_contract_id,
-                ..
-            } => Ok(activation_contract_id.clone()),
-        }
-    }
-
-    pub(crate) fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
-        let Ok(ours) = self.component_projection() else {
-            return false;
-        };
-        let Ok(expected) =
-            expected.managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-        else {
-            return false;
-        };
-        ours.entry_count() == expected.entry_count()
-            && ours
-                .entries()
-                .iter()
-                .zip(expected.entries())
-                .all(|(left, right)| {
-                    left.inventory_ordinal() == right.inventory_ordinal()
-                        && left.entry() == right.entry()
-                })
-    }
-}
-
-impl ManagedLibrariesReconstruction {
-    #[cfg(test)]
-    pub(crate) fn version_id(&self) -> &str {
-        self.reconstruction.receipt.version_id()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn library_entry_count(&self) -> usize {
-        self.library_entry_count
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expected_content_byte_count(&self) -> u64 {
-        self.expected_content_byte_count
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_source_count(&self) -> usize {
-        self.reconstruction.library_sources.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_content_byte_count(&self) -> u64 {
-        self.reconstruction.library_sources.retained_bytes()
-    }
-
-    pub(crate) fn into_effect_parts(
-        self,
-    ) -> (
-        ManagedDir,
-        KnownGoodReconstructionReceipt,
-        Vec<RetainedLibraryComponentSource>,
-    ) {
-        let (receipt, sources, _version_bundle_sources) = self.reconstruction.into_parts();
-        (self.managed_root, receipt, sources.into_sources())
-    }
-}
-
-impl ManagedAssetsReconstruction {
-    #[cfg(test)]
-    pub(crate) fn version_id(&self) -> &str {
-        self.reconstruction.receipt.version_id()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn asset_entry_count(&self) -> usize {
-        self.asset_entry_count
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expected_content_byte_count(&self) -> u64 {
-        self.expected_content_byte_count
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_source_count(&self) -> usize {
-        self.asset_sources.len()
-    }
-
-    pub(crate) fn into_effect_parts(
-        self,
-    ) -> (
-        ManagedDir,
-        KnownGoodReconstructionReceipt,
-        Vec<RetainedAssetComponentSource>,
-    ) {
-        (
-            self.managed_root,
-            self.reconstruction.discard_sources(),
-            self.asset_sources.into_sources(),
-        )
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn managed_libraries_reconstruction_fixture_for_test(
-    managed_root: ManagedDir,
-    version_id: &str,
-) -> Result<ManagedLibrariesReconstruction, DownloadError> {
-    const PATH: &str = "org/axial/fixture/1.0.0/fixture-1.0.0.jar";
-    const BYTES: &[u8] = b"axial managed Libraries fixture";
-    let version_id = KnownGoodId::new(version_id).map_err(|_| {
-        DownloadError::Integrity("managed Libraries fixture version id is invalid".to_string())
-    })?;
-    let path = PortableRelativePath::new(PATH).map_err(|_| {
-        DownloadError::Integrity("managed Libraries fixture path is invalid".to_string())
-    })?;
-    let sha1: [u8; 20] = Sha1::digest(BYTES).into();
-    let mut inventory = InventoryBuilder::default();
-    inventory
-        .insert(KnownGoodEntry {
-            root: KnownGoodRoot::Libraries,
-            path: KnownGoodRelativePath::new(PATH).map_err(|_| {
-                DownloadError::Integrity(
-                    "managed Libraries fixture inventory path is invalid".to_string(),
-                )
-            })?,
-            kind: KnownGoodArtifactKind::Library,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: sha1_array_digest(&sha1),
-                size: BYTES.len() as u64,
-            },
-        })
-        .map_err(|_| {
-            DownloadError::Integrity("managed Libraries fixture inventory is invalid".to_string())
-        })?;
-    let authenticated = AuthenticatedKnownGoodReceipt {
-        version_id: version_id.clone(),
-        inventory: Arc::new(inventory.finish()),
-        effective_version: VersionJson {
-            id: version_id.0,
-            inherits_from: String::new(),
-            materialized: false,
-            kind: "release".to_string(),
-            main_class: String::new(),
-            minimum_launcher_version: 0,
-            compliance_level: 0,
-            release_time: String::new(),
-            time: String::new(),
-            arguments: None,
-            minecraft_arguments: String::new(),
-            asset_index: crate::launch::AssetIndex::default(),
-            assets: String::new(),
-            downloads: crate::launch::Downloads::default(),
-            java_version: crate::launch::JavaVersion::default(),
-            libraries: Vec::new(),
-            logging: None,
-        },
-        environment: crate::rules::default_environment(),
-    };
-    let mut sources = RetainedLibrarySourceSet::new();
-    sources.insert(
-        RetainedLibraryComponentSource::from_authenticated_local_bytes(
-            path,
-            crate::download::library_source::LibraryComponentSourceKind::Library,
-            BYTES.to_vec(),
-            BYTES.len() as u64,
-            sha1,
-        )
-        .map_err(|_| {
-            DownloadError::Integrity("managed Libraries fixture source is invalid".to_string())
-        })?,
-    )?;
-    Ok(ManagedLibrariesReconstruction {
-        reconstruction: RetainedKnownGoodReconstruction::new(
-            KnownGoodReconstructionReceipt { authenticated },
-            sources,
-            None,
-        ),
-        managed_root,
-        #[cfg(test)]
-        library_entry_count: 1,
-        #[cfg(test)]
-        expected_content_byte_count: BYTES.len() as u64,
-    })
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) async fn managed_assets_reconstruction_fixture_for_test(
-    managed_root: ManagedDir,
-    version_id: &str,
-) -> Result<ManagedAssetsReconstruction, DownloadError> {
-    const INDEX_ID: &str = "fixture-assets";
-    const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
-    let version_id = KnownGoodId::new(version_id).map_err(|_| {
-        DownloadError::Integrity("managed Assets fixture version id is invalid".to_string())
-    })?;
-    let object_sha1: [u8; 20] = Sha1::digest(OBJECT_BYTES).into();
-    let object_digest = sha1_array_digest(&object_sha1);
-    let empty_sha1: [u8; 20] = Sha1::digest([]).into();
-    let empty_digest = sha1_array_digest(&empty_sha1);
-    let index_bytes = serde_json::to_vec(&serde_json::json!({
-        "objects": {
-            "fixture/object": {
-                "hash": object_digest.as_str(),
-                "size": OBJECT_BYTES.len()
-            },
-            "fixture/empty": {
-                "hash": empty_digest.as_str(),
-                "size": 0
-            }
-        }
-    }))
-    .map_err(|_| DownloadError::Integrity("managed Assets fixture index is invalid".to_string()))?;
-    let index_sha1: [u8; 20] = Sha1::digest(&index_bytes).into();
-    let index_path = format!("indexes/{INDEX_ID}.json");
-    let object_path = format!(
-        "objects/{}/{}",
-        &object_digest.as_str()[..2],
-        object_digest.as_str()
-    );
-    let empty_path = format!(
-        "objects/{}/{}",
-        &empty_digest.as_str()[..2],
-        empty_digest.as_str()
-    );
-    let mut inventory = InventoryBuilder::default();
-    for (path, kind, digest, size) in [
-        (
-            index_path.as_str(),
-            KnownGoodArtifactKind::AssetIndex,
-            index_sha1,
-            index_bytes.len() as u64,
-        ),
-        (
-            object_path.as_str(),
-            KnownGoodArtifactKind::AssetObject,
-            object_sha1,
-            OBJECT_BYTES.len() as u64,
-        ),
-        (
-            empty_path.as_str(),
-            KnownGoodArtifactKind::AssetObject,
-            empty_sha1,
-            0,
-        ),
-    ] {
-        inventory
-            .insert(KnownGoodEntry {
-                root: KnownGoodRoot::Assets,
-                path: KnownGoodRelativePath::new(path).map_err(|_| {
-                    DownloadError::Integrity(
-                        "managed Assets fixture inventory path is invalid".to_string(),
-                    )
-                })?,
-                kind,
-                integrity: KnownGoodIntegrity::Sha1 {
-                    digest: sha1_array_digest(&digest),
-                    size,
-                },
-            })
-            .map_err(|_| {
-                DownloadError::Integrity("managed Assets fixture inventory is invalid".to_string())
-            })?;
-    }
-    let authenticated = AuthenticatedKnownGoodReceipt {
-        version_id: version_id.clone(),
-        inventory: Arc::new(inventory.finish()),
-        effective_version: VersionJson {
-            id: version_id.0,
-            inherits_from: String::new(),
-            materialized: false,
-            kind: "release".to_string(),
-            main_class: String::new(),
-            minimum_launcher_version: 0,
-            compliance_level: 0,
-            release_time: String::new(),
-            time: String::new(),
-            arguments: None,
-            minecraft_arguments: String::new(),
-            asset_index: crate::launch::AssetIndex {
-                id: INDEX_ID.to_string(),
-                sha1: format!("{:x}", Sha1::digest(&index_bytes)),
-                size: index_bytes.len() as i64,
-                total_size: OBJECT_BYTES.len() as i64,
-                url: String::new(),
-            },
-            assets: INDEX_ID.to_string(),
-            downloads: crate::launch::Downloads::default(),
-            java_version: crate::launch::JavaVersion::default(),
-            libraries: Vec::new(),
-            logging: None,
-        },
-        environment: crate::rules::default_environment(),
-    };
-    let asset_workers = crate::managed_blocking::ManagedBlockingWorkers::new();
-    let asset_attempt = asset_workers.attempt_guard();
-    let source_pool = AssetSourcePool::new_with_workers(asset_workers.clone())?;
-    let mut sources = RetainedAssetSourceSet::new();
-    for (path, kind, bytes) in [
-        (
-            index_path.as_str(),
-            ManagedComponentArtifactKind::AssetIndex,
-            index_bytes,
-        ),
-        (
-            object_path.as_str(),
-            ManagedComponentArtifactKind::AssetObject,
-            OBJECT_BYTES.to_vec(),
-        ),
-        (
-            empty_path.as_str(),
-            ManagedComponentArtifactKind::AssetObject,
-            Vec::new(),
-        ),
-    ] {
-        let path = PortableRelativePath::new(path).map_err(|_| {
-            DownloadError::Integrity("managed Assets fixture source path is invalid".to_string())
-        })?;
-        sources.insert(
-            source_pool
-                .retain_authenticated_local_bytes(path, kind, bytes)
-                .await?,
-        )?;
-    }
-    asset_workers.drain().await;
-    asset_attempt.disarm();
-    RetainedKnownGoodReconstruction::new(
-        KnownGoodReconstructionReceipt { authenticated },
-        RetainedLibrarySourceSet::new(),
-        None,
-    )
-    .bind_managed_assets(
-        managed_root,
-        sources,
-        AuthenticatedAssetCacheProofSet::default(),
-    )
-}
-
 #[cfg(any(test, feature = "test-support"))]
 type ManagedVersionBundleFixtureParts = (
     PendingKnownGoodInstallAuthority,
@@ -1844,13 +1237,13 @@ pub(crate) fn managed_version_bundle_client_fixture_parts_for_test(
     version_id: &str,
     client_bytes: &[u8],
 ) -> Result<ManagedVersionBundleFixtureParts, DownloadError> {
-    const LOG_ID: &str = "guardian-version-bundle.xml";
+    const LOG_ID: &str = "managed-version-bundle.xml";
     const LOG_BYTES: &[u8] = b"<Configuration/>";
     let client_sha1 = format!("{:x}", Sha1::digest(client_bytes));
     let mut version_json = serde_json::json!({
         "id": version_id,
         "type": "release",
-        "mainClass": "org.axial.GuardianFixture",
+        "mainClass": "org.axial.ManagedFixture",
         "downloads": {
             "client": {
                 "sha1": client_sha1,
@@ -1887,61 +1280,6 @@ pub(crate) fn managed_version_bundle_client_fixture_parts_for_test(
         client_bytes.to_vec(),
         Some(LOG_BYTES.to_vec()),
     ))
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn managed_version_bundle_reconstruction_fixture_for_test(
-    managed_root: ManagedDir,
-    version_id: &str,
-) -> Result<ManagedVersionBundleReconstruction, DownloadError> {
-    let (authority, version_json, client_bytes, log_config_bytes) =
-        managed_version_bundle_fixture_parts_for_test(version_id)?;
-    let PendingKnownGoodInstallAuthority { authenticated } = authority;
-    RetainedKnownGoodReconstruction::new(
-        KnownGoodReconstructionReceipt { authenticated },
-        RetainedLibrarySourceSet::new(),
-        Some(
-            RetainedVersionBundleReconstructionSources::from_local_final(
-                version_json,
-                client_bytes,
-                log_config_bytes,
-            ),
-        ),
-    )
-    .bind_managed_version_bundle(managed_root)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn managed_version_bundle_reconstruction_fixture_for_source_test(
-    managed_root: ManagedDir,
-    expected: &KnownGoodActivationSource,
-) -> Result<ManagedVersionBundleReconstruction, DownloadError> {
-    let (_, version_json, client_bytes, log_config_bytes) =
-        managed_version_bundle_fixture_parts_for_test(expected.version_id())?;
-    let projection = expected
-        .inventory
-        .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-        .map_err(|_| {
-            DownloadError::Integrity(
-                "registered fixture VersionBundle projection is invalid".to_string(),
-            )
-        })?;
-    let source = AuthenticatedVersionBundleSource::from_reconstruction_projection(
-        expected.version_id().to_string(),
-        &projection,
-        RetainedVersionBundleReconstructionSources::from_local_final(
-            version_json,
-            client_bytes,
-            log_config_bytes,
-        ),
-    )?;
-    ManagedVersionBundleReconstruction::from_registered(
-        managed_root,
-        expected.version_id(),
-        Arc::clone(&expected.inventory),
-        expected.activation_contract_id.clone(),
-        source,
-    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2845,6 +2183,14 @@ impl KnownGoodReconstructionReceipt {
         self.authenticated.version_id.as_str()
     }
 
+    pub(crate) fn require_game_libraries(
+        mut self,
+        requirements: &crate::loaders::game_libraries::Requirements,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        self.authenticated.require_game_libraries(requirements)?;
+        Ok(self)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn into_activation_source(self) -> KnownGoodActivationSource {
         let activation_contract_id = self
@@ -3111,17 +2457,12 @@ pub(crate) fn reconstructed_effective_version(
 }
 
 pub(crate) fn seal_reconstructed_profile_source(
-    base: RetainedKnownGoodReconstruction,
+    base: KnownGoodReconstructionReceipt,
     record: &LoaderBuildRecord,
     resolved_version: VersionJson,
     version_bytes: Vec<u8>,
     library_declarations: SealedExactLibraryDeclarations,
-    library_sources: RetainedLibrarySourceSet,
-) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
-    let (base, mut retained_sources, version_bundle_sources) = base.into_parts();
-    retained_sources
-        .merge(library_sources)
-        .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
     let authenticated = derive_profile_receipt(
         &base.authenticated,
         record,
@@ -3129,34 +2470,18 @@ pub(crate) fn seal_reconstructed_profile_source(
         &version_bytes,
         library_declarations,
     )?;
-    Ok(RetainedKnownGoodReconstruction::new(
-        KnownGoodReconstructionReceipt { authenticated },
-        retained_sources,
-        version_bundle_sources.map(|sources| sources.replace_final(version_bytes, None)),
-    ))
+    Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
 pub(crate) fn seal_reconstructed_installer_source(
     authority: AuthenticatedInstallerReconstructionAuthority,
-) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
-    let (
-        base,
-        base_client_source,
-        record,
-        input,
-        resolved_version,
-        version_bytes,
-        child_client,
-        library_sources,
-    ) = authority.consume_for_sealing();
-    let (base, mut retained_sources, version_bundle_sources) = base.into_parts();
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
+    let (base, base_client_source, record, input, resolved_version, version_bytes, child_client) =
+        authority.consume_for_sealing();
     let (source, library_declarations, local_library_sources) = input.into_parts();
     if !local_library_sources.is_empty() {
         return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
     }
-    retained_sources
-        .merge(library_sources)
-        .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
     if !source.matches_record(&record) {
         return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
     }
@@ -3173,18 +2498,12 @@ pub(crate) fn seal_reconstructed_installer_source(
             child_client: &child_client,
         },
     )?;
-    let child_client = child_client.into_bytes();
-    Ok(RetainedKnownGoodReconstruction::new(
-        KnownGoodReconstructionReceipt { authenticated },
-        retained_sources,
-        version_bundle_sources
-            .map(|sources| sources.replace_final(version_bytes, Some(child_client))),
-    ))
+    Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
 pub(crate) fn seal_reconstructed_legacy_archive_source(
     authority: AuthenticatedLegacyOverlayAuthority,
-) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
     let (
         base,
         base_client_source,
@@ -3194,7 +2513,6 @@ pub(crate) fn seal_reconstructed_legacy_archive_source(
         version_bytes,
         child_client_bytes,
     ) = authority.consume_for_sealing();
-    let (base, library_sources, version_bundle_sources) = base.into_parts();
     let LoaderInstallSource::LegacyArchive { url: archive_url } = &record.install_source else {
         return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
     };
@@ -3209,12 +2527,7 @@ pub(crate) fn seal_reconstructed_legacy_archive_source(
         &version_bytes,
         &child_client_bytes,
     )?;
-    Ok(RetainedKnownGoodReconstruction::new(
-        KnownGoodReconstructionReceipt { authenticated },
-        library_sources,
-        version_bundle_sources
-            .map(|sources| sources.replace_final(version_bytes, Some(child_client_bytes))),
-    ))
+    Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
 fn authenticate_reconstructed_client_source(
@@ -3245,7 +2558,7 @@ fn authenticate_reconstructed_client_source(
 
 pub(crate) fn seal_reconstructed_vanilla(
     authority: ReconstructedVanillaAuthority,
-) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
     let ReconstructedVanillaAuthorityParts {
         version,
         environment,
@@ -3253,8 +2566,6 @@ pub(crate) fn seal_reconstructed_vanilla(
         version_source,
         asset_source,
         runtime_source,
-        library_sources,
-        version_bundle_sources,
     } = authority.into_parts();
     let authenticated = authenticate_vanilla_authority(
         &version,
@@ -3264,11 +2575,7 @@ pub(crate) fn seal_reconstructed_vanilla(
         asset_source.as_ref(),
         runtime_source.as_ref(),
     )?;
-    Ok(RetainedKnownGoodReconstruction::new(
-        KnownGoodReconstructionReceipt { authenticated },
-        library_sources,
-        version_bundle_sources,
-    ))
+    Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
 pub(crate) fn authenticate_pending_known_good_install(
@@ -3482,19 +2789,6 @@ impl KnownGoodActivationSource {
             self.inventory,
             self.activation_contract_id,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_registered_snapshot(
-        version_id: &str,
-        inventory: Arc<KnownGoodInventory>,
-        activation_contract_id: ManagedInstallActivationContractId,
-    ) -> Result<Self, KnownGoodInventoryError> {
-        Ok(Self {
-            version_id: KnownGoodId::new(version_id)?,
-            inventory,
-            activation_contract_id,
-        })
     }
 
     #[cfg(feature = "test-support")]
@@ -7863,5 +7157,4 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
     }
-
 }

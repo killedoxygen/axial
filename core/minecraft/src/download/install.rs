@@ -1,26 +1,22 @@
-use super::asset_source::{
-    AssetSourcePool, AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource,
-    RetainedAssetSourceSet,
-};
-#[cfg(test)]
-use super::assets::AssetDownloadPipeline;
+use super::asset_source::{RetainedAssetComponentSource, RetainedAssetSourceSet};
 use super::assets::{
     ASSET_OBJECT_BASE_URL, AssetDownloadPipelineEvent, AssetSourceAcquisitionInputs,
-    AssetSourceAcquisitionRequest, RetainedAssetsAcquisition, abort_asset_download_pipeline,
-    acquire_asset_sources_with_cache, asset_cache_error, next_asset_download_pipeline_event,
+    RetainedAssetsAcquisition, abort_asset_download_pipeline, next_asset_download_pipeline_event,
     prepare_asset_download_pipeline, spawn_asset_download_pipeline,
 };
+#[cfg(test)]
+use super::assets::{AssetDownloadPipeline, asset_cache_error};
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::facts::selected_download_source_label;
 use super::libraries::{
     ExactLibraryCacheAdmission, RetainedClassifiedLibraryAcquisition,
     acquire_retained_classified_library, library_jobs_for,
 };
+#[cfg(test)]
+use super::library_source::AuthenticatedLocalLibraryBytes;
 use super::library_source::{
-    AuthenticatedLibraryCacheProof, AuthenticatedLibraryCacheProofSet,
-    AuthenticatedLocalLibraryBytes, LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind,
-    LibrarySourcePool, LibrarySourceRequest, RetainedLibraryComponentSource,
-    RetainedLibrarySourceSet, acquire_retained_library_component_source,
+    LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind, LibrarySourcePool, LibrarySourceRequest,
+    RetainedLibraryComponentSource, acquire_retained_library_component_source,
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
@@ -52,7 +48,7 @@ use crate::known_good::{
     KnownGoodActivationSource, KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
     KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
     MAX_KNOWN_GOOD_VERSION_JSON_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
-    ManagedKnownGoodComponent, PendingKnownGoodInstallAuthority, RetainedKnownGoodReconstruction,
+    ManagedKnownGoodComponent, PendingKnownGoodInstallAuthority,
     authenticate_pending_known_good_install, seal_reconstructed_vanilla,
 };
 use crate::known_good_libraries::{
@@ -66,8 +62,7 @@ use crate::loaders::{
     LoaderInstallBaseCommitVerificationFailure, VerifiedLoaderInstallBaseCheckpoint,
     VerifiedLoaderInstallBaseCommit,
 };
-use crate::managed_blocking::{ManagedBlockingAttemptGuard, ManagedBlockingWorkers};
-use crate::managed_component_cache::ManagedComponentExactCache;
+use crate::managed_blocking::ManagedBlockingWorkers;
 #[cfg(test)]
 use crate::managed_component_lifecycle::publish_managed_component_effect_rolling_back_after_first_row_for_test;
 use crate::managed_component_lifecycle::{
@@ -79,11 +74,8 @@ use crate::managed_publication::{
     ManagedRootPublicationLease, open_managed_target_parent, run_publication_blocking,
     validate_existing_managed_target_path,
 };
-use crate::manifest::{
-    ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest,
-    fetch_registered_repair_version_manifest,
-};
-use crate::portable_path::{PortableFileName, PortableRelativePath};
+use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
+use crate::portable_path::PortableFileName;
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -92,11 +84,11 @@ use crate::runtime::{
 };
 use crate::version_bundle_publication::{
     DurableVersionBundleAcknowledgementOutcome, DurableVersionBundleEvidence,
-    DurableVersionBundleOutcome, VersionBundlePublicationPurpose, VersionBundleTransactionError,
-    VersionBundleTransactionRecovery, VersionBundleTransactionSettledOutcome,
-    acknowledge_durable_version_bundle, classify_durable_version_bundle_candidates,
-    durable_version_bundle_root_binding, publish_version_bundle, read_committed_version_metadata,
-    revalidate_settled_version_bundle, settle_version_bundle_publication,
+    DurableVersionBundleOutcome, VersionBundleTransactionError, VersionBundleTransactionRecovery,
+    VersionBundleTransactionSettledOutcome, acknowledge_durable_version_bundle,
+    classify_durable_version_bundle_candidates, durable_version_bundle_root_binding,
+    publish_version_bundle, read_committed_version_metadata, revalidate_settled_version_bundle,
+    settle_version_bundle_publication,
 };
 use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
@@ -248,12 +240,6 @@ pub(crate) struct AuthenticatedVersionBundleSource {
     members: Vec<AuthenticatedVersionBundleMemberSource>,
 }
 
-pub(crate) struct RetainedVersionBundleReconstructionSources {
-    version_json: Arc<[u8]>,
-    client_jar: Arc<[u8]>,
-    log_config: Option<Arc<[u8]>>,
-}
-
 /// Exact recorded bytes are reconstruction inputs, never publication authority.
 #[derive(Clone)]
 pub struct RecordedVersionMetadata {
@@ -306,27 +292,6 @@ impl RecordedVersionMetadata {
         }))
     }
 
-    pub(crate) async fn read_activation(
-        root: ManagedLibraryOperation,
-        authority: &KnownGoodActivationSource,
-    ) -> Result<Option<Self>, DownloadError> {
-        let projection = authority
-            .inventory()
-            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-            .map_err(|_| {
-                version_bundle_install_error("invalid recorded VersionBundle inventory")
-            })?;
-        let contract = version_bundle_contract(authority.version_id(), &projection)?;
-        Self::read_registered(
-            root,
-            authority.version_id(),
-            authority.activation_contract_id(),
-            &contract.version_json.digest,
-            contract.version_json.size,
-        )
-        .await
-    }
-
     pub(crate) fn matches(
         &self,
         version_id: &str,
@@ -334,13 +299,6 @@ impl RecordedVersionMetadata {
     ) -> bool {
         self.version_id == version_id && self.expected == *expected
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RegisteredVersionBundleSourceError {
-    Source,
-    Authority,
-    LocalPreparation,
 }
 
 #[derive(Clone)]
@@ -351,20 +309,6 @@ struct VersionBundleMemberContract {
     logical_identity: String,
     digest: String,
     size: u64,
-}
-
-#[derive(Clone)]
-struct VersionBundleContract {
-    version_json: VersionBundleMemberContract,
-    client_jar: VersionBundleMemberContract,
-    log_config: Option<VersionBundleMemberContract>,
-}
-
-#[derive(Default)]
-struct ExactLocalVersionBundleSources {
-    version_json: Option<AuthenticatedVersionBundleMemberSource>,
-    client_jar: Option<AuthenticatedVersionBundleMemberSource>,
-    log_config: Option<AuthenticatedVersionBundleMemberSource>,
 }
 
 #[derive(Clone)]
@@ -387,23 +331,6 @@ impl AuthenticatedVersionBundleSource {
 
     pub(crate) fn into_sources(self) -> Vec<AuthenticatedVersionBundleMemberSource> {
         self.members
-    }
-
-    fn from_members(
-        version_id: String,
-        projection: &ManagedComponentProjection<'_>,
-        members: Vec<AuthenticatedVersionBundleMemberSource>,
-    ) -> Result<Self, DownloadError> {
-        let source = Self {
-            version_id,
-            members,
-        };
-        if !source.matches_projection(projection) {
-            return Err(version_bundle_install_error(
-                "VersionBundle sources do not match the admitted projection",
-            ));
-        }
-        Ok(source)
     }
 
     fn from_selected_sources(
@@ -476,54 +403,6 @@ impl AuthenticatedVersionBundleSource {
         if !source.matches_projection(projection) {
             return Err(version_bundle_install_error(
                 "local version bundle sources do not match the admitted projection",
-            ));
-        }
-        Ok(source)
-    }
-
-    pub(crate) fn from_reconstruction_projection(
-        version_id: String,
-        projection: &ManagedComponentProjection<'_>,
-        sources: RetainedVersionBundleReconstructionSources,
-    ) -> Result<Self, DownloadError> {
-        let version_json_identity = projected_member_identity(
-            &version_id,
-            projection,
-            KnownGoodArtifactKind::VersionMetadata,
-        )?;
-        let client_jar_identity =
-            projected_member_identity(&version_id, projection, KnownGoodArtifactKind::ClientJar)?;
-        let projected_log_identity = projected_optional_log_identity(projection)?;
-        if projected_log_identity.is_some() != sources.log_config.is_some() {
-            return Err(version_bundle_install_error(
-                "reconstructed version bundle logging source does not match the projection",
-            ));
-        }
-        let mut members = Vec::with_capacity(2 + usize::from(sources.log_config.is_some()));
-        members.push(AuthenticatedVersionBundleMemberSource::from_shared(
-            KnownGoodArtifactKind::VersionMetadata,
-            version_json_identity,
-            sources.version_json,
-        )?);
-        members.push(AuthenticatedVersionBundleMemberSource::from_shared(
-            KnownGoodArtifactKind::ClientJar,
-            client_jar_identity,
-            sources.client_jar,
-        )?);
-        if let (Some(identity), Some(bytes)) = (projected_log_identity, sources.log_config) {
-            members.push(AuthenticatedVersionBundleMemberSource::from_shared(
-                KnownGoodArtifactKind::LogConfig,
-                identity,
-                bytes,
-            )?);
-        }
-        let source = Self {
-            version_id,
-            members,
-        };
-        if !source.matches_projection(projection) {
-            return Err(version_bundle_install_error(
-                "reconstructed version bundle sources do not match the projection",
             ));
         }
         Ok(source)
@@ -607,40 +486,6 @@ impl AuthenticatedVersionBundleMemberSource {
         })
     }
 
-    fn from_shared(
-        kind: KnownGoodArtifactKind,
-        logical_identity: String,
-        bytes: Arc<[u8]>,
-    ) -> Result<Self, DownloadError> {
-        if !matches!(
-            kind,
-            KnownGoodArtifactKind::VersionMetadata
-                | KnownGoodArtifactKind::ClientJar
-                | KnownGoodArtifactKind::LogConfig
-        ) || logical_identity.trim().is_empty()
-        {
-            return Err(version_bundle_install_error(
-                "reconstructed version bundle member identity is invalid",
-            ));
-        }
-        let observed_size = u64::try_from(bytes.len()).map_err(|_| {
-            version_bundle_install_error("reconstructed version bundle source is too large")
-        })?;
-        if observed_size == 0 || observed_size > MAX_TIER2_ARTIFACT_BYTES {
-            return Err(version_bundle_install_error(
-                "reconstructed version bundle source exceeds the admitted bounds",
-            ));
-        }
-        let observed_sha1 = format!("{:x}", Sha1::digest(&bytes));
-        Ok(Self {
-            kind,
-            logical_identity,
-            bytes,
-            observed_sha1,
-            observed_size,
-        })
-    }
-
     pub(crate) fn kind(&self) -> KnownGoodArtifactKind {
         self.kind
     }
@@ -662,79 +507,6 @@ impl AuthenticatedVersionBundleMemberSource {
     }
 }
 
-impl RetainedVersionBundleReconstructionSources {
-    fn from_authenticated(
-        version_json: &AuthenticatedSelectedArtifactSource,
-        client_jar: &AuthenticatedSelectedArtifactSource,
-        log_config: Option<&AuthenticatedSelectedArtifactSource>,
-    ) -> Result<Self, DownloadError> {
-        if version_json.kind() != SelectedDownloadArtifactKind::VersionJson
-            || client_jar.kind() != SelectedDownloadArtifactKind::ClientJar
-            || log_config
-                .is_some_and(|source| source.kind() != SelectedDownloadArtifactKind::LogConfig)
-        {
-            return Err(version_bundle_install_error(
-                "reconstructed version bundle selected-source shape is invalid",
-            ));
-        }
-        Ok(Self {
-            version_json: version_json.shared_bytes(),
-            client_jar: client_jar.shared_bytes(),
-            log_config: log_config.map(AuthenticatedSelectedArtifactSource::shared_bytes),
-        })
-    }
-
-    pub(crate) fn replace_final(self, version_json: Vec<u8>, client_jar: Option<Vec<u8>>) -> Self {
-        Self {
-            version_json: version_json.into(),
-            client_jar: client_jar.map(Arc::<[u8]>::from).unwrap_or(self.client_jar),
-            log_config: self.log_config,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
-        if projection.component() != ManagedKnownGoodComponent::VersionBundle {
-            return false;
-        }
-        let expected_count = 2 + usize::from(self.log_config.is_some());
-        projection.entry_count() == expected_count
-            && projection.entries().iter().all(|projected| {
-                let bytes = match projected.entry().kind() {
-                    KnownGoodArtifactKind::VersionMetadata => self.version_json.as_ref(),
-                    KnownGoodArtifactKind::ClientJar => self.client_jar.as_ref(),
-                    KnownGoodArtifactKind::LogConfig => {
-                        let Some(bytes) = self.log_config.as_deref() else {
-                            return false;
-                        };
-                        bytes
-                    }
-                    _ => return false,
-                };
-                let (KnownGoodIntegrity::Sha1 { digest, size }
-                | KnownGoodIntegrity::ExactBytes { digest, size }) = projected.entry().integrity()
-                else {
-                    return false;
-                };
-                *size == bytes.len() as u64
-                    && digest.as_str() == format!("{:x}", Sha1::digest(bytes))
-            })
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn from_local_final(
-        version_json: Vec<u8>,
-        client_jar: Vec<u8>,
-        log_config: Option<Vec<u8>>,
-    ) -> Self {
-        Self {
-            version_json: version_json.into(),
-            client_jar: client_jar.into(),
-            log_config: log_config.map(Arc::<[u8]>::from),
-        }
-    }
-}
-
 fn encode_sha1_digest(digest: [u8; 20]) -> String {
     use std::fmt::Write as _;
 
@@ -746,13 +518,12 @@ fn encode_sha1_digest(digest: [u8; 20]) -> String {
 }
 
 pub(crate) struct ReconstructedVanillaClientAuthority {
-    reconstruction: RetainedKnownGoodReconstruction,
+    reconstruction: KnownGoodReconstructionReceipt,
     client_source: AuthenticatedSelectedArtifactSource,
 }
 
 #[derive(Clone)]
 pub(crate) struct ManagedReconstructionContext {
-    mode: ManagedReconstructionMode,
     recorded_metadata: Option<RecordedVersionMetadata>,
     workers: ManagedBlockingWorkers,
     blocking_operation: Arc<tokio::sync::Mutex<()>>,
@@ -769,102 +540,13 @@ struct ManagedReconstructionDrainMonitor {
     workers: ManagedBlockingWorkers,
 }
 
-#[derive(Clone)]
-enum ManagedReconstructionMode {
-    ProofOnly,
-    VersionBundle,
-    Libraries(ManagedLibrariesReconstructionContext),
-    Assets(ManagedAssetsReconstructionContext),
-}
-
-#[derive(Clone)]
-struct ManagedLibrariesReconstructionContext {
-    source_pool: LibrarySourcePool,
-    cache_admission: ExactLibraryCacheAdmission,
-    cache_proofs: Arc<std::sync::Mutex<AuthenticatedLibraryCacheProofSet>>,
-}
-
-#[derive(Clone)]
-struct ManagedAssetsReconstructionContext {
-    source_pool: AssetSourcePool,
-    cache: ManagedComponentExactCache,
-    authority:
-        Arc<std::sync::Mutex<Option<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet)>>>,
-}
-
 impl ManagedReconstructionContext {
-    pub(crate) fn proof_only() -> Self {
-        let workers = ManagedBlockingWorkers::new();
+    pub(crate) fn new() -> Self {
         Self {
-            mode: ManagedReconstructionMode::ProofOnly,
             recorded_metadata: None,
-            workers,
+            workers: ManagedBlockingWorkers::new(),
             blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
         }
-    }
-
-    pub(crate) async fn bind_libraries(managed_root: ManagedDir) -> Result<Self, DownloadError> {
-        let workers = ManagedBlockingWorkers::new();
-        let attempt = workers.attempt_guard();
-        let result = async {
-            Ok(Self {
-                mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {
-                    source_pool: LibrarySourcePool::new_with_workers(workers.clone())?,
-                    cache_admission: ExactLibraryCacheAdmission::bind_guarded_with_workers(
-                        managed_root,
-                        workers.clone(),
-                    )
-                    .await?,
-                    cache_proofs: Arc::new(std::sync::Mutex::new(
-                        AuthenticatedLibraryCacheProofSet::default(),
-                    )),
-                }),
-                recorded_metadata: None,
-                workers: workers.clone(),
-                blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
-            })
-        }
-        .await;
-        settle_new_managed_blocking_scope(workers, attempt, result).await
-    }
-
-    pub(crate) async fn bind_assets(managed_root: ManagedDir) -> Result<Self, DownloadError> {
-        let workers = ManagedBlockingWorkers::new();
-        let attempt = workers.attempt_guard();
-        let result = async {
-            Ok(Self {
-                mode: ManagedReconstructionMode::Assets(ManagedAssetsReconstructionContext {
-                    source_pool: AssetSourcePool::new_with_workers(workers.clone())?,
-                    cache: ManagedComponentExactCache::bind_guarded_with_workers(
-                        managed_root,
-                        ManagedComponentKind::Assets,
-                        workers.clone(),
-                    )
-                    .await
-                    .map_err(asset_cache_error)?,
-                    authority: Arc::new(std::sync::Mutex::new(None)),
-                }),
-                recorded_metadata: None,
-                workers: workers.clone(),
-                blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
-            })
-        }
-        .await;
-        settle_new_managed_blocking_scope(workers, attempt, result).await
-    }
-
-    pub(crate) fn version_bundle() -> Self {
-        let workers = ManagedBlockingWorkers::new();
-        Self {
-            mode: ManagedReconstructionMode::VersionBundle,
-            recorded_metadata: None,
-            workers,
-            blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
-        }
-    }
-
-    fn retains_version_bundle_sources(&self) -> bool {
-        matches!(self.mode, ManagedReconstructionMode::VersionBundle)
     }
 
     pub(crate) fn with_recorded_metadata(
@@ -915,180 +597,8 @@ impl ManagedReconstructionContext {
         result
     }
 
-    pub(crate) fn retains_library_sources(&self) -> bool {
-        matches!(self.mode, ManagedReconstructionMode::Libraries(_))
-    }
-
-    fn phase_library_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
-        match &self.mode {
-            ManagedReconstructionMode::Libraries(libraries) => Ok(libraries.source_pool.clone()),
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets(_) => {
-                LibrarySourcePool::new_with_workers(self.workers.clone())
-            }
-        }
-    }
-
-    async fn requires_retained_exact_source(
-        &self,
-        job: &super::libraries::DownloadJob,
-    ) -> Result<bool, DownloadError> {
-        let libraries = match &self.mode {
-            ManagedReconstructionMode::Libraries(libraries) => libraries,
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets(_) => return Ok(true),
-        };
-        if libraries
-            .cache_admission
-            .requires_retained_source(job)
-            .await?
-        {
-            return Ok(true);
-        }
-        let expected_size = job.expected.size.ok_or_else(|| {
-            DownloadError::Integrity("exact library cache proof lost its size".to_string())
-        })?;
-        let expected_sha1 = job
-            .expected
-            .sha1
-            .as_deref()
-            .and_then(super::libraries::decode_sha1)
-            .ok_or_else(|| {
-                DownloadError::Integrity("exact library cache proof lost its SHA-1".to_string())
-            })?;
-        libraries
-            .cache_proofs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(AuthenticatedLibraryCacheProof::new(
-                job.relative_path.clone(),
-                component_source_kind(job.is_native),
-                expected_size,
-                expected_sha1,
-            ))?;
-        Ok(false)
-    }
-
-    async fn retain_exact_cache_source(
-        &self,
-        job: &super::libraries::DownloadJob,
-        source_pool: &LibrarySourcePool,
-        kind: LibraryComponentSourceKind,
-    ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
-        let libraries = match &self.mode {
-            ManagedReconstructionMode::Libraries(libraries) => libraries,
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets(_) => return Ok(None),
-        };
-        libraries
-            .cache_admission
-            .retain_installer_source(job, source_pool, kind)
-            .await
-    }
-
-    pub(crate) fn take_library_cache_proofs(&self) -> AuthenticatedLibraryCacheProofSet {
-        match &self.mode {
-            ManagedReconstructionMode::Libraries(libraries) => std::mem::take(
-                &mut *libraries
-                    .cache_proofs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets(_) => AuthenticatedLibraryCacheProofSet::default(),
-        }
-    }
-
-    fn assets_acquisition(&self) -> Option<(AssetSourcePool, ManagedComponentExactCache)> {
-        match &self.mode {
-            ManagedReconstructionMode::Assets(assets) => {
-                Some((assets.source_pool.clone(), assets.cache.clone()))
-            }
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Libraries(_) => None,
-        }
-    }
-
-    fn retain_assets_authority(
-        &self,
-        sources: RetainedAssetSourceSet,
-        cache_proofs: AuthenticatedAssetCacheProofSet,
-    ) -> Result<(), DownloadError> {
-        let assets = match &self.mode {
-            ManagedReconstructionMode::Assets(assets) => assets,
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Libraries(_) => {
-                return Err(DownloadError::Integrity(
-                    "non-Assets reconstruction produced retained Assets authority".to_string(),
-                ));
-            }
-        };
-        let mut authority = assets
-            .authority
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if authority.is_some() {
-            return Err(DownloadError::Integrity(
-                "Assets reconstruction produced duplicate retained authority".to_string(),
-            ));
-        }
-        *authority = Some((sources, cache_proofs));
-        Ok(())
-    }
-
-    pub(crate) fn take_assets_authority(
-        self,
-    ) -> Result<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet), DownloadError> {
-        let ManagedReconstructionMode::Assets(assets) = self.mode else {
-            return Err(DownloadError::Integrity(
-                "Assets authority was requested from a different reconstruction mode".to_string(),
-            ));
-        };
-        take_retained_assets_authority(assets.authority)
-    }
-
-    pub(crate) async fn retain_local_sources(
-        &self,
-        sources: Vec<AuthenticatedLocalLibraryBytes>,
-    ) -> Result<RetainedLibrarySourceSet, DownloadError> {
-        let attempt = self.blocking_attempt().await;
-        let result = self.retain_local_sources_unsettled(sources).await;
-        self.settle_blocking_attempt(attempt, result).await
-    }
-
-    async fn retain_local_sources_unsettled(
-        &self,
-        sources: Vec<AuthenticatedLocalLibraryBytes>,
-    ) -> Result<RetainedLibrarySourceSet, DownloadError> {
-        if sources.is_empty() {
-            return Ok(RetainedLibrarySourceSet::new());
-        }
-        let libraries = match &self.mode {
-            ManagedReconstructionMode::Libraries(libraries) => libraries,
-            ManagedReconstructionMode::ProofOnly
-            | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets(_) => {
-                return Err(DownloadError::Integrity(
-                    "non-Libraries reconstruction cannot retain local library bytes".to_string(),
-                ));
-            }
-        };
-        let mut retained = RetainedLibrarySourceSet::new();
-        for source in sources {
-            retained.insert(
-                libraries
-                    .source_pool
-                    .retain_authenticated_local_source(source)
-                    .await?,
-            )?;
-        }
-        Ok(retained)
+    fn library_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
+        LibrarySourcePool::new_with_workers(self.workers.clone())
     }
 }
 
@@ -1117,39 +627,6 @@ impl Drop for ManagedReconstructionAttempt {
     }
 }
 
-async fn settle_new_managed_blocking_scope<T>(
-    workers: ManagedBlockingWorkers,
-    attempt: ManagedBlockingAttemptGuard,
-    result: Result<T, DownloadError>,
-) -> Result<T, DownloadError> {
-    if result.is_err() {
-        workers.cancel();
-    }
-    workers.drain().await;
-    attempt.disarm();
-    result
-}
-
-fn take_retained_assets_authority(
-    authority: Arc<
-        std::sync::Mutex<Option<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet)>>,
-    >,
-) -> Result<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet), DownloadError> {
-    Arc::try_unwrap(authority)
-        .map_err(|_| {
-            DownloadError::Integrity(
-                "Assets reconstruction authority still has live borrowers".to_string(),
-            )
-        })?
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .ok_or_else(|| {
-            DownloadError::Integrity(
-                "Assets reconstruction did not retain source authority".to_string(),
-            )
-        })
-}
-
 pub(crate) struct ReconstructedVanillaProcessorAuthority {
     pending: PendingReconstructedVanillaProcessorAuthority,
     client_source: AuthenticatedSelectedArtifactSource,
@@ -1158,15 +635,13 @@ pub(crate) struct ReconstructedVanillaProcessorAuthority {
 
 pub(crate) struct PendingReconstructedVanillaProcessorAuthority {
     parts: VanillaAuthorityParts,
-    library_sources: RetainedLibrarySourceSet,
-    version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
 }
 
 impl ReconstructedVanillaClientAuthority {
     pub(crate) fn consume_for_overlay(
         self,
     ) -> (
-        RetainedKnownGoodReconstruction,
+        KnownGoodReconstructionReceipt,
         AuthenticatedSelectedArtifactSource,
     ) {
         (self.reconstruction, self.client_source)
@@ -1193,23 +668,20 @@ impl PendingReconstructedVanillaProcessorAuthority {
     pub(crate) fn complete(
         mut self,
         runtime_source: RuntimeSourceReceipt,
-    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
+    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
         if self.parts.runtime_source.is_some() {
             return Err(DownloadError::ResolveManifest(
                 "processor runtime authority was already completed".to_string(),
             ));
         }
         self.parts.runtime_source = Some(runtime_source);
-        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
-            self.parts,
-            self.library_sources,
-            self.version_bundle_sources,
-        ))
-        .map_err(|error| {
-            DownloadError::ResolveManifest(format!(
-                "reconstructed source inventory could not be derived: {error:?}"
-            ))
-        })
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority { parts: self.parts }).map_err(
+            |error| {
+                DownloadError::ResolveManifest(format!(
+                    "reconstructed source inventory could not be derived: {error:?}"
+                ))
+            },
+        )
     }
 }
 
@@ -1240,8 +712,6 @@ struct VanillaAuthorityParts {
 
 pub(crate) struct ReconstructedVanillaAuthority {
     parts: VanillaAuthorityParts,
-    library_sources: RetainedLibrarySourceSet,
-    version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
 }
 
 pub(crate) struct ReconstructedVanillaAuthorityParts {
@@ -1251,8 +721,6 @@ pub(crate) struct ReconstructedVanillaAuthorityParts {
     pub(crate) version_source: AuthenticatedSelectedArtifactSource,
     pub(crate) asset_source: Option<AuthenticatedSelectedArtifactSource>,
     pub(crate) runtime_source: Option<RuntimeSourceReceipt>,
-    pub(crate) library_sources: RetainedLibrarySourceSet,
-    pub(crate) version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
 }
 
 pub(crate) struct PreparedManagedInstall {
@@ -1503,18 +971,6 @@ pub(crate) struct AuthenticatedVanillaInstallSources {
 }
 
 impl ReconstructedVanillaAuthority {
-    fn new(
-        parts: VanillaAuthorityParts,
-        library_sources: RetainedLibrarySourceSet,
-        version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
-    ) -> Self {
-        Self {
-            parts,
-            library_sources,
-            version_bundle_sources,
-        }
-    }
-
     pub(crate) fn into_parts(self) -> ReconstructedVanillaAuthorityParts {
         let (version, environment, libraries, version_source, asset_index_source, runtime_source) =
             self.parts.into_parts();
@@ -1525,8 +981,6 @@ impl ReconstructedVanillaAuthority {
             version_source,
             asset_source: asset_index_source,
             runtime_source,
-            library_sources: self.library_sources,
-            version_bundle_sources: self.version_bundle_sources,
         }
     }
 }
@@ -1773,219 +1227,34 @@ impl Downloader {
         &self,
         version_id: &str,
     ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
-        validate_install_version_id(version_id)?;
-        let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        let context = ManagedReconstructionContext::proof_only();
-        self.reconstruct_version_inner(version_id, version_manifest_entry, &context)
+        self.reconstruct_version_with_context(version_id, &ManagedReconstructionContext::new())
             .await
-            .map(RetainedKnownGoodReconstruction::discard_sources)
     }
 
-    pub(crate) async fn reconstruct_version_authority(
+    pub(crate) async fn reconstruct_version_with_context(
         &self,
         version_id: &str,
         context: &ManagedReconstructionContext,
-    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
+    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        self.reconstruct_version_inner(version_id, version_manifest_entry, context)
-            .await
-    }
-
-    pub(crate) async fn reconstruct_registered_version_bundle_source(
-        &self,
-        managed_root: ManagedDir,
-        version_id: &str,
-        inventory: &crate::known_good::KnownGoodInventory,
-    ) -> Result<AuthenticatedVersionBundleSource, RegisteredVersionBundleSourceError> {
-        validate_install_version_id(version_id)
-            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-        let projection = inventory
-            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-        let contract = version_bundle_contract(version_id, &projection)
-            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-        let local = retain_exact_local_version_bundle_sources(managed_root.clone(), &contract)
-            .await
-            .map_err(|_| RegisteredVersionBundleSourceError::LocalPreparation)?;
-
-        let (version, version_json_source) = match local.version_json {
-            Some(source) => {
-                let version = parse_vanilla_version_source(source.bytes(), version_id)
-                    .and_then(|version| {
-                        validate_vanilla_version_bundle_contracts(&version)?;
-                        Ok(version)
-                    })
-                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-                (version, source)
-            }
-            None => {
-                let manifest = fetch_registered_repair_version_manifest(
-                    version_id,
-                    &contract.version_json.digest,
-                )
-                .await
-                .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
-                let entry = registered_version_metadata_manifest_entry(
-                    manifest,
-                    version_id,
-                    &contract.version_json,
-                )?;
-                let expected = expected_integrity(&contract.version_json);
-                let target = selected_download_source_label(
-                    SelectedDownloadArtifactKind::VersionJson,
-                    version_id,
-                );
-                let selected =
-                    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                        client: &self.client,
-                        kind: SelectedDownloadArtifactKind::VersionJson,
-                        url: &entry.url,
-                        logical_identity: version_id,
-                        expected: &expected,
-                        max_bytes: usize::try_from(contract.version_json.size)
-                            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
-                        target: &target,
-                        fact_tx: None,
-                    })
-                    .await
-                    .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
-                let version = parse_vanilla_version_source(selected.bytes(), version_id)
-                    .and_then(|version| {
-                        validate_vanilla_version_bundle_contracts(&version)?;
-                        Ok(version)
-                    })
-                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-                let source = AuthenticatedVersionBundleMemberSource::from_selected(selected)
-                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-                (version, source)
-            }
-        };
-
-        validate_version_bundle_contract_against_metadata(&contract, &version)
-            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
-        let client_jar_source = match local.client_jar {
-            Some(source) => source,
-            None => {
-                let client = version
-                    .downloads
-                    .client
-                    .as_ref()
-                    .ok_or(RegisteredVersionBundleSourceError::Authority)?;
-                let expected = expected_integrity(&contract.client_jar);
-                let target = selected_download_source_label(
-                    SelectedDownloadArtifactKind::ClientJar,
-                    version_id,
-                );
-                let selected =
-                    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                        client: &self.client,
-                        kind: SelectedDownloadArtifactKind::ClientJar,
-                        url: &client.url,
-                        logical_identity: version_id,
-                        expected: &expected,
-                        max_bytes: usize::try_from(contract.client_jar.size)
-                            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
-                        target: &target,
-                        fact_tx: None,
-                    })
-                    .await
-                    .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
-                AuthenticatedVersionBundleMemberSource::from_selected(selected)
-                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?
-            }
-        };
-
-        let log_config_source = match (&contract.log_config, local.log_config) {
-            (None, None) => None,
-            (Some(_), Some(source)) => Some(source),
-            (Some(contract), None) => {
-                let file = &version
-                    .logging
-                    .as_ref()
-                    .and_then(|logging| logging.client.as_ref())
-                    .ok_or(RegisteredVersionBundleSourceError::Authority)?
-                    .file;
-                let expected = expected_integrity(contract);
-                let target = selected_download_source_label(
-                    SelectedDownloadArtifactKind::LogConfig,
-                    &contract.logical_identity,
-                );
-                let selected =
-                    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                        client: &self.client,
-                        kind: SelectedDownloadArtifactKind::LogConfig,
-                        url: &file.url,
-                        logical_identity: &contract.logical_identity,
-                        expected: &expected,
-                        max_bytes: usize::try_from(contract.size)
-                            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
-                        target: &target,
-                        fact_tx: None,
-                    })
-                    .await
-                    .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
-                Some(
-                    AuthenticatedVersionBundleMemberSource::from_selected(selected)
-                        .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
-                )
-            }
-            (None, Some(_)) => return Err(RegisteredVersionBundleSourceError::Authority),
-        };
-
-        let mut members = Vec::with_capacity(2 + usize::from(log_config_source.is_some()));
-        members.push(version_json_source);
-        members.push(client_jar_source);
-        members.extend(log_config_source);
-        AuthenticatedVersionBundleSource::from_members(version_id.to_string(), &projection, members)
-            .map_err(|_| RegisteredVersionBundleSourceError::Authority)
-    }
-
-    async fn reconstruct_version_inner(
-        &self,
-        version_id: &str,
-        version_manifest_entry: ManifestEntry,
-        context: &ManagedReconstructionContext,
-    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
         let attempt = context.blocking_attempt().await;
         let result = self
-            .reconstruct_version_inner_unsettled(version_id, version_manifest_entry, context)
+            .reconstruct_version_unsettled(version_id, version_manifest_entry, context)
             .await;
         context.settle_blocking_attempt(attempt, result).await
     }
 
-    async fn reconstruct_version_inner_unsettled(
+    async fn reconstruct_version_unsettled(
         &self,
         version_id: &str,
         version_manifest_entry: ManifestEntry,
         context: &ManagedReconstructionContext,
-    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
-        let (authority, library_sources) = self
+    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+        let parts = self
             .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
             .await?;
-        let version_bundle_sources = if context.retains_version_bundle_sources() {
-            let client_source = self
-                .acquire_version_bundle_client_source(version_id, &authority.version)
-                .await?;
-            let log_config_source = self
-                .acquire_version_bundle_log_source(&authority.version)
-                .await?;
-            Some(
-                RetainedVersionBundleReconstructionSources::from_authenticated(
-                    &authority.version_source,
-                    &client_source,
-                    log_config_source.as_ref(),
-                )?,
-            )
-        } else {
-            None
-        };
-        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
-            authority,
-            library_sources,
-            version_bundle_sources,
-        ))
-        .map_err(|error| {
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority { parts }).map_err(|error| {
             DownloadError::ResolveManifest(format!(
                 "reconstructed source inventory could not be derived: {error:?}"
             ))
@@ -2009,19 +1278,15 @@ impl Downloader {
         version_id: &str,
         context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
-        let (authority, library_sources, client_source, version_bundle_sources) = self
+        let (parts, client_source) = self
             .reconstruct_version_with_client_authority(version_id, context)
             .await?;
-        let reconstruction = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
-            authority,
-            library_sources,
-            version_bundle_sources,
-        ))
-        .map_err(|error| {
-            DownloadError::ResolveManifest(format!(
-                "reconstructed source inventory could not be derived: {error:?}"
-            ))
-        })?;
+        let reconstruction = seal_reconstructed_vanilla(ReconstructedVanillaAuthority { parts })
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "reconstructed source inventory could not be derived: {error:?}"
+                ))
+            })?;
         Ok(ReconstructedVanillaClientAuthority {
             reconstruction,
             client_source,
@@ -2045,20 +1310,16 @@ impl Downloader {
         version_id: &str,
         context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaProcessorAuthority, DownloadError> {
-        let (mut authority, library_sources, client_source, version_bundle_sources) = self
+        let (mut parts, client_source) = self
             .reconstruct_version_with_client_authority(version_id, context)
             .await?;
-        let runtime_source = authority.runtime_source.take().ok_or_else(|| {
+        let runtime_source = parts.runtime_source.take().ok_or_else(|| {
             DownloadError::ResolveManifest(
                 "authenticated base version has no processor runtime source".to_string(),
             )
         })?;
         Ok(ReconstructedVanillaProcessorAuthority {
-            pending: PendingReconstructedVanillaProcessorAuthority {
-                parts: authority,
-                library_sources,
-                version_bundle_sources,
-            },
+            pending: PendingReconstructedVanillaProcessorAuthority { parts },
             client_source,
             runtime_source,
         })
@@ -2091,78 +1352,20 @@ impl Downloader {
         .await
     }
 
-    async fn acquire_version_bundle_log_source(
-        &self,
-        version: &VersionJson,
-    ) -> Result<Option<AuthenticatedSelectedArtifactSource>, DownloadError> {
-        let Some(logging) = version
-            .logging
-            .as_ref()
-            .and_then(|logging| logging.client.as_ref())
-        else {
-            return Ok(None);
-        };
-        let expected = ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
-        let max_bytes = exact_version_bundle_source_limit(logging.file.size, "log config")?;
-        let target = selected_download_source_label(
-            SelectedDownloadArtifactKind::LogConfig,
-            &logging.file.id,
-        );
-        acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-            client: &self.client,
-            kind: SelectedDownloadArtifactKind::LogConfig,
-            url: &logging.file.url,
-            logical_identity: &logging.file.id,
-            expected: &expected,
-            max_bytes,
-            target: &target,
-            fact_tx: None,
-        })
-        .await
-        .map(Some)
-    }
-
     async fn reconstruct_version_with_client_authority(
         &self,
         version_id: &str,
         context: &ManagedReconstructionContext,
-    ) -> Result<
-        (
-            VanillaAuthorityParts,
-            RetainedLibrarySourceSet,
-            AuthenticatedSelectedArtifactSource,
-            Option<RetainedVersionBundleReconstructionSources>,
-        ),
-        DownloadError,
-    > {
+    ) -> Result<(VanillaAuthorityParts, AuthenticatedSelectedArtifactSource), DownloadError> {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        let (authority, library_sources) = self
+        let parts = self
             .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
             .await?;
         let client_source = self
-            .acquire_version_bundle_client_source(version_id, &authority.version)
+            .acquire_version_bundle_client_source(version_id, &parts.version)
             .await?;
-        let version_bundle_sources = if context.retains_version_bundle_sources() {
-            let log_config_source = self
-                .acquire_version_bundle_log_source(&authority.version)
-                .await?;
-            Some(
-                RetainedVersionBundleReconstructionSources::from_authenticated(
-                    &authority.version_source,
-                    &client_source,
-                    log_config_source.as_ref(),
-                )?,
-            )
-        } else {
-            None
-        };
-        Ok((
-            authority,
-            library_sources,
-            client_source,
-            version_bundle_sources,
-        ))
+        Ok((parts, client_source))
     }
 
     async fn reconstruct_vanilla_authority(
@@ -2170,62 +1373,23 @@ impl Downloader {
         version_id: &str,
         version_manifest_entry: &ManifestEntry,
         context: &ManagedReconstructionContext,
-    ) -> Result<(VanillaAuthorityParts, RetainedLibrarySourceSet), DownloadError> {
+    ) -> Result<VanillaAuthorityParts, DownloadError> {
         let AuthenticatedVanillaPlan {
             version,
             environment,
             pending_library_declarations,
             library_jobs,
             version_json_source,
-            mut asset_index_source,
+            asset_index_source,
             runtime_source,
         } = self
             .acquire_vanilla_plan(version_id, version_manifest_entry, None)
             .await?;
-        if let Some((source_pool, cache)) = context.assets_acquisition() {
-            let (sources, cache_proofs) = match asset_index_source.take() {
-                Some(source) => {
-                    let plan = TransferPlan::shared();
-                    let contribution = plan.reserve_contribution();
-                    let RetainedAssetsAcquisition {
-                        asset_index_source: retained_index,
-                        sources,
-                        cache_proofs,
-                    } = acquire_asset_sources_with_cache(
-                        AssetSourceAcquisitionRequest::new(
-                            AssetSourceAcquisitionInputs {
-                                client: self.client.clone(),
-                                asset_object_base_url: Arc::clone(&self.asset_object_base_url),
-                                asset_index_id: version.asset_index.id.clone(),
-                                asset_index_source: source,
-                                fact_tx: None,
-                                plan: &plan,
-                                contribution,
-                            },
-                            |_| {},
-                        )
-                        .bind(source_pool, cache),
-                    )
-                    .await?;
-                    asset_index_source = Some(retained_index);
-                    (sources, cache_proofs)
-                }
-                None => (
-                    RetainedAssetSourceSet::new(),
-                    AuthenticatedAssetCacheProofSet::default(),
-                ),
-            };
-            context.retain_assets_authority(sources, cache_proofs)?;
-        }
         let mut library_proofs = Vec::new();
-        let mut library_sources = RetainedLibrarySourceSet::new();
-        let source_pool = context.phase_library_source_pool()?;
+        let source_pool = context.library_source_pool()?;
         for classified in library_jobs {
             let (job, acquisition) = classified.into_parts();
-            if acquisition == LibraryAcquisition::ExactDeclaration
-                && (!context.retains_library_sources()
-                    || !context.requires_retained_exact_source(&job).await?)
-            {
+            if acquisition == LibraryAcquisition::ExactDeclaration {
                 continue;
             }
             let target = selected_download_source_label(
@@ -2246,12 +1410,7 @@ impl Downloader {
                 component_source_kind(job.is_native),
             )
             .await?;
-            if acquisition == LibraryAcquisition::FreshStream {
-                library_proofs.push(reconstruction_download_proof(&source)?);
-            }
-            if context.retains_library_sources() {
-                library_sources.insert(source)?;
-            }
+            library_proofs.push(reconstruction_download_proof(&source)?);
         }
         let library_declarations = pending_library_declarations
             .seal_streamed(library_proofs)
@@ -2261,17 +1420,14 @@ impl Downloader {
                 ))
             })?;
 
-        Ok((
-            VanillaAuthorityParts {
-                version,
-                environment,
-                libraries: library_declarations,
-                version_source: version_json_source,
-                asset_index_source,
-                runtime_source,
-            },
-            library_sources,
-        ))
+        Ok(VanillaAuthorityParts {
+            version,
+            environment,
+            libraries: library_declarations,
+            version_source: version_json_source,
+            asset_index_source,
+            runtime_source,
+        })
     }
 
     pub async fn install_version_with_facts<F, G>(
@@ -3123,61 +2279,10 @@ impl Downloader {
     }
 }
 
-pub(crate) async fn reconstruct_game_library_sources(
-    requirements: &crate::loaders::game_libraries::Requirements,
-    context: &ManagedReconstructionContext,
-) -> Result<Vec<RetainedLibraryComponentSource>, DownloadError> {
-    if !context.retains_library_sources() {
-        return Ok(Vec::new());
-    }
-    let attempt = context.blocking_attempt().await;
-    let result = async {
-        let client = standard_minecraft_download_client();
-        let pool = context.phase_library_source_pool()?;
-        let mut sources = Vec::new();
-        for requirement in requirements.entries() {
-            let job = super::libraries::DownloadJob {
-                relative_path: PortableRelativePath::new(requirement.path())
-                    .map_err(|_| DownloadError::Integrity("invalid game library path".into()))?,
-                url: requirement.provider_url().to_owned(),
-                name: requirement.file_name().to_owned(),
-                expected: ExpectedIntegrity {
-                    sha1: Some(requirement.sha1().to_owned()),
-                    size: Some(requirement.size()),
-                },
-                is_native: false,
-            };
-            if !context.requires_retained_exact_source(&job).await? {
-                continue;
-            }
-            sources.push(
-                acquire_retained_library_component_source(
-                    LibrarySourceRequest {
-                        client: &client,
-                        url: &job.url,
-                        expected: &job.expected,
-                        relative_path: &job.relative_path,
-                        max_bytes: requirement.size(),
-                        target: requirement.file_name(),
-                        pool: &pool,
-                        fact_tx: None,
-                    },
-                    LibraryComponentSourceKind::Library,
-                )
-                .await?
-                .require_exact_prior(),
-            );
-        }
-        Ok(sources)
-    }
-    .await;
-    context.settle_blocking_attempt(attempt, result).await
-}
-
 pub(crate) async fn reconstruct_profile_library_declarations(
     declarations: PendingExactLibraryDeclarations,
     context: &ManagedReconstructionContext,
-) -> Result<(SealedExactLibraryDeclarations, RetainedLibrarySourceSet), DownloadError> {
+) -> Result<SealedExactLibraryDeclarations, DownloadError> {
     let attempt = context.blocking_attempt().await;
     let result = reconstruct_profile_library_declarations_unsettled(declarations, context).await;
     context.settle_blocking_attempt(attempt, result).await
@@ -3186,7 +2291,7 @@ pub(crate) async fn reconstruct_profile_library_declarations(
 async fn reconstruct_profile_library_declarations_unsettled(
     declarations: PendingExactLibraryDeclarations,
     context: &ManagedReconstructionContext,
-) -> Result<(SealedExactLibraryDeclarations, RetainedLibrarySourceSet), DownloadError> {
+) -> Result<SealedExactLibraryDeclarations, DownloadError> {
     let jobs = {
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
             DownloadError::ResolveManifest(
@@ -3202,14 +2307,10 @@ async fn reconstruct_profile_library_declarations_unsettled(
     })?;
     let client = standard_minecraft_download_client();
     let mut proofs = Vec::new();
-    let mut sources = RetainedLibrarySourceSet::new();
-    let source_pool = context.phase_library_source_pool()?;
+    let source_pool = context.library_source_pool()?;
     for classified in classified {
         let (job, acquisition) = classified.into_parts();
-        if acquisition == LibraryAcquisition::ExactDeclaration
-            && (!context.retains_library_sources()
-                || !context.requires_retained_exact_source(&job).await?)
-        {
+        if acquisition == LibraryAcquisition::ExactDeclaration {
             continue;
         }
         let target = selected_download_source_label(
@@ -3230,31 +2331,19 @@ async fn reconstruct_profile_library_declarations_unsettled(
             component_source_kind(job.is_native),
         )
         .await?;
-        if acquisition == LibraryAcquisition::FreshStream {
-            proofs.push(reconstruction_download_proof(&source)?);
-        }
-        if context.retains_library_sources() {
-            sources.insert(source)?;
-        }
+        proofs.push(reconstruction_download_proof(&source)?);
     }
-    let declarations = pending.seal_streamed(proofs).map_err(|error| {
+    pending.seal_streamed(proofs).map_err(|error| {
         DownloadError::ResolveManifest(format!(
             "profile library reconstruction could not be completed: {error:?}"
         ))
-    })?;
-    Ok((declarations, sources))
+    })
 }
 
 pub(crate) async fn reconstruct_installer_library_declarations(
     sources: crate::loaders::PendingForgeReconstructionSources,
     context: &ManagedReconstructionContext,
-) -> Result<
-    (
-        crate::loaders::BoundForgeInstallExecution,
-        RetainedLibrarySourceSet,
-    ),
-    DownloadError,
-> {
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
     reconstruct_installer_library_declarations_inner(sources, None, context).await
 }
 
@@ -3262,13 +2351,7 @@ pub(crate) async fn reconstruct_installer_processor_sources(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: &crate::loaders::workspace::cleanup::ProcessorWorkspace,
     context: &ManagedReconstructionContext,
-) -> Result<
-    (
-        crate::loaders::BoundForgeInstallExecution,
-        RetainedLibrarySourceSet,
-    ),
-    DownloadError,
-> {
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
     reconstruct_installer_library_declarations_inner(sources, Some(workspace), context).await
 }
 
@@ -3276,13 +2359,7 @@ async fn reconstruct_installer_library_declarations_inner(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
     context: &ManagedReconstructionContext,
-) -> Result<
-    (
-        crate::loaders::BoundForgeInstallExecution,
-        RetainedLibrarySourceSet,
-    ),
-    DownloadError,
-> {
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
     let attempt = context.blocking_attempt().await;
     let result =
         reconstruct_installer_library_declarations_unsettled(sources, workspace, context).await;
@@ -3293,13 +2370,7 @@ async fn reconstruct_installer_library_declarations_unsettled(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
     context: &ManagedReconstructionContext,
-) -> Result<
-    (
-        crate::loaders::BoundForgeInstallExecution,
-        RetainedLibrarySourceSet,
-    ),
-    DownloadError,
-> {
+) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
     let (pending, jobs, mut required_execution_inputs) = sources.into_parts();
     if workspace.is_none() && !required_execution_inputs.is_empty() {
         return Err(DownloadError::ResolveManifest(
@@ -3308,51 +2379,26 @@ async fn reconstruct_installer_library_declarations_unsettled(
     }
     let client = standard_minecraft_download_client();
     let mut proofs = Vec::new();
-    let mut retained_sources = RetainedLibrarySourceSet::new();
-    let source_pool = context.phase_library_source_pool()?;
+    let source_pool = context.library_source_pool()?;
     for classified in jobs {
         let (plan, acquisition) = classified.into_parts();
-        let required_by_execution = required_execution_inputs.remove(&plan.relative_path);
-        let stage_in_workspace = required_by_execution;
+        let stage_in_workspace = required_execution_inputs.remove(&plan.relative_path);
         let kind = component_source_kind(plan.is_native);
-        let cache_job = if acquisition == LibraryAcquisition::ExactDeclaration {
-            Some(super::libraries::DownloadJob {
-                relative_path: plan.relative_path.clone(),
-                url: plan.source_url.clone().ok_or_else(|| {
-                    DownloadError::ResolveManifest(
-                        "installer reconstruction library source is missing".to_string(),
-                    )
-                })?,
-                name: plan.name.clone(),
-                expected: plan.expected.clone(),
-                is_native: plan.is_native,
-            })
-        } else {
-            None
-        };
-        let cached_source = if let Some(job) = cache_job.as_ref() {
-            if stage_in_workspace && job.expected.size.is_none_or(|size| size > 128 << 20) {
+        if acquisition == LibraryAcquisition::ExactDeclaration {
+            if plan.source_url.is_none() {
+                return Err(DownloadError::ResolveManifest(
+                    "installer reconstruction library source is missing".to_string(),
+                ));
+            }
+            if !stage_in_workspace {
+                continue;
+            }
+            if plan.expected.size.is_none_or(|size| size > 128 << 20) {
                 return Err(DownloadError::Integrity(
                     "processor library input exceeds its admitted size bound".to_string(),
                 ));
             }
-            if !context.retains_library_sources() {
-                if !stage_in_workspace {
-                    continue;
-                }
-                None
-            } else if stage_in_workspace {
-                context
-                    .retain_exact_cache_source(job, &source_pool, kind)
-                    .await?
-            } else if context.requires_retained_exact_source(job).await? {
-                None
-            } else {
-                continue;
-            }
-        } else {
-            None
-        };
+        }
         let target = selected_download_source_label(
             SelectedDownloadArtifactKind::Library,
             plan.relative_path.as_str(),
@@ -3362,29 +2408,24 @@ async fn reconstruct_installer_library_declarations_unsettled(
         } else {
             LIBRARY_SOURCE_MAX_BYTES
         };
-        let source = match cached_source {
-            Some(source) => source,
-            None => {
-                acquire_retained_library_component_source(
-                    LibrarySourceRequest {
-                        client: &client,
-                        url: plan.source_url.as_deref().ok_or_else(|| {
-                            DownloadError::ResolveManifest(
-                                "installer reconstruction library source is missing".to_string(),
-                            )
-                        })?,
-                        expected: &plan.expected,
-                        relative_path: &plan.relative_path,
-                        max_bytes,
-                        target: &target,
-                        pool: &source_pool,
-                        fact_tx: None,
-                    },
-                    kind,
-                )
-                .await?
-            }
-        };
+        let source = acquire_retained_library_component_source(
+            LibrarySourceRequest {
+                client: &client,
+                url: plan.source_url.as_deref().ok_or_else(|| {
+                    DownloadError::ResolveManifest(
+                        "installer reconstruction library source is missing".to_string(),
+                    )
+                })?,
+                expected: &plan.expected,
+                relative_path: &plan.relative_path,
+                max_bytes,
+                target: &target,
+                pool: &source_pool,
+                fact_tx: None,
+            },
+            kind,
+        )
+        .await?;
         if stage_in_workspace {
             let path = source.relative_path().clone();
             let (reader, size, sha1) = source
@@ -3402,14 +2443,9 @@ async fn reconstruct_installer_library_declarations_unsettled(
                 .map_err(|error| {
                     DownloadError::FileOperation(io::Error::other(error.to_string()))
                 })?;
-            if acquisition == LibraryAcquisition::FreshStream {
-                proofs.push(reconstruction_download_proof(&source)?);
-            }
-        } else if acquisition == LibraryAcquisition::FreshStream {
-            proofs.push(reconstruction_download_proof(&source)?);
         }
-        if context.retains_library_sources() {
-            retained_sources.insert(source)?;
+        if acquisition == LibraryAcquisition::FreshStream {
+            proofs.push(reconstruction_download_proof(&source)?);
         }
     }
     if !required_execution_inputs.is_empty() {
@@ -3417,12 +2453,11 @@ async fn reconstruct_installer_library_declarations_unsettled(
             "processor reconstruction input source is missing".to_string(),
         ));
     }
-    let execution = pending.complete_sources(proofs).map_err(|error| {
+    pending.complete_sources(proofs).map_err(|error| {
         DownloadError::ResolveManifest(format!(
             "installer library reconstruction could not be completed: {error}"
         ))
-    })?;
-    Ok((execution, retained_sources))
+    })
 }
 
 fn component_source_kind(is_native: bool) -> LibraryComponentSourceKind {
@@ -3441,151 +2476,6 @@ fn reconstruction_download_proof(
             "reconstruction source lost its authenticated network origin".to_string(),
         )
     })
-}
-
-fn version_bundle_contract(
-    version_id: &str,
-    projection: &ManagedComponentProjection<'_>,
-) -> Result<VersionBundleContract, DownloadError> {
-    if projection.component() != ManagedKnownGoodComponent::VersionBundle
-        || !(2..=3).contains(&projection.entry_count())
-    {
-        return Err(version_bundle_install_error(
-            "registered VersionBundle projection shape is invalid",
-        ));
-    }
-    let version_json = version_bundle_member_contract(
-        version_id,
-        projection,
-        KnownGoodArtifactKind::VersionMetadata,
-    )?;
-    let client_jar =
-        version_bundle_member_contract(version_id, projection, KnownGoodArtifactKind::ClientJar)?;
-    let log_config = projection
-        .entries()
-        .iter()
-        .any(|projected| projected.entry().kind() == KnownGoodArtifactKind::LogConfig)
-        .then(|| {
-            version_bundle_member_contract(version_id, projection, KnownGoodArtifactKind::LogConfig)
-        })
-        .transpose()?;
-    if projection.entry_count() != 2 + usize::from(log_config.is_some())
-        || version_json.size > MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64
-    {
-        return Err(version_bundle_install_error(
-            "registered VersionBundle projection members are invalid",
-        ));
-    }
-    Ok(VersionBundleContract {
-        version_json,
-        client_jar,
-        log_config,
-    })
-}
-
-fn version_bundle_member_contract(
-    version_id: &str,
-    projection: &ManagedComponentProjection<'_>,
-    kind: KnownGoodArtifactKind,
-) -> Result<VersionBundleMemberContract, DownloadError> {
-    let mut matches = projection
-        .entries()
-        .iter()
-        .filter(|projected| projected.entry().kind() == kind);
-    let projected = matches.next().ok_or_else(|| {
-        version_bundle_install_error("registered VersionBundle projection member is missing")
-    })?;
-    if matches.next().is_some() {
-        return Err(version_bundle_install_error(
-            "registered VersionBundle projection member is duplicated",
-        ));
-    }
-    let entry = projected.entry();
-    let (root_name, logical_identity) = match kind {
-        KnownGoodArtifactKind::VersionMetadata => (
-            "versions",
-            projected_member_identity(version_id, projection, kind)?,
-        ),
-        KnownGoodArtifactKind::ClientJar => (
-            "versions",
-            projected_member_identity(version_id, projection, kind)?,
-        ),
-        KnownGoodArtifactKind::LogConfig => (
-            "assets",
-            projected_optional_log_identity(projection)?.ok_or_else(|| {
-                version_bundle_install_error("registered VersionBundle log projection is missing")
-            })?,
-        ),
-        _ => {
-            return Err(version_bundle_install_error(
-                "registered VersionBundle projection member kind is invalid",
-            ));
-        }
-    };
-    let expected_root = match kind {
-        KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar => {
-            KnownGoodRoot::Versions
-        }
-        KnownGoodArtifactKind::LogConfig => KnownGoodRoot::Assets,
-        _ => unreachable!(),
-    };
-    if entry.root() != &expected_root {
-        return Err(version_bundle_install_error(
-            "registered VersionBundle projection root is invalid",
-        ));
-    }
-    let (digest, size) = match entry.integrity() {
-        KnownGoodIntegrity::Sha1 { digest, size }
-        | KnownGoodIntegrity::ExactBytes { digest, size }
-            if *size > 0 && *size <= MAX_TIER2_ARTIFACT_BYTES =>
-        {
-            (digest.as_str().to_string(), *size)
-        }
-        _ => {
-            return Err(version_bundle_install_error(
-                "registered VersionBundle projection integrity is invalid",
-            ));
-        }
-    };
-    Ok(VersionBundleMemberContract {
-        kind,
-        root_name,
-        relative_path: entry.path().as_str().to_string(),
-        logical_identity,
-        digest,
-        size,
-    })
-}
-
-async fn retain_exact_local_version_bundle_sources(
-    managed_root: ManagedDir,
-    contract: &VersionBundleContract,
-) -> Result<ExactLocalVersionBundleSources, DownloadError> {
-    let contract = contract.clone();
-    run_publication_blocking(move || {
-        Ok(ExactLocalVersionBundleSources {
-            version_json: read_exact_local_version_bundle_member(
-                &managed_root,
-                &contract.version_json,
-            )?,
-            client_jar: read_exact_local_version_bundle_member(
-                &managed_root,
-                &contract.client_jar,
-            )?,
-            log_config: contract
-                .log_config
-                .as_ref()
-                .map(|member| read_exact_local_version_bundle_member(&managed_root, member))
-                .transpose()?
-                .flatten(),
-        })
-    })
-    .await
-    .map_err(|_| {
-        DownloadError::FileOperation(io::Error::other(
-            "registered VersionBundle local source task stopped",
-        ))
-    })?
 }
 
 fn read_exact_local_version_bundle_member(
@@ -3643,51 +2533,6 @@ fn read_exact_local_version_bundle_member(
         return Ok(None);
     }
     Ok(Some(source))
-}
-
-fn expected_integrity(contract: &VersionBundleMemberContract) -> ExpectedIntegrity {
-    ExpectedIntegrity {
-        size: Some(contract.size),
-        sha1: Some(contract.digest.clone()),
-    }
-}
-
-fn validate_version_bundle_contract_against_metadata(
-    contract: &VersionBundleContract,
-    version: &VersionJson,
-) -> Result<(), DownloadError> {
-    let client = version.downloads.client.as_ref().ok_or_else(|| {
-        version_bundle_install_error("authenticated VersionBundle client contract is missing")
-    })?;
-    if client.url.trim().is_empty()
-        || u64::try_from(client.size).ok() != Some(contract.client_jar.size)
-        || !client
-            .sha1
-            .eq_ignore_ascii_case(&contract.client_jar.digest)
-    {
-        return Err(version_bundle_install_error(
-            "authenticated VersionBundle client contract does not match the projection",
-        ));
-    }
-    let metadata_log = version
-        .logging
-        .as_ref()
-        .and_then(|logging| logging.client.as_ref())
-        .map(|logging| &logging.file);
-    match (&contract.log_config, metadata_log) {
-        (None, None) => Ok(()),
-        (Some(contract), Some(file))
-            if file.id == contract.logical_identity
-                && !file.url.trim().is_empty()
-                && u64::try_from(file.size).ok() == Some(contract.size)
-                && file.sha1.eq_ignore_ascii_case(&contract.digest) =>
-        {
-            Ok(())
-        }
-        _ => Err(version_bundle_install_error(
-            "authenticated VersionBundle log contract does not match the projection",
-        )),
-    }
 }
 
 fn exact_version_bundle_source_limit(size: i64, label: &str) -> Result<usize, DownloadError> {
@@ -3939,26 +2784,6 @@ fn validate_version_manifest_entry(entry: ManifestEntry) -> Result<ManifestEntry
     Ok(entry)
 }
 
-fn registered_version_metadata_manifest_entry(
-    manifest: VersionManifest,
-    version_id: &str,
-    contract: &VersionBundleMemberContract,
-) -> Result<ManifestEntry, RegisteredVersionBundleSourceError> {
-    let entry = manifest
-        .versions
-        .into_iter()
-        .find(|entry| entry.id == version_id)
-        .ok_or(RegisteredVersionBundleSourceError::Authority)
-        .and_then(|entry| {
-            validate_version_manifest_entry(entry)
-                .map_err(|_| RegisteredVersionBundleSourceError::Authority)
-        })?;
-    if !entry.sha1.eq_ignore_ascii_case(&contract.digest) {
-        return Err(RegisteredVersionBundleSourceError::Authority);
-    }
-    Ok(entry)
-}
-
 fn parse_vanilla_version_source(
     bytes: &[u8],
     expected_version_id: &str,
@@ -4025,6 +2850,23 @@ pub async fn publish_managed_install_fixture_for_test(
     let prepared =
         prepare_local_managed_install(authority, version_json, client_jar, log_config, Vec::new())?;
     publish_prepared_managed_install(managed_root, prepared).await
+}
+
+#[cfg(test)]
+pub(crate) fn version_bundle_publication_fixture_for_test(
+    version_id: &str,
+) -> Result<
+    (
+        PendingKnownGoodInstallAuthority,
+        AuthenticatedVersionBundleSource,
+    ),
+    DownloadError,
+> {
+    let (authority, version_json, client_jar, log_config) =
+        crate::known_good::managed_version_bundle_fixture_parts_for_test(version_id)?;
+    let prepared =
+        prepare_local_managed_install(authority, version_json, client_jar, log_config, Vec::new())?;
+    Ok((prepared.authority, prepared.version_bundle_source))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -4313,13 +3155,7 @@ async fn classify_managed_install_publication_lease(
     lease: ManagedRootPublicationLease,
     candidates: ManagedInstallPublicationCandidates,
 ) -> Result<ManagedRootPublicationLease, ManagedInstallDurableOutcome> {
-    match classify_durable_version_bundle_candidates(
-        lease,
-        candidates.clone(),
-        VersionBundlePublicationPurpose::Install,
-    )
-    .await
-    {
+    match classify_durable_version_bundle_candidates(lease, candidates.clone()).await {
         DurableVersionBundleOutcome::NoEffect(lease) => Ok(lease),
         DurableVersionBundleOutcome::Committed { lease, evidence } => Err(
             ManagedInstallDurableOutcome::Committed(ManagedInstallCommittedEvidence {
@@ -4883,7 +3719,6 @@ async fn publish_managed_projection_sequence(
             lease,
             version_bundle_source,
             activation_contract_id,
-            VersionBundlePublicationPurpose::Install,
             projection,
         )
         .await
@@ -4892,12 +3727,15 @@ async fn publish_managed_projection_sequence(
         .await
         .map_err(managed_projection_sequence_error)?;
     match settlement {
-        VersionBundleTransactionSettledOutcome::Committed { lease, .. } => {
+        VersionBundleTransactionSettledOutcome::Committed { lease } => {
             Ok(ManagedProjectionSequenceOutcome::Committed(lease))
         }
-        VersionBundleTransactionSettledOutcome::RolledBack { .. } => Ok(
-            ManagedProjectionSequenceOutcome::RolledBack(ManagedKnownGoodComponent::VersionBundle),
-        ),
+        VersionBundleTransactionSettledOutcome::RolledBack { lease } => {
+            drop(lease);
+            Ok(ManagedProjectionSequenceOutcome::RolledBack(
+                ManagedKnownGoodComponent::VersionBundle,
+            ))
+        }
     }
 }
 
@@ -5467,52 +4305,6 @@ mod tests {
     }
 
     #[test]
-    fn registered_metadata_discovery_requires_the_pinned_projection_digest() {
-        const VERSION_ID: &str = "registered-metadata";
-        const PINNED_SHA1: &str = "1111111111111111111111111111111111111111";
-        let contract = VersionBundleMemberContract {
-            kind: KnownGoodArtifactKind::VersionMetadata,
-            root_name: "versions",
-            relative_path: format!("{VERSION_ID}/{VERSION_ID}.json"),
-            logical_identity: VERSION_ID.to_string(),
-            digest: PINNED_SHA1.to_string(),
-            size: 7,
-        };
-        let manifest = |sha1: &str| {
-            serde_json::from_value::<VersionManifest>(serde_json::json!({
-                "latest": { "release": VERSION_ID, "snapshot": VERSION_ID },
-                "versions": [{
-                    "id": VERSION_ID,
-                    "type": "release",
-                    "url": "https://example.invalid/version.json",
-                    "sha1": sha1
-                }]
-            }))
-            .expect("version manifest")
-        };
-
-        assert_eq!(
-            registered_version_metadata_manifest_entry(
-                manifest("2222222222222222222222222222222222222222"),
-                VERSION_ID,
-                &contract,
-            )
-            .expect_err("manifest drift must fail"),
-            RegisteredVersionBundleSourceError::Authority
-        );
-        assert_eq!(
-            registered_version_metadata_manifest_entry(
-                manifest(PINNED_SHA1),
-                VERSION_ID,
-                &contract,
-            )
-            .expect("pinned manifest entry")
-            .sha1,
-            PINNED_SHA1
-        );
-    }
-
-    #[test]
     fn local_version_bundle_source_requires_exact_projected_members() {
         let version_id = "local-bundle";
         let version_json = br#"{"id":"local-bundle"}"#.to_vec();
@@ -5743,6 +4535,24 @@ mod tests {
         ));
     }
 
+    async fn retain_in_attempt(
+        context: &ManagedReconstructionContext,
+        source_pool: &LibrarySourcePool,
+        sources: Vec<AuthenticatedLocalLibraryBytes>,
+    ) -> Result<(), DownloadError> {
+        let attempt = context.blocking_attempt().await;
+        let result = async {
+            for source in sources {
+                source_pool
+                    .retain_authenticated_local_source(source)
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        context.settle_blocking_attempt(attempt, result).await
+    }
+
     #[tokio::test]
     async fn dropped_reconstruction_attempt_holds_serialization_until_workers_drain() {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -5771,22 +4581,9 @@ mod tests {
                 );
             }));
         let setup_attempt = workers.attempt_guard();
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("reconstruction root");
-        let managed_root = ManagedDir::open_root(temporary.path()).expect("managed root");
+        let source_pool =
+            LibrarySourcePool::new_with_workers(workers.clone()).expect("library source pool");
         let context = ManagedReconstructionContext {
-            mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {
-                source_pool: LibrarySourcePool::new_with_workers(workers.clone())
-                    .expect("library source pool"),
-                cache_admission: ExactLibraryCacheAdmission::bind_guarded_with_workers(
-                    managed_root,
-                    workers.clone(),
-                )
-                .await
-                .expect("library cache admission"),
-                cache_proofs: Arc::new(std::sync::Mutex::new(
-                    AuthenticatedLibraryCacheProofSet::default(),
-                )),
-            }),
             recorded_metadata: None,
             workers: workers.clone(),
             blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
@@ -5805,8 +4602,10 @@ mod tests {
         )
         .expect("authenticated local source");
         let first_context = context.clone();
-        let first =
-            tokio::spawn(async move { first_context.retain_local_sources(vec![source]).await });
+        let first_pool = source_pool.clone();
+        let first = tokio::spawn(async move {
+            retain_in_attempt(&first_context, &first_pool, vec![source]).await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(60), entered_rx)
             .await
             .expect("source worker must reach checkpoint")
@@ -5821,8 +4620,10 @@ mod tests {
         assert!(workers.is_cancelled());
 
         let second_context = context.clone();
-        let mut second =
-            tokio::spawn(async move { second_context.retain_local_sources(Vec::new()).await });
+        let second_pool = source_pool.clone();
+        let mut second = tokio::spawn(async move {
+            retain_in_attempt(&second_context, &second_pool, Vec::new()).await
+        });
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
                 .await
@@ -5852,7 +4653,8 @@ mod tests {
             Sha1::digest(&bytes).into(),
         )
         .expect("later authenticated local source");
-        let later_error = match context.retain_local_sources(vec![later_source]).await {
+        let later_error = match retain_in_attempt(&context, &source_pool, vec![later_source]).await
+        {
             Err(error) => error,
             Ok(_) => panic!("cancelled reconstruction context must reject later work"),
         };

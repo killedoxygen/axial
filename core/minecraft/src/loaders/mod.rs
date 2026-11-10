@@ -222,15 +222,6 @@ pub(crate) async fn reconstruct_build(
     strategies::reconstruct_build(&plan, expected, recorded).await
 }
 
-pub(crate) async fn reconstruct_managed_component(
-    installed_version_id: &str,
-    context: &crate::download::ManagedReconstructionContext,
-    expected: Option<&crate::download::ManagedInstallActivationContractId>,
-) -> Result<crate::known_good::RetainedKnownGoodReconstruction, LoaderError> {
-    let plan = api::loader_reconstruction_plan(installed_version_id)?;
-    strategies::reconstruct_managed_component(&plan, context, expected).await
-}
-
 fn require_exact_live_build_record(
     requested: &LoaderBuildRecord,
     live: LoaderBuildRecord,

@@ -91,71 +91,6 @@ pub enum FetchError {
     Unavailable(String),
 }
 
-pub(crate) async fn fetch_registered_repair_version_manifest(
-    version_id: &str,
-    expected_metadata_sha1: &str,
-) -> Result<VersionManifest, String> {
-    let (manifest, fetched_live) = resolve_registered_repair_manifest(
-        fresh_cached_manifest(),
-        stale_cached_manifest(),
-        version_id,
-        expected_metadata_sha1,
-        fetch_manifest_live(),
-    )
-    .await?;
-    if fetched_live {
-        update_manifest_cache(manifest.clone());
-    }
-    Ok(manifest)
-}
-
-async fn resolve_registered_repair_manifest<F>(
-    fresh_manifest: Option<VersionManifest>,
-    stale_manifest: Option<VersionManifest>,
-    version_id: &str,
-    expected_metadata_sha1: &str,
-    live_manifest: F,
-) -> Result<(VersionManifest, bool), String>
-where
-    F: Future<Output = Result<VersionManifest, String>>,
-{
-    if let Some(manifest) = fresh_manifest.filter(|manifest| {
-        manifest_contains_registered_repair_entry(manifest, version_id, expected_metadata_sha1)
-    }) {
-        return Ok((manifest, false));
-    }
-    let stale_manifest = stale_manifest.filter(|manifest| {
-        manifest_contains_registered_repair_entry(manifest, version_id, expected_metadata_sha1)
-    });
-    resolve_read_only_manifest(live_manifest.await, stale_manifest)
-}
-
-fn manifest_contains_registered_repair_entry(
-    manifest: &VersionManifest,
-    version_id: &str,
-    expected_metadata_sha1: &str,
-) -> bool {
-    manifest
-        .versions
-        .iter()
-        .find(|entry| entry.id == version_id)
-        .is_some_and(|entry| {
-            !entry.url.trim().is_empty() && entry.sha1.eq_ignore_ascii_case(expected_metadata_sha1)
-        })
-}
-
-fn resolve_read_only_manifest(
-    live_result: Result<VersionManifest, String>,
-    stale_manifest: Option<VersionManifest>,
-) -> Result<(VersionManifest, bool), String> {
-    match live_result {
-        Ok(manifest) => Ok((manifest, true)),
-        Err(error) => stale_manifest
-            .map(|manifest| (manifest, false))
-            .ok_or(error),
-    }
-}
-
 pub(crate) async fn fetch_fresh_install_version_manifest() -> Result<VersionManifest, String> {
     fetch_manifest_live().await
 }
@@ -636,51 +571,6 @@ mod tests {
 
         assert_eq!(manifest.latest.release, "1.21.4");
         assert!(live_body.is_none());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn registered_repair_manifest_resolution_is_read_only_and_path_independent() {
-        const VERSION_ID: &str = "1.21.11";
-        const PINNED_SHA1: &str = "1111111111111111111111111111111111111111";
-        let root = temp_dir("registered-repair-read-only");
-        fs::create_dir_all(&root).expect("create test root");
-        let sentinel = root.join("persistent-sentinel");
-        fs::write(&sentinel, b"persistent sentinel").expect("write persistent sentinel");
-        let mut insufficient = parse_manifest_body(sample_manifest_body(VERSION_ID).as_bytes())
-            .expect("insufficient cached manifest");
-        let mut duplicate = insufficient.versions[0].clone();
-        duplicate.sha1 = PINNED_SHA1.to_string();
-        insufficient.versions.push(duplicate);
-        let server = ScriptedManifestServer::start(vec![(
-            200,
-            sample_manifest_body_with_sha1(VERSION_ID, PINNED_SHA1),
-        )]);
-        let url = server.url();
-
-        let (resolved, fetched_live) = resolve_registered_repair_manifest(
-            Some(insufficient),
-            None,
-            VERSION_ID,
-            PINNED_SHA1,
-            async move {
-                let body =
-                    fetch_manifest_live_body_with_retry_delays(&url, false, true, &[0, 0, 0])
-                        .await?;
-                parse_manifest_body(&body)
-            },
-        )
-        .await
-        .expect("insufficient memory manifest falls back to live discovery");
-
-        assert_eq!(resolved.latest.release, VERSION_ID);
-        assert!(fetched_live);
-        assert_eq!(server.join(), 1);
-        assert_eq!(
-            fs::read(&sentinel).expect("read persistent sentinel"),
-            b"persistent sentinel"
-        );
 
         let _ = fs::remove_dir_all(root);
     }

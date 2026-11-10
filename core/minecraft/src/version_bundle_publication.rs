@@ -50,9 +50,8 @@ const SETTLEMENT_SCHEMA: &str = "axial.version_bundle_publication.settlement.v5"
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum VersionBundlePublicationPurpose {
+enum VersionBundlePublicationPurpose {
     Install,
-    GuardianRebuild,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -220,14 +219,8 @@ enum SettlementExpectation {
 }
 
 pub(crate) enum VersionBundleTransactionSettledOutcome {
-    Committed {
-        lease: ManagedRootPublicationLease,
-        evidence: DurableVersionBundleEvidence,
-    },
-    RolledBack {
-        lease: ManagedRootPublicationLease,
-        evidence: DurableVersionBundleEvidence,
-    },
+    Committed { lease: ManagedRootPublicationLease },
+    RolledBack { lease: ManagedRootPublicationLease },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -306,37 +299,11 @@ impl DurableVersionBundleEvidence {
         self.settlement.outcome.outcome == PersistedTerminalOutcome::Committed
     }
 
-    pub(crate) fn matches_activation_contract(
-        &self,
-        expected: &ManagedInstallActivationContractId,
-    ) -> bool {
-        self.settlement.intent.activation_contract_id == *expected
-    }
-
     pub(crate) fn rollback_effect(&self) -> Option<VersionBundleTransactionEffect> {
         match self.settlement.outcome.outcome {
             PersistedTerminalOutcome::Committed => None,
             PersistedTerminalOutcome::RolledBack { effect } => Some(effect),
         }
-    }
-
-    pub(crate) fn matches_expected_projection(
-        &self,
-        version_id: &str,
-        activation_contract_id: &ManagedInstallActivationContractId,
-        purpose: VersionBundlePublicationPurpose,
-        projection: &ManagedComponentProjection<'_>,
-    ) -> bool {
-        let Ok(observed) = validate_persisted_intent(&self.settlement.intent) else {
-            return false;
-        };
-        let Ok(expected) = own_fingerprints(projection) else {
-            return false;
-        };
-        self.settlement.intent.version_id == version_id
-            && self.settlement.intent.activation_contract_id == *activation_contract_id
-            && self.settlement.intent.purpose == purpose
-            && observed == expected
     }
 
     pub(crate) fn evidence_id(&self) -> ManagedInstallPublicationEvidenceId {
@@ -425,7 +392,6 @@ struct VersionBundleTransactionPreparationRecovery {
     source: AuthenticatedVersionBundleSource,
     version_id: String,
     activation_contract_id: ManagedInstallActivationContractId,
-    purpose: VersionBundlePublicationPurpose,
     fingerprints: Vec<EntryFingerprint>,
 }
 
@@ -453,7 +419,6 @@ impl VersionBundleTransactionRecovery {
                     recovery.source,
                     recovery.version_id,
                     recovery.activation_contract_id,
-                    recovery.purpose,
                     recovery.fingerprints,
                     #[cfg(any(test, feature = "test-support"))]
                     None,
@@ -554,7 +519,6 @@ pub(crate) async fn publish_version_bundle(
     lease: ManagedRootPublicationLease,
     source: AuthenticatedVersionBundleSource,
     activation_contract_id: ManagedInstallActivationContractId,
-    purpose: VersionBundlePublicationPurpose,
     projection: ManagedComponentProjection<'_>,
 ) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError> {
     if !source.matches_projection(&projection) {
@@ -575,7 +539,6 @@ pub(crate) async fn publish_version_bundle(
         source,
         version_id,
         activation_contract_id,
-        purpose,
         fingerprints,
         #[cfg(any(test, feature = "test-support"))]
         test_hook,
@@ -588,7 +551,6 @@ async fn continue_version_bundle_publication(
     source: AuthenticatedVersionBundleSource,
     version_id: String,
     activation_contract_id: ManagedInstallActivationContractId,
-    purpose: VersionBundlePublicationPurpose,
     fingerprints: Vec<EntryFingerprint>,
     #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError> {
@@ -603,7 +565,6 @@ async fn continue_version_bundle_publication(
         let attempt_source = source.clone();
         let attempt_version_id = version_id.clone();
         let attempt_activation_contract_id = activation_contract_id.clone();
-        let attempt_purpose = purpose;
         let attempt_fingerprints = fingerprints.clone();
         #[cfg(any(test, feature = "test-support"))]
         let attempt_test_hook = test_hook.take();
@@ -614,7 +575,6 @@ async fn continue_version_bundle_publication(
                 attempt_source,
                 attempt_version_id,
                 attempt_activation_contract_id,
-                attempt_purpose,
                 attempt_fingerprints,
                 attempt_test_hook,
             )
@@ -627,7 +587,6 @@ async fn continue_version_bundle_publication(
                 attempt_source,
                 attempt_version_id,
                 attempt_activation_contract_id,
-                attempt_purpose,
                 attempt_fingerprints,
             )
         })
@@ -653,7 +612,6 @@ async fn continue_version_bundle_publication(
                                 source,
                                 version_id,
                                 activation_contract_id,
-                                purpose,
                                 fingerprints,
                             },
                         ),
@@ -683,7 +641,6 @@ async fn continue_version_bundle_publication(
                             source,
                             version_id,
                             activation_contract_id,
-                            purpose,
                             fingerprints,
                         },
                     ),
@@ -759,7 +716,6 @@ async fn settle_version_bundle_progress(
 pub(crate) async fn classify_durable_version_bundle_candidates(
     lease: ManagedRootPublicationLease,
     candidates: ManagedInstallPublicationCandidates,
-    purpose: VersionBundlePublicationPurpose,
 ) -> DurableVersionBundleOutcome {
     let holder = Arc::new(Mutex::new(Some(lease)));
     let worker_holder = Arc::clone(&holder);
@@ -769,7 +725,7 @@ pub(crate) async fn classify_durable_version_bundle_candidates(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .expect("durable classifier lease is present");
-        let outcome = classify_durable_version_bundle_owned(lease, &candidates, purpose);
+        let outcome = classify_durable_version_bundle_owned(lease, &candidates);
         if let Err(lease) = outcome {
             *worker_holder
                 .lock()
@@ -797,7 +753,6 @@ pub(crate) async fn classify_durable_version_bundle_candidates(
 fn classify_durable_version_bundle_owned(
     lease: ManagedRootPublicationLease,
     candidates: &ManagedInstallPublicationCandidates,
-    purpose: VersionBundlePublicationPurpose,
 ) -> Result<DurableVersionBundleOutcome, ManagedRootPublicationLease> {
     let classified = (|| {
         lease
@@ -827,7 +782,6 @@ fn classify_durable_version_bundle_owned(
                 &lease,
                 &lane,
                 candidates,
-                purpose,
                 settlement,
                 settlement_guard,
             );
@@ -846,7 +800,7 @@ fn classify_durable_version_bundle_owned(
         {
             return Err(VersionBundleTransactionError::RecoveryAmbiguous);
         }
-        if !candidates.contains(&intent.version_id) || intent.purpose != purpose {
+        if !candidates.contains(&intent.version_id) {
             return Ok(DurableVersionBundleClassification::Mismatch);
         }
         let (staging, quarantine) = open_or_create_slots_after_intent(&lease, &lane)?;
@@ -901,7 +855,6 @@ fn classify_durable_version_bundle_owned(
             &lease,
             &lane,
             candidates,
-            purpose,
             settlement,
             settlement_guard,
         )
@@ -1030,7 +983,6 @@ fn prepare_transaction(
     source: AuthenticatedVersionBundleSource,
     version_id: String,
     activation_contract_id: ManagedInstallActivationContractId,
-    purpose: VersionBundlePublicationPurpose,
     fingerprints: Vec<EntryFingerprint>,
     #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<PreparationOutcome, VersionBundleTransactionError> {
@@ -1041,13 +993,7 @@ fn prepare_transaction(
     refuse_unacknowledged_settlement(&lane)?;
 
     if let Some((intent, intent_guard)) = read_intent(&lane)? {
-        if !intent_matches_projection(
-            &intent,
-            &version_id,
-            &activation_contract_id,
-            purpose,
-            &planned,
-        )? {
+        if !intent_matches_projection(&intent, &version_id, &activation_contract_id, &planned)? {
             return Err(VersionBundleTransactionError::LaneOccupied);
         }
         let (staging, quarantine) = open_or_create_slots_after_intent(&lease, &lane)?;
@@ -1146,7 +1092,6 @@ fn prepare_transaction(
     let intent = persisted_intent(
         &version_id,
         activation_contract_id,
-        purpose,
         &planned,
         created_ancestors,
     )?;
@@ -1409,14 +1354,13 @@ fn validate_bundle_topology(
 fn persisted_intent(
     version_id: &str,
     activation_contract_id: ManagedInstallActivationContractId,
-    purpose: VersionBundlePublicationPurpose,
     planned: &[PlannedEntry],
     created_ancestors: Vec<String>,
 ) -> Result<PersistedIntent, VersionBundleTransactionError> {
     let intent = PersistedIntent {
         schema: INTENT_SCHEMA.to_string(),
         phase: PersistedIntentPhase::Prepared,
-        purpose,
+        purpose: VersionBundlePublicationPurpose::Install,
         version_id: version_id.to_string(),
         activation_contract_id,
         transaction_nonce: uuid::Uuid::new_v4().simple().to_string(),
@@ -1553,13 +1497,11 @@ fn intent_matches_projection(
     intent: &PersistedIntent,
     version_id: &str,
     activation_contract_id: &ManagedInstallActivationContractId,
-    purpose: VersionBundlePublicationPurpose,
     planned: &[PlannedEntry],
 ) -> Result<bool, VersionBundleTransactionError> {
     let persisted = validate_persisted_intent(intent)?;
     Ok(intent.version_id == version_id
         && intent.activation_contract_id == *activation_contract_id
-        && intent.purpose == purpose
         && persisted
             == planned
                 .iter()
@@ -1793,7 +1735,6 @@ fn durable_classification_from_settlement(
     lease: &ManagedRootPublicationLease,
     lane: &ManagedDir,
     candidates: &ManagedInstallPublicationCandidates,
-    purpose: VersionBundlePublicationPurpose,
     settlement: PersistedSettlement,
     settlement_guard: ManagedFileGuard,
 ) -> Result<DurableVersionBundleClassification, VersionBundleTransactionError> {
@@ -1804,7 +1745,7 @@ fn durable_classification_from_settlement(
     {
         return Err(VersionBundleTransactionError::RecoveryAmbiguous);
     }
-    if !candidates.contains(&settlement.intent.version_id) || settlement.intent.purpose != purpose {
+    if !candidates.contains(&settlement.intent.version_id) {
         return Ok(DurableVersionBundleClassification::Mismatch);
     }
     let evidence = durable_evidence_from_settlement(lease, lane, settlement, settlement_guard)?;
@@ -3647,8 +3588,8 @@ async fn settle_owned_context(
         Some(evidence) => {
             let TransactionContext { lease, .. } = context;
             Ok(match evidence.rollback_effect() {
-                None => VersionBundleTransactionSettledOutcome::Committed { lease, evidence },
-                Some(_) => VersionBundleTransactionSettledOutcome::RolledBack { lease, evidence },
+                None => VersionBundleTransactionSettledOutcome::Committed { lease },
+                Some(_) => VersionBundleTransactionSettledOutcome::RolledBack { lease },
             })
         }
         None => Err(VersionBundleTransactionSettlementRetry {
@@ -3656,15 +3597,6 @@ async fn settle_owned_context(
             expectation: retained_expectation,
         }),
     }
-}
-
-pub(crate) fn settled_version_bundle_matches_managed_library(
-    lease: &ManagedRootPublicationLease,
-    expected: &crate::managed_fs::ManagedLibraryOperation,
-) -> bool {
-    lease.revalidate().is_ok()
-        && lease.root().shares_managed_library_operation(expected)
-        && lease.revalidate().is_ok()
 }
 
 pub(crate) async fn revalidate_settled_version_bundle(
@@ -4345,7 +4277,8 @@ mod settlement_tests {
     }
 
     async fn pending_settlement_fixture(test_hook: PublicationTestHook) -> SettlementFixture {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("settlement retry root");
+        let temporary =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("settlement retry root");
         let root_path = temporary.path().join("library");
         std::fs::create_dir(&root_path).expect("create settlement retry root");
         let root = ManagedDir::open_root(&root_path).expect("open settlement retry root");
@@ -4371,7 +4304,7 @@ mod settlement_tests {
         let intent = PersistedIntent {
             schema: INTENT_SCHEMA.to_string(),
             phase: PersistedIntentPhase::Prepared,
-            purpose: VersionBundlePublicationPurpose::GuardianRebuild,
+            purpose: VersionBundlePublicationPurpose::Install,
             version_id: version_id.to_string(),
             activation_contract_id: ManagedInstallActivationContractId::from_digest([7; 32]),
             transaction_nonce: "0123456789abcdef0123456789abcdef".to_string(),
@@ -4554,6 +4487,22 @@ mod settlement_tests {
         assert!(encoded.contains(intent.activation_contract_id.as_str()));
     }
 
+    async fn classified_rollback_effect(
+        lease: ManagedRootPublicationLease,
+        version_id: &str,
+    ) -> Option<VersionBundleTransactionEffect> {
+        match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::one(version_id)
+                .expect("exact settlement candidate"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::RolledBack { effect, .. } => Some(effect),
+            _ => None,
+        }
+    }
+
     fn assert_settlement_retained(
         lane: &ManagedDir,
         staging: &ManagedDir,
@@ -4668,22 +4617,15 @@ mod settlement_tests {
                 .is_empty()
         );
 
-        let (lease, evidence) = match settlement.retry().await.expect("retry settlement") {
-            VersionBundleTransactionSettledOutcome::RolledBack { lease, evidence } => {
-                (lease, evidence)
-            }
+        let lease = match settlement.retry().await.expect("retry settlement") {
+            VersionBundleTransactionSettledOutcome::RolledBack { lease } => lease,
             _ => panic!("unexpected settlement outcome"),
         };
-        assert_eq!(
-            evidence.rollback_effect(),
-            Some(VersionBundleTransactionEffect::Rollback)
-        );
         assert_settlement_retained(&lane, &staging, &quarantine);
         let (lease, evidence) = match classify_durable_version_bundle_candidates(
             lease,
             ManagedInstallPublicationCandidates::one(version_id)
                 .expect("exact settlement candidate"),
-            VersionBundlePublicationPurpose::GuardianRebuild,
         )
         .await
         {
@@ -4701,9 +4643,132 @@ mod settlement_tests {
         assert_settlement_acknowledged(&lane, &staging, &quarantine);
     }
 
+    async fn publish_fixture(
+        version_id: &str,
+        root: ManagedDir,
+    ) -> (
+        crate::known_good::PendingKnownGoodInstallAuthority,
+        Result<VersionBundleTransactionSettledOutcome, VersionBundleTransactionError>,
+    ) {
+        let (authority, source) =
+            crate::download::version_bundle_publication_fixture_for_test(version_id)
+                .expect("publication fixture");
+        let lease = ManagedRootPublicationLease::acquire(root)
+            .await
+            .expect("acquire publication fixture root");
+        let publication = publish_version_bundle(
+            lease,
+            source,
+            authority
+                .activation_contract_id()
+                .expect("publication fixture contract"),
+            authority
+                .version_bundle_projection()
+                .expect("publication fixture projection"),
+        )
+        .await;
+        (
+            authority,
+            settle_version_bundle_publication(publication).await,
+        )
+    }
+
+    async fn assert_intent_retry_commits(version_id: &str, inject: impl FnOnce(&str)) {
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("intent retry root");
+        let root = ManagedDir::open_root(temporary.path()).expect("open intent retry root");
+        inject(version_id);
+        let (authority, settled) = publish_fixture(version_id, root).await;
+        let lease = match settled.expect("intent-boundary retry should settle") {
+            VersionBundleTransactionSettledOutcome::Committed { lease } => lease,
+            _ => panic!("intent-boundary retry should commit"),
+        };
+        assert!(
+            revalidate_settled_version_bundle(
+                &lease,
+                authority
+                    .version_bundle_projection()
+                    .expect("intent retry projection"),
+            )
+            .await
+        );
+        let (lease, evidence) = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::one(version_id).expect("intent retry candidate"),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::Committed { lease, evidence } => (lease, evidence),
+            _ => panic!("intent retry did not classify its committed settlement"),
+        };
+        assert!(matches!(
+            acknowledge_durable_version_bundle(lease, evidence).await,
+            DurableVersionBundleAcknowledgementOutcome::Acknowledged(_)
+        ));
+        let mut names =
+            std::fs::read_dir(temporary.path().join(".axial-publication").join(LANE_NAME))
+                .expect("intent retry lane")
+                .map(|entry| {
+                    entry
+                        .expect("intent retry entry")
+                        .file_name()
+                        .into_string()
+                        .expect("portable intent retry entry")
+                })
+                .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["quarantine", "staging"]);
+    }
+
+    #[tokio::test]
+    async fn attempted_intent_write_reenters_owned_publication_recovery() {
+        assert_intent_retry_commits(
+            "version-bundle-intent-write-retry",
+            fail_intent_write_after_promotion_for_test,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn post_intent_failure_reenters_owned_publication_recovery() {
+        assert_intent_retry_commits(
+            "version-bundle-post-intent-retry",
+            fail_after_intent_for_test,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unsettled_move_reconciles_without_a_false_terminal() {
+        const VERSION_ID: &str = "fixture-version-bundle-unsettled-move";
+        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("unsettled move root");
+        let root = ManagedDir::open_root(temporary.path()).expect("open unsettled move root");
+        report_first_move_unsettled_for_test(VERSION_ID);
+
+        let (_, settled) = publish_fixture(VERSION_ID, root).await;
+        let lease = match settled.expect("unsettled move must enter durable reconciliation") {
+            VersionBundleTransactionSettledOutcome::RolledBack { lease } => lease,
+            _ => panic!("unsettled move must settle as a reconciled rollback"),
+        };
+        assert_eq!(
+            classified_rollback_effect(lease, VERSION_ID).await,
+            Some(VersionBundleTransactionEffect::Promotion)
+        );
+        for canonical in [
+            format!("versions/{VERSION_ID}/{VERSION_ID}.json"),
+            format!("versions/{VERSION_ID}/{VERSION_ID}.jar"),
+            "assets/log_configs/managed-version-bundle.xml".to_string(),
+        ] {
+            assert!(
+                !temporary.path().join(canonical).exists(),
+                "reconciled rollback must not retain an unproven canonical file"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn two_candidate_classifier_reports_empty_lane_without_provider_work() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("empty candidate root");
+        let temporary =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("empty candidate root");
         let root = ManagedDir::open_root(temporary.path()).expect("open empty candidate root");
         let lease = ManagedRootPublicationLease::acquire(root)
             .await
@@ -4714,7 +4779,6 @@ mod settlement_tests {
                 lease,
                 ManagedInstallPublicationCandidates::pair("candidate-base", "candidate-child")
                     .expect("exact empty-lane candidates"),
-                VersionBundlePublicationPurpose::GuardianRebuild,
             )
             .await,
             DurableVersionBundleOutcome::NoEffect(_)
@@ -4750,7 +4814,6 @@ mod settlement_tests {
             lease,
             ManagedInstallPublicationCandidates::pair("unexpected-a", "unexpected-b")
                 .expect("exact unexpected candidates"),
-            VersionBundlePublicationPurpose::GuardianRebuild,
         )
         .await
         {
@@ -4761,7 +4824,6 @@ mod settlement_tests {
             lease,
             ManagedInstallPublicationCandidates::pair(version_id, "candidate-child")
                 .expect("exact base candidates"),
-            VersionBundlePublicationPurpose::GuardianRebuild,
         )
         .await
         {
@@ -4800,7 +4862,6 @@ mod settlement_tests {
             lease,
             ManagedInstallPublicationCandidates::pair("candidate-base", version_id)
                 .expect("exact child candidates"),
-            VersionBundlePublicationPurpose::GuardianRebuild,
         )
         .await
         {
@@ -4813,32 +4874,23 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn two_candidate_classifier_reports_committed_child_without_provider_work() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("committed candidate root");
+        let temporary =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("committed candidate root");
         let root = ManagedDir::open_root(temporary.path()).expect("open committed candidate root");
-        let reconstruction =
-            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
-                root,
-                "candidate-child",
-            )
-            .expect("build committed candidate fixture");
-        let (root, projection, source) = reconstruction.into_effect_parts();
+        let (authority, source) =
+            crate::download::version_bundle_publication_fixture_for_test("candidate-child")
+                .expect("build committed candidate fixture");
         let lease = ManagedRootPublicationLease::acquire(root)
             .await
             .expect("acquire committed candidate root");
-        let activation_contract_id = projection
+        let activation_contract_id = authority
             .activation_contract_id()
             .expect("derive committed candidate contract");
-        let projection = projection
-            .component_projection()
+        let projection = authority
+            .version_bundle_projection()
             .expect("project committed candidate fixture");
-        let publication = publish_version_bundle(
-            lease,
-            source,
-            activation_contract_id.clone(),
-            VersionBundlePublicationPurpose::GuardianRebuild,
-            projection,
-        )
-        .await;
+        let publication =
+            publish_version_bundle(lease, source, activation_contract_id.clone(), projection).await;
         let lease = match settle_version_bundle_publication(publication)
             .await
             .expect("settle committed candidate")
@@ -4851,7 +4903,6 @@ mod settlement_tests {
             lease,
             ManagedInstallPublicationCandidates::pair("candidate-base", "candidate-child")
                 .expect("exact committed candidates"),
-            VersionBundlePublicationPurpose::GuardianRebuild,
         )
         .await
         {
@@ -4875,30 +4926,32 @@ mod settlement_tests {
         const VERSION: &str = "recorded-metadata-refusal";
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
-        let reconstruction =
-            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
-                root, VERSION,
-            )
-            .unwrap();
-        let (root, projection, source) = reconstruction.into_effect_parts();
+        let (authority, source) =
+            crate::download::version_bundle_publication_fixture_for_test(VERSION).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let contract = projection.activation_contract_id().unwrap();
+        let contract = authority.activation_contract_id().unwrap();
         let publication = publish_version_bundle(
             lease,
             source,
             contract.clone(),
-            VersionBundlePublicationPurpose::GuardianRebuild,
-            projection.component_projection().unwrap(),
+            authority.version_bundle_projection().unwrap(),
         )
         .await;
-        let (lease, evidence) = match settle_version_bundle_publication(publication)
+        let lease = match settle_version_bundle_publication(publication)
             .await
             .unwrap()
         {
-            VersionBundleTransactionSettledOutcome::Committed { lease, evidence } => {
-                (lease, evidence)
-            }
+            VersionBundleTransactionSettledOutcome::Committed { lease } => lease,
             _ => panic!("fixture must commit its real publication"),
+        };
+        let (lease, evidence) = match classify_durable_version_bundle_candidates(
+            lease,
+            ManagedInstallPublicationCandidates::one(VERSION).unwrap(),
+        )
+        .await
+        {
+            DurableVersionBundleOutcome::Committed { lease, evidence } => (lease, evidence),
+            _ => panic!("fixture must classify its committed publication"),
         };
         let read = || {
             tokio::time::timeout(
@@ -5001,7 +5054,7 @@ mod settlement_tests {
             ManagedCreateOnlyWriteFault::Promotion,
         ))
         .await;
-        let (lease, evidence) = match settle_owned_context(
+        let lease = match settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {
                 effect: VersionBundleTransactionEffect::Rollback,
@@ -5010,22 +5063,15 @@ mod settlement_tests {
         .await
         .expect("promotion recovery must synchronize the settlement namespace")
         {
-            VersionBundleTransactionSettledOutcome::RolledBack { lease, evidence } => {
-                (lease, evidence)
-            }
+            VersionBundleTransactionSettledOutcome::RolledBack { lease } => lease,
             _ => panic!("unexpected promotion recovery outcome"),
         };
-        assert_eq!(
-            evidence.rollback_effect(),
-            Some(VersionBundleTransactionEffect::Rollback)
-        );
         assert_settlement_retained(&lane, &staging, &quarantine);
 
         let (lease, first_evidence) = match classify_durable_version_bundle_candidates(
             lease,
             ManagedInstallPublicationCandidates::one(version_id)
                 .expect("exact settlement candidate"),
-            VersionBundlePublicationPurpose::GuardianRebuild,
         )
         .await
         {
@@ -5051,7 +5097,6 @@ mod settlement_tests {
                 restarted_lease,
                 ManagedInstallPublicationCandidates::one(version_id)
                     .expect("exact restart candidate"),
-                VersionBundlePublicationPurpose::GuardianRebuild,
             )
             .await
             {
@@ -5080,6 +5125,7 @@ mod settlement_tests {
             lane,
             staging,
             quarantine,
+            version_id,
             ..
         } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
         let context = Arc::new(context);
@@ -5109,13 +5155,13 @@ mod settlement_tests {
         );
 
         drop(retained_context);
-        let VersionBundleTransactionSettledOutcome::RolledBack { evidence, .. } =
+        let VersionBundleTransactionSettledOutcome::RolledBack { lease } =
             recovery.retry().await.expect("resume retained settlement")
         else {
             panic!("unexpected retained settlement outcome");
         };
         assert_eq!(
-            evidence.rollback_effect(),
+            classified_rollback_effect(lease, version_id).await,
             Some(VersionBundleTransactionEffect::Rollback)
         );
         assert_settlement_retained(&lane, &staging, &quarantine);
@@ -5203,45 +5249,35 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn malformed_active_intent_returns_indeterminate_without_livelock() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("malformed intent root");
+        let temporary =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("malformed intent root");
         let root =
             ManagedDir::open_root(temporary.path()).expect("open malformed intent managed root");
-        let reconstruction =
-            crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
-                root,
-                "malformed-active-intent",
-            )
-            .expect("build malformed intent fixture");
-        let (root, projection, source) = reconstruction.into_effect_parts();
+        let (authority, source) =
+            crate::download::version_bundle_publication_fixture_for_test("malformed-active-intent")
+                .expect("build malformed intent fixture");
         let lease = ManagedRootPublicationLease::acquire(root)
             .await
             .expect("acquire malformed intent lease");
         let lane = open_lane(&lease).expect("open malformed intent lane");
         lane.write_new_exact(INTENT_NAME, b"{")
             .expect("publish malformed active intent");
-        let component = projection
-            .component_projection()
+        let component = authority
+            .version_bundle_projection()
             .expect("project malformed intent fixture");
-        let activation_contract_id = projection
+        let activation_contract_id = authority
             .activation_contract_id()
             .expect("derive malformed intent contract");
 
         let started = std::time::Instant::now();
-        let error = match publish_version_bundle(
-            lease,
-            source,
-            activation_contract_id,
-            VersionBundlePublicationPurpose::GuardianRebuild,
-            component,
-        )
-        .await
-        {
-            Ok(receipt) => {
-                drop(receipt);
-                panic!("malformed active intent unexpectedly committed")
-            }
-            Err(error) => error,
-        };
+        let error =
+            match publish_version_bundle(lease, source, activation_contract_id, component).await {
+                Ok(receipt) => {
+                    drop(receipt);
+                    panic!("malformed active intent unexpectedly committed")
+                }
+                Err(error) => error,
+            };
         let recovery = match error {
             VersionBundleTransactionError::Indeterminate(recovery) => recovery,
             other => panic!("malformed intent did not retain recovery: {other:?}"),
@@ -5282,6 +5318,7 @@ mod settlement_tests {
             lane,
             staging,
             quarantine,
+            version_id,
             ..
         } = pending_settlement_fixture(PublicationTestHook::FailAfterSettlementMarkerOnce).await;
 
@@ -5310,13 +5347,13 @@ mod settlement_tests {
                 .len(),
             2
         );
-        let VersionBundleTransactionSettledOutcome::RolledBack { evidence, .. } =
+        let VersionBundleTransactionSettledOutcome::RolledBack { lease } =
             settlement.retry().await.expect("resume marker cleanup")
         else {
             panic!("unexpected marker cleanup outcome");
         };
         assert_eq!(
-            evidence.rollback_effect(),
+            classified_rollback_effect(lease, version_id).await,
             Some(VersionBundleTransactionEffect::Rollback)
         );
         assert_settlement_retained(&lane, &staging, &quarantine);

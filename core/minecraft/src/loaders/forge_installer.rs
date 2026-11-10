@@ -1065,12 +1065,6 @@ impl AuthenticatedInstallerReconstructionInput {
             .derive_child_client_bytes(authenticated_base_bytes)
     }
 
-    pub(crate) fn take_local_library_sources(
-        &mut self,
-    ) -> Vec<crate::download::library_source::AuthenticatedLocalLibraryBytes> {
-        std::mem::take(&mut self.local_library_sources)
-    }
-
     pub(crate) fn into_parts(
         self,
     ) -> (
