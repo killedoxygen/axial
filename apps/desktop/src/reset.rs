@@ -17,7 +17,6 @@ use std::{
 };
 use tauri::{AppHandle, State, WebviewWindow};
 
-const UNAVAILABLE: &str = "Developer reset is unavailable in this build.";
 const PREFLIGHT_FAILED: &str =
     "Reset is blocked because launcher-owned storage could not be proven safe.";
 const DELETE_FAILED: &str =
@@ -55,9 +54,6 @@ impl NativeReset {
     /// Composition supplies the already admitted replacement library, never a
     /// caller-selected deletion path. Normal startup retains no additional pin.
     pub fn new(library: LibraryLifecycle, tasks: TaskOwner) -> Result<Self, String> {
-        if !cfg!(debug_assertions) {
-            return Err(UNAVAILABLE.into());
-        }
         let pin = library
             .admit_application_root()
             .map_err(|_| PREFLIGHT_FAILED)?;
@@ -358,9 +354,6 @@ pub async fn app_reset(
     lifecycle: State<'_, DesktopLifecycle>,
     reset: State<'_, NativeReset>,
 ) -> Result<(), String> {
-    if !cfg!(debug_assertions) {
-        return Err(UNAVAILABLE.into());
-    }
     crate::window::require_main_window(&window, &bootstrap)?;
     request_reset(
         reset.inner().clone(),
@@ -375,7 +368,7 @@ pub async fn app_reset(
     .map_err(|_| DELETE_FAILED.to_string())?
 }
 
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{discord_presence::PresenceObserver, native_skin::NativeSkinFiles};
