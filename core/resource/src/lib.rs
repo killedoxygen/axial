@@ -1,18 +1,15 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 
 const PROCESS_WORKER_LIMIT: usize = 4;
 const BACKGROUND_WORKER_LIMIT: usize = 2;
-const CRASH_COLLECTION_LIMIT: usize = 2;
 const HEAVY_IO_LIMIT: usize = 1;
 const SCRATCH_UNIT_BYTES: u64 = 1 << 20;
 const SCRATCH_LIMIT_BYTES: u64 = 512 << 20;
 const PROCESS_LIMITS: PhysicalWorkLimits = PhysicalWorkLimits {
     workers: PROCESS_WORKER_LIMIT,
     background: BACKGROUND_WORKER_LIMIT,
-    crash: CRASH_COLLECTION_LIMIT,
     heavy: HEAVY_IO_LIMIT,
     scratch_bytes: SCRATCH_LIMIT_BYTES,
 };
@@ -21,7 +18,6 @@ const PROCESS_LIMITS: PhysicalWorkLimits = PhysicalWorkLimits {
 pub enum PhysicalWorkClass {
     Foreground,
     Background,
-    CrashCollection,
 }
 
 impl PhysicalWorkClass {
@@ -29,7 +25,6 @@ impl PhysicalWorkClass {
         match self {
             Self::Foreground => 0,
             Self::Background => 1,
-            Self::CrashCollection => 2,
         }
     }
 }
@@ -81,15 +76,6 @@ impl PhysicalWorkRequest {
             parallelism: 1,
         }
     }
-
-    pub const fn crash_collection(scratch_bytes: u64) -> Self {
-        Self {
-            class: PhysicalWorkClass::CrashCollection,
-            io: PhysicalIoClass::Read,
-            scratch_bytes,
-            parallelism: 1,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,8 +98,6 @@ pub enum PhysicalWorkError {
     WorkerLimit,
     #[error("physical work was cancelled")]
     Cancelled,
-    #[error("physical work exceeded its deadline")]
-    Deadline,
     #[error("physical worker stopped before returning a result")]
     TaskStopped,
 }
@@ -126,7 +110,7 @@ pub struct PhysicalWorkOwner {
 pub struct PhysicalWorkAdmission {
     owner: Arc<PhysicalWorkOwnerInner>,
     class: PhysicalWorkClass,
-    _class_permits: Vec<OwnedSemaphorePermit>,
+    _background: Option<OwnedSemaphorePermit>,
     _scratch: Option<OwnedSemaphorePermit>,
     _heavy: Option<OwnedSemaphorePermit>,
     _worker: OwnedSemaphorePermit,
@@ -152,19 +136,17 @@ pub struct PhysicalWorkGroup {
 pub struct PhysicalWorkCancellation {
     group_cancelled: Option<Arc<AtomicBool>>,
     task_cancelled: Arc<AtomicBool>,
-    deadline: Option<Instant>,
 }
 
 struct PhysicalWorkOwnerInner {
     workers: Arc<Semaphore>,
     worker_limit: usize,
     background: Arc<Semaphore>,
-    crash: Arc<Semaphore>,
     heavy: Arc<Semaphore>,
     scratch: Arc<Semaphore>,
     scratch_limit_bytes: u64,
-    active: [AtomicUsize; 3],
-    running: [AtomicUsize; 3],
+    active: [AtomicUsize; 2],
+    running: [AtomicUsize; 2],
 }
 
 struct PhysicalWorkGroupInner {
@@ -215,7 +197,6 @@ impl PhysicalWorkOwner {
                 workers: Arc::new(Semaphore::new(limits.workers)),
                 worker_limit: limits.workers,
                 background: Arc::new(Semaphore::new(limits.background)),
-                crash: Arc::new(Semaphore::new(limits.crash)),
                 heavy: Arc::new(Semaphore::new(limits.heavy)),
                 scratch: Arc::new(Semaphore::new(scratch_units)),
                 scratch_limit_bytes: limits.scratch_bytes,
@@ -243,16 +224,11 @@ impl PhysicalWorkOwner {
     ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
         validate_parallelism(&self.inner, request.parallelism)?;
         let scratch = self.reserve_scratch_inner(request.scratch_bytes).await?;
-        let mut class_permits = Vec::with_capacity(2);
-        if matches!(
-            request.class,
-            PhysicalWorkClass::Background | PhysicalWorkClass::CrashCollection
-        ) {
-            class_permits.push(acquire_one(&self.inner.background).await?);
-        }
-        if request.class == PhysicalWorkClass::CrashCollection {
-            class_permits.push(acquire_one(&self.inner.crash).await?);
-        }
+        let background = if request.class == PhysicalWorkClass::Background {
+            Some(acquire_one(&self.inner.background).await?)
+        } else {
+            None
+        };
         let heavy = if request.io == PhysicalIoClass::Heavy {
             Some(acquire_one(&self.inner.heavy).await?)
         } else {
@@ -263,7 +239,7 @@ impl PhysicalWorkOwner {
         Ok(PhysicalWorkAdmission {
             owner: Arc::clone(&self.inner),
             class: request.class,
-            _class_permits: class_permits,
+            _background: background,
             _scratch: scratch,
             _heavy: heavy,
             _worker: worker,
@@ -375,16 +351,11 @@ impl PhysicalWorkOwner {
     ) -> Result<PhysicalWorkAdmission, PhysicalWorkError> {
         validate_parallelism(&self.inner, request.parallelism)?;
         let scratch = self.try_reserve_scratch_inner(request.scratch_bytes)?;
-        let mut class_permits = Vec::with_capacity(2);
-        if matches!(
-            request.class,
-            PhysicalWorkClass::Background | PhysicalWorkClass::CrashCollection
-        ) {
-            class_permits.push(try_acquire_one(&self.inner.background)?);
-        }
-        if request.class == PhysicalWorkClass::CrashCollection {
-            class_permits.push(try_acquire_one(&self.inner.crash)?);
-        }
+        let background = if request.class == PhysicalWorkClass::Background {
+            Some(try_acquire_one(&self.inner.background)?)
+        } else {
+            None
+        };
         let heavy = if request.io == PhysicalIoClass::Heavy {
             Some(try_acquire_one(&self.inner.heavy)?)
         } else {
@@ -395,7 +366,7 @@ impl PhysicalWorkOwner {
         Ok(PhysicalWorkAdmission {
             owner: Arc::clone(&self.inner),
             class: request.class,
-            _class_permits: class_permits,
+            _background: background,
             _scratch: scratch,
             _heavy: heavy,
             _worker: worker,
@@ -464,7 +435,6 @@ impl PhysicalWorkAdmission {
         let cancellation = PhysicalWorkCancellation {
             group_cancelled: None,
             task_cancelled: cancelled,
-            deadline: None,
         };
         let task = tokio::task::spawn_blocking(move || {
             let _running = RunningWorker::new(&self);
@@ -542,20 +512,37 @@ impl PhysicalWorkGroup {
         T: Send + 'static,
         Work: FnOnce(PhysicalWorkCancellation) -> T + Send + 'static,
     {
-        self.run_inner(request, None, work).await
-    }
-
-    pub async fn run_until<T, Work>(
-        &self,
-        request: PhysicalWorkRequest,
-        deadline: Duration,
-        work: Work,
-    ) -> Result<T, PhysicalWorkError>
-    where
-        T: Send + 'static,
-        Work: FnOnce(PhysicalWorkCancellation) -> T + Send + 'static,
-    {
-        self.run_inner(request, Some(deadline), work).await
+        let registration = self.register()?;
+        let mut cancelled = self.inner.cancellation.subscribe();
+        let admission = tokio::select! {
+            admission = self.owner.admit(request) => admission?,
+            changed = cancelled.changed() => {
+                let _ = changed;
+                return Err(PhysicalWorkError::Cancelled);
+            }
+        };
+        let task_cancelled = Arc::new(AtomicBool::new(false));
+        let mut cancel_on_drop = CancelOnDrop {
+            cancelled: Arc::clone(&task_cancelled),
+            armed: true,
+        };
+        let cancellation = PhysicalWorkCancellation {
+            group_cancelled: Some(Arc::clone(&self.inner.cancelled)),
+            task_cancelled,
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _registration = registration;
+            let _running = RunningWorker::new(&admission);
+            let _admission = admission;
+            if cancellation.is_cancelled() {
+                PhysicalWorkOutput::Cancelled
+            } else {
+                PhysicalWorkOutput::Complete(work(cancellation))
+            }
+        });
+        let result = map_task_result(task.await);
+        cancel_on_drop.armed = false;
+        result
     }
 
     pub fn cancel(&self) {
@@ -579,78 +566,6 @@ impl PhysicalWorkGroup {
                 .await
                 .expect("physical work group counter remains owned");
         }
-    }
-
-    pub async fn drain_until(&self, deadline: Duration) -> bool {
-        tokio::time::timeout(deadline, self.drain()).await.is_ok()
-    }
-
-    async fn run_inner<T, Work>(
-        &self,
-        request: PhysicalWorkRequest,
-        deadline: Option<Duration>,
-        work: Work,
-    ) -> Result<T, PhysicalWorkError>
-    where
-        T: Send + 'static,
-        Work: FnOnce(PhysicalWorkCancellation) -> T + Send + 'static,
-    {
-        let blocking_deadline = deadline.and_then(|value| Instant::now().checked_add(value));
-        let async_deadline = deadline.map(|value| tokio::time::Instant::now() + value);
-        let registration = self.register()?;
-        let mut cancelled = self.inner.cancellation.subscribe();
-        let admission = if let Some(deadline) = async_deadline {
-            tokio::select! {
-                admission = self.owner.admit(request) => admission?,
-                changed = cancelled.changed() => {
-                    let _ = changed;
-                    return Err(PhysicalWorkError::Cancelled);
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    return Err(PhysicalWorkError::Deadline);
-                }
-            }
-        } else {
-            tokio::select! {
-                admission = self.owner.admit(request) => admission?,
-                changed = cancelled.changed() => {
-                    let _ = changed;
-                    return Err(PhysicalWorkError::Cancelled);
-                }
-            }
-        };
-        let task_cancelled = Arc::new(AtomicBool::new(false));
-        let mut cancel_on_drop = CancelOnDrop {
-            cancelled: Arc::clone(&task_cancelled),
-            armed: true,
-        };
-        let cancellation = PhysicalWorkCancellation {
-            group_cancelled: Some(Arc::clone(&self.inner.cancelled)),
-            task_cancelled,
-            deadline: blocking_deadline,
-        };
-        let task = tokio::task::spawn_blocking(move || {
-            let _registration = registration;
-            let _running = RunningWorker::new(&admission);
-            let _admission = admission;
-            if cancellation.is_cancelled() {
-                PhysicalWorkOutput::Cancelled
-            } else {
-                PhysicalWorkOutput::Complete(work(cancellation))
-            }
-        });
-        let result = if let Some(deadline) = async_deadline {
-            match tokio::time::timeout_at(deadline, task).await {
-                Ok(result) => map_task_result(result),
-                Err(_) => Err(PhysicalWorkError::Deadline),
-            }
-        } else {
-            map_task_result(task.await)
-        };
-        if !matches!(result, Err(PhysicalWorkError::Deadline)) {
-            cancel_on_drop.armed = false;
-        }
-        result
     }
 
     fn register(&self) -> Result<PhysicalWorkGroupRegistration, PhysicalWorkError> {
@@ -677,9 +592,6 @@ impl PhysicalWorkCancellation {
                 .group_cancelled
                 .as_ref()
                 .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
-            || self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn check(&self) -> Result<(), PhysicalWorkError> {
@@ -814,7 +726,6 @@ fn map_task_result<T>(
 struct PhysicalWorkLimits {
     workers: usize,
     background: usize,
-    crash: usize,
     heavy: usize,
     scratch_bytes: u64,
 }
@@ -824,12 +735,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
 
     fn test_owner() -> PhysicalWorkOwner {
         PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 3,
             background: 2,
-            crash: 2,
             heavy: 1,
             scratch_bytes: 2 * SCRATCH_UNIT_BYTES,
         })
@@ -885,7 +796,6 @@ mod tests {
         let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 2,
             background: 1,
-            crash: 1,
             heavy: 1,
             scratch_bytes: SCRATCH_UNIT_BYTES,
         });
@@ -943,7 +853,6 @@ mod tests {
             let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
                 workers: PROCESS_WORKER_LIMIT,
                 background: BACKGROUND_WORKER_LIMIT,
-                crash: CRASH_COLLECTION_LIMIT,
                 heavy: HEAVY_IO_LIMIT,
                 scratch_bytes: SCRATCH_LIMIT_BYTES,
             });
@@ -1050,17 +959,14 @@ mod tests {
                     .expect("join queued task"),
                 Ok(())
             );
-            for group in &running_groups {
-                assert!(group.drain_until(Duration::from_secs(2)).await);
+            for group in running_groups.iter().chain([&queued]) {
+                tokio::time::timeout(Duration::from_secs(2), group.drain())
+                    .await
+                    .expect("group drains after shutdown");
             }
-            assert!(queued.drain_until(Duration::from_secs(2)).await);
             shutdown_samples.push(shutdown_started.elapsed());
 
-            for class in [
-                PhysicalWorkClass::Foreground,
-                PhysicalWorkClass::Background,
-                PhysicalWorkClass::CrashCollection,
-            ] {
+            for class in [PhysicalWorkClass::Foreground, PhysicalWorkClass::Background] {
                 let snapshot = owner.snapshot(class);
                 assert_eq!(snapshot.active_admissions, 0);
                 assert_eq!(snapshot.running_workers, 0);
@@ -1193,67 +1099,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_filesystem_contract_deadline_retains_capacity_until_physical_exit() {
-        let owner = test_owner();
-        let stalled = owner.group();
-        let other = owner.group();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let gate_for_worker = Arc::clone(&gate);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let result = stalled
-            .run_until(
-                PhysicalWorkRequest::crash_collection(SCRATCH_UNIT_BYTES),
-                Duration::from_millis(20),
-                move |cancellation| {
-                    let _ = started_tx.send(());
-                    let (lock, wake) = &*gate_for_worker;
-                    let released = lock.lock().expect("lock stalled worker");
-                    drop(
-                        wake.wait_while(released, |released| !*released)
-                            .expect("wait for worker release"),
-                    );
-                    assert!(cancellation.is_cancelled());
-                },
-            )
-            .await;
-        started_rx.await.expect("stalled worker started");
-        assert_eq!(result, Err(PhysicalWorkError::Deadline));
-        assert_eq!(stalled.active(), 1);
-        assert_eq!(
-            owner
-                .snapshot(PhysicalWorkClass::CrashCollection)
-                .active_admissions,
-            1
-        );
-
-        assert_eq!(
-            other
-                .run(PhysicalWorkRequest::crash_collection(0), |_| 7_u8)
-                .await,
-            Ok(7)
-        );
-        assert_eq!(stalled.active(), 1);
-
-        let (lock, wake) = &*gate;
-        *lock.lock().expect("release stalled worker") = true;
-        wake.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), stalled.drain())
-            .await
-            .expect("stalled worker exits");
-        assert_eq!(
-            owner
-                .snapshot(PhysicalWorkClass::CrashCollection)
-                .active_admissions,
-            0
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_filesystem_contract_cross_owner_reserves_foreground_and_scratch() {
         let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 2,
             background: 1,
-            crash: 1,
             heavy: 1,
             scratch_bytes: 2 * SCRATCH_UNIT_BYTES,
         });
@@ -1331,67 +1180,5 @@ mod tests {
         *lock.lock().expect("release background worker") = true;
         wake.notify_one();
         assert_eq!(first_task.await.expect("join first work"), Ok(()));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_filesystem_contract_queue_wait_is_inside_the_deadline() {
-        let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
-            workers: 2,
-            background: 2,
-            crash: 2,
-            heavy: 1,
-            scratch_bytes: 2 * SCRATCH_UNIT_BYTES,
-        });
-        let active = owner.group();
-        let queued = owner.group();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let mut tasks = Vec::new();
-        let mut starts = Vec::new();
-        for _ in 0..2 {
-            let active = active.clone();
-            let gate = Arc::clone(&gate);
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            starts.push(started_rx);
-            tasks.push(tokio::spawn(async move {
-                active
-                    .run(PhysicalWorkRequest::crash_collection(0), move |_| {
-                        let _ = started_tx.send(());
-                        let (lock, wake) = &*gate;
-                        let released = lock.lock().expect("lock crash worker");
-                        drop(
-                            wake.wait_while(released, |released| !*released)
-                                .expect("wait for crash release"),
-                        );
-                    })
-                    .await
-            }));
-        }
-        for started in starts {
-            started.await.expect("crash worker started");
-        }
-
-        let starts = Arc::new(AtomicUsize::new(0));
-        let starts_in_work = Arc::clone(&starts);
-        assert_eq!(
-            queued
-                .run_until(
-                    PhysicalWorkRequest::crash_collection(0),
-                    Duration::from_millis(20),
-                    move |_| {
-                        starts_in_work.fetch_add(1, Ordering::Relaxed);
-                    },
-                )
-                .await,
-            Err(PhysicalWorkError::Deadline)
-        );
-        assert_eq!(starts.load(Ordering::Relaxed), 0);
-        assert_eq!(queued.active(), 0);
-
-        let (lock, wake) = &*gate;
-        *lock.lock().expect("release crash workers") = true;
-        wake.notify_all();
-        for task in tasks {
-            assert_eq!(task.await.expect("join crash worker"), Ok(()));
-        }
     }
 }

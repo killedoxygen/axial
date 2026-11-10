@@ -177,8 +177,7 @@ impl ManagedBlockingWorkers {
             .await;
         match result {
             Ok(ManagedBlockingTaskOutput::Complete(output)) => Ok(output),
-            Ok(ManagedBlockingTaskOutput::Cancelled)
-            | Err(PhysicalWorkError::Cancelled | PhysicalWorkError::Deadline) => {
+            Ok(ManagedBlockingTaskOutput::Cancelled) | Err(PhysicalWorkError::Cancelled) => {
                 Err(ManagedBlockingTaskError::Cancelled)
             }
             Err(_) => Err(ManagedBlockingTaskError::TaskStopped),
