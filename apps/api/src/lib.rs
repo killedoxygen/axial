@@ -1,5 +1,7 @@
 //! Composition for the isolated replacement application and its local HTTP API.
 
+#[cfg(test)]
+mod fixture;
 #[cfg(feature = "embedded-frontend")]
 mod frontend;
 #[cfg(test)]
@@ -37,23 +39,22 @@ use axial_app::{
     music::MusicService,
     network::{ClientConfig, ProviderClient},
     performance::{PerformanceService, benchmarks::BenchmarkService},
+    profile::{Profile, Recovery},
     public::DEVELOPMENT_APPLICATION_ID,
     resources::{ResourceService, folders::FolderService},
     runtime::discovery::RuntimeDiscovery,
     settings::{SETTINGS_MIGRATION, SettingsStore},
     skins::{ProfileMedia, library::SavedSkinLibrary, store::SavedSkinStore},
     storage::MetadataStore,
-    tasks::{Exclusions, TaskOwner},
+    tasks::{Exclusions, TaskOwner, retry_until_settled},
     telemetry::{CollectorConfig, Telemetry, TelemetryEnvironment, TelemetryEvent},
     update::UpdateService,
 };
 use axial_minecraft::ManagedRuntimeCache;
 use axum::Router;
-use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
-    io::{self, Read, Write},
-    path::{Component, Path, PathBuf},
+    io,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -67,7 +68,16 @@ use tokio::{
 };
 use transport::{ApiTransportBootstrap, LocalApiAuthority};
 
-const PROFILE_MARKER: &str = ".axial-rewrite-profile";
+#[cfg(test)]
+use {
+    axial_app::profile::MARKER as PROFILE_MARKER,
+    std::{
+        fs,
+        io::{Read, Write},
+        path::Path,
+    },
+};
+
 const DOMAIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -236,52 +246,17 @@ impl ServerHandle {
         self.shutdown_settled.load(Ordering::Acquire)
     }
 
-    /// Destructive shell actions must check before changing terminal admission.
-    pub fn ensure_no_interrupted_launch(&self) -> Result<(), String> {
-        self.library.ensure_no_interrupted_launch().map_err(|_| {
-            "A previous game process has not been proven settled. The local API remains available."
-                .to_string()
-        })
-    }
-
-    pub fn ensure_reset_allowed(&self) -> Result<(), String> {
-        self.ensure_no_interrupted_launch()?;
-        if self.instances.has_pending_intents() {
-            return Err("Reset is blocked while instance changes still require recovery.".into());
+    /// The recovery obligations that refuse destructive reset or update.
+    pub fn recovery(&self) -> Recovery {
+        Recovery {
+            library: self.library.clone(),
+            tasks: self.tasks.clone(),
+            instances: self.instances.clone(),
+            installs: self.installs.clone(),
+            performance: self.performance.clone(),
+            content: self.content_mutations.clone(),
+            resources: self.resources.clone(),
         }
-        if self.tasks.status().is_idle() && self.content_mutations.has_unsettled_effects() {
-            return Err("Reset is blocked while content changes still require recovery.".into());
-        }
-        Ok(())
-    }
-
-    pub fn ensure_reset_settled(&self) -> Result<(), String> {
-        self.ensure_reset_allowed()?;
-        if self.tasks.shutdown_receipt().is_none()
-            || self.content_mutations.has_unsettled_effects()
-            || self.installs.has_unsettled_effects()
-        {
-            return Err("Reset is blocked while file changes still require recovery.".into());
-        }
-        Ok(())
-    }
-
-    pub fn ensure_update_allowed(&self) -> Result<(), String> {
-        self.ensure_no_interrupted_launch()?;
-        if self.instances.has_pending_intents()
-            || self.instances.has_unsettled_effects()
-            || self.performance.has_unsettled_effects()
-            || self
-                .performance
-                .pending_count()
-                .map_or(true, |count| count != 0)
-            || self.content_mutations.has_unsettled_effects()
-            || self.resources.has_unsettled_effects()
-            || self.installs.has_unsettled_effects()
-        {
-            return Err("Update is blocked while file changes still require recovery.".into());
-        }
-        Ok(())
     }
 
     /// Dropping this waiter retains the actual task handle for a later caller.
@@ -352,6 +327,18 @@ impl ServerHandle {
         .await;
         self.shutdown_settled.store(true, Ordering::Release);
         http.and(telemetry).and(rules)
+    }
+
+    /// Retain owned work until shutdown settles. An error returned after
+    /// settlement is a worker failure that another attempt cannot change.
+    pub async fn shutdown_until_settled(&self) -> Result<(), String> {
+        retry_until_settled("Local API shutdown", || async {
+            match self.shutdown().await {
+                Err(error) if !self.is_shutdown_settled() => Err(error),
+                settled => Ok(settled),
+            }
+        })
+        .await
     }
 
     async fn settle_files(&self) -> Result<(), String> {
@@ -488,9 +475,7 @@ async fn start_profile(
         native_login,
         telemetry.clone(),
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
+        TestInputs::default(),
     )
     .await;
     if result.is_err() && telemetry.report_startup_failure() {
@@ -499,18 +484,41 @@ async fn start_profile(
     result
 }
 
+/// Test-only provider endpoints; credentials stay in memory under the app's task owner.
 #[cfg(test)]
-async fn start_profile_with_test_endpoints(
+#[derive(Default)]
+struct TestInputs {
+    endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
+    content: Option<(String, axial_performance::ManagedArtifactTransferResolver)>,
+}
+
+#[cfg(test)]
+async fn start_profile_for_test(
     profile_root: PathBuf,
-    endpoints: axial_minecraft::download::InstallTestEndpoints,
+    inputs: TestInputs,
 ) -> Result<DesktopServices, StartupError> {
     start_profile_inner(
         profile_root,
         None,
         false,
         Arc::new(Telemetry::new(None)),
-        Some(endpoints),
-        None,
+        inputs,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn start_profile_with_test_endpoints(
+    profile_root: PathBuf,
+    endpoints: axial_minecraft::download::InstallTestEndpoints,
+) -> Result<DesktopServices, StartupError> {
+    let endpoints = Some(endpoints);
+    start_profile_for_test(
+        profile_root,
+        TestInputs {
+            endpoints,
+            ..TestInputs::default()
+        },
     )
     .await
 }
@@ -521,13 +529,13 @@ async fn start_profile_with_performance_test_inputs(
     content_base_url: String,
     transfers: axial_performance::ManagedArtifactTransferResolver,
 ) -> Result<DesktopServices, StartupError> {
-    start_profile_inner(
+    let content = Some((content_base_url, transfers));
+    start_profile_for_test(
         profile_root,
-        None,
-        false,
-        Arc::new(Telemetry::new(None)),
-        None,
-        Some((content_base_url, transfers)),
+        TestInputs {
+            content,
+            ..TestInputs::default()
+        },
     )
     .await
 }
@@ -556,12 +564,13 @@ async fn start_profile_inner(
     extra_origin: Option<&str>,
     native_login: bool,
     telemetry: Arc<Telemetry>,
-    #[cfg(test)] test_endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
-    #[cfg(test)] performance_inputs: Option<(
-        String,
-        axial_performance::ManagedArtifactTransferResolver,
-    )>,
+    #[cfg(test)] inputs: TestInputs,
 ) -> Result<DesktopServices, StartupError> {
+    #[cfg(test)]
+    let TestInputs {
+        endpoints: test_endpoints,
+        content: performance_inputs,
+    } = inputs;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .map_err(|_| "Could not bind the local API.".to_string())?;
@@ -573,9 +582,9 @@ async fn start_profile_inner(
     )?;
     let telemetry_for_init = telemetry.clone();
     let (profile, library, metadata, settings, accounts, consent, identity, inspector_override) = tokio::task::spawn_blocking(move || {
-        let profile = admit_profile(&profile_root)?;
-        let library_id = LibraryId::parse(&profile.identity.profile_id.to_string()).map_err(|_| "The replacement profile identity is invalid.")?;
-        let library = match LibraryLifecycle::open_with_id(&profile.root, library_id) {
+        let profile = Profile::admit(&profile_root)?;
+        let library_id = LibraryId::parse(&profile.id().to_string()).map_err(|_| "The replacement profile identity is invalid.")?;
+        let library = match LibraryLifecycle::open_with_id(profile.root(), library_id) {
             LibraryOpenOutcome::Ready(library) => library,
             LibraryOpenOutcome::NoEffect(_) => return Err("The replacement profile is already open or unavailable. Existing files have been preserved.".into()),
             LibraryOpenOutcome::Unresolved(obligation) => {
@@ -588,6 +597,9 @@ async fn start_profile_inner(
                 });
             }
         };
+        if let Err(message) = profile.bind(&library) {
+            return Err(StartupError::with_library(message.into(), library));
+        }
         match library.interrupted_root_reset() {
             Ok(false) => {}
             Ok(true) => {
@@ -607,7 +619,7 @@ async fn start_profile_inner(
         (|| {
         library.restore_startup_selection(library_id)
             .map_err(|error| error.to_string())?;
-        let metadata = Arc::new(MetadataStore::open(profile.root.join("metadata.sqlite"))
+        let metadata = Arc::new(MetadataStore::open(profile.root().join("metadata.sqlite"))
             .map_err(|_| "Could not open replacement metadata. Existing data has been preserved.".to_string())?);
         metadata.migrate(&[SETTINGS_MIGRATION, ACCOUNTS_MIGRATION,
             axial_app::instances::directory::MIGRATION, axial_app::instances::delete::MIGRATION,
@@ -641,10 +653,13 @@ async fn start_profile_inner(
             library.clone(),
         )
     })?;
+    #[cfg(not(test))]
     let credentials = Arc::new(CredentialStore::with_task_owner(
-        profile.identity.profile_id,
+        profile.id(),
         tasks.clone(),
     ));
+    #[cfg(test)]
+    let credentials = Arc::new(CredentialStore::isolated_with_task_owner(tasks.clone()));
     let auth = Arc::new(AuthService::new(
         accounts.clone(),
         credentials,
@@ -762,11 +777,11 @@ async fn start_profile_inner(
                     MusicService::new(library.clone(), tasks.clone())
                         .map_err(|error| error.to_string())?,
                 );
-                let content_routes = Arc::new(routes::content::ContentRoutes::new(
-                    content.as_ref().clone(),
-                    content_mutations.as_ref().clone(),
-                    installs.clone(),
-                ));
+                let content_routes = Arc::new(routes::content::ContentRoutes {
+                    service: content.as_ref().clone(),
+                    mutations: content_mutations.as_ref().clone(),
+                    queue: installs.clone(),
+                });
                 let root_pin = library
                     .admit_application_root()
                     .map_err(|error| error.to_string())?;
@@ -853,7 +868,7 @@ async fn start_profile_inner(
             )
         })??
     };
-    let config = routes::config::ConfigRouteState::new(
+    let settings_service = axial_app::settings::SettingsService::new(
         settings.clone(),
         accounts.clone(),
         telemetry.clone(),
@@ -890,6 +905,8 @@ async fn start_profile_inner(
         std::env::consts::OS,
         std::env::consts::ARCH,
     );
+    let catalogs =
+        axial_app::catalog::CatalogService::new(library.clone(), catalog.clone(), tasks.clone());
     let folders = Arc::new(FolderService::new(
         instances.clone(),
         tasks.clone(),
@@ -897,12 +914,7 @@ async fn start_profile_inner(
     ));
     let router = Router::new()
         .merge(routes::status_router(settings.clone(), library.clone()))
-        .merge(routes::config::router(config))
-        .merge(routes::flags::router(
-            settings.clone(),
-            telemetry.clone(),
-            tasks.clone(),
-        ))
+        .merge(routes::settings::router(settings_service))
         .merge(routes::accounts::router(auth.clone(), native_login))
         .merge(routes::auth::router(auth.clone()))
         .merge(routes::telemetry::router(telemetry.clone()))
@@ -912,18 +924,9 @@ async fn start_profile_inner(
             setup.clone(),
             sessions.clone(),
         ))
-        .merge(routes::setup::router(setup.clone()))
         .merge(routes::install::router(installs.clone(), setup.clone()))
-        .merge(routes::loaders::router(
-            library.clone(),
-            catalog.clone(),
-            tasks.clone(),
-        ))
-        .merge(routes::versions::router(
-            library.clone(),
-            catalog.clone(),
-            tasks.clone(),
-        ))
+        .merge(routes::loaders::router(catalogs.clone()))
+        .merge(routes::versions::router(catalogs))
         .merge(routes::java::router(runtimes))
         .merge(routes::launch::router(
             launch.as_ref().clone(),
@@ -1020,7 +1023,7 @@ async fn start_profile_inner(
     Ok(DesktopServices {
         server,
         tasks,
-        profile_root: profile.root,
+        profile_root: profile.root().to_owned(),
         library,
         settings,
         accounts,
@@ -1087,100 +1090,27 @@ async fn serve(
     Ok(())
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileIdentity {
-    application_id: String,
-    profile_id: uuid::Uuid,
-}
-
+/// Production admission for fixtures: creates or reopens a marked profile,
+/// then preserves and releases its root as a closed application would.
+#[cfg(test)]
 struct AdmittedProfile {
     root: PathBuf,
-    identity: ProfileIdentity,
 }
 
+#[cfg(test)]
 fn admit_profile(requested: &Path) -> Result<AdmittedProfile, String> {
-    const INVALID: &str = "Use an absolute, isolated replacement profile directory.";
-    const UNKNOWN: &str = "The selected directory is not an admitted replacement profile. Existing files have been preserved.";
-    if !requested.is_absolute()
-        || requested
-            .components()
-            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
-    {
-        return Err(INVALID.into());
-    }
-    // Resolve the existing ancestor before creating anything. An alias into an
-    // installed profile must be refused just like its direct spelling.
-    let mut ancestor = requested;
-    let mut missing = Vec::new();
-    while !ancestor.try_exists().map_err(|_| UNKNOWN)? {
-        missing.push(ancestor.file_name().ok_or(INVALID)?.to_owned());
-        ancestor = ancestor.parent().ok_or(INVALID)?;
-    }
-    let mut root = fs::canonicalize(ancestor).map_err(|_| UNKNOWN)?;
-    for component in missing.iter().rev() {
-        root.push(component);
-    }
-    if root.parent().is_none()
-        || root == dirs::home_dir().unwrap_or_default()
-        || root.components().any(|part| {
-            matches!(part, Component::Normal(name)
-            if name == "dev.mateoltd.axial" || name == "com.mateoltd.axial")
-        })
-    {
-        return Err(INVALID.into());
-    }
-    fs::create_dir_all(&root).map_err(|_| UNKNOWN)?;
-    if !fs::symlink_metadata(&root).map_err(|_| UNKNOWN)?.is_dir() {
-        return Err(UNKNOWN.into());
-    }
-    let marker = root.join(PROFILE_MARKER);
-    let identity = match fs::symlink_metadata(&marker) {
-        Ok(metadata) => {
-            if !metadata.is_file() || metadata.len() > 4096 {
-                return Err(UNKNOWN.into());
-            }
-            let mut bytes = Vec::new();
-            fs::File::open(&marker)
-                .map_err(|_| UNKNOWN)?
-                .take(4097)
-                .read_to_end(&mut bytes)
-                .map_err(|_| UNKNOWN)?;
-            if bytes.len() > 4096 {
-                return Err(UNKNOWN.into());
-            }
-            let identity: ProfileIdentity = serde_json::from_slice(&bytes).map_err(|_| UNKNOWN)?;
-            if identity.application_id != DEVELOPMENT_APPLICATION_ID || identity.profile_id.is_nil()
-            {
-                return Err(UNKNOWN.into());
-            }
-            identity
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if fs::read_dir(&root).map_err(|_| UNKNOWN)?.next().is_some() {
-                return Err(UNKNOWN.into());
-            }
-            let identity = ProfileIdentity {
-                application_id: DEVELOPMENT_APPLICATION_ID.into(),
-                profile_id: uuid::Uuid::new_v4(),
-            };
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&marker).map_err(|_| UNKNOWN)?;
-            let bytes = serde_json::to_vec(&identity).map_err(|_| UNKNOWN)?;
-            file.write_all(&bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|_| UNKNOWN)?;
-            identity
-        }
-        Err(_) => return Err(UNKNOWN.into()),
+    let profile = Profile::admit(requested)?;
+    let id = LibraryId::parse(&profile.id().to_string()).map_err(|error| error.to_string())?;
+    let LibraryOpenOutcome::Ready(library) = LibraryLifecycle::open_with_id(profile.root(), id)
+    else {
+        return Err("The fixture profile root could not be acquired.".into());
     };
-    Ok(AdmittedProfile { root, identity })
+    let bound = profile.bind(&library).map_err(String::from);
+    library.try_preserve().map_err(|error| error.to_string())?;
+    bound?;
+    Ok(AdmittedProfile {
+        root: profile.root().to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -1850,29 +1780,6 @@ mod tests {
                 "error":"Performance rules provider response could not be verified. Try again later."
             })
         );
-    }
-
-    #[test]
-    fn profile_identity_persists_and_unknown_files_are_preserved() {
-        let temporary = tempfile::tempdir().unwrap();
-        let isolated = temporary.path().join("replacement");
-        let first = admit_profile(&isolated).unwrap();
-        let second = admit_profile(&isolated).unwrap();
-        assert_eq!(first.identity.profile_id, second.identity.profile_id);
-        let unknown = temporary.path().join("unknown");
-        fs::create_dir(&unknown).unwrap();
-        fs::write(unknown.join("keep.txt"), "user data").unwrap();
-        assert!(admit_profile(&unknown).is_err());
-        assert_eq!(
-            fs::read_to_string(unknown.join("keep.txt")).unwrap(),
-            "user data"
-        );
-        assert!(!unknown.join(PROFILE_MARKER).exists());
-        assert!(admit_profile(Path::new("relative-profile")).is_err());
-        assert!(
-            admit_profile(&temporary.path().join("dev.mateoltd.axial").join("rewrite")).is_err()
-        );
-        assert!(!temporary.path().join("dev.mateoltd.axial").exists());
     }
 
     #[tokio::test]

@@ -31,18 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         services.telemetry.report_startup_failure();
     }
     // Even a listener or signal error must settle owned application effects.
-    loop {
-        match services.server.shutdown().await {
-            Ok(()) => break,
-            Err(error) if services.server.is_shutdown_settled() => {
-                return Err(std::io::Error::other(error).into());
-            }
-            Err(error) => {
-                tracing::error!(%error, "shutdown remains incomplete; preserving owned work");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
+    services.server.shutdown_until_settled().await.map_err(std::io::Error::other)?;
     outcome?;
     Ok(())
 }

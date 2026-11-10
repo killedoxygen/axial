@@ -611,7 +611,7 @@ async fn disconnected_instance_intent(deletion: bool) {
     assert!(!services.instances.has_unsettled_effects());
     let pending_deletions = services.instances.pending_deletions().unwrap();
     assert_eq!(pending_deletions.len(), usize::from(deletion));
-    assert!(services.server.ensure_reset_allowed().is_err());
+    assert!(services.server.recovery().ensure_reset_allowed().is_err());
     assert!(!services.server.is_shutdown_settled());
     assert!(get(&services, "status").await.status().is_success());
     assert_eq!(
@@ -672,7 +672,7 @@ async fn disconnected_instance_intent(deletion: bool) {
             DeletionStatus::Aborted
         );
     }
-    assert!(recovered.server.ensure_reset_allowed().is_ok());
+    assert!(recovered.server.recovery().ensure_reset_allowed().is_ok());
     let instances: Value = get(&recovered, "instances")
         .await
         .error_for_status()
@@ -820,7 +820,7 @@ async fn pending_external_instance_exit_helper() {
     );
     assert!(services.instances.has_pending_intents());
     assert!(services.instances.has_unsettled_effects());
-    assert!(services.server.ensure_reset_allowed().is_err());
+    assert!(services.server.recovery().ensure_reset_allowed().is_err());
     // The injected database refusal retains the effect; this later exit loses its owner.
     std::process::exit(PENDING_INSTANCE_EXIT);
 }
@@ -940,8 +940,8 @@ async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, boo
     (
         read,
         refused,
-        services.server.ensure_reset_allowed().is_err(),
-        services.server.ensure_update_allowed().is_err(),
+        services.server.recovery().ensure_reset_allowed().is_err(),
+        services.server.recovery().ensure_update_allowed().is_err(),
     )
 }
 
@@ -1118,7 +1118,7 @@ async fn interrupted_content_exit(boundary: ContentExit) {
         let shutdown = services.server.shutdown().await;
         let shutdown_settled = services.server.is_shutdown_settled();
         let joined = services.tasks.shutdown_receipt().is_some();
-        let reset_refused = services.server.ensure_reset_settled().is_err();
+        let reset_refused = services.server.recovery().ensure_reset_settled().is_err();
         let queue_after = content_queue_rows(services.instances.registry().storage(), true);
         let queue_after_status = services.installs.snapshot().active.map(|active| {
             (
@@ -1240,8 +1240,8 @@ async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, o
         .status()
         .is_success();
     let admitted = services.instances.directories().admit(id).map(drop).is_ok();
-    let destructive_allowed = services.server.ensure_reset_allowed().is_ok()
-        && services.server.ensure_update_allowed().is_ok();
+    let destructive_allowed = services.server.recovery().ensure_reset_allowed().is_ok()
+        && services.server.recovery().ensure_update_allowed().is_ok();
     let fresh = if receipt_absent && admitted {
         let content =
             ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap();
