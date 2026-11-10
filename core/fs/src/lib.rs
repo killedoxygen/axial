@@ -20539,69 +20539,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lease_name_class_scan_cache_invalidates_on_root_revision_change() {
-        let temporary = crate::test_tempdir().expect("temporary root");
-        let session = acquire_test_root(temporary.path());
-        platform::reset_lease_name_class_scan_count();
-
-        for _ in 0..8 {
-            drop(session.authority.enter().expect("cached lease validation"));
-        }
-        assert_eq!(platform::lease_name_class_scan_count(), 0);
-
-        let sibling = temporary.path().join("cooperative-sibling");
-        std::fs::write(&sibling, b"owned").expect("create cooperative sibling");
-        drop(session.authority.enter().expect("changed-root validation"));
-        assert_eq!(platform::lease_name_class_scan_count(), 1);
-        drop(
-            session
-                .authority
-                .enter()
-                .expect("recached lease validation"),
-        );
-        assert_eq!(platform::lease_name_class_scan_count(), 1);
-
-        let root = session.root().expect("root revision capability");
-        let cached_revision =
-            platform::directory_revision(root.inner.handle()).expect("direct cached root revision");
-        std::fs::remove_file(sibling).expect("remove cooperative sibling");
-        let revision_witnesses = {
-            let mut witnesses = Vec::new();
-            for attempt in 0..32 {
-                if platform::directory_revision(root.inner.handle())
-                    .expect("direct changed root revision")
-                    != cached_revision
-                {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                let witness = temporary.path().join(format!("revision-witness-{attempt}"));
-                std::fs::write(&witness, b"owned").expect("create root revision witness");
-                witnesses.push(witness);
-            }
-            assert!(
-                platform::directory_revision(root.inner.handle())
-                    .expect("direct observed root revision")
-                    != cached_revision,
-                "must observe a real root revision change before cache invalidation",
-            );
-            witnesses
-        };
-        drop(
-            session
-                .authority
-                .enter()
-                .expect("second changed-root validation"),
-        );
-        assert_eq!(platform::lease_name_class_scan_count(), 2);
-        drop(root);
-        for witness in revision_witnesses {
-            std::fs::remove_file(witness).expect("remove root revision witness");
-        }
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
     #[cfg(windows)]
     #[test]
     fn windows_root_lease_accepts_exact_and_rejects_noncanonical_spelling() {

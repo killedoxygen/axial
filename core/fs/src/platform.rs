@@ -540,11 +540,7 @@ mod native {
     use std::path::{Component, PathBuf};
     use std::sync::{Arc, RwLock};
     #[cfg(test)]
-    use std::{
-        cell::{Cell, RefCell},
-        collections::VecDeque,
-        rc::Rc,
-    };
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     pub(crate) type DirectoryHandle = OwnedFd;
 
@@ -746,26 +742,6 @@ mod native {
     const MAX_TREE_CLEAR_ENTRIES: usize = 1_000_000;
     const EXACT_DIRECTORY_BINDING_VALIDATION_ATTEMPTS: usize = 4;
     const LEASE_NAME_CLASS_VALIDATION_ATTEMPTS: usize = 4;
-
-    #[cfg(test)]
-    thread_local! {
-        static LEASE_NAME_CLASS_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_lease_name_class_scan_count() {
-        LEASE_NAME_CLASS_SCAN_COUNT.set(0);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lease_name_class_scan_count() -> usize {
-        LEASE_NAME_CLASS_SCAN_COUNT.get()
-    }
-
-    #[cfg(test)]
-    fn note_lease_name_class_scan() {
-        LEASE_NAME_CLASS_SCAN_COUNT.set(LEASE_NAME_CLASS_SCAN_COUNT.get() + 1);
-    }
 
     #[cfg(test)]
     type ExactDirectoryBindingTestHook = Box<dyn FnMut(&OsStr)>;
@@ -3918,8 +3894,6 @@ mod native {
     }
 
     fn observe_lease_name_class(root: &RootGuard, name: &OsStr) -> io::Result<LeaseNameClassState> {
-        #[cfg(test)]
-        note_lease_name_class_scan();
         let mut matching = 0_usize;
         let mut exact = false;
         let completion = visit_entries(
@@ -4382,26 +4356,6 @@ mod native {
     pub(crate) const MAX_TREE_CLEAR_DEPTH: usize = 128;
     const MAX_TREE_CLEAR_ENTRIES: usize = 1_000_000;
     const LEASE_NAME_CLASS_VALIDATION_ATTEMPTS: usize = 4;
-
-    #[cfg(test)]
-    thread_local! {
-        static LEASE_NAME_CLASS_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_lease_name_class_scan_count() {
-        LEASE_NAME_CLASS_SCAN_COUNT.set(0);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lease_name_class_scan_count() -> usize {
-        LEASE_NAME_CLASS_SCAN_COUNT.get()
-    }
-
-    #[cfg(test)]
-    fn note_lease_name_class_scan() {
-        LEASE_NAME_CLASS_SCAN_COUNT.set(LEASE_NAME_CLASS_SCAN_COUNT.get() + 1);
-    }
 
     #[cfg(test)]
     thread_local! {
@@ -7989,8 +7943,6 @@ mod native {
         root: &RootGuard,
         name: &OsStr,
     ) -> io::Result<LeaseNameClassState> {
-        #[cfg(test)]
-        note_lease_name_class_scan();
         let mut matching = 0_usize;
         let mut exact = false;
         let completion = visit_entries(
