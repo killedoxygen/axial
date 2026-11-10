@@ -5,8 +5,8 @@
 //! or discard a process owner on cancellation. The retained implementation owns
 //! archive traversal checks, exact outputs, process-tree containment and drainage.
 
-use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::loaders::{LoaderInstallBaseContinuation, LoaderInstallError};
+use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::{DownloadProgress, KnownGoodInstallReceipt};
 
 /// Continue any retained loader strategy with the exact acknowledged base inputs.
@@ -23,5 +23,6 @@ where
         if !progress.done {
             send(progress);
         }
-    }).await
+    })
+    .await
 }

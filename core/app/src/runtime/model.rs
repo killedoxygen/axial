@@ -69,7 +69,9 @@ impl JavaSelectionRequirement {
         if self.major == 8 && info.update < 312 {
             return Err(JavaDiscoveryError::OutdatedJava8);
         }
-        if architecture == JavaArchitecture::Unknown || self.architecture == JavaArchitecture::Unknown {
+        if architecture == JavaArchitecture::Unknown
+            || self.architecture == JavaArchitecture::Unknown
+        {
             return Err(JavaDiscoveryError::UnknownArchitecture);
         }
         let translated = self.allow_macos_x86_64_translation
@@ -117,7 +119,10 @@ pub enum JavaDiscoveryError {
     #[error("Java 8 update 312 or newer is required.")]
     OutdatedJava8,
     #[error("The selected Java architecture is incompatible with this launch.")]
-    IncompatibleArchitecture { required: JavaArchitecture, actual: JavaArchitecture },
+    IncompatibleArchitecture {
+        required: JavaArchitecture,
+        actual: JavaArchitecture,
+    },
     #[error("The selected Java runtime requires Rosetta 2 on this Mac.")]
     RosettaRequired,
     #[error("The managed Java runtime is not ready.")]
@@ -139,23 +144,65 @@ mod tests {
     use super::*;
 
     fn info(major: u32, update: u32) -> JavaRuntimeInfo {
-        JavaRuntimeInfo { id: String::new(), major, update, distribution: "temurin".into(), path: String::new() }
+        JavaRuntimeInfo {
+            id: String::new(),
+            major,
+            update,
+            distribution: "temurin".into(),
+            path: String::new(),
+        }
     }
 
     #[test]
     fn selection_enforces_major_update_and_architecture() {
-        let request = JavaSelectionRequirement { major: 8, architecture: JavaArchitecture::Aarch64, allow_macos_x86_64_translation: false };
-        assert_eq!(request.validate(&info(8, 311), JavaArchitecture::Aarch64), Err(JavaDiscoveryError::OutdatedJava8));
-        assert!(request.validate(&info(8, 312), JavaArchitecture::Aarch64).is_ok());
-        assert!(matches!(request.validate(&info(17, 10), JavaArchitecture::Aarch64), Err(JavaDiscoveryError::IncompatibleVersion { .. })));
-        assert!(matches!(request.validate(&info(8, 312), JavaArchitecture::X86_64), Err(JavaDiscoveryError::IncompatibleArchitecture { .. })));
-        assert_eq!(request.validate(&info(8, 312), JavaArchitecture::Unknown), Err(JavaDiscoveryError::UnknownArchitecture));
-        assert!(JavaSelectionRequirement { allow_macos_x86_64_translation: true, ..request }.validate(&info(8, 312), JavaArchitecture::X86_64).is_ok());
+        let request = JavaSelectionRequirement {
+            major: 8,
+            architecture: JavaArchitecture::Aarch64,
+            allow_macos_x86_64_translation: false,
+        };
+        assert_eq!(
+            request.validate(&info(8, 311), JavaArchitecture::Aarch64),
+            Err(JavaDiscoveryError::OutdatedJava8)
+        );
+        assert!(
+            request
+                .validate(&info(8, 312), JavaArchitecture::Aarch64)
+                .is_ok()
+        );
+        assert!(matches!(
+            request.validate(&info(17, 10), JavaArchitecture::Aarch64),
+            Err(JavaDiscoveryError::IncompatibleVersion { .. })
+        ));
+        assert!(matches!(
+            request.validate(&info(8, 312), JavaArchitecture::X86_64),
+            Err(JavaDiscoveryError::IncompatibleArchitecture { .. })
+        ));
+        assert_eq!(
+            request.validate(&info(8, 312), JavaArchitecture::Unknown),
+            Err(JavaDiscoveryError::UnknownArchitecture)
+        );
+        assert!(
+            JavaSelectionRequirement {
+                allow_macos_x86_64_translation: true,
+                ..request
+            }
+            .validate(&info(8, 312), JavaArchitecture::X86_64)
+            .is_ok()
+        );
     }
 
     #[test]
     fn runtime_response_keeps_existing_wire_shape() {
-        let value = JavaRuntimesResponse { runtimes: vec![JavaRuntimeResult { path: "/java/bin/java".into(), component: "java-runtime-delta".into(), source: "managed".into() }] };
-        assert_eq!(serde_json::to_value(value).unwrap(), serde_json::json!({"runtimes":[{"path":"/java/bin/java","component":"java-runtime-delta","source":"managed"}]}));
+        let value = JavaRuntimesResponse {
+            runtimes: vec![JavaRuntimeResult {
+                path: "/java/bin/java".into(),
+                component: "java-runtime-delta".into(),
+                source: "managed".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({"runtimes":[{"path":"/java/bin/java","component":"java-runtime-delta","source":"managed"}]})
+        );
     }
 }

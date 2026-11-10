@@ -369,10 +369,7 @@ fn classify_crash_evidence(evidence: &CrashEvidence) -> Option<FailureClass> {
     None
 }
 
-fn stronger_failure_class(
-    left: FailureClass,
-    right: FailureClass,
-) -> FailureClass {
+fn stronger_failure_class(left: FailureClass, right: FailureClass) -> FailureClass {
     if failure_class_precedence(left) <= failure_class_precedence(right) {
         left
     } else {
@@ -555,24 +552,64 @@ mod tests {
 
     #[test]
     fn terminal_outcome_waits_for_process_tree_and_both_output_streams() {
-        let evidence = LaunchEvidence { boot_observed: true, ..Default::default() };
+        let evidence = LaunchEvidence {
+            boot_observed: true,
+            ..Default::default()
+        };
         for facts in [
-            SessionExitFacts { process_exited: false, ..exit_facts() },
-            SessionExitFacts { tree_settled: false, ..exit_facts() },
-            SessionExitFacts { outputs_drained: false, ..exit_facts() },
+            SessionExitFacts {
+                process_exited: false,
+                ..exit_facts()
+            },
+            SessionExitFacts {
+                tree_settled: false,
+                ..exit_facts()
+            },
+            SessionExitFacts {
+                outputs_drained: false,
+                ..exit_facts()
+            },
         ] {
             assert!(classify_session_outcome(facts, &evidence).is_none());
         }
-        assert_eq!(classify_session_outcome(exit_facts(), &evidence).unwrap().kind, SessionOutcomeKind::Clean);
+        assert_eq!(
+            classify_session_outcome(exit_facts(), &evidence)
+                .unwrap()
+                .kind,
+            SessionOutcomeKind::Clean
+        );
     }
 
     #[test]
     fn zero_exit_before_boot_is_unknown_and_stop_is_not_a_crash() {
-        assert_eq!(classify_session_outcome(exit_facts(), &LaunchEvidence::default()).unwrap().reason, SessionExitReason::UnknownExit);
-        let facts = SessionExitFacts { exit_code: None, signal: Some(9), stop_requested: true, ..exit_facts() };
-        assert_eq!(classify_session_outcome(facts, &LaunchEvidence::default()).unwrap().reason, SessionExitReason::LauncherStopped);
-        let facts = SessionExitFacts { stop_requested: false, ..facts };
-        assert_eq!(classify_session_outcome(facts, &LaunchEvidence::default()).unwrap().reason, SessionExitReason::CrashedBeforeBoot);
+        assert_eq!(
+            classify_session_outcome(exit_facts(), &LaunchEvidence::default())
+                .unwrap()
+                .reason,
+            SessionExitReason::UnknownExit
+        );
+        let facts = SessionExitFacts {
+            exit_code: None,
+            signal: Some(9),
+            stop_requested: true,
+            ..exit_facts()
+        };
+        assert_eq!(
+            classify_session_outcome(facts, &LaunchEvidence::default())
+                .unwrap()
+                .reason,
+            SessionExitReason::LauncherStopped
+        );
+        let facts = SessionExitFacts {
+            stop_requested: false,
+            ..facts
+        };
+        assert_eq!(
+            classify_session_outcome(facts, &LaunchEvidence::default())
+                .unwrap()
+                .reason,
+            SessionExitReason::CrashedBeforeBoot
+        );
     }
 
     #[test]
@@ -585,22 +622,52 @@ mod tests {
         ] {
             evidence.observe_line(line);
         }
-        let facts = SessionExitFacts { exit_code: None, signal: Some(15), stop_requested: true, was_running: true, ..exit_facts() };
+        let facts = SessionExitFacts {
+            exit_code: None,
+            signal: Some(15),
+            stop_requested: true,
+            was_running: true,
+            ..exit_facts()
+        };
         let outcome = classify_session_outcome(facts, &evidence).unwrap();
         assert_eq!(
             (outcome.kind, outcome.reason, outcome.failure_class),
-            (SessionOutcomeKind::Failed, SessionExitReason::StartupFailed, Some(FailureClass::MissingDependency))
+            (
+                SessionOutcomeKind::Failed,
+                SessionExitReason::StartupFailed,
+                Some(FailureClass::MissingDependency)
+            )
         );
-        assert!(outcome.summary.starts_with("A mod needs another mod or loader version"));
-        let booted = LaunchEvidence { boot_observed: true, ..evidence };
-        assert_eq!(classify_session_outcome(facts, &booted).unwrap().reason, SessionExitReason::LauncherStopped);
+        assert!(
+            outcome
+                .summary
+                .starts_with("A mod needs another mod or loader version")
+        );
+        let booted = LaunchEvidence {
+            boot_observed: true,
+            ..evidence
+        };
+        assert_eq!(
+            classify_session_outcome(facts, &booted).unwrap().reason,
+            SessionExitReason::LauncherStopped
+        );
     }
 
     #[test]
     fn explicit_stall_remains_the_reason_when_the_process_is_stopped() {
-        let evidence = LaunchEvidence { boot_observed: false, failure_classes: vec![FailureClass::StartupStalled] };
-        let facts = SessionExitFacts { stop_requested: true, exit_code: Some(1), ..exit_facts() };
-        assert_eq!(classify_session_outcome(facts, &evidence).unwrap().reason, SessionExitReason::StartupStalled);
+        let evidence = LaunchEvidence {
+            boot_observed: false,
+            failure_classes: vec![FailureClass::StartupStalled],
+        };
+        let facts = SessionExitFacts {
+            stop_requested: true,
+            exit_code: Some(1),
+            ..exit_facts()
+        };
+        assert_eq!(
+            classify_session_outcome(facts, &evidence).unwrap().reason,
+            SessionExitReason::StartupStalled
+        );
     }
     use super::super::reports::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
 
@@ -856,12 +923,7 @@ mod tests {
                 None,
                 Some(FailureClass::JvmUnsupportedOption),
             ),
-            (
-                None,
-                &[][..],
-                Some(&oom),
-                Some(FailureClass::OutOfMemory),
-            ),
+            (None, &[][..], Some(&oom), Some(FailureClass::OutOfMemory)),
         ] {
             assert_eq!(
                 classify_launch_failure(classes, exit_code, evidence),
@@ -927,11 +989,7 @@ mod tests {
         let oom =
             report("Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space");
         assert_eq!(
-            classify_launch_failure(
-                &[FailureClass::JavaRuntimeMismatch],
-                Some(1),
-                Some(&oom),
-            ),
+            classify_launch_failure(&[FailureClass::JavaRuntimeMismatch], Some(1), Some(&oom),),
             Some(FailureClass::JavaRuntimeMismatch)
         );
     }
