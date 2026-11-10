@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use ts_rs::TS;
 
 use super::SettingsError;
+use crate::accounts::model::is_name_text;
 
 macro_rules! setting_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -113,12 +114,6 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(de: D) -> Result<Opti
 pub struct ConfigPatch {
     pub expected_revision: u64,
     #[serde(default, deserialize_with = "present")]
-    pub expected_account_selection_revision: Option<u64>,
-    #[serde(default, deserialize_with = "present")]
-    pub username: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    pub launch_auth_mode: Option<ConfigLaunchAuthMode>,
-    #[serde(default, deserialize_with = "present")]
     pub max_memory_mb: Option<i32>,
     #[serde(default, deserialize_with = "present")]
     pub min_memory_mb: Option<i32>,
@@ -158,16 +153,10 @@ pub struct ConfigPatch {
 
 impl ConfigPatch {
     pub(super) fn apply(self, config: &mut ConfigView) -> Result<(), SettingsError> {
-        // This command edits the offline name, never a provider-owned profile.
-        if let Some(username) = self.username.as_deref() {
-            validate_username(username.trim())?;
-        }
         macro_rules! set {
             ($($field:ident),+ $(,)?) => { $(if let Some(value) = self.$field { config.$field = value; })+ };
         }
         set!(
-            username,
-            launch_auth_mode,
             max_memory_mb,
             min_memory_mb,
             java_path_override,
@@ -192,10 +181,8 @@ impl ConfigPatch {
             music_enabled,
             music_volume
         );
-        config.username = config.username.trim().to_owned();
         config.java_path_override = config.java_path_override.trim().to_owned();
-        // A mode change may temporarily leave the previous account's name in
-        // place. Validate that pair after the account owner projects selection.
+        // The account owner projects the name and launch mode after this.
         config.validate_preferences()
     }
 }
@@ -213,11 +200,7 @@ impl ConfigView {
         match self.launch_auth_mode {
             ConfigLaunchAuthMode::Offline => validate_username(&self.username)?,
             ConfigLaunchAuthMode::Online => ensure(
-                (1..=16).contains(&self.username.len())
-                    && self
-                        .username
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                (1..=16).contains(&self.username.len()) && is_name_text(&self.username),
                 "Authenticated profile name must contain 1 to 16 letters, numbers, or underscores.",
             )?,
         }
@@ -265,10 +248,7 @@ impl ConfigView {
 
 pub fn validate_username(value: &str) -> Result<(), SettingsError> {
     ensure(
-        (3..=16).contains(&value.len())
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        (3..=16).contains(&value.len()) && is_name_text(value),
         "Username must contain 3 to 16 letters, numbers, or underscores.",
     )
 }

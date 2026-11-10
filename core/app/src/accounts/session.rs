@@ -588,6 +588,17 @@ pub(crate) fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn active_account(service: &AuthService) -> crate::accounts::view::AccountView {
+        service
+            .account_list(false)
+            .await
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|account| account.active)
+            .expect("selected account")
+    }
     use crate::storage::MetadataStore;
 
     fn service() -> AuthService {
@@ -641,7 +652,7 @@ mod tests {
                 .minecraft_access_token(),
             "game-PlayerOne"
         );
-        let status = service.status(false).await.unwrap();
+        let status = active_account(&service).await;
         assert!(status.readiness.online_mode_ready);
         let json = serde_json::to_string(&status).unwrap();
         for secret in [
@@ -859,14 +870,7 @@ mod tests {
             service.refresh_selected().await,
             Err(AuthError::Credentials(CredentialError::Unresolved))
         ));
-        assert!(
-            !service
-                .status(false)
-                .await
-                .unwrap()
-                .readiness
-                .online_mode_ready
-        );
+        assert!(!active_account(&service).await.readiness.online_mode_ready);
         let recovered = login(&service, FIRST, "PlayerOne").await;
         assert!(recovered.credential_revision() > capture.credential_revision());
         assert!(service.launch_credentials(&recovered).await.is_ok());
@@ -935,7 +939,7 @@ mod tests {
             service.launch_credentials(&updated).await,
             Err(AuthError::OwnershipMissing)
         ));
-        let status = service.status(false).await.unwrap();
+        let status = active_account(&service).await;
         assert!(!status.readiness.online_mode_ready);
         assert!(
             status.readiness.refresh_action.enabled && status.readiness.profile_sync_action.enabled

@@ -32,13 +32,25 @@ impl PendingSkin {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingSkinPhase {
+    Queued,
+    Applying,
+    Failed,
+    Idle,
+}
+
 #[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct PendingSkinStatus {
     pub account_id: String,
     pub texture_key: Option<String>,
     #[ts(type = "number")]
     pub generation: u64,
-    pub phase: &'static str,
+    pub phase: PendingSkinPhase,
+    /// Milliseconds until a queued change starts applying.
+    #[ts(type = "number | null")]
+    pub due_in_ms: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -430,13 +442,22 @@ impl PendingSkins {
                 .map(|entry| entry.texture_key.clone()),
             generation: slot.generation,
             phase: if slot.running.is_some() {
-                "applying"
+                PendingSkinPhase::Applying
             } else if slot.queued.is_some() {
-                "queued"
+                PendingSkinPhase::Queued
             } else if slot.error.is_some() {
-                "failed"
+                PendingSkinPhase::Failed
             } else {
-                "idle"
+                PendingSkinPhase::Idle
+            },
+            due_in_ms: match (&slot.running, &slot.queued) {
+                (None, Some(queued)) => Some(
+                    queued
+                        .due
+                        .saturating_duration_since(Instant::now())
+                        .as_millis() as u64,
+                ),
+                _ => None,
             },
             error: slot.error.map(|error| error.to_string()),
         })
@@ -526,6 +547,9 @@ mod tests {
         queue.begin_effect(&running).unwrap();
         queue.finish(&running, Err(ProfileMediaError::PartialChange));
         assert!(queue.claim("alice", None).unwrap().is_none());
-        assert_eq!(queue.status("alice").unwrap().phase, "failed");
+        assert_eq!(
+            queue.status("alice").unwrap().phase,
+            PendingSkinPhase::Failed
+        );
     }
 }

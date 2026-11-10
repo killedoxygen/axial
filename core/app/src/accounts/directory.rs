@@ -301,32 +301,6 @@ impl AccountDirectory {
         })
     }
 
-    /// The settings owner calls this inside its settings write transaction.
-    /// A duplicate username selects the existing identity, as the legacy
-    /// username setting did. Microsoft names are provider-owned.
-    pub fn sync_active_offline_username_in_transaction(
-        transaction: &Transaction<'_>,
-        username: &str,
-    ) -> Result<(), AccountError> {
-        let name = validate_username(username)?;
-        mutate_transaction(transaction, |snapshot, revision| {
-            let Some(active) = snapshot.active_account() else {
-                return Ok(());
-            };
-            if active.kind != AccountKind::Offline {
-                return Ok(());
-            }
-            let active_id = active.account_id.clone();
-            let next_id = AccountId::parse(&format!("offline-{}", offline_uuid(&name)))?;
-            if snapshot.accounts.iter().any(|a| a.account_id == next_id) {
-                select_identity(snapshot, Some(next_id));
-                return Ok(());
-            }
-            rename_offline(snapshot, revision, &active_id, name)
-        })?;
-        Ok(())
-    }
-
     /// Call within the caller's read transaction to project the authoritative
     /// account username/mode into retained settings without duplicating state.
     pub fn selection_in_transaction(
@@ -339,32 +313,6 @@ impl AccountDirectory {
 
     pub fn selection_revision_in_transaction(connection: &Connection) -> Result<u64, AccountError> {
         Ok(read_snapshot(connection)?.selection_revision)
-    }
-
-    pub fn select_launch_mode_in_transaction(
-        transaction: &Transaction<'_>,
-        mode: LaunchAuthMode,
-    ) -> Result<(), AccountError> {
-        mutate_transaction(transaction, |snapshot, _| {
-            if mode == LaunchAuthMode::Offline && snapshot.active_account_id.is_none() {
-                return Ok(());
-            }
-            if snapshot
-                .active_account()
-                .is_some_and(|a| a.kind.launch_mode() == mode)
-            {
-                return Ok(());
-            }
-            let id = snapshot
-                .accounts
-                .iter()
-                .find(|a| a.kind.launch_mode() == mode)
-                .map(|a| a.account_id.clone())
-                .ok_or(AccountError::NoSelection)?;
-            select_identity(snapshot, Some(id));
-            Ok(())
-        })?;
-        Ok(())
     }
 
     fn mutate(
@@ -822,20 +770,6 @@ mod tests {
         assert!(directory.validate_account_capture(&retained).is_ok());
         assert!(directory.validate_capture(&retained).is_err());
         assert_eq!(directory.capture_selected().unwrap().account_id(), steve);
-    }
-
-    #[test]
-    fn settings_failure_rolls_back_identity_and_selection_together() {
-        let directory = directory();
-        let before = directory.create_offline_account("Steve").unwrap();
-        let result = directory
-            .store
-            .transaction(|tx| -> Result<(), AccountError> {
-                AccountDirectory::sync_active_offline_username_in_transaction(tx, "Notch")?;
-                Err(AccountError::InvalidInput("settings rejected"))
-            });
-        assert!(result.is_err());
-        assert_eq!(directory.snapshot().unwrap(), before);
     }
 
     #[test]

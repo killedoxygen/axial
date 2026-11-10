@@ -208,44 +208,12 @@ async fn commit_config(
                 return Err(SettingsError::Unavailable);
             }
             tokio::task::spawn_blocking(move || {
-                let rename = patch.username.is_some();
-                let mode = patch.launch_auth_mode;
-                let expected_selection = patch.expected_account_selection_revision;
                 let suppress_failure = patch.telemetry_enabled == Some(false);
-                let result =
-                    state
-                        .settings
-                        .commit_with_transaction(patch, |transaction, config| {
-                            if rename || mode.is_some() {
-                                let expected = expected_selection.ok_or(SettingsError::Validation(
-                                "Account selection revision is required for identity changes.",
-                            ))?;
-                                if AccountDirectory::selection_revision_in_transaction(transaction)
-                                    .map_err(account_error)?
-                                    != expected
-                                {
-                                    return Err(SettingsError::Conflict);
-                                }
-                            }
-                            if let Some(mode) = mode {
-                                AccountDirectory::select_launch_mode_in_transaction(
-                                    transaction,
-                                    match mode {
-                                        ConfigLaunchAuthMode::Offline => LaunchAuthMode::Offline,
-                                        ConfigLaunchAuthMode::Online => LaunchAuthMode::Online,
-                                    },
-                                )
-                                .map_err(account_error)?;
-                            }
-                            if rename {
-                                AccountDirectory::sync_active_offline_username_in_transaction(
-                                    transaction,
-                                    &config.username,
-                                )
-                                .map_err(account_error)?;
-                            }
-                            state.project_accounts(transaction, config)
-                        });
+                let result = state
+                    .settings
+                    .commit_with_transaction(patch, |transaction, config| {
+                        state.project_accounts(transaction, config)
+                    });
                 match result {
                     Ok(commit) => {
                         consent.publish(
@@ -883,7 +851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_projection_is_authoritative_and_setting_rename_commits_together() {
+    async fn account_projection_is_authoritative_over_settings() {
         let fixture = Fixture::new();
         fixture.accounts.create_offline_account("Alex").unwrap();
         let (status, body) = fixture
@@ -905,64 +873,30 @@ mod tests {
             .request(
                 Method::PUT,
                 "/api/v1/config",
-                json!({"expected_revision":0,"expected_account_selection_revision":body["account_selection_revision"],"username":"Steve","theme":"birch"}),
+                json!({"expected_revision":0,"theme":"birch"}),
             )
             .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(saved["username"], "Steve");
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        assert_eq!(saved["username"], "Alex");
         assert_eq!(saved["revision"], 1);
-        assert_eq!(
-            fixture
-                .accounts
-                .snapshot()
-                .unwrap()
-                .active_account()
-                .unwrap()
-                .display_name,
-            "Steve"
-        );
         let (status, _) = fixture
             .request(
                 Method::PUT,
                 "/api/v1/config",
-                json!({"expected_revision":0,"username":"Other"}),
+                json!({"expected_revision":1,"username":"Steve"}),
             )
             .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            fixture
-                .accounts
-                .snapshot()
-                .unwrap()
-                .active_account()
-                .unwrap()
-                .display_name,
-            "Steve"
-        );
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         fixture.accounts.create_offline_account("Third").unwrap();
         let (_, body) = fixture
             .request(Method::GET, "/api/v1/config", Value::Null)
             .await;
         assert_eq!(body["username"], "Third");
-        let (status, _) = fixture.request(Method::PUT, "/api/v1/config", json!({
-            "expected_revision":1,"expected_account_selection_revision":saved["account_selection_revision"],"username":"StaleName"
-        })).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            fixture
-                .accounts
-                .snapshot()
-                .unwrap()
-                .active_account()
-                .unwrap()
-                .display_name,
-            "Third"
-        );
         assert_eq!(fixture.settings.current().unwrap().revision, 1);
     }
 
     #[tokio::test]
-    async fn short_authenticated_names_survive_projection_edits_and_mode_changes() {
+    async fn short_authenticated_names_survive_settings_edits() {
         for name in ["A", "A1"] {
             let fixture = Fixture::new();
             fixture.accounts.create_offline_account("Alex").unwrap();
@@ -988,51 +922,6 @@ mod tests {
             assert_eq!(fixture.accounts.snapshot().unwrap(), account_before);
             let reopened = SettingsStore::new(fixture.metadata.clone()).unwrap();
             assert_eq!(reopened.current().unwrap().username, name);
-
-            // Explicit names are offline edits even while an online account is
-            // selected. They must not inherit the provider's shorter-name rule.
-            let (status, _) = fixture
-                .request(
-                    Method::PUT,
-                    "/api/v1/config",
-                    json!({"expected_revision":1,"expected_account_selection_revision":saved["account_selection_revision"],"username":name}),
-                )
-                .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(fixture.accounts.snapshot().unwrap(), account_before);
-            assert_eq!(fixture.settings.current().unwrap().revision, 1);
-
-            let (status, offline) = fixture
-                .request(
-                    Method::PUT,
-                    "/api/v1/config",
-                    json!({"expected_revision":1,"expected_account_selection_revision":saved["account_selection_revision"],"launch_auth_mode":"offline"}),
-                )
-                .await;
-            assert_eq!(status, StatusCode::OK, "{offline}");
-            assert_eq!(offline["username"], "Alex");
-            assert_eq!(offline["launch_auth_mode"], "offline");
-            let offline_before = fixture.accounts.snapshot().unwrap();
-            let (status, _) = fixture
-                .request(
-                    Method::PUT,
-                    "/api/v1/config",
-                    json!({"expected_revision":2,"expected_account_selection_revision":offline["account_selection_revision"],"username":name}),
-                )
-                .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(fixture.accounts.snapshot().unwrap(), offline_before);
-            assert_eq!(fixture.settings.current().unwrap().revision, 2);
-            let (status, online) = fixture
-                .request(
-                    Method::PUT,
-                    "/api/v1/config",
-                    json!({"expected_revision":2,"expected_account_selection_revision":offline["account_selection_revision"],"launch_auth_mode":"online"}),
-                )
-                .await;
-            assert_eq!(status, StatusCode::OK, "{online}");
-            assert_eq!(online["username"], name);
-            assert_eq!(online["launch_auth_mode"], "online");
         }
     }
 
@@ -1070,7 +959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_settings_commit_rolls_back_account_rename_and_onboarding() {
+    async fn failed_settings_commit_preserves_accounts_and_onboarding() {
         let fixture = Fixture::new();
         fixture.accounts.create_offline_account("Alex").unwrap();
         let before = fixture.accounts.snapshot().unwrap();
@@ -1082,7 +971,7 @@ mod tests {
             .request(
                 Method::PUT,
                 "/api/v1/config",
-                json!({"expected_revision":0,"expected_account_selection_revision":before.selection_revision,"username":"Steve"}),
+                json!({"expected_revision":0,"theme":"birch"}),
             )
             .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1165,8 +1054,8 @@ mod tests {
         let fixture = Fixture::new();
         for body in [
             json!({"theme":"nether"}),
-            json!({"expected_revision":0,"username":null}),
-            json!({"expected_revision":0,"expected_account_selection_revision":null}),
+            json!({"expected_revision":0,"username":"Steve"}),
+            json!({"expected_revision":0,"launch_auth_mode":"online"}),
             json!({"expected_revision":0,"guardian_mode":"secret-value"}),
             json!({"expected_revision":0,"library_dir":"/private/secret-value"}),
             json!({"expected_revision":0,"performance_mode":"secret-value"}),
@@ -1179,21 +1068,22 @@ mod tests {
             fixture.app.clone(),
             Method::PUT,
             "/api/v1/config",
-            "{\"username\":\"secret-value".into(),
+            "{\"theme\":\"secret-value".into(),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(error, json!({"error":"Invalid JSON syntax."}));
-        for body in [
-            json!({"expected_revision":0,"max_memory_mb":32769}),
-            json!({"expected_revision":0,"launch_auth_mode":"online"}),
-            json!({"expected_revision":0,"username":"MissingFence"}),
-        ] {
-            assert_eq!(
-                fixture.request(Method::PUT, "/api/v1/config", body).await.0,
-                StatusCode::BAD_REQUEST
-            );
-        }
+        assert_eq!(
+            fixture
+                .request(
+                    Method::PUT,
+                    "/api/v1/config",
+                    json!({"expected_revision":0,"max_memory_mb":32769})
+                )
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
         assert_eq!(
             fixture
                 .request(Method::POST, "/api/v1/onboarding/complete", json!({}))

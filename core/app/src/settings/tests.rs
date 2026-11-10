@@ -47,12 +47,6 @@ fn authenticated_profile_names_do_not_weaken_offline_name_validation() {
             offline.validate(),
             Err(SettingsError::Validation(_))
         ));
-        assert!(matches!(
-            settings.update(patch(json!({
-                "expected_revision":0,"username":name,"launch_auth_mode":"online"
-            }))),
-            Err(SettingsError::Validation(_))
-        ));
     }
     for name in ["", " A", "A B", "A/B", "é", "01234567890123456"] {
         let online = ConfigView {
@@ -82,7 +76,7 @@ fn preferences_survive_real_database_reopen_without_reinitializing() {
         let settings = SettingsStore::new(metadata).unwrap();
         settings
             .update(patch(
-                json!({"expected_revision":0,"username":" Alex_1 ","theme":"nether",
+                json!({"expected_revision":0,"theme":"nether",
             "min_memory_mb":1024,"max_memory_mb":6144,"window_width":1280,"window_height":720,
             "onboarding_done":true,"jvm_preset":"smooth","performance_mode":"vanilla",
             "custom_hue":123,"custom_vibrancy":77,"lightness":55,"music_enabled":true,
@@ -104,7 +98,6 @@ fn preferences_survive_real_database_reopen_without_reinitializing() {
     metadata.migrate(&[SETTINGS_MIGRATION]).unwrap();
     let settings = SettingsStore::new(metadata).unwrap();
     let restored = settings.current().unwrap();
-    assert_eq!(restored.username, "Alex_1");
     assert_eq!(restored.revision, 2);
     assert_eq!(restored.theme, ConfigTheme::Nether);
     assert_eq!(
@@ -144,7 +137,7 @@ fn stale_config_and_flag_writers_never_overwrite_committed_data() {
         .update(patch(json!({"expected_revision":0,"theme":"birch"})))
         .unwrap();
     assert!(matches!(
-        second.update(patch(json!({"expected_revision":0,"username":"Other"}))),
+        second.update(patch(json!({"expected_revision":0,"theme":"nether"}))),
         Err(SettingsError::Conflict)
     ));
     assert!(matches!(
@@ -158,7 +151,6 @@ fn stale_config_and_flag_writers_never_overwrite_committed_data() {
         Err(SettingsError::Conflict)
     ));
     assert_eq!(second.current().unwrap().theme, ConfigTheme::Birch);
-    assert_eq!(second.current().unwrap().username, "Player");
     assert_eq!(second.current().unwrap().revision, 1);
 }
 
@@ -193,7 +185,6 @@ fn invalid_patches_cannot_change_settings_or_revision() {
         json!({"expected_revision":0,"max_memory_mb":32769}),
         json!({"expected_revision":0,"min_memory_mb":8192}),
         json!({"expected_revision":0,"window_width":1280}),
-        json!({"expected_revision":0,"username":"../../private"}),
         json!({"expected_revision":0,"java_path_override":"/java\nsecret"}),
         json!({"expected_revision":0,"custom_hue":361}),
         json!({"expected_revision":0,"music_volume":101}),
@@ -206,7 +197,7 @@ fn invalid_patches_cannot_change_settings_or_revision() {
     }
     for invalid in [
         json!({"theme":"nether"}),
-        json!({"expected_revision":0,"username":null}),
+        json!({"expected_revision":0,"username":"Player"}),
         json!({"expected_revision":0,"performance_mode":"automatic"}),
         json!({"expected_revision":0,"guardian_mode":"managed"}),
         json!({"expected_revision":0,"library_dir":"/private"}),

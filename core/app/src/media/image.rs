@@ -410,69 +410,6 @@ fn suggest_skin_variant(rgba: &[u8]) -> &'static str {
     "slim"
 }
 
-pub fn render_skin_head_png(skin_png: &[u8], size: u32) -> Result<Vec<u8>, MediaError> {
-    if size == 0 || size > 512 {
-        return Err(MediaError::InvalidDimensions);
-    }
-    let decoded = decode_skin_png(skin_png)?;
-    let mut head_rgba = vec![0; (size * size * 4) as usize];
-    draw_scaled_skin_region(&decoded.rgba, &mut head_rgba, 8, 8, size, false);
-    draw_scaled_skin_region(&decoded.rgba, &mut head_rgba, 40, 8, size, true);
-    encode_rgba_png(&head_rgba, size, size, "failed to build skin head image")
-}
-
-fn draw_scaled_skin_region(
-    source_rgba: &[u8],
-    target_rgba: &mut [u8],
-    source_x: u32,
-    source_y: u32,
-    target_size: u32,
-    blend: bool,
-) {
-    for target_y in 0..target_size {
-        for target_x in 0..target_size {
-            let skin_x = source_x + target_x * 8 / target_size;
-            let skin_y = source_y + target_y * 8 / target_size;
-            let source_index = ((skin_y * SKIN_WIDTH + skin_x) * 4) as usize;
-            let target_index = ((target_y * target_size + target_x) * 4) as usize;
-            let source_pixel = [
-                source_rgba[source_index],
-                source_rgba[source_index + 1],
-                source_rgba[source_index + 2],
-                source_rgba[source_index + 3],
-            ];
-
-            if blend {
-                blend_rgba_pixel(target_rgba, target_index, source_pixel);
-            } else {
-                target_rgba[target_index..target_index + 4].copy_from_slice(&source_pixel);
-            }
-        }
-    }
-}
-
-fn blend_rgba_pixel(target_rgba: &mut [u8], target_index: usize, source: [u8; 4]) {
-    let source_alpha = source[3] as u16;
-    if source_alpha == 0 {
-        return;
-    }
-    if source_alpha == 255 {
-        target_rgba[target_index..target_index + 4].copy_from_slice(&source);
-        return;
-    }
-
-    let inverse_alpha = 255 - source_alpha;
-    for channel in 0..3 {
-        let source_channel = source[channel] as u16;
-        let target_channel = target_rgba[target_index + channel] as u16;
-        target_rgba[target_index + channel] =
-            ((source_channel * source_alpha + target_channel * inverse_alpha) / 255) as u8;
-    }
-    let target_alpha = target_rgba[target_index + 3] as u16;
-    target_rgba[target_index + 3] =
-        (source_alpha + target_alpha * inverse_alpha / 255).min(255) as u8;
-}
-
 fn encode_skin_png(rgba: &[u8]) -> Result<Vec<u8>, MediaError> {
     encode_rgba_png(
         rgba,

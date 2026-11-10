@@ -903,8 +903,8 @@ async fn start_profile_inner(
             telemetry.clone(),
             tasks.clone(),
         ))
-        .merge(routes::accounts::router(auth.clone()))
-        .merge(routes::auth::router(auth.clone(), native_login))
+        .merge(routes::accounts::router(auth.clone(), native_login))
+        .merge(routes::auth::router(auth.clone()))
         .merge(routes::telemetry::router(telemetry.clone()))
         .merge(routes::update::router(updates.clone()))
         .merge(routes::instances::router(

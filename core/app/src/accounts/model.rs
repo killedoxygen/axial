@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::microsoft::MinecraftProfile;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, ts_rs::TS)]
 #[serde(transparent)]
 pub struct AccountId(String);
 
@@ -42,14 +42,14 @@ impl<'de> Deserialize<'de> for AccountId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountKind {
     Offline,
     Microsoft,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchAuthMode {
     #[default]
@@ -66,26 +66,34 @@ impl AccountKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct AccountRecord {
     pub account_id: AccountId,
     pub kind: AccountKind,
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub login_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub minecraft_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub offline_uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub minecraft_profile: Option<MinecraftProfile>,
     #[serde(skip)]
     pub(super) owns_minecraft_java: bool,
+    #[ts(type = "number")]
     pub account_revision: u64,
+    #[ts(type = "number")]
     pub profile_revision: u64,
     /// Zero for offline identities.
+    #[ts(type = "number")]
     pub credential_revision: u64,
+    #[ts(type = "number")]
     pub created_revision: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -177,6 +185,8 @@ impl From<crate::storage::rusqlite::Error> for AccountError {
     }
 }
 
+/// The offline player-name rule: 3 to 16 ASCII letters, digits or underscores.
+/// Returns the trimmed name.
 pub fn validate_username(raw: &str) -> Result<String, AccountError> {
     let value = raw.trim();
     if value.is_empty() {
@@ -188,15 +198,19 @@ pub fn validate_username(raw: &str) -> Result<String, AccountError> {
     if value.len() > 16 {
         return Err(AccountError::InvalidInput("At most 16 characters."));
     }
-    if !value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if !is_name_text(value) {
         return Err(AccountError::InvalidInput(
             "Letters, numbers, and underscores only.",
         ));
     }
     Ok(value.to_owned())
+}
+
+/// The characters every Minecraft name uses, offline or provider-issued.
+pub fn is_name_text(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Minecraft's name UUID hashes the literal prefix without a UUID namespace.

@@ -1,5 +1,6 @@
 //! Bounded Mojang profile lookup. Provider URLs never grant general network access.
 
+use crate::{accounts::model::validate_username, media::SkinVariant};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -101,36 +102,14 @@ impl TextureUrl {
     }
 }
 
-pub fn validate_username(value: &str) -> Result<&str, ProfileMediaError> {
-    let value = value.trim();
-    if !(3..=16).contains(&value.len())
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        return Err(ProfileMediaError::InvalidUsername);
-    }
-    Ok(value)
-}
-
-pub fn variant(value: &str) -> &'static str {
-    if value.eq_ignore_ascii_case("slim") {
-        "slim"
-    } else {
-        "classic"
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ts_rs::TS)]
 pub struct UsernameProfile {
     pub uuid: String,
     pub username: String,
     pub source: &'static str,
-    pub variant: String,
+    pub variant: SkinVariant,
     pub texture_url: String,
-    pub texture_file_url: String,
     pub cape_url: Option<String>,
-    pub head_url: String,
 }
 
 #[derive(Clone)]
@@ -166,7 +145,8 @@ impl ProfileLookup {
     }
 
     pub async fn lookup(&self, username: &str) -> Result<UsernameProfile, ProfileMediaError> {
-        let username = validate_username(username)?;
+        let username =
+            validate_username(username).map_err(|_| ProfileMediaError::InvalidUsername)?;
         let key = username.to_ascii_lowercase();
         if let Some((expires, result)) = self.cache.lock().await.get(&key) {
             if *expires > Instant::now() {
@@ -352,11 +332,8 @@ fn parse_textures(
         .map(|url| url.0);
     let model = skin
         .metadata
-        .map(|m| variant(&m.model).to_owned())
-        .unwrap_or_else(|| "classic".into());
+        .map_or(SkinVariant::Classic, |m| SkinVariant::from_provider(&m.model));
     Ok(UsernameProfile {
-        texture_file_url: format!("/api/v1/skin/lookup/file?username={}", profile.name),
-        head_url: format!("/api/v1/skin/lookup/head?username={}", profile.name),
         uuid: profile.id,
         username: profile.name,
         source: "minecraft_username",

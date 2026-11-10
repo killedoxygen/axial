@@ -1,47 +1,21 @@
 use super::accounts::auth_error;
-use axial_app::accounts::{session::AuthService, view::AuthStatusResponse};
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    routing::{get, post},
-};
+use axial_app::accounts::session::AuthService;
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-#[derive(Clone)]
-struct AuthRoutes {
-    auth: Arc<AuthService>,
-    login_available: bool,
-}
-
-/// The native composition may set login_available only after its OAuth window
-/// commands are registered. Browser composition always supplies false.
-pub fn router(auth: Arc<AuthService>, login_available: bool) -> Router {
+/// Commands on the selected Microsoft account. Mount beside the accounts router.
+pub fn router(auth: Arc<AuthService>) -> Router {
     Router::new()
-        .route("/api/v1/auth/status", get(status))
         .route("/api/v1/auth/refresh", post(refresh))
         .route("/api/v1/auth/profile/sync", post(sync))
-        .route("/api/v1/auth/logout", post(logout))
-        .with_state(AuthRoutes {
-            auth,
-            login_available,
-        })
+        .with_state(auth)
 }
 
 type ApiError = (StatusCode, Json<Value>);
 
-async fn status(State(state): State<AuthRoutes>) -> Result<Json<AuthStatusResponse>, ApiError> {
-    state
-        .auth
-        .status(state.login_available)
-        .await
-        .map(Json)
-        .map_err(auth_error)
-}
-
-async fn refresh(State(state): State<AuthRoutes>) -> Result<Json<Value>, ApiError> {
-    let capture = state.auth.refresh_selected().await.map_err(auth_error)?;
+async fn refresh(State(auth): State<Arc<AuthService>>) -> Result<Json<Value>, ApiError> {
+    let capture = auth.refresh_selected().await.map_err(auth_error)?;
     Ok(Json(
         json!({"status":"refreshed", "account_id":capture.account_id(),
         "selection_revision":capture.selection_revision(), "minecraft_profile_ready":true,
@@ -50,25 +24,13 @@ async fn refresh(State(state): State<AuthRoutes>) -> Result<Json<Value>, ApiErro
     ))
 }
 
-async fn sync(State(state): State<AuthRoutes>) -> Result<Json<Value>, ApiError> {
-    let capture = state
-        .auth
-        .sync_selected_profile()
-        .await
-        .map_err(auth_error)?;
+async fn sync(State(auth): State<Arc<AuthService>>) -> Result<Json<Value>, ApiError> {
+    let capture = auth.sync_selected_profile().await.map_err(auth_error)?;
     Ok(Json(
         json!({"status":"profile_synced", "account_id":capture.account_id(),
         "selection_revision":capture.selection_revision(), "minecraft_profile_ready":true,
         "minecraft_ownership_verified":capture.owns_minecraft_java(), "minecraft_profile":capture.profile(),
         "view_model":{"summary":"Minecraft profile synced."}}),
-    ))
-}
-
-async fn logout(State(state): State<AuthRoutes>) -> Result<Json<Value>, ApiError> {
-    let snapshot = state.auth.logout().await.map_err(auth_error)?;
-    Ok(Json(
-        json!({"status":"logged_out", "selection_revision":snapshot.selection_revision,
-        "view_model":{"summary":"Signed out of Microsoft."}}),
     ))
 }
 
@@ -87,6 +49,7 @@ mod tests {
     use axum::{
         body::{Body, to_bytes},
         http::{HeaderMap, Request},
+        routing::get,
     };
     use std::{
         path::PathBuf,
@@ -219,7 +182,7 @@ mod tests {
             )
             .with_profile_endpoints_for_tests(&base),
         );
-        let app = router(auth.clone(), false).merge(super::super::accounts::router(auth.clone()));
+        let app = router(auth.clone()).merge(super::super::accounts::router(auth.clone(), false));
         Fixture {
             _root: root,
             path,
@@ -292,21 +255,14 @@ mod tests {
             f.auth.launch_credentials(&capture).await,
             Err(AuthError::OwnershipMissing)
         ));
-        let (_, status) = request(&f.app, "GET", "/api/v1/auth/status").await;
-        assert_eq!(status["minecraft_ownership_verified"], false);
-        assert_eq!(status["minecraft_profile_ready"], true);
-        assert_eq!(status["online_mode_ready"], false);
-        assert_eq!(status["mode"], "offline");
-        assert_eq!(status["provider"], "offline");
-        assert_eq!(status["msa_provider"], "microsoft");
-        assert_eq!(status["launch_auth_mode"], "online");
-        assert_eq!(status["profile_sync_action"]["enabled"], true);
-        assert_eq!(status["skin_action"]["enabled"], false);
         let (_, accounts) = request(&f.app, "GET", "/api/v1/accounts").await;
-        assert_eq!(
-            accounts["accounts"][0]["minecraft_ownership_verified"],
-            false
-        );
+        assert_eq!(accounts["launch_auth_mode"], "online");
+        let account = &accounts["accounts"][0];
+        assert_eq!(account["minecraft_ownership_verified"], false);
+        assert_eq!(account["minecraft_profile_ready"], true);
+        assert_eq!(account["online_mode_ready"], false);
+        assert_eq!(account["profile_sync_action"]["enabled"], true);
+        assert_eq!(account["skin_action"]["enabled"], false);
 
         let reopened = Arc::new(
             AccountDirectory::new(Arc::new(MetadataStore::open(&f.path).unwrap())).unwrap(),

@@ -6,7 +6,7 @@ mod native;
 pub use image::{
     CAPE_PNG_MAX_BYTES, NormalizedSkinPng, SKIN_PNG_MAX_BYTES, SkinPngValidationError,
     is_valid_cape_texture_png, is_valid_normalized_skin_cache_png, normalize_cape_png,
-    normalize_skin_png, render_skin_head_png, texture_key, validate_skin_png,
+    normalize_skin_png, texture_key, validate_skin_png,
 };
 pub use native::{
     AdmittedSkinFile, NativeSelection, NativeSkinAdmission, NativeSkinHandle, NativeSkinScope,
@@ -14,7 +14,7 @@ pub use native::{
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "lowercase")]
 pub enum SkinVariant {
     Classic,
@@ -26,6 +26,15 @@ impl SkinVariant {
         match self {
             Self::Classic => "classic",
             Self::Slim => "slim",
+        }
+    }
+
+    /// Minecraft services name the model in varying case; anything but slim is classic.
+    pub fn from_provider(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("slim") {
+            Self::Slim
+        } else {
+            Self::Classic
         }
     }
 }

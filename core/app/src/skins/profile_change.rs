@@ -23,10 +23,7 @@ use crate::{
 };
 
 use super::{
-    delivery::{
-        ProfileProvider, SkinProfileResponse, TextureDelivery, active_cape, offline_profile,
-        online_profile, profile_texture, unverified_profile,
-    },
+    delivery::{ProfileProvider, TextureDelivery, active_cape, current_skin, profile_texture},
     library::{
         CapeUpdate, ReplaceSkinOptions, SaveSkinOptions, SavedSkinDeleteResult, SavedSkinLibrary,
         SavedSkinRecord, SkinLibraryError, UpdateSavedSkinRequest, default_profile_skin_name,
@@ -44,10 +41,11 @@ pub enum SkinError {
     Profile(#[from] ProfileMediaError),
 }
 
-#[derive(Serialize)]
+/// The wardrobe of the selected account: the saved skins and its queued change, if any.
+#[derive(Serialize, ts_rs::TS)]
 pub struct SavedSkinsResponse {
     pub skins: Vec<SavedSkinRecord>,
-    pub pending_apply_texture_key: Option<String>,
+    pub pending: Option<PendingSkinStatus>,
 }
 
 #[derive(Default)]
@@ -139,18 +137,6 @@ impl ProfileMedia {
         Ok(capture)
     }
 
-    pub fn profile(&self) -> Result<SkinProfileResponse, ProfileMediaError> {
-        let capture = self.selected()?;
-        Ok(match capture.profile() {
-            Some(profile) if capture.owns_minecraft_java() => online_profile(profile),
-            Some(_) => unverified_profile(capture.display_name(), capture.minecraft_uuid()),
-            None if capture.kind() == AccountKind::Microsoft => {
-                unverified_profile(capture.display_name(), capture.minecraft_uuid())
-            }
-            None => offline_profile(capture.display_name(), capture.minecraft_uuid()),
-        })
-    }
-
     pub fn list(&self) -> Result<SavedSkinsResponse, SkinError> {
         let snapshot = self.accounts.snapshot().map_err(account_error)?;
         let Some(id) = snapshot.active_account_id else {
@@ -161,20 +147,13 @@ impl ProfileMedia {
             }
             return Ok(SavedSkinsResponse {
                 skins,
-                pending_apply_texture_key: None,
+                pending: None,
             });
         };
         Ok(SavedSkinsResponse {
             skins: self.library.list_for_account(id.as_str())?,
-            pending_apply_texture_key: self
-                .pending
-                .status(id.as_str())
-                .and_then(|status| status.texture_key),
+            pending: self.pending.status(id.as_str()),
         })
-    }
-
-    pub fn pending_status(&self) -> Result<Option<PendingSkinStatus>, ProfileMediaError> {
-        Ok(self.pending.status(self.selected()?.account_id()))
     }
 
     pub async fn profile_file(&self, texture: Option<&str>) -> Result<Vec<u8>, ProfileMediaError> {
@@ -465,11 +444,7 @@ impl ProfileMedia {
             &bytes,
             SaveSkinOptions {
                 name: name.unwrap_or_else(|| default_username_skin_name(&profile.username)),
-                variant: variant.or(Some(if profile.variant == "slim" {
-                    SkinVariant::Slim
-                } else {
-                    SkinVariant::Classic
-                })),
+                variant: variant.or(Some(profile.variant)),
                 cape_id: None,
             },
         )?)
@@ -910,7 +885,7 @@ impl ProfileMedia {
             );
         let uploaded = match self
             .provider
-            .upload(token, skin.record.variant.as_str(), png, &profile.id)
+            .upload(token, skin.record.variant, png, &profile.id)
             .await
         {
             Ok(profile) => profile,
@@ -1195,14 +1170,9 @@ fn require_online_account(capture: &CapturedAccount) -> Result<(), ProfileMediaE
 }
 
 fn profile_variant(profile: &MinecraftProfile) -> SkinVariant {
-    let selected = profile_texture(profile)
-        .ok()
-        .and_then(|url| profile.skins.iter().find(|skin| skin.url == url));
-    if selected.is_some_and(|skin| skin.variant.eq_ignore_ascii_case("slim")) {
-        SkinVariant::Slim
-    } else {
-        SkinVariant::Classic
-    }
+    current_skin(profile).map_or(SkinVariant::Classic, |skin| {
+        SkinVariant::from_provider(&skin.variant)
+    })
 }
 
 fn account_error(error: AccountError) -> ProfileMediaError {
@@ -1233,6 +1203,12 @@ fn auth_error(error: AuthError) -> ProfileMediaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn selected_texture(service: &ProfileMedia) -> Option<String> {
+        let capture = service.selected().unwrap();
+        let profile = capture.profile()?;
+        profile_texture(profile).ok().map(str::to_owned)
+    }
     use crate::skins::{
         store::{MIGRATION, SavedSkinStore},
         tests::{Reply, png, server},
@@ -1614,7 +1590,7 @@ mod tests {
         let public = service.list().unwrap();
         assert_eq!(public.skins.len(), 2);
         assert!(public.skins.iter().all(|skin| skin.applied_at.is_none()));
-        assert!(public.pending_apply_texture_key.is_none());
+        assert!(public.pending.is_none());
         assert!(matches!(
             service.delete_saved(&first).await.unwrap(),
             SavedSkinDeleteResult::Deleted(record) if record.texture_key == first
@@ -1771,10 +1747,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(service.list().unwrap().skins, records);
-        assert_eq!(
-            service.profile().unwrap().texture_url.as_deref(),
-            Some(FIRST_URL)
-        );
+        assert_eq!(selected_texture(&service).as_deref(), Some(FIRST_URL));
         service.shutdown().await.unwrap();
         server.await.unwrap();
         assert!(requests.recv().await.unwrap().starts_with("GET /profile "));
@@ -1802,10 +1775,7 @@ mod tests {
             service.flush_account(capture.account_id()).await,
             Err(ProfileMediaError::PartialChange)
         );
-        assert_eq!(
-            service.profile().unwrap().texture_url.as_deref(),
-            Some(FIRST_URL)
-        );
+        assert_eq!(selected_texture(&service).as_deref(), Some(FIRST_URL));
         assert!(
             service
                 .library
@@ -1816,7 +1786,7 @@ mod tests {
         );
         assert_eq!(
             service.pending.status(capture.account_id()).unwrap().phase,
-            "failed"
+            crate::skins::pending::PendingSkinPhase::Failed
         );
         // The failed operation stays visible, but its fetched remote profile
         // has settled locally, so it does not strand application shutdown.
@@ -2018,10 +1988,7 @@ mod tests {
                 .applied_at
                 .is_some()
         );
-        assert_eq!(
-            service.profile().unwrap().texture_url.as_deref(),
-            Some(SECOND_URL)
-        );
+        assert_eq!(selected_texture(&service).as_deref(), Some(SECOND_URL));
         service.shutdown().await.unwrap();
         server.await.unwrap();
     }
@@ -2049,7 +2016,7 @@ mod tests {
             .unwrap();
         resume.send(()).unwrap();
         assert_eq!(waiter.await.unwrap(), Err(ProfileMediaError::StaleIdentity));
-        assert_eq!(service.profile().unwrap().username, "NewPlayer");
+        assert_eq!(service.selected().unwrap().display_name(), "NewPlayer");
         server.await.unwrap();
         assert!(requests.try_recv().is_err());
     }

@@ -546,7 +546,7 @@ pub(super) mod tests {
             } else {
                 prepared.settings.update(
                     serde_json::from_value(serde_json::json!({
-                        "expected_revision": prepared.settings_revision, "username": "Elsewhere",
+                        "expected_revision": prepared.settings_revision, "theme": "nether",
                     })).unwrap(),
                 ).unwrap();
                 LaunchError::SettingsChanged

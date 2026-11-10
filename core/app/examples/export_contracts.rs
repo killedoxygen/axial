@@ -1,6 +1,7 @@
 //! Export only reviewed public DTOs, never runtime commands or credentials.
 
 use axial_app::{
+    accounts::view::AccountListResponse,
     content::provenance::RequiredRefusal,
     instances::{
         delete::DeletionSnapshot,
@@ -18,7 +19,9 @@ use axial_app::{
         ConfigView, FlagsResponse, InterfacePreferencesReceipt, InterfacePreferencesSnapshot,
         InterfacePreferencesUpdate,
     },
-    skins::pending::PendingSkinStatus,
+    skins::{
+        library::SkinNormalizeResponse, lookup::UsernameProfile, profile_change::SavedSkinsResponse,
+    },
     system::SystemResourceResponse,
     update::UpdateSnapshot,
 };
@@ -75,7 +78,10 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     InstanceModMetadata::export_all(&config)?;
     InstancePackInfo::export_all(&config)?;
     ModImportResponse::export_all(&config)?;
-    PendingSkinStatus::export_all(&config)?;
+    AccountListResponse::export_all(&config)?;
+    SavedSkinsResponse::export_all(&config)?;
+    SkinNormalizeResponse::export_all(&config)?;
+    UsernameProfile::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
     JavaSelection::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;

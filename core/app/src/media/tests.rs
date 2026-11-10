@@ -203,30 +203,3 @@ fn grayscale_palette_and_sixteen_bit_inputs_normalize_to_rgba() {
         );
     }
 }
-
-#[test]
-fn head_overlay_blends_and_rendering_is_bounded() {
-    let mut source = vec![0; 64 * 64 * 4];
-    for y in 8..16 {
-        for x in 8..16 {
-            source[(y * 64 + x) * 4..(y * 64 + x + 1) * 4].copy_from_slice(&[200, 100, 0, 255]);
-            source[(y * 64 + x + 32) * 4..(y * 64 + x + 33) * 4]
-                .copy_from_slice(&[0, 100, 200, 128]);
-        }
-    }
-    let source = png(64, 64, &source);
-    let head = rgba(&render_skin_head_png(&source, 1).unwrap());
-    assert_eq!(head, [99, 100, 100, 255]);
-    assert_eq!(
-        render_skin_head_png(&source, 0),
-        Err(MediaError::InvalidDimensions)
-    );
-    assert_eq!(
-        render_skin_head_png(&source, 513),
-        Err(MediaError::InvalidDimensions)
-    );
-    assert_eq!(
-        texture_key(b"abc"),
-        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-    );
-}

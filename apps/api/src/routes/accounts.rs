@@ -19,8 +19,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// Mount inside the authenticated local API boundary.
-pub fn router(auth: Arc<AuthService>) -> Router {
+#[derive(Clone)]
+struct Accounts {
+    auth: Arc<AuthService>,
+    sign_in_available: bool,
+}
+
+/// Mount inside the authenticated local API boundary. The native composition sets
+/// `sign_in_available` only after its sign-in window commands are registered.
+pub fn router(auth: Arc<AuthService>, sign_in_available: bool) -> Router {
     Router::new()
         .route("/api/v1/accounts", get(list))
         .route("/api/v1/accounts/offline", post(create))
@@ -30,7 +37,10 @@ pub fn router(auth: Arc<AuthService>) -> Router {
         )
         .route("/api/v1/accounts/{account_id}/select", post(select))
         .layer(DefaultBodyLimit::max(4096))
-        .with_state(auth)
+        .with_state(Accounts {
+            auth,
+            sign_in_available,
+        })
 }
 
 type ApiError = (StatusCode, Json<Value>);
@@ -65,12 +75,17 @@ pub struct CommandViewModel {
     pub summary: &'static str,
 }
 
-async fn list(State(auth): State<Arc<AuthService>>) -> Result<Json<AccountListResponse>, ApiError> {
-    auth.account_list().await.map(Json).map_err(auth_error)
+async fn list(State(state): State<Accounts>) -> Result<Json<AccountListResponse>, ApiError> {
+    state
+        .auth
+        .account_list(state.sign_in_available)
+        .await
+        .map(Json)
+        .map_err(auth_error)
 }
 
 async fn create(
-    State(auth): State<Arc<AuthService>>,
+    State(Accounts { auth, .. }): State<Accounts>,
     request: Result<Json<OfflineAccountRequest>, JsonRejection>,
 ) -> Result<Json<AccountCommandResponse>, ApiError> {
     let Json(request) = request.map_err(|_| invalid_request())?;
@@ -90,7 +105,7 @@ async fn create(
 }
 
 async fn rename(
-    State(auth): State<Arc<AuthService>>,
+    State(Accounts { auth, .. }): State<Accounts>,
     Path(id): Path<String>,
     request: Result<Json<OfflineAccountRequest>, JsonRejection>,
 ) -> Result<Json<AccountCommandResponse>, ApiError> {
@@ -111,7 +126,7 @@ async fn rename(
 }
 
 async fn select(
-    State(auth): State<Arc<AuthService>>,
+    State(Accounts { auth, .. }): State<Accounts>,
     Path(id): Path<String>,
     request: Result<Json<AccountPreconditions>, JsonRejection>,
 ) -> Result<Json<AccountCommandResponse>, ApiError> {
@@ -124,7 +139,7 @@ async fn select(
 }
 
 async fn remove(
-    State(auth): State<Arc<AuthService>>,
+    State(Accounts { auth, .. }): State<Accounts>,
     Path(id): Path<String>,
     request: Result<Query<AccountPreconditions>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
@@ -281,7 +296,7 @@ mod tests {
             tasks.clone(),
         ));
         let auth = Arc::new(AuthService::new(directory, credentials, tasks));
-        let app = router(auth.clone()).merge(super::super::auth::router(auth, false));
+        let app = router(auth, false);
         let (status, created) = request(
             &app,
             "POST",
@@ -309,11 +324,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         let (_, accounts) = request(&app, "GET", "/api/v1/accounts", Value::Null).await;
-        let (_, status) = request(&app, "GET", "/api/v1/auth/status", Value::Null).await;
-        assert_eq!(accounts["selection_revision"], status["selection_revision"]);
+        assert_eq!(accounts["selection_revision"], 2);
+        assert_eq!(accounts["sign_in_available"], false);
         assert_eq!(accounts["accounts"][0]["active"], true);
-        assert_eq!(status["username"], "Notch");
-        assert_eq!(status["online_mode_ready"], false);
+        assert_eq!(accounts["accounts"][0]["display_name"], "Notch");
+        assert_eq!(accounts["accounts"][0]["online_mode_ready"], false);
         let (status, _) = request(&app, "DELETE", &format!("/api/v1/accounts/{new_id}?expected_selection_revision=2&expected_account_revision=2"), Value::Null).await;
         assert_eq!(status, StatusCode::OK);
         let (_, accounts) = request(&app, "GET", "/api/v1/accounts", Value::Null).await;

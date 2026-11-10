@@ -1,14 +1,13 @@
 //! Profile texture delivery and provider mutations, with bounded responses.
 
-use super::lookup::{
-    ProfileLookup, ProfileMediaError, TextureUrl, http_client, read_response, variant,
-};
+use super::lookup::{ProfileLookup, ProfileMediaError, TextureUrl, http_client, read_response};
 use crate::{
-    accounts::microsoft::MinecraftProfile,
-    media::{normalize_cape_png, normalize_skin_png, render_skin_head_png},
+    accounts::microsoft::{
+        MicrosoftAuthErrorKind, MinecraftProfile, MinecraftSkin, minecraft_profile,
+    },
+    media::{SkinVariant, normalize_cape_png, normalize_skin_png},
 };
-use serde::Serialize;
-use std::{collections::HashMap, fmt::Write as _, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
@@ -64,71 +63,23 @@ impl TextureDelivery {
         cache.insert(key, Arc::from(bytes.clone()));
         Ok(bytes)
     }
-
-    pub async fn head(&self, url: &str, size: Option<u32>) -> Result<Vec<u8>, ProfileMediaError> {
-        let bytes = self.skin(url).await?;
-        render_skin_head_png(&bytes, head_size(size)).map_err(|_| ProfileMediaError::InvalidImage)
-    }
 }
 
-pub fn head_size(value: Option<u32>) -> u32 {
-    value.unwrap_or(64).clamp(16, 256)
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct SkinProfileResponse {
-    pub auth_mode: &'static str,
-    pub username: String,
-    pub uuid: String,
-    pub source: &'static str,
-    pub variant: &'static str,
-    pub texture_url: Option<String>,
-    pub head_url: Option<String>,
-}
-
-pub fn online_profile(profile: &MinecraftProfile) -> SkinProfileResponse {
-    let selected = profile
+/// The skin a profile wears: its active one, or else the first with a usable texture.
+pub fn current_skin(profile: &MinecraftProfile) -> Option<&MinecraftSkin> {
+    let mut usable = profile
         .skins
         .iter()
-        .filter(|skin| TextureUrl::parse(&skin.url).is_ok())
+        .filter(|skin| TextureUrl::parse(&skin.url).is_ok());
+    let first = usable.next()?;
+    std::iter::once(first)
+        .chain(usable)
         .find(|skin| skin.state.eq_ignore_ascii_case("ACTIVE"))
-        .or_else(|| {
-            profile
-                .skins
-                .iter()
-                .find(|skin| TextureUrl::parse(&skin.url).is_ok())
-        });
-    SkinProfileResponse {
-        auth_mode: "online",
-        username: profile.name.clone(),
-        uuid: profile.id.clone(),
-        source: if selected.is_some() {
-            "minecraft_profile_skin"
-        } else {
-            "default"
-        },
-        variant: selected
-            .map(|skin| variant(&skin.variant))
-            .unwrap_or("classic"),
-        texture_url: selected
-            .and_then(|skin| TextureUrl::parse(&skin.url).ok())
-            .map(|url| url.as_str().to_owned()),
-        head_url: None,
-    }
+        .or(Some(first))
 }
 
 pub fn profile_texture(profile: &MinecraftProfile) -> Result<&str, ProfileMediaError> {
-    profile
-        .skins
-        .iter()
-        .filter(|skin| TextureUrl::parse(&skin.url).is_ok())
-        .find(|skin| skin.state.eq_ignore_ascii_case("ACTIVE"))
-        .or_else(|| {
-            profile
-                .skins
-                .iter()
-                .find(|skin| TextureUrl::parse(&skin.url).is_ok())
-        })
+    current_skin(profile)
         .map(|skin| skin.url.as_str())
         .ok_or(ProfileMediaError::MissingSkin)
 }
@@ -139,91 +90,6 @@ pub fn active_cape(profile: &MinecraftProfile) -> Option<&str> {
         .iter()
         .find(|cape| cape.state.eq_ignore_ascii_case("ACTIVE"))
         .map(|cape| cape.id.as_str())
-}
-
-pub fn offline_profile(username: &str, uuid: &str) -> SkinProfileResponse {
-    SkinProfileResponse {
-        auth_mode: "offline",
-        username: username.to_owned(),
-        uuid: uuid.to_owned(),
-        source: "default",
-        variant: offline_variant(uuid),
-        texture_url: None,
-        head_url: Some(format!("/api/v1/skin/head?username={username}")),
-    }
-}
-
-/// An imported Microsoft identity has no authenticated skin/profile yet.
-pub fn unverified_profile(username: &str, uuid: &str) -> SkinProfileResponse {
-    SkinProfileResponse {
-        auth_mode: "online",
-        username: username.to_owned(),
-        uuid: uuid.to_owned(),
-        source: "default",
-        variant: offline_variant(uuid),
-        texture_url: None,
-        head_url: None,
-    }
-}
-
-pub fn offline_variant(uuid: &str) -> &'static str {
-    let hash = uuid.bytes().fold(0_i32, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(i32::from(byte))
-    });
-    if hash & 1 == 0 { "classic" } else { "slim" }
-}
-
-/// Preserve the predecessor's deterministic offline avatar appearance.
-pub fn offline_head_svg(uuid: &str, size: Option<u32>) -> String {
-    let size = head_size(size);
-    let seed = uuid.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-    });
-    let palette = [
-        mix_color(seed, 0x111827, 0x374151),
-        mix_color(seed.rotate_left(7), 0x111827, 0x1f2937),
-        mix_color(seed.rotate_left(17), 0xc58c65, 0xf1c27d),
-        mix_color(seed.rotate_left(31), 0x2563eb, 0x22c55e),
-        mix_color(seed.rotate_left(43), 0x4b5563, 0x7c2d12),
-    ];
-    let mut state = seed;
-    let mut svg = format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 8 8" shape-rendering="crispEdges">"#
-    );
-    for y in 0..8 {
-        for x in 0..8 {
-            state = splitmix64(state.wrapping_add((y * 8 + x) as u64 + 1));
-            let index = if x == 0 || x == 7 || y == 0 || y == 7 {
-                1
-            } else {
-                (state as usize % 3) + 2
-            };
-            let _ = write!(
-                svg,
-                r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#{:06x}"/>"##,
-                palette[index]
-            );
-        }
-    }
-    svg.push_str("</svg>");
-    svg
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e3779b97f4a7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-    value ^ (value >> 31)
-}
-
-fn mix_color(seed: u64, first: u32, second: u32) -> u32 {
-    let amount = (seed & 255) as u32;
-    [16, 8, 0].into_iter().fold(0, |color, shift| {
-        color
-            | ((((first >> shift) & 255) * (255 - amount) + ((second >> shift) & 255) * amount)
-                / 255
-                << shift)
-    })
 }
 
 #[derive(Clone)]
@@ -261,20 +127,18 @@ impl ProfileProvider {
         token: &str,
         expected_id: &str,
     ) -> Result<MinecraftProfile, ProfileMediaError> {
-        let response = self
-            .http
-            .get(&self.profile_endpoint)
-            .bearer_auth(token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
+        // The sign-in owner fetches and validates profiles; this only maps its refusals.
+        let profile = minecraft_profile(token, &self.profile_endpoint)
             .await
-            .map_err(|_| ProfileMediaError::Unavailable)?;
-        let profile: MinecraftProfile =
-            serde_json::from_slice(&read_response(response, 64 * 1024).await?)
-                .map_err(|_| ProfileMediaError::InvalidResponse)?;
-        if !profile.id.eq_ignore_ascii_case(expected_id)
-            || crate::accounts::microsoft::validate_profile(&profile).is_err()
-        {
+            .map_err(|error| match (error.kind(), error.provider_status()) {
+                (_, Some(401 | 403)) => ProfileMediaError::AccountRequired,
+                (_, Some(404)) => ProfileMediaError::NotFound,
+                (_, Some(429)) => ProfileMediaError::RateLimited,
+                (MicrosoftAuthErrorKind::UpstreamRejected, _) => ProfileMediaError::Rejected,
+                (MicrosoftAuthErrorKind::Parse, _) => ProfileMediaError::InvalidResponse,
+                _ => ProfileMediaError::Unavailable,
+            })?;
+        if !profile.id.eq_ignore_ascii_case(expected_id) {
             return Err(ProfileMediaError::InvalidResponse);
         }
         Ok(profile)
@@ -283,7 +147,7 @@ impl ProfileProvider {
     pub async fn upload(
         &self,
         token: &str,
-        skin_variant: &str,
+        variant: SkinVariant,
         png: Vec<u8>,
         expected_profile_id: &str,
     ) -> Result<Option<MinecraftProfile>, ProfileMediaError> {
@@ -295,7 +159,7 @@ impl ProfileProvider {
             .mime_str("image/png")
             .map_err(|_| ProfileMediaError::InvalidImage)?;
         let form = reqwest::multipart::Form::new()
-            .text("variant", variant(skin_variant).to_owned())
+            .text("variant", variant.as_str())
             .part("file", part);
         self.mutate(
             self.http
@@ -373,27 +237,5 @@ impl ProfileProvider {
             return Err(ProfileMediaError::UncertainChange);
         }
         Ok(Some(profile))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn offline_head_is_deterministic_and_size_bounded() {
-        assert_eq!(
-            offline_head_svg("player", Some(64)),
-            offline_head_svg("player", Some(64))
-        );
-        assert_ne!(
-            offline_head_svg("player", Some(64)),
-            offline_head_svg("other", Some(64))
-        );
-        assert!(offline_head_svg("player", Some(u32::MAX)).contains("width=\"256\""));
-        assert!(offline_head_svg("player", Some(0)).contains("width=\"16\""));
-        assert_eq!(
-            offline_head_svg("player", None).matches("<rect ").count(),
-            64
-        );
     }
 }

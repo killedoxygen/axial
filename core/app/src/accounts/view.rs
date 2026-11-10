@@ -3,89 +3,104 @@
 use super::{
     credential_store::CredentialError,
     credentials::Credentials,
+    microsoft::MinecraftProfile,
     model::{AccountId, AccountKind, AccountRecord, LaunchAuthMode},
     session::{AuthError, AuthService, now_seconds},
 };
+use crate::{
+    media::SkinVariant,
+    skins::delivery::{active_cape, current_skin},
+};
 use serde::Serialize;
+use ts_rs::TS;
 
 const STORAGE_UNAVAILABLE: &str = "Secure credential storage is unavailable.";
+const OWNERSHIP_UNVERIFIED: &str =
+    "The selected Microsoft account has not verified Minecraft Java ownership.";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct AccountActionState {
     pub state_id: &'static str,
     pub label: &'static str,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub disabled_reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub success_summary: Option<&'static str>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct AccountReadiness {
     pub msa_authenticated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
     pub msa_token_expires_in: Option<u64>,
     pub msa_refresh_available: bool,
     pub minecraft_profile_ready: bool,
     pub minecraft_ownership_verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
     pub minecraft_token_expires_in: Option<u64>,
     pub online_mode_ready: bool,
     pub online_action: AccountActionState,
     pub refresh_action: AccountActionState,
     pub profile_sync_action: AccountActionState,
+    /// Changing the Minecraft profile's skin or cape.
+    pub skin_action: AccountActionState,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// The skin a Minecraft profile wears right now.
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct ProfileSkin {
+    pub id: String,
+    pub url: String,
+    pub variant: SkinVariant,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct AccountView {
     #[serde(flatten)]
     pub identity: AccountRecord,
     pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub profile_skin: Option<ProfileSkin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub profile_cape_id: Option<String>,
     #[serde(flatten)]
     pub readiness: AccountReadiness,
     pub view_model: AccountViewModel,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct AccountViewModel {
     pub detail: &'static str,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct AccountListResponse {
+    #[ts(type = "number")]
     pub revision: u64,
+    #[ts(type = "number")]
     pub selection_revision: u64,
     pub active_account_id: Option<AccountId>,
     pub launch_auth_mode: LaunchAuthMode,
+    /// Whether this build can open the Microsoft sign-in window.
+    pub sign_in_available: bool,
     pub accounts: Vec<AccountView>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct AuthStatusResponse {
-    pub selection_revision: u64,
-    pub launch_auth_mode: LaunchAuthMode,
-    pub mode: &'static str,
-    pub username: String,
-    pub uuid: String,
-    pub provider: &'static str,
-    pub verified: bool,
-    pub skin_source: &'static str,
-    pub login_available: bool,
-    pub login_reason: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub msa_provider: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub minecraft_profile: Option<super::microsoft::MinecraftProfile>,
-    #[serde(flatten)]
-    pub readiness: AccountReadiness,
-    pub skin_action: AccountActionState,
-}
-
 impl AuthService {
-    pub async fn account_list(&self) -> Result<AccountListResponse, AuthError> {
+    pub async fn account_list(
+        &self,
+        sign_in_available: bool,
+    ) -> Result<AccountListResponse, AuthError> {
         let snapshot = self.directory().snapshot()?;
         let mut accounts = Vec::with_capacity(snapshot.accounts.len());
         for account in &snapshot.accounts {
@@ -105,7 +120,7 @@ impl AuthService {
             } else {
                 None
             };
-            let readiness = readiness(Some(account), credentials.as_ref(), storage_unavailable);
+            let readiness = readiness(account, credentials.as_ref(), storage_unavailable);
             let detail = match account.kind {
                 AccountKind::Offline => "Offline identity",
                 AccountKind::Microsoft if storage_unavailable => STORAGE_UNAVAILABLE,
@@ -120,9 +135,12 @@ impl AuthService {
                 }
                 AccountKind::Microsoft => "Sign in again to use this Microsoft account",
             };
+            let profile = account.minecraft_profile.as_ref();
             accounts.push(AccountView {
                 identity: account.clone(),
                 active: snapshot.active_account_id.as_ref() == Some(&account.account_id),
+                profile_skin: profile.and_then(profile_skin),
+                profile_cape_id: profile.and_then(active_cape).map(str::to_owned),
                 readiness,
                 view_model: AccountViewModel { detail },
             });
@@ -135,81 +153,31 @@ impl AuthService {
             selection_revision: snapshot.selection_revision,
             active_account_id: snapshot.active_account_id,
             launch_auth_mode: snapshot.launch_auth_mode,
+            sign_in_available,
             accounts,
-        })
-    }
-
-    pub async fn status(&self, login_available: bool) -> Result<AuthStatusResponse, AuthError> {
-        let list = self.account_list().await?;
-        let active = list.accounts.into_iter().find(|account| account.active);
-        let readiness = active
-            .as_ref()
-            .map(|account| account.readiness.clone())
-            .unwrap_or_else(|| readiness(None, None, false));
-        let microsoft = active
-            .as_ref()
-            .is_some_and(|account| account.identity.kind == AccountKind::Microsoft);
-        let online = microsoft
-            && active
-                .as_ref()
-                .is_some_and(|account| account.identity.owns_minecraft_java);
-        let skin_action = action(
-            "online_profile_ready",
-            "Online profile ready",
-            readiness.online_mode_ready,
-            if readiness.online_action.state_id == "online_credentials_unavailable" {
-                STORAGE_UNAVAILABLE
-            } else if microsoft && !online {
-                "The selected Microsoft account has not verified Minecraft Java ownership."
-            } else {
-                "A verified Microsoft account is required for online profile actions."
-            },
-            "Minecraft profile updated.",
-        );
-        Ok(AuthStatusResponse {
-            selection_revision: list.selection_revision,
-            launch_auth_mode: list.launch_auth_mode,
-            mode: if online { "online" } else { "offline" },
-            username: active
-                .as_ref()
-                .map(|a| a.identity.display_name.clone())
-                .unwrap_or_default(),
-            uuid: active
-                .as_ref()
-                .map(|a| a.identity.minecraft_uuid().to_owned())
-                .unwrap_or_default(),
-            provider: if online { "microsoft" } else { "offline" },
-            verified: readiness.online_mode_ready,
-            skin_source: if readiness.minecraft_profile_ready {
-                "minecraft_profile"
-            } else {
-                "default"
-            },
-            login_available,
-            login_reason: if login_available {
-                ""
-            } else {
-                "Microsoft sign-in is available in the desktop app"
-            },
-            msa_provider: microsoft.then_some("microsoft"),
-            minecraft_profile: active.and_then(|a| a.identity.minecraft_profile),
-            readiness,
-            skin_action,
         })
     }
 }
 
+fn profile_skin(profile: &MinecraftProfile) -> Option<ProfileSkin> {
+    current_skin(profile).map(|skin| ProfileSkin {
+        id: skin.id.clone(),
+        url: skin.url.clone(),
+        variant: SkinVariant::from_provider(&skin.variant),
+    })
+}
+
 fn readiness(
-    account: Option<&AccountRecord>,
+    account: &AccountRecord,
     credentials: Option<&Credentials>,
     storage_unavailable: bool,
 ) -> AccountReadiness {
-    let microsoft = account.is_some_and(|a| a.kind == AccountKind::Microsoft);
+    let microsoft = account.kind == AccountKind::Microsoft;
     let now = now_seconds();
     let msa_expiry = credentials.map(|c| c.microsoft_expires_at().saturating_sub(now));
     let game_expiry = credentials.map(|c| c.minecraft_expires_at().saturating_sub(now));
     let refresh = credentials.is_some_and(|c| c.microsoft_refresh_token().is_some());
-    let owned = account.is_some_and(|a| a.owns_minecraft_java);
+    let owned = account.owns_minecraft_java;
     let ready = microsoft && owned && game_expiry.is_some_and(|expiry| expiry > 30);
     let mut online_action = if ready {
         action(
@@ -241,7 +209,7 @@ fn readiness(
             "Sign in required",
             false,
             if microsoft && !owned {
-                "The selected Microsoft account has not verified Minecraft Java ownership."
+                OWNERSHIP_UNVERIFIED
             } else {
                 "Sign in with Microsoft to use Online mode."
             },
@@ -249,14 +217,13 @@ fn readiness(
         )
     };
     if microsoft && !owned && !storage_unavailable {
-        online_action.detail =
-            Some("The selected Microsoft account has not verified Minecraft Java ownership.");
+        online_action.detail = Some(OWNERSHIP_UNVERIFIED);
     }
     AccountReadiness {
         msa_authenticated: msa_expiry.is_some_and(|expiry| expiry > 0),
         msa_token_expires_in: msa_expiry,
         msa_refresh_available: refresh,
-        minecraft_profile_ready: account.is_some_and(|a| a.minecraft_profile.is_some()),
+        minecraft_profile_ready: account.minecraft_profile.is_some(),
         minecraft_ownership_verified: owned && credentials.is_some(),
         minecraft_token_expires_in: game_expiry,
         online_mode_ready: ready,
@@ -282,6 +249,19 @@ fn readiness(
                 "Refresh Microsoft sign-in before syncing this profile."
             },
             "Minecraft profile synced.",
+        ),
+        skin_action: action(
+            "online_profile_ready",
+            "Online profile ready",
+            ready,
+            if storage_unavailable {
+                STORAGE_UNAVAILABLE
+            } else if microsoft && !owned {
+                OWNERSHIP_UNVERIFIED
+            } else {
+                "A verified Microsoft account is required for online profile actions."
+            },
+            "Minecraft profile updated.",
         ),
     }
 }
@@ -319,7 +299,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     #[tokio::test]
-    async fn offline_status_and_list_expose_coherent_revisions_without_credentials() {
+    async fn offline_list_exposes_identity_without_credentials() {
         let directory =
             Arc::new(AccountDirectory::new(Arc::new(MetadataStore::in_memory().unwrap())).unwrap());
         directory.create_offline_account("Steve").unwrap();
@@ -328,13 +308,15 @@ mod tests {
             Arc::new(CredentialStore::isolated_for_tests()),
             TaskOwner::new(8).unwrap(),
         );
-        let list = service.account_list().await.unwrap();
-        let status = service.status(false).await.unwrap();
-        assert_eq!(list.selection_revision, status.selection_revision);
-        assert_eq!(status.uuid, "5627dd98e6be3c21b8a8e92344183641");
-        assert!(!status.readiness.online_mode_ready);
-        assert!(!status.readiness.msa_refresh_available);
-        assert!(!status.login_available);
+        let list = service.account_list(false).await.unwrap();
+        let active = &list.accounts[0];
+        assert_eq!(
+            active.identity.minecraft_uuid(),
+            "5627dd98e6be3c21b8a8e92344183641"
+        );
+        assert!(!active.readiness.online_mode_ready);
+        assert!(!active.readiness.msa_refresh_available);
+        assert!(!list.sign_in_available);
         let json = serde_json::to_value(list).unwrap();
         assert_eq!(json["accounts"][0]["active"], true);
         assert_eq!(json["accounts"][0]["minecraft_profile_ready"], false);
@@ -383,13 +365,16 @@ mod tests {
         let before = directory.snapshot().unwrap();
         let service = AuthService::new(directory.clone(), Arc::new(credentials), tasks.clone());
         assert_eq!(service.launch_credentials(&capture).await.unwrap(), bundle);
-        assert!(service.status(true).await.unwrap().verified);
+        assert!(
+            service.account_list(true).await.unwrap().accounts[0]
+                .readiness
+                .online_mode_ready
+        );
 
         deny_reads();
-        let (list, status, exact, launch) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (list, exact, launch) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(
-                service.account_list(),
-                service.status(true),
+                service.account_list(true),
                 service.credentials(&capture),
                 service.launch_credentials(&capture),
             )
@@ -409,7 +394,6 @@ mod tests {
             Err(AuthError::Credentials(CredentialError::Unavailable))
         ));
         let list = list.unwrap();
-        let status = status.unwrap();
         assert_eq!(directory.snapshot().unwrap(), before);
         assert_eq!(list.accounts.len(), 1);
         assert_eq!(list.accounts[0].identity, before.accounts[0]);
@@ -419,18 +403,14 @@ mod tests {
         );
         assert!(list.accounts[0].active);
         assert_eq!(list.active_account_id, before.active_account_id);
-        assert_eq!(list.selection_revision, status.selection_revision);
-        assert_eq!(status.launch_auth_mode, LaunchAuthMode::Online);
-        assert_eq!((status.mode, status.provider), ("online", "microsoft"));
-        assert_eq!(status.username, "SavedPlayer");
-        assert_eq!(status.uuid, PROFILE);
-        assert_eq!(status.minecraft_profile, Some(profile));
-        assert!(status.login_available);
-        assert!(!status.verified && !status.skin_action.enabled);
-        for response in [
-            serde_json::to_value(&list).unwrap()["accounts"][0].clone(),
-            serde_json::to_value(&status).unwrap(),
-        ] {
+        assert_eq!(list.launch_auth_mode, LaunchAuthMode::Online);
+        assert_eq!(list.accounts[0].identity.display_name, "SavedPlayer");
+        assert_eq!(list.accounts[0].identity.minecraft_uuid(), PROFILE);
+        assert_eq!(list.accounts[0].identity.minecraft_profile, Some(profile));
+        assert!(list.sign_in_available);
+        assert!(!list.accounts[0].readiness.skin_action.enabled);
+        {
+            let response = serde_json::to_value(&list).unwrap()["accounts"][0].clone();
             assert_eq!(
                 response["online_action"]["state_id"],
                 "online_credentials_unavailable"
@@ -443,10 +423,11 @@ mod tests {
             }
         }
         assert_eq!(
-            serde_json::to_value(&status).unwrap()["skin_action"]["disabled_reason"],
+            serde_json::to_value(&list).unwrap()["accounts"][0]["skin_action"]["disabled_reason"],
             "Secure credential storage is unavailable."
         );
-        for readiness in [&list.accounts[0].readiness, &status.readiness] {
+        {
+            let readiness = &list.accounts[0].readiness;
             assert!(readiness.minecraft_profile_ready);
             assert!(!readiness.msa_authenticated);
             assert!(!readiness.msa_refresh_available);

@@ -186,13 +186,6 @@ impl MicrosoftLoginFlow {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MicrosoftLoginOutcome {
-    pub login_id: String,
-    pub profile_name: String,
-    pub owns_minecraft_java: bool,
-}
-
 pub async fn begin_login() -> Result<MicrosoftLoginFlow, MicrosoftAuthError> {
     let current_date = Utc::now();
     let device_pair = DeviceTokenPair::new(current_date).await?;
@@ -366,7 +359,7 @@ fn validate_authorization_url(raw: &str) -> Result<(), MicrosoftAuthError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, ts_rs::TS)]
 pub struct MinecraftProfile {
     pub id: String,
     pub name: String,
@@ -375,14 +368,14 @@ pub struct MinecraftProfile {
     #[serde(default)]
     pub capes: Vec<MinecraftCape>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, ts_rs::TS)]
 pub struct MinecraftSkin {
     pub id: String,
     pub state: String,
     pub url: String,
     pub variant: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, ts_rs::TS)]
 pub struct MinecraftCape {
     pub id: String,
     pub state: String,
@@ -825,7 +818,7 @@ async fn minecraft_entitlements(token: &str, endpoint: &str) -> Result<bool, Mic
         .any(|item| matches!(item.name.as_str(), "game_minecraft" | "product_minecraft")))
 }
 
-async fn minecraft_profile(
+pub(crate) async fn minecraft_profile(
     token: &str,
     endpoint: &str,
 ) -> Result<MinecraftProfile, MicrosoftAuthError> {
@@ -1019,10 +1012,7 @@ pub fn validate_profile(profile: &MinecraftProfile) -> Result<(), MicrosoftAuthE
         .is_none_or(|id| id.is_nil())
         || profile.name.is_empty()
         || profile.name.len() > 16
-        || !profile
-            .name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || !super::model::is_name_text(&profile.name)
         || profile.skins.len() > 128
         || profile.capes.len() > 128
     {

@@ -18,15 +18,10 @@ pub const DEFAULT_SKIN_SOURCE: &str = "minecraft_default_skin";
 pub const PROFILE_SKIN_SOURCE: &str = "minecraft_profile_skin";
 pub const USERNAME_SKIN_SOURCE: &str = "minecraft_username_skin";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, ts_rs::TS)]
 pub struct SkinNormalizeResponse {
     pub texture_key: String,
     pub variant_suggestion: SkinVariant,
-    pub original_width: u32,
-    pub original_height: u32,
-    pub normalized_width: u32,
-    pub normalized_height: u32,
-    pub normalized_byte_size: usize,
     pub normalized_data_url: String,
 }
 
@@ -35,11 +30,6 @@ pub fn normalize_upload(bytes: &[u8]) -> Result<SkinNormalizeResponse, SkinLibra
     Ok(SkinNormalizeResponse {
         texture_key: crate::media::texture_key(&normalized.png_bytes),
         variant_suggestion: normalized.variant_suggestion,
-        original_width: normalized.original_width,
-        original_height: normalized.original_height,
-        normalized_width: 64,
-        normalized_height: 64,
-        normalized_byte_size: normalized.png_bytes.len(),
         normalized_data_url: format!(
             "data:image/png;base64,{}",
             STANDARD.encode(&normalized.png_bytes)
@@ -48,7 +38,7 @@ pub fn normalize_upload(bytes: &[u8]) -> Result<SkinNormalizeResponse, SkinLibra
 }
 
 /// Existing wardrobe wire shape. Revisions and image bytes remain private.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct SavedSkinRecord {
     pub texture_key: String,
