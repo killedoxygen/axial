@@ -68,25 +68,6 @@ pub struct EmergencyDisableDiagnostic {
     pub tiers: Vec<CompositionTier>,
 }
 
-pub fn rules_status(manifest: &Manifest) -> PerformanceRulesStatus {
-    rules_status_with_cache(manifest, RulesCacheStatus::unavailable())
-}
-
-pub fn rules_status_with_cache(
-    manifest: &Manifest,
-    rules_cache: RulesCacheStatus,
-) -> PerformanceRulesStatus {
-    rules_status_for(
-        manifest,
-        RuleSource::BuiltIn,
-        RuleChannel::Bundled,
-        rules_cache,
-        false,
-        None,
-        RulesValidation::Valid,
-    )
-}
-
 pub fn rules_status_for(
     manifest: &Manifest,
     rule_source: RuleSource,
@@ -207,13 +188,28 @@ fn coverage_for_family(manifest: &Manifest, family: VersionFamily) -> FamilyCove
 
 #[cfg(test)]
 mod tests {
-    use super::{RuleChannel, RuleSource, RulesValidation, rules_status, rules_status_with_cache};
+    use super::{
+        PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status_for,
+    };
     use crate::health::BundleHealth;
     use crate::resolve::builtin_manifest;
-    use crate::rules_cache::RulesCacheState;
+    use crate::rules_cache::{RulesCacheState, RulesCacheStatus};
     use crate::types::{
-        CompositionTier, EmergencyDisable, EmergencyDisableTarget, OwnershipClass, VersionFamily,
+        CompositionTier, EmergencyDisable, EmergencyDisableTarget, Manifest, OwnershipClass,
+        VersionFamily,
     };
+
+    fn rules_status(manifest: &Manifest) -> PerformanceRulesStatus {
+        rules_status_for(
+            manifest,
+            RuleSource::BuiltIn,
+            RuleChannel::Bundled,
+            RulesCacheStatus::unavailable(),
+            false,
+            None,
+            RulesValidation::Valid,
+        )
+    }
 
     #[test]
     fn bundled_manifest_status_is_truthful_about_current_foundation() {
@@ -250,34 +246,6 @@ mod tests {
         assert_eq!(status.emergency_disable_count, 0);
         assert!(status.emergency_disables.is_empty());
         assert!(status.warnings.is_empty());
-    }
-
-    #[test]
-    fn status_exposes_rules_cache_diagnostics() {
-        let manifest = builtin_manifest().expect("builtin manifest should validate");
-
-        let status = rules_status_with_cache(
-            &manifest,
-            crate::rules_cache::RulesCacheStatus {
-                recorded: false,
-                state: RulesCacheState::Invalid,
-                updated_at: Some("2026-05-30T10:00:00Z".to_string()),
-                loaded_at: Some("2026-05-30T10:01:00Z".to_string()),
-                warning: Some("Rules cache is invalid.".to_string()),
-            },
-        );
-
-        assert!(!status.rules_cache.recorded);
-        assert_eq!(status.rules_cache.state, RulesCacheState::Invalid);
-        assert_eq!(
-            status.rules_cache.updated_at.as_deref(),
-            Some("2026-05-30T10:00:00Z")
-        );
-        assert_eq!(
-            status.rules_cache.loaded_at.as_deref(),
-            Some("2026-05-30T10:01:00Z")
-        );
-        assert!(status.rules_cache.warning.is_some());
     }
 
     #[test]

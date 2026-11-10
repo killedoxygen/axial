@@ -12,7 +12,7 @@ mod tests;
 
 pub use crate::storage::ManagedInstanceEffectAuthority;
 pub use manager::{
-    ManagedCompositionAuthority, ManagedIdentityError, ManagedInstanceIdentity, PerformanceManager,
+    ManagedCompositionAuthority, ManagedInstanceIdentity, PerformanceManager,
     PerformanceRulesAuthority,
 };
 pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError, VerifiedRemoteRules};

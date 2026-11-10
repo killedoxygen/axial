@@ -2,7 +2,6 @@ pub mod effective;
 mod health;
 pub mod install;
 pub mod resolve;
-pub mod rules;
 pub mod rules_cache;
 pub mod signature;
 mod state;
@@ -25,10 +24,10 @@ pub use health::BundleHealth;
 pub use install::{
     InstallError, ManagedArtifactPin, ManagedArtifactRole, ManagedArtifactTransferResolver,
     ManagedArtifactWitnessProof, ManagedCompositionAuthority, ManagedCompositionInspection,
-    ManagedCompositionInstallPlan, ManagedDependencyEdge, ManagedIdentityError,
-    ManagedIndeterminate, ManagedInstallExecutionError, ManagedInstallExecutionOutcome,
-    ManagedInstallPlanError, ManagedInstanceEffectAuthority, ManagedInstanceIdentity,
-    ManagedMutationError, ManagedResolvedInspection, PERFORMANCE_RULES_URL_ENV, PerformanceManager,
+    ManagedCompositionInstallPlan, ManagedDependencyEdge, ManagedIndeterminate,
+    ManagedInstallExecutionError, ManagedInstallExecutionOutcome, ManagedInstallPlanError,
+    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError,
+    ManagedResolvedInspection, PERFORMANCE_RULES_URL_ENV, PerformanceManager,
     PerformanceRulesAuthority, RulesRefreshError, VerifiedRemoteRules,
     remote_rules_refresh_warning,
 };
@@ -37,8 +36,7 @@ pub use resolve::{
     parse_mode, resolve_plan,
 };
 pub use rules_cache::{
-    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheStartupSource, RulesCacheState,
-    RulesCacheStatus,
+    RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus,
 };
 pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,
@@ -49,7 +47,7 @@ pub use state::{
     RollbackSnapshotTarget, StateError,
 };
 pub use status::{
-    FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status,
+    FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation,
     rules_status_for,
 };
 pub use types::{

@@ -1,8 +1,5 @@
 use super::manager::{ACTIVE_RULES_LOCK_INVARIANT, PerformanceManager, PerformanceRulesAuthority};
-use super::model::{
-    ActiveRules, PERFORMANCE_RULES_URL_ENV, RemoteRulesCandidate, RulesRefreshError,
-    VerifiedRemoteRules,
-};
+use super::model::{ActiveRules, RemoteRulesCandidate, RulesRefreshError, VerifiedRemoteRules};
 use crate::resolve::validate_manifest;
 use crate::rules_cache::{
     RulesCacheState, RulesCacheStatus, bounded_warning, remote_rules_snapshot,
@@ -162,10 +159,6 @@ impl PerformanceManager {
             signature,
         })
     }
-}
-
-pub(super) fn configured_remote_rules_url() -> Option<String> {
-    normalize_remote_rules_url(std::env::var(PERFORMANCE_RULES_URL_ENV).ok())
 }
 
 pub(super) fn normalize_remote_rules_url(value: Option<String>) -> Option<String> {

@@ -126,13 +126,6 @@ fn validate_signature_metadata(
     Ok(())
 }
 
-pub fn configured_remote_rules_verifier(remote_enabled: bool) -> RemoteRulesVerifier {
-    if !remote_enabled {
-        return RemoteRulesVerifier::disabled();
-    }
-    RemoteRulesVerifier::from_public_key_hex(std::env::var(PERFORMANCE_RULES_PUBLIC_KEY_ENV).ok())
-}
-
 pub fn canonical_manifest_payload(manifest: &Manifest) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(manifest)
 }

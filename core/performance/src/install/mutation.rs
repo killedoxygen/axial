@@ -14,7 +14,7 @@ use crate::state::{
 };
 use crate::storage::{ManagedInstanceEffectAuthority, ManagedStorageDirectory};
 use crate::types::{CompositionPlan, CompositionState, InstalledMod, ResolutionRequest};
-use axial_fs::{Directory, DirectoryListingState, EntryKind, LeafName};
+use axial_fs::{Directory, DirectoryListingState, EntryKind};
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use axial_resource::{
     PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
@@ -483,35 +483,20 @@ impl ManagedCompositionAuthority {
         &self,
         identity: &ManagedInstanceIdentity,
     ) -> Result<Directory, ManagedMutationError> {
-        if let Some(directory) = identity.admitted_directory.as_ref() {
-            let current = directory
-                .identity()
-                .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
-            let bound = self
-                .instances_root_directory()
-                .identity()
-                .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
-            if current != bound {
-                return Err(ManagedMutationError::reconciliation_required(
-                    "admitted_instance_mismatch",
-                ));
-            }
-            return Ok(directory.clone());
+        let directory = &identity.admitted_directory;
+        let current = directory
+            .identity()
+            .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+        let bound = self
+            .instances_root_directory()
+            .identity()
+            .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+        if current != bound {
+            return Err(ManagedMutationError::reconciliation_required(
+                "admitted_instance_mismatch",
+            ));
         }
-        let instances_root = self.instances_root_directory().clone();
-        let instance_id = identity.instance_id().to_string();
-        run_managed_blocking(PhysicalIoClass::Metadata, move || {
-            let instance_id = LeafName::new(instance_id).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "managed composition instance identity is not a direct leaf",
-                )
-            })?;
-            instances_root.open_directory(&instance_id)
-        })
-        .await
-        .map_err(|_| ManagedMutationError::task_stopped("identity_validation"))?
-        .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
+        Ok(directory.clone())
     }
 }
 
