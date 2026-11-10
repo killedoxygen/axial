@@ -2708,159 +2708,250 @@ enum OwnedEffect {
     DirectoryRemoval(DirectoryRemovalObligation),
     ParkedDirectoryTreeRemoval(RetainedDirectoryTreeRemoval),
     DirectoryTreeRemoval(DirectoryTreeRemovalObligation),
-    FilePromotion(OwnedFilePromotion),
-    FileReplace(OwnedFileReplace),
-    FileMove(OwnedFileMove),
-    DirectoryMove(OwnedDirectoryMove),
+    FilePromotion(OwnedReceipt<Box<FilePromotionObligation>>),
+    FileReplace(Box<OwnedReceipt<FileReplaceObligation>>),
+    FileMove(OwnedReceipt<FileMoveObligation>),
+    DirectoryMove(OwnedReceipt<DirectoryMoveObligation>),
 }
 
-enum OwnedFilePromotion {
-    Pending {
-        obligation: Box<FilePromotionObligation>,
-        receipt_live: ReceiptLiveness,
-    },
-    Ready {
-        terminal: FilePromotionTerminal,
-        receipt_live: ReceiptLiveness,
-    },
+/// An effect an owner reconciles until a live receipt claims its terminal result.
+trait ReceiptEffect: Sized {
+    type Applied;
+    type NoEffect;
+
+    fn reconcile_owned(self) -> Resolution<Self::Applied, Self::NoEffect, Self>;
+    fn wrap(owned: OwnedReceipt<Self>) -> OwnedEffect;
+    fn project(effect: OwnedEffect) -> Result<OwnedReceipt<Self>, OwnedEffect>;
 }
 
-enum FilePromotionTerminal {
-    Applied(FileCapability),
-    NoEffect(SealedStagedFile),
+macro_rules! impl_owned_receipt {
+    ($effect:ty, $outcome:ty) => {
+        impl Receipt<$effect> {
+            pub fn claim(self) -> $outcome {
+                claim_receipt(self)
+            }
+        }
+    };
 }
 
-enum OwnedFileReplace {
-    Pending {
-        obligation: Box<FileReplaceObligation>,
-        receipt_live: ReceiptLiveness,
-    },
-    Ready {
-        terminal: Box<FileReplaceTerminal>,
-        receipt_live: ReceiptLiveness,
-    },
+impl ReceiptEffect for Box<FilePromotionObligation> {
+    type Applied = FileCapability;
+    type NoEffect = SealedStagedFile;
+
+    fn reconcile_owned(self) -> FilePromotionResolution {
+        (*self).reconcile()
+    }
+
+    fn wrap(owned: OwnedReceipt<Self>) -> OwnedEffect {
+        OwnedEffect::FilePromotion(owned)
+    }
+
+    fn project(effect: OwnedEffect) -> Result<OwnedReceipt<Self>, OwnedEffect> {
+        match effect {
+            OwnedEffect::FilePromotion(owned) => Ok(owned),
+            effect => Err(effect),
+        }
+    }
 }
 
-enum FileReplaceTerminal {
-    Replaced {
-        current: FileCapability,
-        displaced: Option<ParkedFile>,
-    },
-    NoEffect {
-        staged: SealedStagedFile,
-        destination: ReplaceDestination,
-    },
+impl ReceiptEffect for FileReplaceObligation {
+    type Applied = (FileCapability, Option<ParkedFile>);
+    type NoEffect = (SealedStagedFile, ReplaceDestination);
+
+    fn reconcile_owned(self) -> Resolution<Self::Applied, Self::NoEffect, Self> {
+        match self.reconcile() {
+            FileReplaceResolution::Replaced { current, displaced } => {
+                Resolution::Applied((current, displaced))
+            }
+            FileReplaceResolution::NoEffect {
+                staged,
+                destination,
+            } => Resolution::NoEffect((staged, destination)),
+            FileReplaceResolution::Indeterminate(obligation) => {
+                Resolution::Indeterminate(obligation)
+            }
+        }
+    }
+
+    fn wrap(owned: OwnedReceipt<Self>) -> OwnedEffect {
+        OwnedEffect::FileReplace(Box::new(owned))
+    }
+
+    fn project(effect: OwnedEffect) -> Result<OwnedReceipt<Self>, OwnedEffect> {
+        match effect {
+            OwnedEffect::FileReplace(owned) => Ok(*owned),
+            effect => Err(effect),
+        }
+    }
 }
 
-enum OwnedFileMove {
-    Pending {
-        obligation: FileMoveObligation,
-        receipt_live: ReceiptLiveness,
-    },
-    Ready {
-        terminal: FileMoveTerminal,
-        receipt_live: ReceiptLiveness,
-    },
+impl ReceiptEffect for FileMoveObligation {
+    type Applied = FileCapability;
+    type NoEffect = FileCapability;
+
+    fn reconcile_owned(self) -> FileMoveResolution {
+        self.reconcile()
+    }
+
+    fn wrap(owned: OwnedReceipt<Self>) -> OwnedEffect {
+        OwnedEffect::FileMove(owned)
+    }
+
+    fn project(effect: OwnedEffect) -> Result<OwnedReceipt<Self>, OwnedEffect> {
+        match effect {
+            OwnedEffect::FileMove(owned) => Ok(owned),
+            effect => Err(effect),
+        }
+    }
 }
 
-enum FileMoveTerminal {
-    Applied(FileCapability),
-    NoEffect(FileCapability),
+impl ReceiptEffect for DirectoryMoveObligation {
+    type Applied = Directory;
+    type NoEffect = Directory;
+
+    fn reconcile_owned(self) -> DirectoryMoveResolution {
+        self.reconcile()
+    }
+
+    fn wrap(owned: OwnedReceipt<Self>) -> OwnedEffect {
+        OwnedEffect::DirectoryMove(owned)
+    }
+
+    fn project(effect: OwnedEffect) -> Result<OwnedReceipt<Self>, OwnedEffect> {
+        match effect {
+            OwnedEffect::DirectoryMove(owned) => Ok(owned),
+            effect => Err(effect),
+        }
+    }
 }
 
-enum OwnedDirectoryMove {
-    Pending {
-        obligation: DirectoryMoveObligation,
-        receipt_live: ReceiptLiveness,
-    },
-    Ready {
-        terminal: DirectoryMoveTerminal,
-        receipt_live: ReceiptLiveness,
-    },
+enum Owned<E: ReceiptEffect> {
+    Pending(E),
+    Applied(E::Applied),
+    NoEffect(E::NoEffect),
 }
 
-enum DirectoryMoveTerminal {
-    Applied(Directory),
-    NoEffect(Directory),
-}
-
-#[must_use = "file promotion receipts must be claimed after explicit owner settlement"]
-pub struct FilePromotionReceipt {
-    owner: Arc<EffectOwnerState>,
-    id: u64,
+/// An owner-held effect and the liveness of the receipt that may claim it.
+struct OwnedReceipt<E: ReceiptEffect> {
+    state: Owned<E>,
     live: ReceiptLiveness,
 }
 
-impl_redacted_debug!(FilePromotionReceipt);
+impl<E: ReceiptEffect> OwnedReceipt<E> {
+    fn is_pending(&self) -> bool {
+        matches!(self.state, Owned::Pending(_))
+    }
 
-#[must_use = "file promotion receipt outcomes must be handled"]
-pub enum FilePromotionReceiptOutcome {
-    Pending(FilePromotionReceipt),
-    Applied(FileCapability),
-    NoEffect(SealedStagedFile),
+    fn is_domain_pending(&self) -> bool {
+        self.is_pending() || receipt_is_live(&self.live)
+    }
+
+    /// Reconciles a pending effect; a settled result whose receipt was dropped is
+    /// abandoned instead of retained.
+    fn settle(self) -> Option<Self> {
+        let state = match self.state {
+            Owned::Pending(effect) => match effect.reconcile_owned() {
+                Resolution::Applied(applied) => Owned::Applied(applied),
+                Resolution::NoEffect(item) => Owned::NoEffect(item),
+                Resolution::Indeterminate(effect) => Owned::Pending(effect),
+            },
+            settled => settled,
+        };
+        let owned = Self {
+            state,
+            live: self.live,
+        };
+        (owned.is_pending() || receipt_is_live(&owned.live)).then_some(owned)
+    }
 }
 
-impl_redacted_debug!(FilePromotionReceiptOutcome);
-
-#[must_use = "file replacement receipts must be claimed after explicit owner settlement"]
-pub struct FileReplaceReceipt {
+/// Claims an owner-settled effect. Dropping the receipt abandons its result.
+#[must_use = "effect receipts must be claimed after explicit owner settlement"]
+pub struct Receipt<E> {
     owner: Arc<EffectOwnerState>,
     id: u64,
     live: ReceiptLiveness,
+    effect: std::marker::PhantomData<fn() -> E>,
 }
 
-impl_redacted_debug!(FileReplaceReceipt);
-
-#[must_use = "file replacement receipt outcomes must be handled"]
-pub enum FileReplaceReceiptOutcome {
-    Pending(FileReplaceReceipt),
-    Replaced {
-        current: FileCapability,
-        displaced: Option<ParkedFile>,
-    },
-    NoEffect {
-        staged: SealedStagedFile,
-        destination: ReplaceDestination,
-    },
+impl<E> fmt::Debug for Receipt<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Receipt").finish_non_exhaustive()
+    }
 }
 
-impl_redacted_debug!(FileReplaceReceiptOutcome);
-
-#[must_use = "file move receipts must be claimed after explicit owner settlement"]
-pub struct FileMoveReceipt {
-    owner: Arc<EffectOwnerState>,
-    id: u64,
-    live: ReceiptLiveness,
+impl<E> Drop for Receipt<E> {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
 }
 
-impl_redacted_debug!(FileMoveReceipt);
-
-#[must_use = "file move receipt outcomes must be handled"]
-pub enum FileMoveReceiptOutcome {
-    Pending(FileMoveReceipt),
-    Applied(FileCapability),
-    NoEffect(FileCapability),
+#[must_use = "receipt outcomes must be handled"]
+#[derive(Debug)]
+pub enum ReceiptOutcome<A, N, R> {
+    Pending(R),
+    Applied(A),
+    NoEffect(N),
 }
 
-impl_redacted_debug!(FileMoveReceiptOutcome);
+pub type FilePromotionReceipt = Receipt<Box<FilePromotionObligation>>;
+pub type FileReplaceReceipt = Receipt<FileReplaceObligation>;
+pub type FileMoveReceipt = Receipt<FileMoveObligation>;
+pub type DirectoryMoveReceipt = Receipt<DirectoryMoveObligation>;
+pub type FilePromotionReceiptOutcome =
+    ReceiptOutcome<FileCapability, SealedStagedFile, FilePromotionReceipt>;
+pub type FileReplaceReceiptOutcome = ReceiptOutcome<
+    (FileCapability, Option<ParkedFile>),
+    (SealedStagedFile, ReplaceDestination),
+    FileReplaceReceipt,
+>;
+pub type FileMoveReceiptOutcome = ReceiptOutcome<FileCapability, FileCapability, FileMoveReceipt>;
+pub type DirectoryMoveReceiptOutcome = ReceiptOutcome<Directory, Directory, DirectoryMoveReceipt>;
 
-#[must_use = "directory move receipts must be claimed after explicit owner settlement"]
-pub struct DirectoryMoveReceipt {
-    owner: Arc<EffectOwnerState>,
-    id: u64,
-    live: ReceiptLiveness,
+impl_owned_receipt!(Box<FilePromotionObligation>, FilePromotionReceiptOutcome);
+impl_owned_receipt!(FileReplaceObligation, FileReplaceReceiptOutcome);
+impl_owned_receipt!(FileMoveObligation, FileMoveReceiptOutcome);
+impl_owned_receipt!(DirectoryMoveObligation, DirectoryMoveReceiptOutcome);
+
+fn claim_receipt<E: ReceiptEffect>(
+    receipt: Receipt<E>,
+) -> ReceiptOutcome<E::Applied, E::NoEffect, Receipt<E>> {
+    let mut records = receipt
+        .owner
+        .effects
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(effect) = records.effects.remove(&receipt.id) else {
+        drop(records);
+        return ReceiptOutcome::Pending(receipt);
+    };
+    let owned = match E::project(effect) {
+        Ok(owned)
+            if Arc::ptr_eq(&owned.live, &receipt.live)
+                && receipt_is_live(&owned.live)
+                && !owned.is_pending() =>
+        {
+            owned
+        }
+        Ok(owned) => {
+            records.effects.insert(receipt.id, E::wrap(owned));
+            drop(records);
+            return ReceiptOutcome::Pending(receipt);
+        }
+        Err(effect) => {
+            records.effects.insert(receipt.id, effect);
+            drop(records);
+            return ReceiptOutcome::Pending(receipt);
+        }
+    };
+    drop(records);
+    deactivate_claimed_owner(&receipt.owner);
+    match owned.state {
+        Owned::Applied(applied) => ReceiptOutcome::Applied(applied),
+        Owned::NoEffect(item) => ReceiptOutcome::NoEffect(item),
+        Owned::Pending(_) => unreachable!("claimed receipt is settled"),
+    }
 }
-
-impl_redacted_debug!(DirectoryMoveReceipt);
-
-#[must_use = "directory move receipt outcomes must be handled"]
-pub enum DirectoryMoveReceiptOutcome {
-    Pending(DirectoryMoveReceipt),
-    Applied(Directory),
-    NoEffect(Directory),
-}
-
-impl_redacted_debug!(DirectoryMoveReceiptOutcome);
 
 impl EffectOwner {
     pub fn anchor_identity(&self) -> DirectoryIdentity {
@@ -3076,25 +3167,9 @@ impl EffectOwner {
         &self,
         obligation: Box<FilePromotionObligation>,
     ) -> Result<FilePromotionReceipt, EffectOwnerRetentionError<Box<FilePromotionObligation>>> {
-        let live = Arc::new(AtomicBool::new(true));
-        let record_live = live.clone();
-        self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation.retained.file.parent.is_within(anchor)
-                    && obligation.destination.is_within(anchor)
-            },
-            move |obligation| {
-                OwnedEffect::FilePromotion(OwnedFilePromotion::Pending {
-                    obligation,
-                    receipt_live: record_live,
-                })
-            },
-        )
-        .map(|id| FilePromotionReceipt {
-            owner: self.state.clone(),
-            id,
-            live,
+        self.retain_receipt(obligation, |anchor, obligation| {
+            obligation.retained.file.parent.is_within(anchor)
+                && obligation.destination.is_within(anchor)
         })
     }
 
@@ -3102,22 +3177,8 @@ impl EffectOwner {
         &self,
         obligation: FileReplaceObligation,
     ) -> Result<FileReplaceReceipt, EffectOwnerRetentionError<FileReplaceObligation>> {
-        let live = Arc::new(AtomicBool::new(true));
-        let record_live = live.clone();
-        self.retain(
-            obligation,
-            |_, anchor, obligation| file_replace_obligation_is_within(obligation, anchor),
-            move |obligation| {
-                OwnedEffect::FileReplace(OwnedFileReplace::Pending {
-                    obligation: Box::new(obligation),
-                    receipt_live: record_live,
-                })
-            },
-        )
-        .map(|id| FileReplaceReceipt {
-            owner: self.state.clone(),
-            id,
-            live,
+        self.retain_receipt(obligation, |anchor, obligation| {
+            file_replace_obligation_is_within(obligation, anchor)
         })
     }
 
@@ -3125,28 +3186,12 @@ impl EffectOwner {
         &self,
         obligation: FileMoveObligation,
     ) -> Result<FileMoveReceipt, EffectOwnerRetentionError<FileMoveObligation>> {
-        let live = Arc::new(AtomicBool::new(true));
-        let record_live = live.clone();
-        self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation
-                    .file
-                    .as_ref()
-                    .is_some_and(|file| file.parent.is_within(anchor))
-                    && obligation.destination.is_within(anchor)
-            },
-            move |obligation| {
-                OwnedEffect::FileMove(OwnedFileMove::Pending {
-                    obligation,
-                    receipt_live: record_live,
-                })
-            },
-        )
-        .map(|id| FileMoveReceipt {
-            owner: self.state.clone(),
-            id,
-            live,
+        self.retain_receipt(obligation, |anchor, obligation| {
+            obligation
+                .file
+                .as_ref()
+                .is_some_and(|file| file.parent.is_within(anchor))
+                && obligation.destination.is_within(anchor)
         })
     }
 
@@ -3154,28 +3199,37 @@ impl EffectOwner {
         &self,
         obligation: DirectoryMoveObligation,
     ) -> Result<DirectoryMoveReceipt, EffectOwnerRetentionError<DirectoryMoveObligation>> {
+        self.retain_receipt(obligation, |anchor, obligation| {
+            obligation
+                .directory
+                .as_ref()
+                .is_some_and(|directory| directory.is_within(anchor))
+                && obligation.destination.is_within(anchor)
+        })
+    }
+
+    fn retain_receipt<E: ReceiptEffect>(
+        &self,
+        effect: E,
+        within: impl FnOnce(&Directory, &E) -> bool,
+    ) -> Result<Receipt<E>, EffectOwnerRetentionError<E>> {
         let live = Arc::new(AtomicBool::new(true));
         let record_live = live.clone();
         self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation
-                    .directory
-                    .as_ref()
-                    .is_some_and(|directory| directory.is_within(anchor))
-                    && obligation.destination.is_within(anchor)
-            },
-            move |obligation| {
-                OwnedEffect::DirectoryMove(OwnedDirectoryMove::Pending {
-                    obligation,
-                    receipt_live: record_live,
+            effect,
+            |_, anchor, effect| within(anchor, effect),
+            move |effect| {
+                E::wrap(OwnedReceipt {
+                    state: Owned::Pending(effect),
+                    live: record_live,
                 })
             },
         )
-        .map(|id| DirectoryMoveReceipt {
+        .map(|id| Receipt {
             owner: self.state.clone(),
             id,
             live,
+            effect: std::marker::PhantomData,
         })
     }
 
@@ -3379,29 +3433,23 @@ impl OwnedEffect {
             Self::DirectoryCreateCompletion(_)
             | Self::DirectoryCreatePreservation(_)
             | Self::ParkedDirectoryTreeRemoval(_)
-            | Self::DirectoryTreeRemoval(_)
-            | Self::FilePromotion(OwnedFilePromotion::Pending { .. })
-            | Self::FileReplace(OwnedFileReplace::Pending { .. })
-            | Self::FileMove(OwnedFileMove::Pending { .. })
-            | Self::DirectoryMove(OwnedDirectoryMove::Pending { .. }) => true,
-            Self::FilePromotion(OwnedFilePromotion::Ready { receipt_live, .. })
-            | Self::FileReplace(OwnedFileReplace::Ready { receipt_live, .. })
-            | Self::FileMove(OwnedFileMove::Ready { receipt_live, .. })
-            | Self::DirectoryMove(OwnedDirectoryMove::Ready { receipt_live, .. }) => {
-                receipt_is_live(receipt_live)
-            }
+            | Self::DirectoryTreeRemoval(_) => true,
+            Self::FilePromotion(owned) => owned.is_domain_pending(),
+            Self::FileReplace(owned) => owned.is_domain_pending(),
+            Self::FileMove(owned) => owned.is_domain_pending(),
+            Self::DirectoryMove(owned) => owned.is_domain_pending(),
             _ => false,
         }
     }
 
     fn is_unresolved(&self) -> bool {
-        !matches!(
-            self,
-            Self::FilePromotion(OwnedFilePromotion::Ready { .. })
-                | Self::FileReplace(OwnedFileReplace::Ready { .. })
-                | Self::FileMove(OwnedFileMove::Ready { .. })
-                | Self::DirectoryMove(OwnedDirectoryMove::Ready { .. })
-        )
+        match self {
+            Self::FilePromotion(owned) => owned.is_pending(),
+            Self::FileReplace(owned) => owned.is_pending(),
+            Self::FileMove(owned) => owned.is_pending(),
+            Self::DirectoryMove(owned) => owned.is_pending(),
+            _ => true,
+        }
     }
 
     fn settle(self) -> Option<Self> {
@@ -3481,149 +3529,13 @@ impl OwnedEffect {
                     Some(Self::DirectoryTreeRemoval(obligation))
                 }
             },
-            Self::FilePromotion(owned) => settle_owned_file_promotion(owned),
-            Self::FileReplace(owned) => settle_owned_file_replace(owned),
-            Self::FileMove(owned) => settle_owned_file_move(owned),
-            Self::DirectoryMove(owned) => settle_owned_directory_move(owned),
+            Self::FilePromotion(owned) => owned.settle().map(Self::FilePromotion),
+            Self::FileReplace(owned) => (*owned)
+                .settle()
+                .map(|owned| Self::FileReplace(Box::new(owned))),
+            Self::FileMove(owned) => owned.settle().map(Self::FileMove),
+            Self::DirectoryMove(owned) => owned.settle().map(Self::DirectoryMove),
         }
-    }
-}
-
-fn settle_owned_file_promotion(owned: OwnedFilePromotion) -> Option<OwnedEffect> {
-    let owned = match owned {
-        OwnedFilePromotion::Pending {
-            obligation,
-            receipt_live,
-        } => match (*obligation).reconcile() {
-            FilePromotionResolution::Applied(file) => OwnedFilePromotion::Ready {
-                terminal: FilePromotionTerminal::Applied(file),
-                receipt_live,
-            },
-            FilePromotionResolution::NoEffect(staged) => OwnedFilePromotion::Ready {
-                terminal: FilePromotionTerminal::NoEffect(staged),
-                receipt_live,
-            },
-            FilePromotionResolution::Indeterminate(obligation) => OwnedFilePromotion::Pending {
-                obligation,
-                receipt_live,
-            },
-        },
-        ready => ready,
-    };
-    match owned {
-        OwnedFilePromotion::Ready {
-            terminal,
-            receipt_live,
-        } if !receipt_is_live(&receipt_live) => {
-            drop(terminal);
-            None
-        }
-        owned => Some(OwnedEffect::FilePromotion(owned)),
-    }
-}
-
-fn settle_owned_file_replace(owned: OwnedFileReplace) -> Option<OwnedEffect> {
-    let owned = match owned {
-        OwnedFileReplace::Pending {
-            obligation,
-            receipt_live,
-        } => match obligation.reconcile() {
-            FileReplaceResolution::Replaced { current, displaced } => OwnedFileReplace::Ready {
-                terminal: Box::new(FileReplaceTerminal::Replaced { current, displaced }),
-                receipt_live,
-            },
-            FileReplaceResolution::NoEffect {
-                staged,
-                destination,
-            } => OwnedFileReplace::Ready {
-                terminal: Box::new(FileReplaceTerminal::NoEffect {
-                    staged,
-                    destination,
-                }),
-                receipt_live,
-            },
-            FileReplaceResolution::Indeterminate(obligation) => OwnedFileReplace::Pending {
-                obligation: Box::new(obligation),
-                receipt_live,
-            },
-        },
-        ready => ready,
-    };
-    match owned {
-        OwnedFileReplace::Ready {
-            terminal,
-            receipt_live,
-        } if !receipt_is_live(&receipt_live) => {
-            drop(terminal);
-            None
-        }
-        owned => Some(OwnedEffect::FileReplace(owned)),
-    }
-}
-
-fn settle_owned_file_move(owned: OwnedFileMove) -> Option<OwnedEffect> {
-    let owned = match owned {
-        OwnedFileMove::Pending {
-            obligation,
-            receipt_live,
-        } => match obligation.reconcile() {
-            FileMoveResolution::Applied(file) => OwnedFileMove::Ready {
-                terminal: FileMoveTerminal::Applied(file),
-                receipt_live,
-            },
-            FileMoveResolution::NoEffect(file) => OwnedFileMove::Ready {
-                terminal: FileMoveTerminal::NoEffect(file),
-                receipt_live,
-            },
-            FileMoveResolution::Indeterminate(obligation) => OwnedFileMove::Pending {
-                obligation,
-                receipt_live,
-            },
-        },
-        ready => ready,
-    };
-    match owned {
-        OwnedFileMove::Ready {
-            terminal,
-            receipt_live,
-        } if !receipt_is_live(&receipt_live) => {
-            drop(terminal);
-            None
-        }
-        owned => Some(OwnedEffect::FileMove(owned)),
-    }
-}
-
-fn settle_owned_directory_move(owned: OwnedDirectoryMove) -> Option<OwnedEffect> {
-    let owned = match owned {
-        OwnedDirectoryMove::Pending {
-            obligation,
-            receipt_live,
-        } => match obligation.reconcile() {
-            DirectoryMoveResolution::Applied(directory) => OwnedDirectoryMove::Ready {
-                terminal: DirectoryMoveTerminal::Applied(directory),
-                receipt_live,
-            },
-            DirectoryMoveResolution::NoEffect(directory) => OwnedDirectoryMove::Ready {
-                terminal: DirectoryMoveTerminal::NoEffect(directory),
-                receipt_live,
-            },
-            DirectoryMoveResolution::Indeterminate(obligation) => OwnedDirectoryMove::Pending {
-                obligation,
-                receipt_live,
-            },
-        },
-        ready => ready,
-    };
-    match owned {
-        OwnedDirectoryMove::Ready {
-            terminal,
-            receipt_live,
-        } if !receipt_is_live(&receipt_live) => {
-            drop(terminal);
-            None
-        }
-        owned => Some(OwnedEffect::DirectoryMove(owned)),
     }
 }
 
@@ -3671,178 +3583,6 @@ fn owned_parked_directory_tree_removal(
         DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
             Some(OwnedEffect::DirectoryTreeRemoval(obligation))
         }
-    }
-}
-
-impl FilePromotionReceipt {
-    pub fn claim(self) -> FilePromotionReceiptOutcome {
-        let mut records = self
-            .owner
-            .effects
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let effect = records.effects.remove(&self.id);
-        match effect {
-            Some(OwnedEffect::FilePromotion(OwnedFilePromotion::Ready {
-                terminal,
-                receipt_live,
-            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
-                drop(records);
-                deactivate_claimed_owner(&self.owner);
-                match terminal {
-                    FilePromotionTerminal::Applied(file) => {
-                        FilePromotionReceiptOutcome::Applied(file)
-                    }
-                    FilePromotionTerminal::NoEffect(staged) => {
-                        FilePromotionReceiptOutcome::NoEffect(staged)
-                    }
-                }
-            }
-            Some(effect) => {
-                records.effects.insert(self.id, effect);
-                drop(records);
-                FilePromotionReceiptOutcome::Pending(self)
-            }
-            None => {
-                drop(records);
-                FilePromotionReceiptOutcome::Pending(self)
-            }
-        }
-    }
-}
-
-impl FileReplaceReceipt {
-    pub fn claim(self) -> FileReplaceReceiptOutcome {
-        let mut records = self
-            .owner
-            .effects
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let effect = records.effects.remove(&self.id);
-        match effect {
-            Some(OwnedEffect::FileReplace(OwnedFileReplace::Ready {
-                terminal,
-                receipt_live,
-            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
-                drop(records);
-                deactivate_claimed_owner(&self.owner);
-                match *terminal {
-                    FileReplaceTerminal::Replaced { current, displaced } => {
-                        FileReplaceReceiptOutcome::Replaced { current, displaced }
-                    }
-                    FileReplaceTerminal::NoEffect {
-                        staged,
-                        destination,
-                    } => FileReplaceReceiptOutcome::NoEffect {
-                        staged,
-                        destination,
-                    },
-                }
-            }
-            Some(effect) => {
-                records.effects.insert(self.id, effect);
-                drop(records);
-                FileReplaceReceiptOutcome::Pending(self)
-            }
-            None => {
-                drop(records);
-                FileReplaceReceiptOutcome::Pending(self)
-            }
-        }
-    }
-}
-
-impl FileMoveReceipt {
-    pub fn claim(self) -> FileMoveReceiptOutcome {
-        let mut records = self
-            .owner
-            .effects
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let effect = records.effects.remove(&self.id);
-        match effect {
-            Some(OwnedEffect::FileMove(OwnedFileMove::Ready {
-                terminal,
-                receipt_live,
-            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
-                drop(records);
-                deactivate_claimed_owner(&self.owner);
-                match terminal {
-                    FileMoveTerminal::Applied(file) => FileMoveReceiptOutcome::Applied(file),
-                    FileMoveTerminal::NoEffect(file) => FileMoveReceiptOutcome::NoEffect(file),
-                }
-            }
-            Some(effect) => {
-                records.effects.insert(self.id, effect);
-                drop(records);
-                FileMoveReceiptOutcome::Pending(self)
-            }
-            None => {
-                drop(records);
-                FileMoveReceiptOutcome::Pending(self)
-            }
-        }
-    }
-}
-
-impl DirectoryMoveReceipt {
-    pub fn claim(self) -> DirectoryMoveReceiptOutcome {
-        let mut records = self
-            .owner
-            .effects
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let effect = records.effects.remove(&self.id);
-        match effect {
-            Some(OwnedEffect::DirectoryMove(OwnedDirectoryMove::Ready {
-                terminal,
-                receipt_live,
-            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
-                drop(records);
-                deactivate_claimed_owner(&self.owner);
-                match terminal {
-                    DirectoryMoveTerminal::Applied(directory) => {
-                        DirectoryMoveReceiptOutcome::Applied(directory)
-                    }
-                    DirectoryMoveTerminal::NoEffect(directory) => {
-                        DirectoryMoveReceiptOutcome::NoEffect(directory)
-                    }
-                }
-            }
-            Some(effect) => {
-                records.effects.insert(self.id, effect);
-                drop(records);
-                DirectoryMoveReceiptOutcome::Pending(self)
-            }
-            None => {
-                drop(records);
-                DirectoryMoveReceiptOutcome::Pending(self)
-            }
-        }
-    }
-}
-
-impl Drop for FilePromotionReceipt {
-    fn drop(&mut self) {
-        self.live.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for FileReplaceReceipt {
-    fn drop(&mut self) {
-        self.live.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for FileMoveReceipt {
-    fn drop(&mut self) {
-        self.live.store(false, Ordering::Release);
-    }
-}
-
-impl Drop for DirectoryMoveReceipt {
-    fn drop(&mut self) {
-        self.live.store(false, Ordering::Release);
     }
 }
 
@@ -18137,17 +17877,25 @@ mod tests {
             let records = owner.state.effects.lock().expect("owner records");
             assert!(matches!(
                 records.effects.get(&first.id),
-                Some(OwnedEffect::FileMove(OwnedFileMove::Pending { .. }))
+                Some(OwnedEffect::FileMove(OwnedReceipt {
+                    state: Owned::Pending(_),
+                    ..
+                }))
             ));
             assert!(matches!(
                 records.effects.get(&second.id),
-                Some(OwnedEffect::FileMove(OwnedFileMove::Pending { .. }))
+                Some(OwnedEffect::FileMove(OwnedReceipt {
+                    state: Owned::Pending(_),
+                    ..
+                }))
             ));
         }
         {
             let mut records = owner.state.effects.lock().expect("owner records");
-            let Some(OwnedEffect::FileMove(OwnedFileMove::Pending { obligation, .. })) =
-                records.effects.get_mut(&first.id)
+            let Some(OwnedEffect::FileMove(OwnedReceipt {
+                state: Owned::Pending(obligation),
+                ..
+            })) = records.effects.get_mut(&first.id)
             else {
                 panic!("first move remains pending")
             };
@@ -18298,11 +18046,8 @@ mod tests {
             outcome => panic!("live replacement receipt did not block revocation: {outcome:?}"),
         };
         let (staged, destination) = match receipt.claim() {
-            FileReplaceReceiptOutcome::NoEffect {
-                staged,
-                destination,
-            } => (staged, destination),
-            FileReplaceReceiptOutcome::Replaced { .. } => {
+            FileReplaceReceiptOutcome::NoEffect(refused) => refused,
+            FileReplaceReceiptOutcome::Applied(_) => {
                 panic!("test replacement unexpectedly applied")
             }
             FileReplaceReceiptOutcome::Pending(_) => {

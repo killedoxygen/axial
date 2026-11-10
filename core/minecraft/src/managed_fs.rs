@@ -1126,17 +1126,14 @@ impl ManagedEffectContinuation {
             },
             Self::FileReplace(receipt) => match receipt.claim() {
                 FileReplaceReceiptOutcome::Pending(receipt) => Some(Self::FileReplace(receipt)),
-                FileReplaceReceiptOutcome::Replaced { current, displaced } => {
+                FileReplaceReceiptOutcome::Applied((current, displaced)) => {
                     drop(current);
                     if let Some(displaced) = displaced {
                         retain_parked_file_removal_locked(transition, displaced);
                     }
                     None
                 }
-                FileReplaceReceiptOutcome::NoEffect {
-                    staged,
-                    destination,
-                } => {
+                FileReplaceReceiptOutcome::NoEffect((staged, destination)) => {
                     drop(destination);
                     retain_stage_discard_locked(transition, staged.discard());
                     None
@@ -3147,7 +3144,7 @@ impl ManagedDir {
                 );
                 let _settlement = root.effects.settle();
                 match receipt.claim() {
-                    FileReplaceReceiptOutcome::Replaced { current, displaced } => {
+                    FileReplaceReceiptOutcome::Applied((current, displaced)) => {
                         if let Some(displaced) = displaced {
                             retain_parked_file_removal_locked(&transition, displaced);
                         }
@@ -3155,10 +3152,7 @@ impl ManagedDir {
                         root.settle_locked(&transition)?;
                         Ok(guard)
                     }
-                    FileReplaceReceiptOutcome::NoEffect {
-                        staged,
-                        destination,
-                    } => {
+                    FileReplaceReceiptOutcome::NoEffect((staged, destination)) => {
                         drop(destination);
                         self.discard_sealed_stage_locked(&transition, staged)?;
                         Err(unsettled("managed replacement had no effect"))
