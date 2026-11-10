@@ -4726,19 +4726,6 @@ impl CapabilityAuthority {
         Ok(())
     }
 
-    fn cancel_reset_pending_directory_creates(&self) -> io::Result<()> {
-        let mut state = self.state()?;
-        if state.phase != AUTHORITY_DRAINING {
-            return Err(stale_capability());
-        }
-        for record in state.directory_creations.values_mut() {
-            if record.phase == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending {
-                record.phase = DirectoryCreateEffectPhase::UnclassifiedAbandoned;
-            }
-        }
-        Ok(())
-    }
-
     fn enter_reset_operation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
         let mut state = self.state()?;
         if state.phase != AUTHORITY_RESETTING || state.active != 0 {
@@ -9815,7 +9802,7 @@ impl Directory {
         file.validate_revision_observation_in(&operation, expected)
     }
 
-    pub fn create_file_create_only(&self, name: &LeafName) -> FileCreateOutcome {
+    pub(crate) fn create_file_create_only(&self, name: &LeafName) -> FileCreateOutcome {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => return FileCreateOutcome::NoEffect(error),
@@ -10642,10 +10629,6 @@ impl FileRevision {
         platform::file_modified_at_ns(self.stamp)
     }
 
-    pub fn changed_at_ns(&self) -> io::Result<u64> {
-        platform::file_changed_at_ns(self.stamp)
-    }
-
     pub fn has_same_rename_stable_metadata(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.authority, &other.authority)
             && self.identity == other.identity
@@ -11433,7 +11416,7 @@ impl StagedFile {
 
     /// Seals scratch bytes whose durability is deferred until promotion.
     /// Recoverable stages journal their sealed proof and stay durable at seal.
-    pub fn seal_scratch(self) -> Result<SealedStagedFile, StageSealFailure> {
+    pub(crate) fn seal_scratch(self) -> Result<SealedStagedFile, StageSealFailure> {
         self.seal_inner(false)
     }
 
@@ -12835,7 +12818,7 @@ impl RootSession {
         Ok(())
     }
 
-    pub fn admit_absolute_directory_authority(
+    pub(crate) fn admit_absolute_directory_authority(
         &self,
         path: &Path,
     ) -> io::Result<AdmittedAbsoluteDirectory> {
@@ -12914,7 +12897,7 @@ impl RootSession {
         }
     }
 
-    pub fn begin_reset(self) -> ResetStartOutcome {
+    pub(crate) fn begin_reset(self) -> ResetStartOutcome {
         if let Err(error) = self
             .authority
             .validate_retained_process_image_outside_root()
@@ -13318,18 +13301,6 @@ impl ResetDrainAuthority {
             }
         }
     }
-
-    fn cancel_reset(mut self) -> RootRevokeOutcome {
-        let session = self.session.take().expect("reset drain retains session");
-        let cancellation = session.authority.cancel_reset_pending_directory_creates();
-        let revoke = RootRevokeDrain {
-            session: Some(session),
-        };
-        match cancellation {
-            Ok(()) => revoke.try_settle(),
-            Err(error) => RootRevokeOutcome::Failed(RootRevokeDrainFailure::new(revoke, error)),
-        }
-    }
 }
 
 #[must_use = "reset recovery must settle every abandoned effect before the drain can finish"]
@@ -13391,7 +13362,8 @@ impl ResetStartFailure {
             .begin_reset()
     }
 
-    pub fn cancel_reset(mut self) -> RootSession {
+    #[cfg(test)]
+    pub(crate) fn cancel_reset(mut self) -> RootSession {
         self.session
             .take()
             .expect("reset start refusal retains session")
@@ -13429,13 +13401,6 @@ impl ResetDrainFailure {
             .take()
             .expect("reset failure retains drain")
             .try_settle()
-    }
-
-    pub fn cancel_reset(mut self) -> RootRevokeOutcome {
-        self.drain
-            .take()
-            .expect("reset failure retains drain")
-            .cancel_reset()
     }
 }
 
@@ -21337,7 +21302,6 @@ mod tests {
         let revision = file.revision().expect("file revision");
         assert_eq!(revision.size(), 6);
         let _ = revision.modified_at_ns().expect("mtime");
-        let _ = revision.changed_at_ns().expect("ctime");
         assert_eq!(
             file.read_range_bounded(&revision, 2, 3)
                 .expect("bounded range"),
