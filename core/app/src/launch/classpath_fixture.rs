@@ -229,6 +229,7 @@ async fn real_java_loads_verified_classpath_from_canonical_windows_capabilities(
         },
         installed,
         prepared_natives: None,
+        game_assets: None,
     })
     .unwrap();
     let classpath_index = command

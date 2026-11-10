@@ -262,7 +262,7 @@ pub(super) mod tests {
         let (version_id, metadata, java_version) = if legacy {
             (
                 "1.4.7",
-                br#"{"id":"1.4.7","type":"release","mainClass":"net.minecraft.client.Minecraft","minecraftArguments":"${auth_player_name} ${auth_session} --gameDir ${game_directory}"}"#.as_slice(),
+                br#"{"id":"1.4.7","type":"release","mainClass":"net.minecraft.client.Minecraft","minecraftArguments":"${auth_player_name} ${auth_session} --gameDir ${game_directory} --assetsDir ${game_assets}","assetIndex":{"id":"pre-1.6"}}"#.as_slice(),
                 "1.8.0_312",
             )
         } else {
@@ -337,13 +337,27 @@ pub(super) mod tests {
             .await
             .unwrap();
         let mut files = Vec::new();
-        for (path, bytes) in [
+        let object = hex::encode(Sha1::digest(b"step"));
+        let index = format!(
+            r#"{{"map_to_resources":true,"objects":{{"sound/step.ogg":{{"hash":"{object}","size":4}}}}}}"#
+        );
+        let mut inventory = vec![
             (format!("versions/{version_id}/{version_id}.json"), metadata),
             (
                 format!("versions/{version_id}/{version_id}.jar"),
                 b"verified client".as_slice(),
             ),
-        ] {
+        ];
+        if legacy {
+            inventory.extend([
+                ("assets/indexes/pre-1.6.json".into(), index.as_bytes()),
+                (
+                    format!("assets/objects/{}/{object}", &object[..2]),
+                    b"step".as_slice(),
+                ),
+            ]);
+        }
+        for (path, bytes) in inventory {
             let target = root.path().join(&path);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
             std::fs::write(target, bytes).unwrap();
@@ -373,18 +387,33 @@ pub(super) mod tests {
         accounts.create_offline_account("Player").unwrap();
         let settings = Arc::new(SettingsStore::new(storage).unwrap());
         let operation = instance.generation().managed_library().unwrap();
+        let library_dir = instance.generation().read_projection().unwrap();
+        let game_dir = instance.game_directory().read_projection().unwrap();
+        let game_assets = super::super::assets::prepare(
+            &installed,
+            &operation,
+            &library_dir,
+            &game_dir,
+            Arc::new(super::super::libraries::Retention::isolated_for_test(
+                instance.game_directory().clone(),
+            )),
+            &crate::tasks::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         let command = super::super::plan::build(super::super::model::LaunchPlanRequest {
             version_guard: axial_minecraft::VersionBundleReadGuard::acquire(&operation).unwrap(),
             library_operation: operation,
-            library_dir: instance.generation().read_projection().unwrap(),
+            library_dir,
             target_version_id: version_id.into(),
-            game_dir: instance.game_directory().read_projection().unwrap(),
+            game_dir,
             auth: super::super::model::LaunchAuthContext::offline("Player"),
             runtime,
             managed_launch: None,
             settings: Default::default(),
             installed,
             prepared_natives: None,
+            game_assets,
         })
         .unwrap();
         let installed_versions = crate::catalog::installed_snapshot(instance.generation())

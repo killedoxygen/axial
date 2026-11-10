@@ -103,6 +103,8 @@ pub(crate) struct LaunchPlanRequest {
     pub installed: InstalledVersionReceipt,
     pub version_guard: VersionBundleReadGuard,
     pub prepared_natives: Option<Arc<PreparedNatives>>,
+    /// The verified legacy asset tree, when the installed index names one.
+    pub game_assets: Option<PathBuf>,
 }
 
 /// There is no public constructor, deserializer, or raw command export. The
@@ -189,8 +191,6 @@ pub enum LaunchPlanError {
     ArtifactChanged,
     #[error("Native libraries have not been prepared. Finish installation before launching.")]
     NativesUnavailable,
-    #[error("Legacy game assets have not been prepared. Finish installation before launching.")]
-    LegacyAssetsUnavailable,
     #[error("The selected Java runtime changed or is unavailable. Select a runtime again.")]
     RuntimeChanged,
     #[error("The selected Java runtime is incompatible with this version.")]

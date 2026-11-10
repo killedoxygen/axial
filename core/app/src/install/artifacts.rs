@@ -10,7 +10,9 @@ use axial_minecraft::loaders::{
     LoaderInstallBaseCommit, LoaderInstallBaseCommitVerificationFailure,
     VerifiedLoaderInstallBaseCommit,
 };
-use axial_minecraft::managed_path::{FileAbsence, FileObservation, ManagedLibraryOperation};
+use axial_minecraft::managed_path::{
+    FileAbsence, FileObservation, ManagedLibraryFile, ManagedLibraryOperation,
+};
 use axial_minecraft::portable_path::{PortableFileName, PortableRelativePath};
 use axial_minecraft::{
     KnownGoodInstallReceipt, ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome,
@@ -109,7 +111,7 @@ impl InventoryBudget {
                     .and_then(|bytes| bytes.checked_add(2))
                     .ok_or(InstallError::AtCapacity)?;
             }
-            if file.path == metadata || (inspection.hashes() && is_asset_index(&file.path)) {
+            if file.path == metadata {
                 // Bounded JSON reads also perform EOF and completion probes.
                 bytes = bytes
                     .checked_add(file.size)
@@ -456,7 +458,6 @@ impl ActivatedVersion {
             // The first damage of each reason, with its absence when missing.
             damage: Vec<(InstallError, Option<FileAbsence>)>,
             version: Option<VersionJson>,
-            asset_flags: BTreeMap<String, bool>,
         }
         let files = &self.files;
         let inspect_range = |range: std::ops::Range<usize>| {
@@ -562,24 +563,6 @@ impl ActivatedVersion {
                                 .map_err(|_| InstallError::NotReady)?,
                         );
                     }
-                    if is_asset_index && inspection.hashes() {
-                        #[derive(Deserialize)]
-                        struct AssetFlags {
-                            #[serde(default, rename = "virtual")]
-                            virtual_assets: bool,
-                            #[serde(default)]
-                            map_to_resources: bool,
-                        }
-                        let bytes = file
-                            .read_bounded(64 << 20)
-                            .map_err(|_| InstallError::NotReady)?;
-                        let flags: AssetFlags =
-                            serde_json::from_slice(&bytes).map_err(|_| InstallError::NotReady)?;
-                        inspected.asset_flags.insert(
-                            expected.path.clone(),
-                            flags.virtual_assets || flags.map_to_resources,
-                        );
-                    }
                     // Retain compact revision evidence, not an open descriptor for
                     // every asset object. Re-observation below is bounded to one file.
                     inspected.guards.push((path, file.revision_observation()));
@@ -593,7 +576,6 @@ impl ActivatedVersion {
         let mut missing = Vec::new();
         let mut reasons = Vec::new();
         let mut version = None;
-        let mut asset_flags = BTreeMap::new();
         for range in ranges {
             guards.extend(range.guards);
             for (reason, absence) in range.damage {
@@ -603,7 +585,6 @@ impl ActivatedVersion {
                 }
             }
             version = version.or(range.version);
-            asset_flags.extend(range.asset_flags);
         }
         let contains = |path: &str| {
             self.files
@@ -613,7 +594,7 @@ impl ActivatedVersion {
         if !contains(&client) || !contains(&metadata_path) {
             return Err(InstallError::NotReady);
         }
-        let virtual_assets = if let Some(version) = version.as_mut() {
+        if let Some(version) = version.as_mut() {
             if version.id != self.version_id
                 || (!version.inherits_from.is_empty() && !version.materialized)
             {
@@ -627,24 +608,14 @@ impl ActivatedVersion {
             if version.asset_index.id.is_empty() && !version.assets.is_empty() {
                 version.asset_index.id = version.assets.clone();
             }
-            if version.asset_index.id.is_empty() {
-                Some(false)
-            } else {
+            if !version.asset_index.id.is_empty() {
                 PortableFileName::new_exact(&version.asset_index.id)
                     .map_err(|_| InstallError::NotReady)?;
-                let index = format!("assets/indexes/{}.json", version.asset_index.id);
-                if !contains(&index) {
+                if !contains(&format!("assets/indexes/{}.json", version.asset_index.id)) {
                     return Err(InstallError::NotReady);
                 }
-                if inspection == Inspection::Summary {
-                    Some(false)
-                } else {
-                    asset_flags.get(&index).copied()
-                }
             }
-        } else {
-            None
-        };
+        }
         let evidence = InventoryEvidence {
             pin,
             operation,
@@ -667,7 +638,6 @@ impl ActivatedVersion {
                 version,
             }));
         }
-        let virtual_assets = virtual_assets.ok_or(InstallError::NotReady)?;
         let client_jar = client_path.join_under(
             &evidence
                 .pin
@@ -683,7 +653,6 @@ impl ActivatedVersion {
                     .map(|file| (file.path, (file.sha1, file.size)))
                     .collect(),
             ),
-            virtual_assets,
             client_jar,
         };
         receipt.revalidate()?;
@@ -796,6 +765,26 @@ impl InventoryEvidence {
         self.guards.len() as u64 + self.missing.len() as u64
     }
 
+    /// Opens an inventoried file only while it keeps its verified revision.
+    fn exact_file(&self, path: &str) -> Result<ManagedLibraryFile, super::queue::InstallError> {
+        use super::queue::InstallError;
+        // Guards follow the inventory's path order.
+        let index = self
+            .guards
+            .binary_search_by(|(recorded, _)| recorded.as_str().cmp(path))
+            .map_err(|_| InstallError::NotReady)?;
+        let (path, revision) = &self.guards[index];
+        let file = self
+            .operation
+            .observe_file(path)
+            .map_err(|_| InstallError::NotReady)?
+            .ok_or(InstallError::NotReady)?;
+        if file.revision_observation() != *revision {
+            return Err(InstallError::NotReady);
+        }
+        Ok(file)
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
         observe_inventory(&self.operation, || {
@@ -861,8 +850,25 @@ pub struct InstalledVersionReceipt {
     evidence: Arc<InventoryEvidence>,
     version: VersionJson,
     exact: Arc<BTreeMap<String, (String, u64)>>,
-    virtual_assets: bool,
     client_jar: PathBuf,
+}
+
+/// A verified legacy index projection. Sources are opened one at a time so a
+/// large tree never holds a descriptor per object.
+pub(crate) struct LegacyAssetInputs {
+    pub(crate) index_id: String,
+    pub(crate) assets: axial_minecraft::LegacyAssets,
+    evidence: Arc<InventoryEvidence>,
+}
+
+impl LegacyAssetInputs {
+    pub(crate) fn source(
+        &self,
+        file: &axial_minecraft::LegacyAssetFile,
+    ) -> Result<ManagedLibraryFile, super::queue::InstallError> {
+        self.evidence
+            .exact_file(&format!("assets/{}", file.object_path()))
+    }
 }
 
 #[derive(Debug)]
@@ -896,9 +902,6 @@ impl InstalledVersionReceipt {
 
     pub fn version(&self) -> &VersionJson {
         &self.version
-    }
-    pub fn virtual_assets(&self) -> bool {
-        self.virtual_assets
     }
     pub fn client_jar(&self) -> &Path {
         &self.client_jar
@@ -1027,6 +1030,65 @@ impl InstalledVersionReceipt {
         .await
         .map_err(GameLibrariesError::Physical)?
         .map_err(GameLibrariesError::Install)
+    }
+
+    /// The named tree this version's verified asset index requires, if any.
+    /// Every named object must belong to the verified inventory.
+    pub(crate) async fn legacy_assets(
+        &self,
+    ) -> Result<Option<LegacyAssetInputs>, super::queue::InstallError> {
+        use super::queue::InstallError;
+        use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
+
+        let index_id = self.version.asset_index.id.clone();
+        if index_id.is_empty() {
+            return Ok(None);
+        }
+        let index_path = format!("assets/indexes/{index_id}.json");
+        let size = self
+            .exact
+            .get(&index_path)
+            .map(|(_, size)| *size)
+            .ok_or(InstallError::NotReady)?;
+        let evidence = self.evidence.clone();
+        let exact = self.exact.clone();
+        // The bounded read plus its parsed projection.
+        let scratch = size.checked_mul(4).ok_or(InstallError::AtCapacity)?;
+        process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Read,
+                scratch,
+            ))
+            .await
+            .map_err(|_| InstallError::AtCapacity)?
+            .run(move |_| {
+                let bytes = evidence
+                    .exact_file(&index_path)?
+                    .read_bounded(size)
+                    .map_err(|_| InstallError::NotReady)?;
+                let Some(assets) =
+                    axial_minecraft::legacy_assets(&bytes).map_err(|_| InstallError::NotReady)?
+                else {
+                    return Ok(None);
+                };
+                for file in &assets.files {
+                    let path = format!("assets/{}", file.object_path());
+                    if exact
+                        .get(&path)
+                        .is_none_or(|(sha1, size)| sha1 != &file.hash || *size != file.size)
+                    {
+                        return Err(InstallError::NotReady);
+                    }
+                }
+                evidence.revalidate()?;
+                Ok(Some(LegacyAssetInputs {
+                    index_id,
+                    assets,
+                    evidence,
+                }))
+            })
+            .await
+            .map_err(|_| InstallError::AtCapacity)?
     }
 
     pub(crate) async fn prepare_natives(

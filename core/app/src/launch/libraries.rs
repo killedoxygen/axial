@@ -1,4 +1,4 @@
-//! Verified immutable FML inputs become create-only, process-writable instance files.
+//! Verified immutable library inputs become create-only, process-writable instance files.
 
 use super::coordinator::LaunchError;
 use crate::{files::ScopedDirectory, install::artifacts::GameLibraries, tasks::CancellationToken};
@@ -29,7 +29,7 @@ use std::{
 
 const MAX_DIRECTORY_ENTRIES: usize = 16_384;
 // Complete bounded namespace listings dominate the streamed copy buffers.
-const SCRATCH_BYTES: u64 = 64 << 20;
+pub(super) const SCRATCH_BYTES: u64 = 64 << 20;
 
 pub(super) struct Prepared {
     directory: ScopedDirectory,
@@ -63,7 +63,7 @@ impl Prepared {
     }
 }
 
-struct FileProof {
+pub(super) struct FileProof {
     name: LeafName,
     file: FileCapability,
     revision: FileRevision,
@@ -71,9 +71,9 @@ struct FileProof {
 
 /// The accepted launch task retains this alongside its instance admission.
 pub(super) struct Retention {
-    game: ScopedDirectory,
+    pub(super) game: ScopedDirectory,
     pending: Mutex<Option<Effect>>,
-    work: PhysicalWorkOwner,
+    pub(super) work: PhysicalWorkOwner,
 }
 
 impl Retention {
@@ -82,6 +82,14 @@ impl Retention {
             game,
             pending: Mutex::new(None),
             work: process_physical_work(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn isolated_for_test(game: ScopedDirectory) -> Self {
+        Self {
+            work: PhysicalWorkOwner::isolated_for_test(),
+            ..Self::new(game)
         }
     }
 
@@ -135,7 +143,11 @@ pub(super) async fn prepare(
         if cancelled.is_cancelled() {
             return Err(LaunchError::Cancelled);
         }
-        let directory = prepare_directory(&retention)?;
+        let directory = prepare_directory(
+            &retention,
+            &retention.game,
+            &LeafName::new("lib").expect("fixed game library directory"),
+        )?;
         let mut files = Vec::with_capacity(inputs.sources.len());
         if inputs.sources.len() != inputs.requirements.entries().len() {
             return Err(LaunchError::InstallUnavailable);
@@ -227,27 +239,26 @@ fn exact_entry(directory: &ScopedDirectory, name: &LeafName) -> io::Result<Optio
     Ok(Some(entry.kind()))
 }
 
-fn prepare_directory(retention: &Retention) -> Result<ScopedDirectory, LaunchError> {
-    let name = LeafName::new("lib").expect("fixed game library directory");
-    let capability = match exact_entry(&retention.game, &name)
-        .map_err(|_| LaunchError::PreparationFailed)?
-    {
-        Some(EntryKind::Directory) => retention
-            .game
+pub(super) fn prepare_directory(
+    retention: &Retention,
+    parent: &ScopedDirectory,
+    name: &LeafName,
+) -> Result<ScopedDirectory, LaunchError> {
+    let capability = match exact_entry(parent, name).map_err(|_| LaunchError::PreparationFailed)? {
+        Some(EntryKind::Directory) => parent
             .capability()
-            .open_directory(&name)
+            .open_directory(name)
             .map_err(|_| LaunchError::PreparationFailed)?,
         Some(_) => return Err(LaunchError::PreparationFailed),
-        None => match retention.game.capability().create_directory(&name) {
+        None => match parent.capability().create_directory(name) {
             DirectoryCreateOutcome::Created(directory) => directory,
             DirectoryCreateOutcome::NoEffect(_) => {
-                if exact_entry(&retention.game, &name).ok() != Some(Some(EntryKind::Directory)) {
+                if exact_entry(parent, name).ok() != Some(Some(EntryKind::Directory)) {
                     return Err(LaunchError::PreparationFailed);
                 }
-                retention
-                    .game
+                parent
                     .capability()
-                    .open_directory(&name)
+                    .open_directory(name)
                     .map_err(|_| LaunchError::PreparationFailed)?
             }
             DirectoryCreateOutcome::AppliedUnverified(effect) => match effect.reconcile() {
@@ -265,7 +276,7 @@ fn prepare_directory(retention: &Retention) -> Result<ScopedDirectory, LaunchErr
             }
         },
     };
-    ScopedDirectory::from_admitted(capability, retention.game.pin().clone())
+    ScopedDirectory::from_admitted(capability, parent.pin().clone())
         .map_err(|_| LaunchError::PreparationFailed)
 }
 
@@ -319,7 +330,7 @@ fn file_proof(
     })
 }
 
-fn prepare_file(
+pub(super) fn prepare_file(
     source: &ManagedLibraryFile,
     directory: &ScopedDirectory,
     name: LeafName,
@@ -478,7 +489,7 @@ pub(super) mod tests {
             work: PhysicalWorkOwner::isolated_for_test(),
             ..Retention::new(game)
         };
-        let directory = prepare_directory(&retention).unwrap();
+        let directory = lib_directory(&retention).unwrap();
         let (_sender, cancellation) = transfer_cancellation_channel();
         let file = prepare_file(
             &source,
@@ -541,6 +552,10 @@ pub(super) mod tests {
         }
     }
 
+    fn lib_directory(retention: &Retention) -> Result<ScopedDirectory, LaunchError> {
+        prepare_directory(retention, &retention.game, &LeafName::new("lib").unwrap())
+    }
+
     fn copy(fixture: &Fixture, directory: &ScopedDirectory) -> Result<FileProof, LaunchError> {
         let (_sender, cancellation) = transfer_cancellation_channel();
         prepare_file(
@@ -557,7 +572,7 @@ pub(super) mod tests {
     #[test]
     fn copy_and_reuse_preserve_sources_unrelated_files_and_published_identity() {
         let fixture = fixture();
-        let directory = prepare_directory(&fixture.retention).unwrap();
+        let directory = lib_directory(&fixture.retention).unwrap();
         let unrelated = fixture.temporary.path().join("game/lib/unrelated.jar");
         std::fs::write(&unrelated, b"user-owned bytes").unwrap();
         let first = copy(&fixture, &directory).unwrap();
@@ -580,7 +595,7 @@ pub(super) mod tests {
     #[test]
     fn conflicting_target_is_refused_without_overwrite() {
         let fixture = fixture();
-        let directory = prepare_directory(&fixture.retention).unwrap();
+        let directory = lib_directory(&fixture.retention).unwrap();
         let target = fixture.temporary.path().join("game/lib/required.jar");
         std::fs::write(&target, b"abd").unwrap();
         assert!(matches!(
@@ -600,7 +615,7 @@ pub(super) mod tests {
     fn matching_symlink_or_hardlink_target_is_not_adopted() {
         for symlink in [true, false] {
             let fixture = fixture();
-            let directory = prepare_directory(&fixture.retention).unwrap();
+            let directory = lib_directory(&fixture.retention).unwrap();
             let outside = fixture.temporary.path().join("outside.jar");
             let target = fixture.temporary.path().join("game/lib/required.jar");
             std::fs::write(&outside, b"abc").unwrap();
@@ -630,7 +645,7 @@ pub(super) mod tests {
     fn cancellation_and_changed_source_do_not_publish_a_target() {
         for cancel in [true, false] {
             let fixture = fixture();
-            let directory = prepare_directory(&fixture.retention).unwrap();
+            let directory = lib_directory(&fixture.retention).unwrap();
             let (sender, cancellation) = transfer_cancellation_channel();
             if cancel {
                 sender.cancel();
@@ -670,7 +685,7 @@ pub(super) mod tests {
     #[test]
     fn published_capability_cannot_adopt_a_same_bytes_path_replacement() {
         let fixture = fixture();
-        let directory = prepare_directory(&fixture.retention).unwrap();
+        let directory = lib_directory(&fixture.retention).unwrap();
         let name = LeafName::new("required.jar").unwrap();
         let target = CreateOnlyTransferTarget::new(
             directory
@@ -712,7 +727,7 @@ pub(super) mod tests {
     #[test]
     fn prepared_copy_rejects_same_bytes_replacement_before_spawn() {
         let fixture = fixture();
-        let directory = prepare_directory(&fixture.retention).unwrap();
+        let directory = lib_directory(&fixture.retention).unwrap();
         let file = copy(&fixture, &directory).unwrap();
         let prepared = Prepared {
             directory,
@@ -734,7 +749,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn prepared_copy_refuses_its_exhausted_worker_pool_and_recovers() {
         let fixture = fixture();
-        let directory = prepare_directory(&fixture.retention).unwrap();
+        let directory = lib_directory(&fixture.retention).unwrap();
         let file = copy(&fixture, &directory).unwrap();
         let prepared = Prepared {
             directory,

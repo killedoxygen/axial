@@ -50,15 +50,3 @@ pub(super) fn download_value_looks_sensitive(value: &str) -> bool {
         || lower.contains("password")
         || lower.contains("provider_payload")
 }
-
-pub(super) fn bounded_provider_path_label(path: &str) -> String {
-    const MAX_LABEL_CHARS: usize = 120;
-    let sanitized = path.replace(['\r', '\n'], "?");
-    let mut chars = sanitized.chars();
-    let label = chars.by_ref().take(MAX_LABEL_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        format!("{label}...")
-    } else {
-        label
-    }
-}

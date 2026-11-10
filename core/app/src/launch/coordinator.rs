@@ -1451,11 +1451,20 @@ impl LaunchCoordinator {
             [&library_dir, &game_dir],
         );
         let game_libraries = match game_libraries {
-            Some(inputs) => {
-                Some(super::libraries::prepare(inputs, library_retention, cancellation).await?)
-            }
+            Some(inputs) => Some(
+                super::libraries::prepare(inputs, library_retention.clone(), cancellation).await?,
+            ),
             None => None,
         };
+        let game_assets = super::assets::prepare(
+            &installed,
+            &library_operation,
+            &library_dir,
+            &game_dir,
+            library_retention,
+            cancellation,
+        )
+        .await?;
         let prepared_natives = installed
             .prepare_natives(&library_operation, &library_dir, &environment)
             .await
@@ -1480,6 +1489,7 @@ impl LaunchCoordinator {
                 installed,
                 version_guard,
                 prepared_natives,
+                game_assets,
                 settings: options,
             })
             .map_err(|error| {
@@ -1643,7 +1653,7 @@ fn bundle_read_error(error: std::io::Error) -> LaunchError {
     }
 }
 
-fn install_read_error(error: InstallError) -> LaunchError {
+pub(super) fn install_read_error(error: InstallError) -> LaunchError {
     match error {
         InstallError::NotReady
         | InstallError::ClientJarMissing

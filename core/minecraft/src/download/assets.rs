@@ -9,38 +9,28 @@ use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
     SelectedDownloadArtifactKind, progress,
 };
-use super::path_safety::bounded_provider_path_label;
 use super::plan::{TransferPlan, TransferPlanContribution};
 use super::transfer::{
     AuthenticatedSelectedArtifactSource, SelectedArtifactSourceRequest,
     acquire_authenticated_selected_artifact_source,
 };
-use crate::asset_index::AssetIndexFlags;
+use crate::asset_index::{LegacyAssetLayout, LegacyAssets, parse_asset_index};
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
 use crate::managed_blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
-use crate::portable_path::{
-    MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName, PortablePathKey, PortableRelativePath,
-};
+use crate::portable_path::{PortableFileName, PortableRelativePath};
 use axial_resource::PhysicalIoClass;
 use futures_util::StreamExt;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-#[cfg(feature = "test-support")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "test-support")]
-use std::sync::{Condvar, Mutex, OnceLock};
 use tokio::sync::mpsc;
 
 pub(crate) const ASSET_OBJECT_BASE_URL: &str = "https://resources.download.minecraft.net";
-const ASSET_INDEX_REPAIR_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const ASSET_REPAIR_PREPARATION_SCRATCH_BYTES: u64 = ASSET_INDEX_REPAIR_MAX_BYTES * 4;
-const ASSET_REPAIR_IO_SCRATCH_BYTES: u64 = 64 * 1024;
+const ASSET_TREE_IO_SCRATCH_BYTES: u64 = 64 * 1024;
 
 pub(super) struct AssetDownloadPipeline {
     task: Option<tokio::task::JoinHandle<Result<RetainedAssetsAcquisition, DownloadError>>>,
@@ -120,19 +110,6 @@ impl<'a, F> AssetSourceAcquisitionRequest<'a, F> {
             cache,
         }
     }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct AssetIndex {
-    pub(crate) objects: HashMap<String, AssetObject>,
-    #[serde(flatten)]
-    flags: AssetIndexFlags,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct AssetObject {
-    pub(crate) hash: String,
-    pub(crate) size: i64,
 }
 
 pub(super) async fn prepare_asset_download_pipeline(
@@ -397,197 +374,88 @@ where
     })
 }
 
-pub async fn repair_virtual_assets_from_index_retained<R>(
+/// Copies each verified object to `assets/virtual/<index id>/<name>`, replacing
+/// stale or missing copies. The library owns this tree; nothing else writes it.
+pub async fn materialize_virtual_assets(
     library: &ManagedLibraryOperation,
     asset_index_id: &str,
-    retention: R,
-) -> Result<bool, DownloadError>
-where
-    R: Clone + Send + 'static,
-{
+    assets: &LegacyAssets,
+) -> Result<(), DownloadError> {
+    if assets.layout != LegacyAssetLayout::Virtual {
+        return Err(DownloadError::Integrity(
+            "asset index does not name a virtual tree".to_string(),
+        ));
+    }
+    let tree_name = PortableFileName::new_exact(asset_index_id)
+        .map_err(|_| DownloadError::Integrity("asset index identity is invalid".to_string()))?;
+    let mut jobs = HashMap::<&str, VirtualAssetJob>::new();
+    for file in &assets.files {
+        jobs.entry(&file.hash)
+            .or_insert_with(|| VirtualAssetJob {
+                hash: file.hash.clone(),
+                size: file.size,
+                sha1: file.sha1,
+                destinations: Vec::new(),
+            })
+            .destinations
+            .push(file.path.clone());
+    }
     let workers = ManagedBlockingWorkers::new();
-    let library = library.clone();
-    let asset_index_id = asset_index_id.to_string();
-    let preparation_retention = retention.clone();
-    let prepared = workers
-        .run_physical(
-            PhysicalIoClass::Heavy,
-            ASSET_REPAIR_PREPARATION_SCRATCH_BYTES,
-            move |_| {
-                let _retention = preparation_retention;
-                prepare_virtual_asset_repair(&library, &asset_index_id)
-            },
-        )
-        .await
-        .map_err(asset_repair_worker_error)??;
-    let Some(prepared) = prepared else {
-        return Ok(false);
+    let roots = {
+        let library = library.clone();
+        workers
+            .run_physical(
+                PhysicalIoClass::Heavy,
+                ASSET_TREE_IO_SCRATCH_BYTES,
+                move |_| {
+                    let assets = library
+                        .managed_directory()
+                        .and_then(|root| root.open_child("assets"))
+                        .map_err(managed_asset_error)?;
+                    let objects = assets.open_child("objects").map_err(managed_asset_error)?;
+                    let tree = assets
+                        .open_or_create_child("virtual")
+                        .and_then(|virtual_dir| {
+                            virtual_dir.open_or_create_child(tree_name.as_str())
+                        })
+                        .map_err(managed_asset_error)?;
+                    Ok::<_, DownloadError>((objects, tree))
+                },
+            )
+            .await
+            .map_err(asset_tree_worker_error)??
     };
-
-    let PreparedVirtualAssetRepair {
-        objects,
-        virtual_root,
-        jobs,
-    } = prepared;
-    let copy_retention = retention.clone();
-    let mut repairs = futures_util::stream::iter(jobs.into_iter().map(move |job| {
-        let objects = objects.clone();
-        let virtual_root = virtual_root.clone();
-        let retention = copy_retention.clone();
+    let mut copies = futures_util::stream::iter(jobs.into_values().map(|job| {
+        let (objects, tree) = roots.clone();
         let workers = workers.clone();
         async move {
             workers
                 .run_physical(
                     PhysicalIoClass::Heavy,
-                    ASSET_REPAIR_IO_SCRATCH_BYTES,
-                    move |_| {
-                        let _retention = retention;
-                        repair_virtual_asset(&objects, &virtual_root, job)
-                    },
+                    ASSET_TREE_IO_SCRATCH_BYTES,
+                    move |_| materialize_virtual_asset(&objects, &tree, job),
                 )
                 .await
         }
     }))
     .buffer_unordered(asset_download_concurrency().clamp(1, 4));
-    while let Some(result) = repairs.next().await {
-        result.map_err(asset_repair_worker_error)??;
+    while let Some(result) = copies.next().await {
+        result.map_err(asset_tree_worker_error)??;
     }
-    Ok(true)
+    Ok(())
 }
 
-struct PreparedVirtualAssetRepair {
-    objects: ManagedDir,
-    virtual_root: ManagedDir,
-    jobs: Vec<VirtualAssetRepairJob>,
-}
-
-struct VirtualAssetRepairJob {
+struct VirtualAssetJob {
     hash: String,
-    expected_size: u64,
-    expected_sha1: [u8; 20],
+    size: u64,
+    sha1: [u8; 20],
     destinations: Vec<PortableRelativePath>,
 }
 
-fn prepare_virtual_asset_repair(
-    library: &ManagedLibraryOperation,
-    asset_index_id: &str,
-) -> Result<Option<PreparedVirtualAssetRepair>, DownloadError> {
-    if asset_index_id.is_empty()
-        || asset_index_id.trim() != asset_index_id
-        || asset_index_id.len() > MAX_PORTABLE_FILE_NAME_BYTES - ".json".len()
-    {
-        return Err(DownloadError::Integrity(
-            "asset index identity is invalid".to_string(),
-        ));
-    }
-    let index_name = PortableFileName::new_exact(&format!("{asset_index_id}.json"))
-        .map_err(|_| DownloadError::Integrity("asset index identity is invalid".to_string()))?;
-    let root = library.managed_directory().map_err(managed_asset_error)?;
-    let assets = root.open_child("assets").map_err(managed_asset_error)?;
-    let indexes = assets.open_child("indexes").map_err(managed_asset_error)?;
-    let index_guard = indexes
-        .inspect_regular_file(index_name.as_str())
-        .map_err(managed_asset_error)?
-        .ok_or_else(|| DownloadError::Integrity("managed asset index is missing".to_string()))?;
-    let index_bytes = indexes
-        .read_guarded_file_bounded(
-            index_name.as_str(),
-            &index_guard,
-            ASSET_INDEX_REPAIR_MAX_BYTES,
-        )
-        .map_err(managed_asset_error)?;
-    let index = parse_asset_index(&index_bytes).map_err(DownloadError::ParseVersion)?;
-    if !index.flags.requires_virtual_repair() {
-        return Ok(None);
-    }
-
-    let jobs = virtual_asset_repair_jobs(index_bytes.len() as u64, index.objects)?;
-    let objects = assets.open_child("objects").map_err(managed_asset_error)?;
-    let virtual_root = assets
-        .open_or_create_child("virtual")
-        .and_then(|virtual_dir| virtual_dir.open_or_create_child("legacy"))
-        .map_err(managed_asset_error)?;
-    Ok(Some(PreparedVirtualAssetRepair {
-        objects,
-        virtual_root,
-        jobs,
-    }))
-}
-
-fn virtual_asset_repair_jobs(
-    index_size: u64,
-    objects: HashMap<String, AssetObject>,
-) -> Result<Vec<VirtualAssetRepairJob>, DownloadError> {
-    if objects.len() > MAX_TIER2_ENTRIES {
-        return Err(DownloadError::Integrity(
-            "asset index exceeds the entry bound".to_string(),
-        ));
-    }
-    let validated = unique_asset_object_jobs(
-        index_size,
-        objects
-            .values()
-            .map(|object| (object.hash.as_str(), object.size)),
-    )?;
-
-    let mut destinations = HashMap::<PortablePathKey, String>::new();
-    let mut grouped = validated
-        .into_iter()
-        .map(|job| {
-            (
-                job.hash.clone(),
-                VirtualAssetRepairJob {
-                    hash: job.hash,
-                    expected_size: job.expected_size,
-                    expected_sha1: job.expected_sha1,
-                    destinations: Vec::new(),
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let mut projected_bytes = 0_u64;
-    for (name, object) in objects {
-        let destination = PortableRelativePath::new_exact(&name)
-            .map_err(|_| unsafe_virtual_asset_path_error(&name))?;
-        match destinations.insert(destination.key(), name.clone()) {
-            Some(previous) if previous != name => {
-                return Err(DownloadError::Integrity(
-                    "virtual asset paths contain a portable alias collision".to_string(),
-                ));
-            }
-            _ => {}
-        }
-        let hash = object.hash.to_ascii_lowercase();
-        let job = grouped.get_mut(&hash).ok_or_else(|| {
-            DownloadError::Integrity(
-                "asset object is absent from the validated repair projection".to_string(),
-            )
-        })?;
-        projected_bytes = projected_bytes
-            .checked_add(job.expected_size)
-            .ok_or_else(|| {
-                DownloadError::Integrity("virtual asset repair byte budget overflowed".to_string())
-            })?;
-        if projected_bytes > MAX_TIER2_AGGREGATE_BYTES {
-            return Err(DownloadError::Integrity(
-                "virtual asset repair exceeds its aggregate byte bound".to_string(),
-            ));
-        }
-        job.destinations.push(destination);
-    }
-    let mut jobs = grouped.into_values().collect::<Vec<_>>();
-    for job in &mut jobs {
-        job.destinations
-            .sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    }
-    jobs.sort_by(|left, right| left.hash.cmp(&right.hash));
-    Ok(jobs)
-}
-
-fn repair_virtual_asset(
+fn materialize_virtual_asset(
     objects: &ManagedDir,
-    virtual_root: &ManagedDir,
-    job: VirtualAssetRepairJob,
+    tree: &ManagedDir,
+    job: VirtualAssetJob,
 ) -> Result<(), DownloadError> {
     let prefix = asset_object_hash_prefix(&job.hash)?;
     let object_directory = objects.open_child(prefix).map_err(|error| match error {
@@ -600,152 +468,45 @@ fn repair_virtual_asset(
         .inspect_regular_file(&job.hash)
         .map_err(managed_asset_error)?
         .ok_or_else(|| DownloadError::Integrity("virtual asset source is missing".to_string()))?;
-    if source.size() != job.expected_size
+    if source.size() != job.size
         || object_directory
-            .sha1_guarded_file_bytes(&job.hash, &source, job.expected_size)
+            .sha1_reverified_file_bytes(&job.hash, &source, job.size)
             .map_err(managed_asset_error)?
-            != job.expected_sha1
+            != job.sha1
     {
         return Err(DownloadError::Integrity(
             "virtual asset source failed authentication".to_string(),
         ));
     }
-
-    #[cfg(feature = "test-support")]
-    pause_virtual_asset_repair_for_test(&job.hash);
-
     for destination in job.destinations {
-        let (parent, name) = virtual_root
+        let (parent, name) = tree
             .open_or_create_relative_parent(&destination)
             .map_err(managed_asset_error)?;
         let current = parent
             .inspect_regular_file(&name)
             .map_err(managed_asset_error)?;
-        let matches = match current {
-            Some(guard) if guard.size() == job.expected_size => {
+        let current = match current {
+            Some(guard) if guard.size() == job.size => {
                 parent
-                    .sha1_guarded_file_bytes(&name, &guard, job.expected_size)
+                    .sha1_reverified_file_bytes(&name, &guard, job.size)
                     .map_err(managed_asset_error)?
-                    == job.expected_sha1
+                    == job.sha1
             }
             Some(_) | None => false,
         };
-        if !matches {
+        if !current {
             parent
                 .copy_guarded_file_exact_authenticated(
                     &name,
                     &object_directory,
                     &job.hash,
                     &source,
-                    job.expected_sha1,
+                    job.sha1,
                 )
                 .map_err(managed_asset_error)?;
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "test-support")]
-struct VirtualAssetRepairTestHook {
-    reached: tokio::sync::oneshot::Sender<()>,
-    release: Arc<(Mutex<bool>, Condvar)>,
-    claimed: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "test-support")]
-pub struct VirtualAssetRepairTestGate {
-    hash: String,
-    reached: tokio::sync::oneshot::Receiver<()>,
-    release: Arc<(Mutex<bool>, Condvar)>,
-    claimed: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "test-support")]
-static VIRTUAL_ASSET_REPAIR_TEST_HOOKS: OnceLock<
-    Mutex<HashMap<String, VirtualAssetRepairTestHook>>,
-> = OnceLock::new();
-
-#[cfg(feature = "test-support")]
-fn virtual_asset_repair_test_hooks() -> &'static Mutex<HashMap<String, VirtualAssetRepairTestHook>>
-{
-    VIRTUAL_ASSET_REPAIR_TEST_HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-#[cfg(feature = "test-support")]
-pub fn arm_virtual_asset_repair_test_pause(hash: &str) -> VirtualAssetRepairTestGate {
-    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let claimed = Arc::new(AtomicBool::new(false));
-    let hook = VirtualAssetRepairTestHook {
-        reached: reached_tx,
-        release: Arc::clone(&release),
-        claimed: Arc::clone(&claimed),
-    };
-    let mut hooks = virtual_asset_repair_test_hooks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(
-        hooks.insert(hash.to_string(), hook).is_none(),
-        "virtual asset repair test hook is already armed"
-    );
-    VirtualAssetRepairTestGate {
-        hash: hash.to_string(),
-        reached: reached_rx,
-        release,
-        claimed,
-    }
-}
-
-#[cfg(feature = "test-support")]
-impl VirtualAssetRepairTestGate {
-    pub async fn wait_until_reached(&mut self) {
-        (&mut self.reached)
-            .await
-            .expect("virtual asset repair must reach its test pause");
-    }
-
-    pub fn release(&self) {
-        let (released, ready) = &*self.release;
-        *released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        ready.notify_all();
-    }
-}
-
-#[cfg(feature = "test-support")]
-impl Drop for VirtualAssetRepairTestGate {
-    fn drop(&mut self) {
-        if !self.claimed.load(Ordering::Acquire) {
-            virtual_asset_repair_test_hooks()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&self.hash);
-        }
-        self.release();
-    }
-}
-
-#[cfg(feature = "test-support")]
-fn pause_virtual_asset_repair_for_test(hash: &str) {
-    let hook = virtual_asset_repair_test_hooks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(hash);
-    let Some(hook) = hook else {
-        return;
-    };
-    hook.claimed.store(true, Ordering::Release);
-    let _ = hook.reached.send(());
-    let (released, ready) = &*hook.release;
-    let mut released = released
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while !*released {
-        released = ready
-            .wait(released)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
 }
 
 fn managed_asset_error(error: LoaderError) -> DownloadError {
@@ -755,14 +516,10 @@ fn managed_asset_error(error: LoaderError) -> DownloadError {
     }
 }
 
-fn asset_repair_worker_error(error: ManagedBlockingTaskError) -> DownloadError {
+fn asset_tree_worker_error(error: ManagedBlockingTaskError) -> DownloadError {
     DownloadError::FileOperation(io::Error::other(format!(
-        "virtual asset repair task failed: {error:?}"
+        "virtual asset task failed: {error:?}"
     )))
-}
-
-pub(crate) fn parse_asset_index(bytes: &[u8]) -> Result<AssetIndex, serde_json::Error> {
-    serde_json::from_slice(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -868,11 +625,4 @@ pub(super) fn asset_cache_error(error: ManagedComponentExactCacheError) -> Downl
             io::Error::other("asset cache admission task stopped unexpectedly"),
         ),
     }
-}
-
-fn unsafe_virtual_asset_path_error(asset_name: &str) -> DownloadError {
-    DownloadError::Integrity(format!(
-        "unsafe virtual asset path: {}",
-        bounded_provider_path_label(asset_name)
-    ))
 }

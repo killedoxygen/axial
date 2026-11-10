@@ -502,7 +502,8 @@ fn extract_native_archive(
 /// The retained installer fetches a fresh Mojang manifest and authenticates the
 /// selected version metadata itself. A catalog display record or caller-supplied
 /// URL is never substituted for that authority. It retains the existing client,
-/// logging, library, native, asset, legacy virtual-asset, and Java requirements.
+/// logging, library, native, asset, and Java requirements. Launch preparation
+/// materializes any legacy asset tree the index names.
 ///
 /// Cancellation governs metadata acquisition only. Dropping the waiter alone
 /// must not be reported as a cancelled installation. The caller retains `library` and

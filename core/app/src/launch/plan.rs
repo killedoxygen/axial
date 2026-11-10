@@ -67,8 +67,6 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         .resolution
         .map(|(w, h)| (w.to_string(), h.to_string()))
         .unwrap_or_default();
-    // The installation verifier authenticates this index and its virtual tree.
-    let virtual_assets = request.installed.virtual_assets();
     let vars = LaunchVars {
         auth_player_name: request.auth.player_name.clone(),
         version_name: version.id.clone(),
@@ -89,11 +87,12 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         classpath_separator: if cfg!(windows) { ";" } else { ":" }.into(),
         resolution_width: width,
         resolution_height: height,
-        game_assets: if virtual_assets {
-            encode_path(&request.library_dir.join("assets/virtual/legacy"))?
-        } else {
-            String::new()
-        },
+        game_assets: request
+            .game_assets
+            .as_deref()
+            .map(encode_path)
+            .transpose()?
+            .unwrap_or_default(),
     };
     let (mut args, game_args) = resolve_arguments(version, &environment, &vars);
     args.extend(jvm::boot_throttle_args(
@@ -359,6 +358,17 @@ mod tests {
             command.args()[main + 1..]
                 .windows(2)
                 .any(|pair| pair == ["--gameDir", game])
+        );
+        // The pre-1.6 index is copied where the client reads it, not left hashed.
+        let resources = Path::new(game).join("resources");
+        assert!(
+            command.args()[main + 1..]
+                .windows(2)
+                .any(|pair| pair == ["--assetsDir", resources.to_str().unwrap()])
+        );
+        assert_eq!(
+            std::fs::read(resources.join("sound/step.ogg")).unwrap(),
+            b"step"
         );
     }
 

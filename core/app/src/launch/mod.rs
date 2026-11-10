@@ -1,3 +1,4 @@
+mod assets;
 pub mod coordinator;
 pub(crate) mod jvm;
 mod libraries;
