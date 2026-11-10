@@ -1018,52 +1018,6 @@ mod native {
         })
     }
 
-    pub(crate) fn absolute_directory_guard_from_root_child(
-        root: &RootGuard,
-        name: &OsStr,
-        child: &DirectoryHandle,
-        child_identity: Identity,
-    ) -> io::Result<AbsoluteDirectoryGuard> {
-        validate_root(root)?;
-        if directory_identity(child)? != child_identity
-            || directory_binding_state(&root.handle, name, child_identity)? != BindingState::Exact
-        {
-            return Err(binding_changed(
-                "root child changed binding during admission",
-            ));
-        }
-        let mut bindings = Vec::new();
-        bindings
-            .try_reserve(root.bindings.len().saturating_add(1))
-            .map_err(|_| {
-                io::Error::other("could not reserve absolute directory binding capacity")
-            })?;
-        for binding in &root.bindings {
-            bindings.push(AbsoluteDirectoryBinding {
-                parent: clone_directory_handle(&binding.parent)?,
-                name: binding.name.clone(),
-                identity: binding.identity,
-                exact_name: binding.exact_name,
-                exact_revision: Arc::clone(&binding.exact_revision),
-            });
-        }
-        bindings.push(AbsoluteDirectoryBinding {
-            parent: clone_directory_handle(&root.handle)?,
-            name: name.to_os_string(),
-            identity: child_identity,
-            exact_name: true,
-            exact_revision: Arc::new(RwLock::new(None)),
-        });
-        let guard = AbsoluteDirectoryGuard {
-            handle: clone_directory_handle(child)?,
-            identity: child_identity,
-            bindings,
-            ancestry_complete: !root.bindings.is_empty(),
-        };
-        validate_absolute_directory_guard(&guard)?;
-        Ok(guard)
-    }
-
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
     }
@@ -1169,19 +1123,6 @@ mod native {
             }
         }
         Ok(identity)
-    }
-
-    pub(crate) fn validate_absolute_directory_outside_root(
-        guard: &AbsoluteDirectoryGuard,
-        root: &RootGuard,
-    ) -> io::Result<()> {
-        if !absolute_directory_is_outside_root(guard, root)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "external directory is inside the application root",
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn absolute_directory_is_outside_root(
@@ -4932,51 +4873,6 @@ mod native {
         })
     }
 
-    pub(crate) fn absolute_directory_guard_from_root_child(
-        root: &RootGuard,
-        name: &OsStr,
-        child: &DirectoryHandle,
-        child_identity: Identity,
-    ) -> io::Result<AbsoluteDirectoryGuard> {
-        validate_root(root)?;
-        if directory_identity(child)? != child_identity
-            || root_chain_exact_binding_state(&root.handle, name, child_identity)?
-                != BindingState::Exact
-        {
-            return Err(binding_changed(
-                "root child changed binding during admission",
-            ));
-        }
-        let mut bindings = Vec::new();
-        bindings
-            .try_reserve(root.bindings.len().saturating_add(1))
-            .map_err(|_| {
-                io::Error::other("could not reserve absolute directory binding capacity")
-            })?;
-        for binding in &root.bindings {
-            bindings.push(AbsoluteDirectoryBinding {
-                parent: clone_directory_handle(&binding.parent)?,
-                name: binding.name.clone(),
-                identity: binding.identity,
-                exact_name: binding.exact_name,
-            });
-        }
-        bindings.push(AbsoluteDirectoryBinding {
-            parent: clone_directory_handle(&root.handle)?,
-            name: name.to_os_string(),
-            identity: child_identity,
-            exact_name: true,
-        });
-        let guard = AbsoluteDirectoryGuard {
-            handle: clone_directory_handle(child)?,
-            identity: child_identity,
-            bindings,
-            ancestry_complete: !root.bindings.is_empty(),
-        };
-        validate_absolute_directory_guard(&guard)?;
-        Ok(guard)
-    }
-
     pub(crate) fn absolute_directory_identity(guard: &AbsoluteDirectoryGuard) -> Identity {
         guard.identity
     }
@@ -5050,19 +4946,6 @@ mod native {
             }
         }
         Ok(identity)
-    }
-
-    pub(crate) fn validate_absolute_directory_outside_root(
-        guard: &AbsoluteDirectoryGuard,
-        root: &RootGuard,
-    ) -> io::Result<()> {
-        if !absolute_directory_is_outside_root(guard, root)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "external directory is inside the application root",
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn absolute_directory_is_outside_root(

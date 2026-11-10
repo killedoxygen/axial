@@ -56,7 +56,7 @@ fn recovery_owns_park(record: &RecoveryRecord) -> bool {
     record.old.is_some()
 }
 
-const ROOT_LEASE_NAME: &str = ".axial-root.lease";
+pub const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 const MAX_LEAF_UNITS: usize = 255;
 const MAX_STAGE_ATTEMPTS: usize = 32;
 pub const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
@@ -859,70 +859,6 @@ impl FileMoveObligation {
             Err(file) => {
                 self.file = Some(file);
                 FileMoveResolution::Indeterminate(self)
-            }
-        }
-    }
-}
-
-#[must_use = "file-move park handoffs must be explicitly settled"]
-#[derive(Debug)]
-pub enum FileMoveAfterParkOutcome {
-    Applied {
-        current: FileCapability,
-        displaced: ParkedFile,
-    },
-    NoEffect {
-        error: io::Error,
-        source: FileCapability,
-        displaced: ParkedFile,
-    },
-    AppliedUnverified(FileMoveAfterParkObligation),
-}
-
-#[must_use = "file-move park handoff resolutions must be handled"]
-#[derive(Debug)]
-pub enum FileMoveAfterParkResolution {
-    Applied {
-        current: FileCapability,
-        displaced: ParkedFile,
-    },
-    NoEffect {
-        source: FileCapability,
-        displaced: ParkedFile,
-    },
-    Indeterminate(FileMoveAfterParkObligation),
-}
-
-#[must_use = "file-move park handoff obligations must be reconciled"]
-pub struct FileMoveAfterParkObligation {
-    movement: FileMoveObligation,
-    displaced: ParkedFile,
-}
-
-impl_redacted_debug!(FileMoveAfterParkObligation);
-
-impl FileMoveAfterParkObligation {
-    pub fn error(&self) -> &io::Error {
-        self.movement.error()
-    }
-
-    pub fn reconcile(self) -> FileMoveAfterParkResolution {
-        let Self {
-            movement,
-            displaced,
-        } = self;
-        match movement.reconcile() {
-            FileMoveResolution::Applied(current) => {
-                FileMoveAfterParkResolution::Applied { current, displaced }
-            }
-            FileMoveResolution::NoEffect(source) => {
-                FileMoveAfterParkResolution::NoEffect { source, displaced }
-            }
-            FileMoveResolution::Indeterminate(movement) => {
-                FileMoveAfterParkResolution::Indeterminate(Self {
-                    movement,
-                    displaced,
-                })
             }
         }
     }
@@ -3028,10 +2964,6 @@ fn validate_directory_level(
     directory: &DirectoryInner,
     authority: &Arc<CapabilityAuthority>,
 ) -> io::Result<()> {
-    #[cfg(test)]
-    authority
-        .ancestry_steps
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if directory.authority.as_ptr() != Arc::as_ptr(authority) {
         return Err(stale_capability());
     }
@@ -3278,22 +3210,14 @@ enum OwnedEffect {
     FileParkRemoval(FileParkObligation),
     ParkedFileRemoval(ParkedFile),
     FileRemoval(FileRemovalObligation),
-    FileParkRestore(FileParkObligation),
-    ParkedFileRestore(ParkedFile),
-    FileRestore(FileRestoreObligation),
-    ParkedFilePreservation(ParkedFile),
     DirectoryParkRemoval(DirectoryParkObligation),
     ParkedDirectoryRemoval(ParkedDirectory),
     DirectoryRemoval(DirectoryRemovalObligation),
     ParkedDirectoryTreeRemoval(RetainedDirectoryTreeRemoval),
     DirectoryTreeRemoval(DirectoryTreeRemovalObligation),
-    DirectoryParkRestore(DirectoryParkObligation),
-    ParkedDirectoryRestore(ParkedDirectory),
-    DirectoryRestore(DirectoryRestoreObligation),
     FilePromotion(OwnedFilePromotion),
     FileReplace(OwnedFileReplace),
     FileMove(OwnedFileMove),
-    FileMoveAfterPark(OwnedFileMoveAfterPark),
     DirectoryMove(OwnedDirectoryMove),
 }
 
@@ -3349,28 +3273,6 @@ enum OwnedFileMove {
 enum FileMoveTerminal {
     Applied(FileCapability),
     NoEffect(FileCapability),
-}
-
-enum OwnedFileMoveAfterPark {
-    Pending {
-        obligation: FileMoveAfterParkObligation,
-        receipt_live: ReceiptLiveness,
-    },
-    Ready {
-        terminal: FileMoveAfterParkTerminal,
-        receipt_live: ReceiptLiveness,
-    },
-}
-
-enum FileMoveAfterParkTerminal {
-    Applied {
-        current: FileCapability,
-        displaced: ParkedFile,
-    },
-    NoEffect {
-        source: FileCapability,
-        displaced: ParkedFile,
-    },
 }
 
 enum OwnedDirectoryMove {
@@ -3448,30 +3350,6 @@ pub enum FileMoveReceiptOutcome {
 }
 
 impl_redacted_debug!(FileMoveReceiptOutcome);
-
-#[must_use = "file-move park handoff receipts must be claimed after explicit owner settlement"]
-pub struct FileMoveAfterParkReceipt {
-    owner: Arc<EffectOwnerState>,
-    id: u64,
-    live: ReceiptLiveness,
-}
-
-impl_redacted_debug!(FileMoveAfterParkReceipt);
-
-#[must_use = "file-move park handoff receipt outcomes must be handled"]
-pub enum FileMoveAfterParkReceiptOutcome {
-    Pending(FileMoveAfterParkReceipt),
-    Applied {
-        current: FileCapability,
-        displaced: ParkedFile,
-    },
-    NoEffect {
-        source: FileCapability,
-        displaced: ParkedFile,
-    },
-}
-
-impl_redacted_debug!(FileMoveAfterParkReceiptOutcome);
 
 #[must_use = "directory move receipts must be claimed after explicit owner settlement"]
 pub struct DirectoryMoveReceipt {
@@ -3620,59 +3498,6 @@ impl EffectOwner {
         .map(|_| ())
     }
 
-    pub fn retain_file_park_restore(
-        &self,
-        obligation: FileParkObligation,
-    ) -> Result<(), EffectOwnerRetentionError<FileParkObligation>> {
-        self.retain(
-            obligation,
-            |_, anchor, obligation| file_park_obligation_is_within(obligation, anchor),
-            OwnedEffect::FileParkRestore,
-        )
-        .map(|_| ())
-    }
-
-    pub fn retain_parked_file_restore(
-        &self,
-        parked: ParkedFile,
-    ) -> Result<(), EffectOwnerRetentionError<ParkedFile>> {
-        self.retain(
-            parked,
-            |_, anchor, parked| parked.parent.is_within(anchor),
-            OwnedEffect::ParkedFileRestore,
-        )
-        .map(|_| ())
-    }
-
-    pub fn retain_file_restore(
-        &self,
-        obligation: FileRestoreObligation,
-    ) -> Result<(), EffectOwnerRetentionError<FileRestoreObligation>> {
-        self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation
-                    .parked
-                    .as_ref()
-                    .is_some_and(|parked| parked.parent.is_within(anchor))
-            },
-            OwnedEffect::FileRestore,
-        )
-        .map(|_| ())
-    }
-
-    pub fn retain_parked_file_preservation(
-        &self,
-        parked: ParkedFile,
-    ) -> Result<(), EffectOwnerRetentionError<ParkedFile>> {
-        self.retain(
-            parked,
-            |_, anchor, parked| parked.parent.is_within(anchor),
-            OwnedEffect::ParkedFilePreservation,
-        )
-        .map(|_| ())
-    }
-
     pub fn retain_directory_park_removal(
         &self,
         obligation: DirectoryParkObligation,
@@ -3754,53 +3579,6 @@ impl EffectOwner {
         .map(|_| ())
     }
 
-    pub fn retain_directory_park_restore(
-        &self,
-        obligation: DirectoryParkObligation,
-    ) -> Result<(), EffectOwnerRetentionError<DirectoryParkObligation>> {
-        self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation.parent.is_within(anchor)
-                    && obligation
-                        .directory
-                        .as_ref()
-                        .is_some_and(|directory| directory.is_within(anchor))
-            },
-            OwnedEffect::DirectoryParkRestore,
-        )
-        .map(|_| ())
-    }
-
-    pub fn retain_parked_directory_restore(
-        &self,
-        parked: ParkedDirectory,
-    ) -> Result<(), EffectOwnerRetentionError<ParkedDirectory>> {
-        self.retain(
-            parked,
-            |_, anchor, parked| parked.parent.is_within(anchor),
-            OwnedEffect::ParkedDirectoryRestore,
-        )
-        .map(|_| ())
-    }
-
-    pub fn retain_directory_restore(
-        &self,
-        obligation: DirectoryRestoreObligation,
-    ) -> Result<(), EffectOwnerRetentionError<DirectoryRestoreObligation>> {
-        self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation
-                    .parked
-                    .as_ref()
-                    .is_some_and(|parked| parked.parent.is_within(anchor))
-            },
-            OwnedEffect::DirectoryRestore,
-        )
-        .map(|_| ())
-    }
-
     pub fn retain_file_promotion(
         &self,
         obligation: Box<FilePromotionObligation>,
@@ -3873,38 +3651,6 @@ impl EffectOwner {
             },
         )
         .map(|id| FileMoveReceipt {
-            owner: self.state.clone(),
-            id,
-            live,
-        })
-    }
-
-    pub fn retain_file_move_after_park(
-        &self,
-        obligation: FileMoveAfterParkObligation,
-    ) -> Result<FileMoveAfterParkReceipt, EffectOwnerRetentionError<FileMoveAfterParkObligation>>
-    {
-        let live = Arc::new(AtomicBool::new(true));
-        let record_live = live.clone();
-        self.retain(
-            obligation,
-            |_, anchor, obligation| {
-                obligation
-                    .movement
-                    .file
-                    .as_ref()
-                    .is_some_and(|file| file.parent.is_within(anchor))
-                    && obligation.movement.destination.is_within(anchor)
-                    && obligation.displaced.parent.is_within(anchor)
-            },
-            move |obligation| {
-                OwnedEffect::FileMoveAfterPark(OwnedFileMoveAfterPark::Pending {
-                    obligation,
-                    receipt_live: record_live,
-                })
-            },
-        )
-        .map(|id| FileMoveAfterParkReceipt {
             owner: self.state.clone(),
             id,
             live,
@@ -4139,24 +3885,15 @@ impl OwnedEffect {
         match self {
             Self::DirectoryCreateCompletion(_)
             | Self::DirectoryCreatePreservation(_)
-            | Self::FileParkRestore(_)
-            | Self::ParkedFileRestore(_)
-            | Self::FileRestore(_)
-            | Self::ParkedFilePreservation(_)
-            | Self::DirectoryParkRestore(_)
-            | Self::ParkedDirectoryRestore(_)
-            | Self::DirectoryRestore(_)
             | Self::ParkedDirectoryTreeRemoval(_)
             | Self::DirectoryTreeRemoval(_)
             | Self::FilePromotion(OwnedFilePromotion::Pending { .. })
             | Self::FileReplace(OwnedFileReplace::Pending { .. })
             | Self::FileMove(OwnedFileMove::Pending { .. })
-            | Self::FileMoveAfterPark(OwnedFileMoveAfterPark::Pending { .. })
             | Self::DirectoryMove(OwnedDirectoryMove::Pending { .. }) => true,
             Self::FilePromotion(OwnedFilePromotion::Ready { receipt_live, .. })
             | Self::FileReplace(OwnedFileReplace::Ready { receipt_live, .. })
             | Self::FileMove(OwnedFileMove::Ready { receipt_live, .. })
-            | Self::FileMoveAfterPark(OwnedFileMoveAfterPark::Ready { receipt_live, .. })
             | Self::DirectoryMove(OwnedDirectoryMove::Ready { receipt_live, .. }) => {
                 receipt_is_live(receipt_live)
             }
@@ -4170,7 +3907,6 @@ impl OwnedEffect {
             Self::FilePromotion(OwnedFilePromotion::Ready { .. })
                 | Self::FileReplace(OwnedFileReplace::Ready { .. })
                 | Self::FileMove(OwnedFileMove::Ready { .. })
-                | Self::FileMoveAfterPark(OwnedFileMoveAfterPark::Ready { .. })
                 | Self::DirectoryMove(OwnedDirectoryMove::Ready { .. })
         )
     }
@@ -4225,35 +3961,6 @@ impl OwnedEffect {
                     Some(Self::FileRemoval(obligation))
                 }
             },
-            Self::FileParkRestore(obligation) => match obligation.restore() {
-                FileParkResolution::Parked(parked) => owned_parked_file_restore(parked),
-                FileParkResolution::NoEffect(request) => {
-                    drop(request);
-                    None
-                }
-                FileParkResolution::Preserved { file, .. } => {
-                    drop(file);
-                    None
-                }
-                FileParkResolution::Indeterminate(obligation) => {
-                    Some(Self::FileParkRestore(obligation))
-                }
-            },
-            Self::ParkedFileRestore(parked) => owned_parked_file_restore(parked),
-            Self::FileRestore(obligation) => match obligation.reconcile() {
-                FileRestoreResolution::Restored(file) => {
-                    drop(file);
-                    None
-                }
-                FileRestoreResolution::NoEffect(parked) => owned_parked_file_restore(parked),
-                FileRestoreResolution::Indeterminate(obligation) => {
-                    Some(Self::FileRestore(obligation))
-                }
-            },
-            Self::ParkedFilePreservation(parked) => match parked.acknowledge_preserved() {
-                Ok(()) => None,
-                Err(failure) => Some(Self::ParkedFilePreservation(failure.into_parked())),
-            },
             Self::DirectoryParkRemoval(obligation) => match obligation.reconcile() {
                 DirectoryParkResolution::Parked(parked) => owned_parked_directory_removal(parked),
                 DirectoryParkResolution::NoEffect(directory) => {
@@ -4281,33 +3988,9 @@ impl OwnedEffect {
                     Some(Self::DirectoryTreeRemoval(obligation))
                 }
             },
-            Self::DirectoryParkRestore(obligation) => match obligation.restore() {
-                DirectoryParkResolution::Parked(parked) => owned_parked_directory_restore(parked),
-                DirectoryParkResolution::NoEffect(directory) => {
-                    drop(directory);
-                    None
-                }
-                DirectoryParkResolution::Indeterminate(obligation) => {
-                    Some(Self::DirectoryParkRestore(obligation))
-                }
-            },
-            Self::ParkedDirectoryRestore(parked) => owned_parked_directory_restore(parked),
-            Self::DirectoryRestore(obligation) => match obligation.reconcile() {
-                DirectoryRestoreResolution::Restored(directory) => {
-                    drop(directory);
-                    None
-                }
-                DirectoryRestoreResolution::NoEffect(parked) => {
-                    owned_parked_directory_restore(parked)
-                }
-                DirectoryRestoreResolution::Indeterminate(obligation) => {
-                    Some(Self::DirectoryRestore(obligation))
-                }
-            },
             Self::FilePromotion(owned) => settle_owned_file_promotion(owned),
             Self::FileReplace(owned) => settle_owned_file_replace(owned),
             Self::FileMove(owned) => settle_owned_file_move(owned),
-            Self::FileMoveAfterPark(owned) => settle_owned_file_move_after_park(owned),
             Self::DirectoryMove(owned) => settle_owned_directory_move(owned),
         }
     }
@@ -4418,45 +4101,6 @@ fn settle_owned_file_move(owned: OwnedFileMove) -> Option<OwnedEffect> {
     }
 }
 
-fn settle_owned_file_move_after_park(owned: OwnedFileMoveAfterPark) -> Option<OwnedEffect> {
-    let owned = match owned {
-        OwnedFileMoveAfterPark::Pending {
-            obligation,
-            receipt_live,
-        } => match obligation.reconcile() {
-            FileMoveAfterParkResolution::Applied { current, displaced } => {
-                OwnedFileMoveAfterPark::Ready {
-                    terminal: FileMoveAfterParkTerminal::Applied { current, displaced },
-                    receipt_live,
-                }
-            }
-            FileMoveAfterParkResolution::NoEffect { source, displaced } => {
-                OwnedFileMoveAfterPark::Ready {
-                    terminal: FileMoveAfterParkTerminal::NoEffect { source, displaced },
-                    receipt_live,
-                }
-            }
-            FileMoveAfterParkResolution::Indeterminate(obligation) => {
-                OwnedFileMoveAfterPark::Pending {
-                    obligation,
-                    receipt_live,
-                }
-            }
-        },
-        ready => ready,
-    };
-    match owned {
-        OwnedFileMoveAfterPark::Ready {
-            terminal,
-            receipt_live,
-        } if !receipt_is_live(&receipt_live) => {
-            drop(terminal);
-            None
-        }
-        owned => Some(OwnedEffect::FileMoveAfterPark(owned)),
-    }
-}
-
 fn settle_owned_directory_move(owned: OwnedDirectoryMove) -> Option<OwnedEffect> {
     let owned = match owned {
         OwnedDirectoryMove::Pending {
@@ -4509,19 +4153,6 @@ fn owned_parked_file_removal(parked: ParkedFile) -> Option<OwnedEffect> {
     }
 }
 
-fn owned_parked_file_restore(parked: ParkedFile) -> Option<OwnedEffect> {
-    match parked.restore() {
-        FileRestoreOutcome::Restored(file) => {
-            drop(file);
-            None
-        }
-        FileRestoreOutcome::NoEffect { parked, .. } => Some(OwnedEffect::ParkedFileRestore(parked)),
-        FileRestoreOutcome::AppliedUnverified(obligation) => {
-            Some(OwnedEffect::FileRestore(obligation))
-        }
-    }
-}
-
 fn owned_parked_directory_removal(parked: ParkedDirectory) -> Option<OwnedEffect> {
     match parked.remove_empty() {
         DirectoryRemovalOutcome::Removed => None,
@@ -4544,21 +4175,6 @@ fn owned_parked_directory_tree_removal(
         }
         DirectoryTreeRemovalOutcome::Indeterminate(obligation) => {
             Some(OwnedEffect::DirectoryTreeRemoval(obligation))
-        }
-    }
-}
-
-fn owned_parked_directory_restore(parked: ParkedDirectory) -> Option<OwnedEffect> {
-    match parked.restore() {
-        DirectoryRestoreOutcome::Restored(directory) => {
-            drop(directory);
-            None
-        }
-        DirectoryRestoreOutcome::NoEffect { parked, .. } => {
-            Some(OwnedEffect::ParkedDirectoryRestore(parked))
-        }
-        DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
-            Some(OwnedEffect::DirectoryRestore(obligation))
         }
     }
 }
@@ -4674,43 +4290,6 @@ impl FileMoveReceipt {
     }
 }
 
-impl FileMoveAfterParkReceipt {
-    pub fn claim(self) -> FileMoveAfterParkReceiptOutcome {
-        let mut records = self
-            .owner
-            .effects
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let effect = records.effects.remove(&self.id);
-        match effect {
-            Some(OwnedEffect::FileMoveAfterPark(OwnedFileMoveAfterPark::Ready {
-                terminal,
-                receipt_live,
-            })) if Arc::ptr_eq(&receipt_live, &self.live) && receipt_is_live(&receipt_live) => {
-                drop(records);
-                deactivate_claimed_owner(&self.owner);
-                match terminal {
-                    FileMoveAfterParkTerminal::Applied { current, displaced } => {
-                        FileMoveAfterParkReceiptOutcome::Applied { current, displaced }
-                    }
-                    FileMoveAfterParkTerminal::NoEffect { source, displaced } => {
-                        FileMoveAfterParkReceiptOutcome::NoEffect { source, displaced }
-                    }
-                }
-            }
-            Some(effect) => {
-                records.effects.insert(self.id, effect);
-                drop(records);
-                FileMoveAfterParkReceiptOutcome::Pending(self)
-            }
-            None => {
-                drop(records);
-                FileMoveAfterParkReceiptOutcome::Pending(self)
-            }
-        }
-    }
-}
-
 impl DirectoryMoveReceipt {
     pub fn claim(self) -> DirectoryMoveReceiptOutcome {
         let mut records = self
@@ -4766,12 +4345,6 @@ impl Drop for FileMoveReceipt {
     }
 }
 
-impl Drop for FileMoveAfterParkReceipt {
-    fn drop(&mut self) {
-        self.live.store(false, Ordering::Release);
-    }
-}
-
 impl Drop for DirectoryMoveReceipt {
     fn drop(&mut self) {
         self.live.store(false, Ordering::Release);
@@ -4786,12 +4359,6 @@ fn deactivate_claimed_owner(owner: &Arc<EffectOwnerState>) {
 
 struct CapabilityAuthority {
     operations: Mutex<OperationState>,
-    #[cfg(test)]
-    successful_entries: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    ancestry_steps: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    file_binding_checks: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     directory_open_pause: Mutex<Option<DirectoryOpenReservationPause>>,
     #[cfg(test)]
@@ -4876,7 +4443,6 @@ struct MoveEffectRecord {
     destination: NamespaceLeaf,
     moved_directory: Option<platform::Identity>,
     moved_file: Option<platform::Identity>,
-    displaced_park: Option<u64>,
 }
 
 fn directory_has_physical_ancestor(directory: &Directory, ancestor: platform::Identity) -> bool {
@@ -5059,7 +4625,6 @@ impl MoveEffectToken {
         destination: NamespaceLeaf,
         moved_directory: Option<platform::Identity>,
         moved_file: Option<platform::Identity>,
-        displaced_park: Option<&FileParkRegistryToken>,
     ) -> io::Result<Self> {
         if !Arc::ptr_eq(authority, &operation.authority) {
             return Err(stale_capability());
@@ -5076,26 +4641,6 @@ impl MoveEffectToken {
             destination,
             moved_directory,
             moved_file,
-            displaced_park: None,
-        };
-        let displaced_park = match (moved_file, displaced_park) {
-            (Some(identity), displaced) => state.file_park_handoff_id(
-                displaced,
-                Arc::as_ptr(authority),
-                &record.destination,
-                Some((identity, &record.source)),
-            )?,
-            (None, None) => None,
-            (None, Some(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "directory moves cannot consume a file-park handoff",
-                ));
-            }
-        };
-        let record = MoveEffectRecord {
-            displaced_park,
-            ..record
         };
         if state.namespace_footprint_is_reserved(
             &[
@@ -5106,7 +4651,7 @@ impl MoveEffectToken {
                 .moved_directory
                 .map(|identity| (identity, &record.source.parent)),
             moved_file,
-            displaced_park,
+            None,
             None,
             None,
         ) {
@@ -5116,14 +4661,6 @@ impl MoveEffectToken {
             ));
         }
         let id = state.reserve_move_effect(record)?;
-        if let Some(park_id) = displaced_park {
-            let park = state
-                .file_parks
-                .get_mut(&park_id)
-                .expect("prevalidated move handoff park remains registered");
-            assert!(park.linked_effect.is_none());
-            park.linked_effect = Some(FileParkLink::Move(id));
-        }
         Ok(Self {
             id,
             authority: Arc::downgrade(authority),
@@ -5238,7 +4775,6 @@ struct FileParkRegistryRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileParkLink {
     Stage(u64),
-    Move(u64),
 }
 
 struct FileParkSettlementRecord {
@@ -5465,30 +5001,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let displaced_park = state
-            .moves
-            .get(&id)
-            .ok_or_else(stale_capability)?
-            .displaced_park;
-        if let Some(park_id) = displaced_park {
-            let park = state.file_parks.get(&park_id).ok_or_else(|| {
-                io::Error::other("move handoff lost its file-park registry header")
-            })?;
-            if park.linked_effect != Some(FileParkLink::Move(id)) {
-                return Err(io::Error::other("move handoff link is inconsistent"));
-            }
-        }
-        state
-            .moves
-            .remove(&id)
-            .expect("prevalidated move effect remains registered");
-        if let Some(park_id) = displaced_park {
-            state
-                .file_parks
-                .get_mut(&park_id)
-                .expect("prevalidated move handoff park remains registered")
-                .linked_effect = None;
-        }
+        state.moves.remove(&id).ok_or_else(stale_capability)?;
         state.release_effect(operation);
         Ok(())
     }
@@ -5503,9 +5016,6 @@ impl CapabilityAuthority {
         let mut operation = self.admit_operation()?;
         operation.window_effect = note_window_effect(self);
         self.validate_entry(false)?;
-        #[cfg(test)]
-        self.successful_entries
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(operation)
     }
 
@@ -5514,9 +5024,6 @@ impl CapabilityAuthority {
         let mut operation = self.admit_operation()?;
         operation.window_effect = note_window_effect(self);
         self.validate_entry(true)?;
-        #[cfg(test)]
-        self.successful_entries
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(operation)
     }
 
@@ -5545,9 +5052,6 @@ impl CapabilityAuthority {
         });
         operation.windowed = true;
         operation.remembers_files = observation;
-        #[cfg(test)]
-        self.successful_entries
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(operation)
     }
 
@@ -9541,50 +9045,6 @@ impl Directory {
         self.create_recoverable_stage_with_old(destination, None, None)
     }
 
-    pub fn create_recoverable_replacement_stage(
-        &self,
-        destination: &FileParkRequest,
-    ) -> FileCreateOutcome {
-        match self.recovery_destination_proof(destination) {
-            Ok(proof) => {
-                self.create_recoverable_stage_with_old(&destination.file.name, Some(proof), None)
-            }
-            Err(error) => FileCreateOutcome::NoEffect(error),
-        }
-    }
-
-    fn recovery_destination_proof(
-        &self,
-        destination: &FileParkRequest,
-    ) -> io::Result<recovery::RecoveryFileProof> {
-        let authority = self.authority()?;
-        let operation = authority.enter()?;
-        self.validate(&operation)
-            .and_then(|()| destination.file.validate_bound_to(self, &operation))
-            .and_then(|()| destination.validate_revision(&operation))?;
-        let proof = match recovery_runtime::prove_file(
-            self.inner.handle(),
-            destination.file.name.as_os_str(),
-            &destination.file.handle,
-            destination.file.identity,
-        ) {
-            Ok(proof)
-                if proof.size == destination.expected.revision.size
-                    && proof.sha256 == destination.expected.sha256 =>
-            {
-                proof
-            }
-            Ok(_) => {
-                return Err(identity_changed(
-                    "replacement destination changed during recovery admission",
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        destination.validate_revision(&operation)?;
-        Ok(proof)
-    }
-
     fn create_recoverable_stage_with_old(
         &self,
         destination: &LeafName,
@@ -9965,7 +9425,6 @@ impl Directory {
                 name: destination_name.clone(),
             },
             Some(self.inner.identity.physical),
-            None,
             None,
         ) {
             Ok(token) => token,
@@ -12343,28 +11802,6 @@ pub struct FileParkRequest {
 
 impl_redacted_debug!(FileParkRequest);
 
-#[must_use = "file park source classification must be handled"]
-pub enum FileParkRequestSource {
-    Current(FileParkRequest),
-    Displaced,
-}
-
-impl_redacted_debug!(FileParkRequestSource);
-
-#[must_use = "failed file park source classification retains its exact request"]
-pub struct FileParkRequestSourceError {
-    error: io::Error,
-    request: FileParkRequest,
-}
-
-impl_redacted_debug!(FileParkRequestSourceError);
-
-impl FileParkRequestSourceError {
-    pub fn into_parts(self) -> (io::Error, FileParkRequest) {
-        (self.error, self.request)
-    }
-}
-
 impl FileParkRequest {
     pub fn into_parts(self) -> (FileCapability, FileRevision, [u8; 32]) {
         (self.file, self.expected.revision, self.expected.sha256)
@@ -12390,107 +11827,6 @@ impl FileParkRequest {
             ));
         }
         Ok(())
-    }
-
-    pub fn classify_source(
-        self,
-        parent: &Directory,
-    ) -> Result<FileParkRequestSource, FileParkRequestSourceError> {
-        if self.file.parent.inner.authority.as_ptr() != parent.inner.authority.as_ptr()
-            || self.file.parent.inner.identity != parent.inner.identity
-        {
-            return Err(FileParkRequestSourceError {
-                error: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "file park request belongs to another directory",
-                ),
-                request: self,
-            });
-        }
-        let current = match parent.open_file(&self.file.name) {
-            Ok(current) => current,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(FileParkRequestSource::Displaced);
-            }
-            Err(error) => {
-                return Err(FileParkRequestSourceError {
-                    error,
-                    request: self,
-                });
-            }
-        };
-        let revision = match current.revision() {
-            Ok(revision) => revision,
-            Err(error) => {
-                return Err(FileParkRequestSourceError {
-                    error,
-                    request: self,
-                });
-            }
-        };
-        if current.identity != self.file.identity
-            || revision.authority.as_ptr() != self.expected.revision.authority.as_ptr()
-            || revision.identity != self.expected.revision.identity
-            || revision.size != self.expected.revision.size
-            || revision.stamp != self.expected.revision.stamp
-        {
-            return Ok(FileParkRequestSource::Displaced);
-        }
-        let digest = {
-            use sha2::{Digest, Sha256};
-
-            let mut reader = match current.reader(self.expected.revision.size) {
-                Ok(reader) => reader,
-                Err(error) => {
-                    return Err(FileParkRequestSourceError {
-                        error,
-                        request: self,
-                    });
-                }
-            };
-            let mut hasher = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = match reader.read(&mut buffer) {
-                    Ok(read) => read,
-                    Err(error) => {
-                        return Err(FileParkRequestSourceError {
-                            error,
-                            request: self,
-                        });
-                    }
-                };
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-            }
-            if let Err(error) = reader.finish() {
-                return Err(FileParkRequestSourceError {
-                    error,
-                    request: self,
-                });
-            }
-            <[u8; 32]>::from(hasher.finalize())
-        };
-        let after = match current.revision() {
-            Ok(revision) => revision,
-            Err(error) => {
-                return Err(FileParkRequestSourceError {
-                    error,
-                    request: self,
-                });
-            }
-        };
-        if after.authority.as_ptr() != self.expected.revision.authority.as_ptr()
-            || after.identity != self.expected.revision.identity
-            || after.size != self.expected.revision.size
-            || after.stamp != self.expected.revision.stamp
-            || digest != self.expected.sha256
-        {
-            return Ok(FileParkRequestSource::Displaced);
-        }
-        Ok(FileParkRequestSource::Current(self))
     }
 }
 
@@ -12556,7 +11892,7 @@ impl FileCapability {
         destination: &Directory,
         destination_name: &LeafName,
     ) -> FileMoveOutcome {
-        self.move_no_replace_internal(destination, destination_name, None, true)
+        self.move_no_replace_internal(destination, destination_name, true)
     }
 
     /// Like `move_no_replace`, but an applied move is not yet durable: the caller must
@@ -12567,38 +11903,13 @@ impl FileCapability {
         destination: &Directory,
         destination_name: &LeafName,
     ) -> FileMoveOutcome {
-        self.move_no_replace_internal(destination, destination_name, None, false)
-    }
-
-    pub fn move_no_replace_after_park(
-        self,
-        destination: &Directory,
-        destination_name: &LeafName,
-        displaced: ParkedFile,
-    ) -> FileMoveAfterParkOutcome {
-        match self.move_no_replace_internal(destination, destination_name, Some(&displaced), true) {
-            FileMoveOutcome::Applied(current) => {
-                FileMoveAfterParkOutcome::Applied { current, displaced }
-            }
-            FileMoveOutcome::NoEffect { error, file } => FileMoveAfterParkOutcome::NoEffect {
-                error,
-                source: file,
-                displaced,
-            },
-            FileMoveOutcome::AppliedUnverified(movement) => {
-                FileMoveAfterParkOutcome::AppliedUnverified(FileMoveAfterParkObligation {
-                    movement,
-                    displaced,
-                })
-            }
-        }
+        self.move_no_replace_internal(destination, destination_name, false)
     }
 
     fn move_no_replace_internal(
         self,
         destination: &Directory,
         destination_name: &LeafName,
-        displaced: Option<&ParkedFile>,
         sync_parents: bool,
     ) -> FileMoveOutcome {
         let source_parent = self.parent.clone();
@@ -12646,7 +11957,6 @@ impl FileCapability {
             },
             None,
             Some(self.identity),
-            displaced.map(|parked| &parked.token),
         ) {
             Ok(token) => token,
             Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
@@ -12959,11 +12269,6 @@ impl FileCapability {
         if remembered {
             return Ok(());
         }
-        #[cfg(test)]
-        operation
-            .authority
-            .file_binding_checks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if platform::file_binding_state(
             self.parent.inner.handle(),
             self.name.as_os_str(),
@@ -14841,10 +14146,6 @@ impl SessionDrainRecoveryState {
             .saturating_add(self.directory_restores.len())
     }
 
-    fn preserved_directory_create_count(&self) -> usize {
-        self.directory_create_preservations.len()
-    }
-
     fn is_empty(&self) -> bool {
         self.files.is_empty()
             && self.directories.is_empty()
@@ -14996,25 +14297,6 @@ impl SessionDrainRecoveryState {
                         self.directory_restores.push(obligation);
                     }
                 },
-            }
-        }
-    }
-
-    fn acknowledge_preserved_directory_creates(&mut self, permits: &[DrainRecoveryPermit]) {
-        let permit_by_effect = permits
-            .iter()
-            .map(|permit| (permit.park_token_id, permit))
-            .collect::<HashMap<_, _>>();
-        for preservation in std::mem::take(&mut self.directory_create_preservations) {
-            let token_id = preservation.token.id;
-            let Some(permit) =
-                permit_by_effect.get(&DrainRecoveryParkId::DirectoryCreate(token_id))
-            else {
-                self.directory_create_preservations.push(preservation);
-                continue;
-            };
-            if let Err(preservation) = preservation.acknowledge_preserved_with_recovery(permit) {
-                self.directory_create_preservations.push(preservation);
             }
         }
     }
@@ -15171,29 +14453,6 @@ impl RootSession {
         }
     }
 
-    pub fn admit_root_child_directory_authority(
-        &self,
-        directory: Directory,
-        name: &LeafName,
-    ) -> io::Result<AdmittedAbsoluteDirectory> {
-        let operation = self.authority.enter()?;
-        directory.validate(&operation)?;
-        let identity = directory.inner.identity;
-        let ancestry = platform::absolute_directory_guard_from_root_child(
-            &self.authority.root,
-            name.as_os_str(),
-            directory.inner.handle(),
-            identity.physical,
-        )?;
-        let admitted = AdmittedAbsoluteDirectory {
-            inner: Arc::new(AdmittedAbsoluteDirectoryInner {
-                directory: Directory::from_absolute_guard(ancestry, &self.authority),
-            }),
-        };
-        admitted.revalidate()?;
-        Ok(admitted)
-    }
-
     pub fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
         self.admit_absolute_directory_capability(path)
     }
@@ -15211,18 +14470,6 @@ impl RootSession {
         let directory = Directory::from_absolute_guard(ancestry, &self.authority);
         directory.validate(&operation)?;
         Ok(directory)
-    }
-
-    pub fn validate_absolute_directory_outside_root(&self, path: &Path) -> io::Result<()> {
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "external directory is not absolute",
-            ));
-        }
-        let _operation = self.authority.enter()?;
-        let ancestry = platform::open_absolute_directory_guard(path)?;
-        platform::validate_absolute_directory_outside_root(&ancestry, &self.authority.root)
     }
 
     pub fn validate_reset_preflight(&self) -> io::Result<()> {
@@ -15403,12 +14650,6 @@ fn finish_root_session_with_recovery(
             physical: identity,
         },
         authority: Arc::new(CapabilityAuthority {
-            #[cfg(test)]
-            successful_entries: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            ancestry_steps: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            file_binding_checks: std::sync::atomic::AtomicUsize::new(0),
             operations: Mutex::new(OperationState {
                 phase: AUTHORITY_LIVE,
                 root_identity: identity,
@@ -15546,25 +14787,9 @@ impl RootRevokeRecovery {
         self.recovery.directory_count()
     }
 
-    pub fn preserved_directory_create_count(&self) -> usize {
-        self.recovery.preserved_directory_create_count()
-    }
-
-    pub fn acknowledge_preserved_directory_creates(mut self) -> RootRevokeOutcome {
-        self.recovery
-            .acknowledge_preserved_directory_creates(&self.permits);
-        self.finish()
-    }
-
     pub fn restore_all(mut self) -> RootRevokeOutcome {
         self.recovery
             .settle(&self.permits, DrainRecoveryDecision::Restore);
-        self.finish()
-    }
-
-    pub fn remove_all(mut self) -> RootRevokeOutcome {
-        self.recovery
-            .settle(&self.permits, DrainRecoveryDecision::Remove);
         self.finish()
     }
 
@@ -15711,10 +14936,6 @@ impl ResetDrainRecovery {
         self.recovery.directory_count()
     }
 
-    pub fn unsettled_external_or_deferred_count(&self) -> usize {
-        self.recovery.preserved_directory_create_count()
-    }
-
     pub fn defer_managed_reset(mut self) -> ResetStartOutcome {
         self.recovery
             .transfer_preserved_directory_creates_to_reset(&self.permits);
@@ -15844,94 +15065,6 @@ pub struct RootResetAuthority {
     session: Option<RootSession>,
 }
 
-#[must_use = "root clear outcomes retain reset authority until deletion is proven"]
-#[derive(Debug)]
-pub enum RootClearOutcome {
-    Cleared(RootClearReceipt),
-    Failed(RootClearFailure),
-}
-
-#[must_use = "a cleared root receipt must explicitly release its retained lease"]
-pub struct RootClearReceipt {
-    authority: Option<RootResetAuthority>,
-}
-
-impl_redacted_debug!(RootClearReceipt);
-
-impl RootClearReceipt {
-    pub fn root_identity(&self) -> DirectoryIdentity {
-        self.authority
-            .as_ref()
-            .expect("clear receipt retains reset authority")
-            .root_identity()
-    }
-
-    pub fn release(mut self) -> Result<(), Self> {
-        let authority = self
-            .authority
-            .take()
-            .expect("clear receipt retains reset authority");
-        match authority.release() {
-            Ok(()) => Ok(()),
-            Err(authority) => {
-                self.authority = Some(authority);
-                Err(self)
-            }
-        }
-    }
-}
-
-impl Drop for RootClearReceipt {
-    fn drop(&mut self) {
-        if self.authority.is_some() {
-            std::process::abort();
-        }
-    }
-}
-
-#[must_use = "failed root clear authority must be retried or explicitly preserved"]
-pub struct RootClearFailure {
-    error: io::Error,
-    authority: Option<RootResetAuthority>,
-}
-
-impl_redacted_debug!(RootClearFailure);
-
-impl RootClearFailure {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
-    pub fn retry(mut self) -> RootClearOutcome {
-        self.authority
-            .take()
-            .expect("root clear failure retains reset authority")
-            .clear_root()
-    }
-
-    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
-        let authority = self
-            .authority
-            .take()
-            .expect("root clear failure retains reset authority");
-        match authority.acknowledge_preserved_directory_creates() {
-            Ok(()) => Ok(()),
-            Err(authority) => {
-                self.authority = Some(authority);
-                Err(self)
-            }
-        }
-    }
-}
-
-impl Drop for RootClearFailure {
-    fn drop(&mut self) {
-        if self.authority.is_some() {
-            std::process::abort();
-        }
-    }
-}
-
 impl fmt::Debug for RootResetAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -15946,19 +15079,6 @@ impl RootResetAuthority {
             .as_ref()
             .expect("reset session is retained")
             .root_identity
-    }
-
-    pub fn clear_root(self) -> RootClearOutcome {
-        let result = self.try_clear_root(&[]);
-        if let Err(error) = result {
-            return RootClearOutcome::Failed(RootClearFailure {
-                error,
-                authority: Some(self),
-            });
-        }
-        RootClearOutcome::Cleared(RootClearReceipt {
-            authority: Some(self),
-        })
     }
 
     fn try_clear_root(&self, preserved: &[(&OsStr, platform::Identity)]) -> io::Result<()> {
@@ -15980,25 +15100,6 @@ impl RootResetAuthority {
         session
             .authority
             .retire_reset_pending_directory_creates(&operation)
-    }
-
-    pub fn acknowledge_preserved_directory_creates(mut self) -> Result<(), Self> {
-        let session = self.session.as_ref().expect("reset session is retained");
-        let operation = match session.authority.enter_reset_operation() {
-            Ok(operation) => operation,
-            Err(_) => return Err(self),
-        };
-        if session
-            .authority
-            .retire_reset_pending_directory_creates(&operation)
-            .is_err()
-        {
-            return Err(self);
-        }
-        drop(operation);
-        self.revoke();
-        drop(self.session.take());
-        Ok(())
     }
 
     pub fn release(mut self) -> Result<(), Self> {
@@ -17267,176 +16368,6 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
-    #[test]
-    fn file_move_handoff_occupies_only_its_exact_park_original() {
-        let temporary = crate::test_tempdir().expect("temporary root");
-        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
-        std::fs::write(temporary.path().join("staged.bin"), b"new payload").expect("staged file");
-        std::fs::write(temporary.path().join("unrelated.bin"), b"unrelated payload")
-            .expect("unrelated file");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root capability");
-        let parked = park_test_file(&root, "target.bin", "target.park", b"old payload");
-        let unrelated = park_test_file(
-            &root,
-            "unrelated.bin",
-            "unrelated.park",
-            b"unrelated payload",
-        );
-        let staged = root
-            .open_file(&LeafName::new("staged.bin").expect("staged leaf"))
-            .expect("staged capability");
-        let target = LeafName::new("target.bin").expect("target leaf");
-
-        let staged = match staged.move_no_replace(&root, &target) {
-            FileMoveOutcome::NoEffect { error, file } => {
-                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                file
-            }
-            FileMoveOutcome::Applied(_) => panic!("ordinary move bypassed the park reservation"),
-            FileMoveOutcome::AppliedUnverified(obligation) => {
-                panic!("reserved move became indeterminate: {}", obligation.error())
-            }
-        };
-        let (current, parked) = match staged.move_no_replace_after_park(&root, &target, parked) {
-            FileMoveAfterParkOutcome::Applied { current, displaced } => (current, displaced),
-            FileMoveAfterParkOutcome::NoEffect { error, .. } => {
-                panic!("exact park handoff had no effect: {error}")
-            }
-            FileMoveAfterParkOutcome::AppliedUnverified(obligation) => {
-                panic!(
-                    "exact park handoff remained indeterminate: {}",
-                    obligation.error()
-                )
-            }
-        };
-        assert_eq!(
-            current.read_bounded(32).expect("current payload"),
-            b"new payload"
-        );
-        parked
-            .validate_current()
-            .expect("settled move released its exact park link");
-        unrelated
-            .validate_current()
-            .expect("exact handoff did not consume an unrelated park");
-        assert!(matches!(parked.remove(), FileRemovalOutcome::Removed));
-        let unrelated = match unrelated.restore() {
-            FileRestoreOutcome::Restored(file) => file,
-            FileRestoreOutcome::NoEffect { error, .. } => {
-                panic!("unrelated restore had no effect: {error}")
-            }
-            FileRestoreOutcome::AppliedUnverified(obligation) => {
-                panic!(
-                    "unrelated restore remained indeterminate: {}",
-                    obligation.error()
-                )
-            }
-        };
-
-        drop((current, unrelated, root));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn file_move_handoff_link_survives_indeterminate_reconciliation() {
-        let temporary = crate::test_tempdir().expect("temporary root");
-        std::fs::write(temporary.path().join("target.bin"), b"old payload").expect("target file");
-        std::fs::write(temporary.path().join("staged.bin"), b"new payload").expect("staged file");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root capability");
-        let parked = park_test_file(&root, "target.bin", "target.park", b"old payload");
-        let staged = root
-            .open_file(&LeafName::new("staged.bin").expect("staged leaf"))
-            .expect("staged capability");
-        let target = LeafName::new("target.bin").expect("target leaf");
-        let authority = root.authority().expect("root authority");
-        let token = {
-            let operation = authority.enter().expect("move reservation operation");
-            MoveEffectToken::reserve(
-                &authority,
-                &operation,
-                NamespaceLeaf {
-                    parent: root.clone(),
-                    name: staged.name.clone(),
-                },
-                NamespaceLeaf {
-                    parent: root.clone(),
-                    name: target.clone(),
-                },
-                None,
-                Some(staged.identity),
-                Some(&parked.token),
-            )
-            .expect("exact move handoff reservation")
-        };
-        std::fs::rename(
-            temporary.path().join("staged.bin"),
-            temporary.path().join("displaced-stage.bin"),
-        )
-        .expect("displace staged source");
-        let obligation = FileMoveAfterParkObligation {
-            movement: FileMoveObligation {
-                error: io::Error::other("test move requires reconciliation"),
-                file: Some(staged),
-                destination: root.clone(),
-                destination_name: target,
-                reported_success: false,
-                token,
-            },
-            displaced: parked,
-        };
-        let obligation = match obligation.reconcile() {
-            FileMoveAfterParkResolution::Indeterminate(obligation) => obligation,
-            _ => panic!("displaced source did not preserve the move obligation"),
-        };
-        assert_eq!(
-            obligation
-                .displaced
-                .validate_current()
-                .expect_err("indeterminate move retains its park link")
-                .kind(),
-            io::ErrorKind::WouldBlock,
-        );
-        std::fs::rename(
-            temporary.path().join("displaced-stage.bin"),
-            temporary.path().join("staged.bin"),
-        )
-        .expect("restore staged source");
-        let (staged, parked) = match obligation.reconcile() {
-            FileMoveAfterParkResolution::NoEffect { source, displaced } => (source, displaced),
-            FileMoveAfterParkResolution::Applied { .. } => {
-                panic!("no-effect move unexpectedly applied")
-            }
-            FileMoveAfterParkResolution::Indeterminate(obligation) => {
-                panic!(
-                    "restored no-effect move remained indeterminate: {}",
-                    obligation.error()
-                )
-            }
-        };
-        parked
-            .validate_current()
-            .expect("no-effect settlement released its park link");
-        drop(staged);
-        std::fs::remove_file(temporary.path().join("staged.bin")).expect("remove staged source");
-        let restored = match parked.restore() {
-            FileRestoreOutcome::Restored(file) => file,
-            FileRestoreOutcome::NoEffect { error, .. } => {
-                panic!("park restore had no effect: {error}")
-            }
-            FileRestoreOutcome::AppliedUnverified(obligation) => {
-                panic!(
-                    "park restore remained indeterminate: {}",
-                    obligation.error()
-                )
-            }
-        };
-
-        drop((restored, authority, root));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
     #[cfg(unix)]
     #[test]
     fn unsettled_file_move_blocks_hardlink_alias_park_ownership() {
@@ -17462,7 +16393,6 @@ mod tests {
             },
             None,
             Some(source.identity),
-            None,
         )
         .expect("file move reservation");
         let rebind = std::fs::hard_link(
@@ -17889,7 +16819,6 @@ mod tests {
                 },
                 None,
                 None,
-                None,
             )
             .expect_err("directory park must block a nested move")
             .kind(),
@@ -18159,7 +17088,6 @@ mod tests {
                     parent: admitted.clone(),
                     name: LeafName::new("move-destination").expect("move destination"),
                 },
-                None,
                 None,
                 None,
             )
@@ -19144,7 +18072,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_park_refreshes_revision_and_classifies_current() {
+    fn restored_park_refreshes_its_request_revision() {
         let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("current.bin"), b"current payload")
             .expect("current payload");
@@ -19169,18 +18097,10 @@ mod tests {
                 )
             }
         };
-        let request = match request.classify_source(&root) {
-            Ok(FileParkRequestSource::Current(request)) => request,
-            Ok(FileParkRequestSource::Displaced) => {
-                panic!("refreshed restored request was displaced")
-            }
-            Err(error) => {
-                let (error, _) = error.into_parts();
-                panic!("refreshed restored request could not be classified: {error}")
-            }
-        };
-        drop(request);
-        drop(root);
+        let (file, revision, _) = request.into_parts();
+        file.validate_revision(&revision)
+            .expect("restored request carries the refreshed revision");
+        drop((file, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
@@ -19824,7 +18744,6 @@ mod tests {
                 },
                 None,
                 Some(file.identity),
-                None,
             )
             .expect("move effect reservation")
         };
@@ -19862,7 +18781,6 @@ mod tests {
                     name: destination_name.clone(),
                 },
                 Some(directory.inner.identity.physical),
-                None,
                 None,
             )
             .expect("move effect reservation")
@@ -20598,27 +19516,11 @@ mod tests {
     }
 
     #[test]
-    fn dropped_owner_settles_file_and_directory_restore_and_preservation_at_drain() {
+    fn dropped_owner_preserves_unclassified_directory_create_at_drain() {
         let temporary = crate::test_tempdir().expect("temporary root");
-        std::fs::write(temporary.path().join("restore.bin"), b"restore").expect("restore file");
-        std::fs::write(temporary.path().join("preserve.bin"), b"preserve").expect("preserve file");
-        std::fs::create_dir(temporary.path().join("folder")).expect("restore directory");
         let session = acquire_test_root(temporary.path());
         let root = session.root().expect("root capability");
         let owner = root.create_effect_owner().expect("effect owner");
-        let restore_file = park_test_file(&root, "restore.bin", "restore.parked", b"restore");
-        owner
-            .retain_parked_file_restore(restore_file)
-            .expect("retain file restore");
-        let preserve_file = park_test_file(&root, "preserve.bin", "preserve.parked", b"preserve");
-        owner
-            .retain_parked_file_preservation(preserve_file)
-            .expect("retain file preservation");
-        let restore_directory = park_test_directory(&root, "folder", "folder.parked");
-        owner
-            .retain_parked_directory_restore(restore_directory)
-            .expect("retain directory restore");
-
         let authority = session.authority.clone();
         let name = LeafName::new("preserved-directory").expect("preserved leaf");
         let operation = authority.enter().expect("directory create operation");
@@ -20637,15 +19539,6 @@ mod tests {
         drop((operation, authority, owner, root));
 
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(
-            std::fs::read(temporary.path().join("restore.bin")).expect("restored file"),
-            b"restore",
-        );
-        assert_eq!(
-            std::fs::read(temporary.path().join("preserve.parked")).expect("preserved file"),
-            b"preserve",
-        );
-        assert!(temporary.path().join("folder").is_dir());
         assert!(temporary.path().join("preserved-directory").is_dir());
     }
 
@@ -20870,18 +19763,10 @@ mod tests {
                 panic!("unchanged restored replacement lost retry authority")
             }
         };
-        let parent = request.file.parent.clone();
-        let request = match request.classify_source(&parent) {
-            Ok(FileParkRequestSource::Current(request)) => request,
-            Ok(FileParkRequestSource::Displaced) => {
-                panic!("refreshed restored replacement request was displaced")
-            }
-            Err(error) => {
-                let (error, _) = error.into_parts();
-                panic!("refreshed restored replacement request was stale: {error}")
-            }
-        };
-        drop((request, parent));
+        let (file, revision, _) = request.into_parts();
+        file.validate_revision(&revision)
+            .expect("restored replacement request carries the refreshed revision");
+        drop(file);
         assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
         assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
         assert_eq!(
@@ -21350,7 +20235,6 @@ mod tests {
                 },
                 None,
                 None,
-                None,
             )
             .expect("move effect reservation")
         };
@@ -21565,7 +20449,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_receipt_retains_the_root_lease_until_release() {
+    fn root_clear_retains_the_lease_until_release() {
         let temporary = crate::test_tempdir().expect("temporary root");
         std::fs::write(temporary.path().join("owned.bin"), b"owned").expect("owned file");
         let session = acquire_test_root(temporary.path());
@@ -21573,19 +20457,14 @@ mod tests {
             ResetStartOutcome::Ready(authority) => authority,
             outcome => panic!("reset did not become ready: {outcome:?}"),
         };
-        let receipt = match reset.clear_root() {
-            RootClearOutcome::Cleared(receipt) => receipt,
-            RootClearOutcome::Failed(failure) => {
-                panic!("root clear failed: {}", failure.error())
-            }
-        };
+        reset.try_clear_root(&[]).expect("root clear");
         assert!(!temporary.path().join("owned.bin").exists());
         assert!(temporary.path().join(ROOT_LEASE_NAME).is_file());
         assert!(matches!(
             RootSession::acquire(temporary.path()),
             RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
         ));
-        receipt.release().expect("release clear receipt");
+        reset.release().expect("release reset authority");
         drop(acquire_test_root(temporary.path()));
     }
 
@@ -23956,28 +22835,17 @@ mod tests {
         std::fs::rename(&lease, &displaced).expect("displace retained lease");
         std::fs::write(&lease, b"replacement").expect("replacement lease");
 
-        let failure = match reset.clear_root() {
-            RootClearOutcome::Failed(failure) => failure,
-            RootClearOutcome::Cleared(receipt) => {
-                receipt.release().expect("release unexpected clear receipt");
-                panic!("clear accepted a replaced lease binding");
-            }
-        };
+        reset
+            .try_clear_root(&[])
+            .expect_err("clear accepted a replaced lease binding");
         assert!(owned.is_file(), "clear mutated children before lease proof");
         std::fs::remove_file(&lease).expect("remove replacement lease");
         std::fs::rename(&displaced, &lease).expect("restore retained lease");
-        let receipt = match failure.retry() {
-            RootClearOutcome::Cleared(receipt) => receipt,
-            RootClearOutcome::Failed(failure) => {
-                let error = failure.error().to_string();
-                failure
-                    .acknowledge_preserved()
-                    .expect("release failed clear authority");
-                panic!("clear did not recover after lease restoration: {error}")
-            }
-        };
+        reset
+            .try_clear_root(&[])
+            .expect("clear recovers after lease restoration");
         assert!(!owned.exists());
-        receipt.release().expect("release clear receipt");
+        reset.release().expect("release reset authority");
     }
 
     #[cfg(windows)]
@@ -24002,14 +22870,9 @@ mod tests {
             ResetStartOutcome::Ready(authority) => authority,
             outcome => panic!("reset did not become ready: {outcome:?}"),
         };
-        let receipt = match reset.clear_root() {
-            RootClearOutcome::Cleared(receipt) => receipt,
-            RootClearOutcome::Failed(failure) => {
-                panic!("ordinary root clear failed: {}", failure.error())
-            }
-        };
+        reset.try_clear_root(&[]).expect("ordinary root clear");
         assert!(!owned.exists());
-        receipt.release().expect("release clear receipt");
+        reset.release().expect("release reset authority");
     }
 
     #[test]
@@ -24177,15 +23040,11 @@ mod tests {
         let root = detached.root().expect("detached root");
         let child_name = LeafName::new("child").expect("child name");
         let child = root.open_directory(&child_name).expect("retained child");
-        let admitted_child = detached
-            .session
-            .admit_root_child_directory_authority(child.clone(), &child_name)
-            .expect("admitted detached root child");
         let other = session.root().expect("unrelated application root");
 
         assert!(root.overlaps(&root).expect("known detached equality"));
         assert!(root.overlaps(&child).expect("known retained child"));
-        for directory in [&root, &child, &admitted_child.inner.directory] {
+        for directory in [&root, &child] {
             assert_eq!(
                 directory
                     .overlaps(&other)
@@ -24196,7 +23055,7 @@ mod tests {
             assert!(other.overlaps(directory).is_err());
         }
 
-        drop((root, child, admitted_child, other));
+        drop((root, child, other));
         assert!(matches!(detached.revoke(), RootRevokeOutcome::Revoked));
         drop(admitted);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
@@ -24214,23 +23073,14 @@ mod tests {
             session.admit_absolute_directory_authority_outside_root(temporary.path()),
             AbsoluteDirectoryOutsideRootAdmission::InsideRoot
         ));
-        assert_eq!(
-            session
-                .validate_absolute_directory_outside_root(temporary.path())
-                .expect_err("root itself is not external")
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            session
-                .validate_absolute_directory_outside_root(&nested)
-                .expect_err("nested directory is not external")
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
-        session
-            .validate_absolute_directory_outside_root(external.path())
-            .expect("sibling physical directory is external");
+        assert!(matches!(
+            session.admit_absolute_directory_authority_outside_root(&nested),
+            AbsoluteDirectoryOutsideRootAdmission::InsideRoot
+        ));
+        assert!(matches!(
+            session.admit_absolute_directory_authority_outside_root(external.path()),
+            AbsoluteDirectoryOutsideRootAdmission::Admitted(_)
+        ));
 
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
@@ -24246,9 +23096,10 @@ mod tests {
         symlink(external.path(), &alias).expect("external alias");
         let session = acquire_test_root(temporary.path());
 
-        session
-            .validate_absolute_directory_outside_root(&alias)
-            .expect_err("symlink ancestry must fail closed");
+        assert!(matches!(
+            session.admit_absolute_directory_authority_outside_root(&alias),
+            AbsoluteDirectoryOutsideRootAdmission::Unavailable(_)
+        ));
 
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
@@ -24750,9 +23601,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_revision_sampling_budget_refusal_does_not_enter_authority() {
-        use std::sync::atomic::Ordering;
-
+    fn parent_revision_sampling_refuses_beyond_its_budget() {
         let temporary = crate::test_tempdir().unwrap();
         std::fs::create_dir_all(temporary.path().join("one/two")).unwrap();
         let session = acquire_test_root(temporary.path());
@@ -24762,83 +23611,10 @@ mod tests {
             .unwrap()
             .open_directory(&LeafName::new("two").unwrap())
             .unwrap();
-        let authority = root.authority().unwrap();
-        authority.successful_entries.store(0, Ordering::Relaxed);
         let result = root.parent_revisions_to(&descendant, 1);
-        let entries = authority.successful_entries.load(Ordering::Relaxed);
-        drop((descendant, root, authority));
+        drop((descendant, root));
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
         assert!(result.unwrap().is_none());
-        assert_eq!(entries, 0);
-    }
-
-    #[test]
-    fn parent_revision_sampling_bounds_admission_and_ancestry_work() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().unwrap();
-        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
-        let mut directories = vec![root.clone()];
-        for name in ["assets", "objects", "aa"] {
-            directories.push(
-                directories
-                    .last()
-                    .unwrap()
-                    .open_directory(&LeafName::new(name).unwrap())
-                    .unwrap(),
-            );
-        }
-        let expected = directories[..3]
-            .iter()
-            .map(Directory::revision)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
-        let authority = root.authority().unwrap();
-        authority.successful_entries.store(0, Ordering::Relaxed);
-        authority.ancestry_steps.store(0, Ordering::Relaxed);
-        let observed = root
-            .parent_revisions_to(directories.last().unwrap(), 3)
-            .unwrap()
-            .unwrap();
-        let entries = authority.successful_entries.load(Ordering::Relaxed);
-        let steps = authority.ancestry_steps.load(Ordering::Relaxed);
-        assert_eq!(observed, expected);
-        drop((directories, root, authority));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(entries, 1, "Repeated native admission: {entries}");
-        assert!(steps <= 8, "Repeated native ancestry validation: {steps}");
-    }
-
-    #[test]
-    fn file_revision_observation_bounds_admission_and_ancestry_work() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().expect("temporary root");
-        let parent = temporary.path().join("assets/objects/aa");
-        std::fs::create_dir_all(&parent).unwrap();
-        std::fs::write(parent.join("sample.bin"), b"sample").unwrap();
-        let session = acquire_test_root(temporary.path());
-        let mut root = session.root().unwrap();
-        for name in ["assets", "objects", "aa"] {
-            root = root.open_directory(&LeafName::new(name).unwrap()).unwrap();
-        }
-        let name = LeafName::new("sample.bin").unwrap();
-        let file = root.open_file(&name).unwrap();
-        let expected = file.revision().unwrap().observation();
-        let authority = root.authority().unwrap();
-        authority.successful_entries.store(0, Ordering::Relaxed);
-        authority.ancestry_steps.store(0, Ordering::Relaxed);
-        root.validate_file_revision_observation(&name, &expected)
-            .unwrap();
-        let entries = authority.successful_entries.load(Ordering::Relaxed);
-        let steps = authority.ancestry_steps.load(Ordering::Relaxed);
-        assert_eq!(file.read_bounded(6).unwrap(), b"sample");
-        drop((file, expected, authority, root));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(entries, 1, "Native observation must own one admission");
-        assert!(steps <= 12, "Repeated ancestry validation: {steps}");
     }
 
     fn observation_window_fixture(
@@ -24855,29 +23631,6 @@ mod tests {
                 .unwrap();
         }
         (session, root, bucket)
-    }
-
-    #[test]
-    fn observation_window_validates_each_ancestry_once_and_again_on_close() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().unwrap();
-        let (session, root, bucket) = observation_window_fixture(&temporary);
-        let authority = root.authority().unwrap();
-        authority.ancestry_steps.store(0, Ordering::Relaxed);
-        root.observe_validated(|| {
-            for _ in 0..32 {
-                bucket.identity().unwrap();
-            }
-        })
-        .unwrap();
-        let windowed = authority.ancestry_steps.swap(0, Ordering::Relaxed);
-        bucket.identity().unwrap();
-        let unwindowed = authority.ancestry_steps.load(Ordering::Relaxed);
-        drop((bucket, root, authority));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(unwindowed, 4);
-        assert_eq!(windowed, 8, "Window must walk once and revalidate once");
     }
 
     #[cfg(unix)]
@@ -24957,33 +23710,6 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
-    #[test]
-    fn batch_window_shares_one_validation_across_file_effects() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().unwrap();
-        let (session, root, bucket) = observation_window_fixture(&temporary);
-        let authority = root.authority().unwrap();
-        let publish = |index: usize| {
-            let staged = test_sealed_stage(&bucket, b"payload");
-            let name = LeafName::new(format!("file-{index}")).unwrap();
-            assert!(matches!(
-                staged.promote_no_replace(&bucket, &bucket, &name),
-                FilePromotionOutcome::Applied(_)
-            ));
-        };
-        publish(0);
-        authority.ancestry_steps.store(0, Ordering::Relaxed);
-        publish(1);
-        let unbatched = authority.ancestry_steps.swap(0, Ordering::Relaxed);
-        root.batch_validated(|| (2..10).for_each(publish)).unwrap();
-        let batched = authority.ancestry_steps.load(Ordering::Relaxed);
-        drop((bucket, root, authority));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert!(unbatched > 8, "Each unbatched effect walks the ancestry");
-        assert_eq!(batched, 8, "Batch must walk once and revalidate once");
-    }
-
     #[cfg(unix)]
     #[test]
     fn batch_window_reports_ancestry_displaced_after_file_effects() {
@@ -25048,66 +23774,6 @@ mod tests {
         assert!(temporary.path().join("assets/objects/aa/moved").is_dir());
     }
 
-    #[test]
-    fn observation_window_remembers_exact_file_bindings_until_close() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().unwrap();
-        let (session, root, bucket) = observation_window_fixture(&temporary);
-        std::fs::write(temporary.path().join("assets/objects/aa/file"), b"file").unwrap();
-        let file = bucket.open_file(&LeafName::new("file").unwrap()).unwrap();
-        let authority = root.authority().unwrap();
-        authority.file_binding_checks.store(0, Ordering::Relaxed);
-        root.observe_validated(|| {
-            for _ in 0..32 {
-                file.revision().unwrap();
-            }
-        })
-        .unwrap();
-        let windowed = authority.file_binding_checks.swap(0, Ordering::Relaxed);
-        file.revision().unwrap();
-        let unwindowed = authority.file_binding_checks.load(Ordering::Relaxed);
-        drop((file, bucket, root, authority));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(unwindowed, 2);
-        assert_eq!(
-            windowed, 1,
-            "Window must check each binding once before close"
-        );
-    }
-
-    #[test]
-    fn observation_window_confirms_full_file_memory_and_keeps_remembering() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().unwrap();
-        let (session, root, bucket) = observation_window_fixture(&temporary);
-        let files = (0..=MAX_OBSERVATION_WINDOW_FILES)
-            .map(|index| {
-                let name = format!("file{index}");
-                std::fs::write(
-                    temporary.path().join("assets/objects/aa").join(&name),
-                    b"file",
-                )
-                .unwrap();
-                bucket.open_file(&LeafName::new(&name).unwrap()).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let authority = root.authority().unwrap();
-        authority.file_binding_checks.store(0, Ordering::Relaxed);
-        root.observe_validated(|| {
-            for file in &files {
-                file.revision().unwrap();
-                file.revision().unwrap();
-            }
-        })
-        .unwrap();
-        let checks = authority.file_binding_checks.load(Ordering::Relaxed);
-        drop((files, bucket, root, authority));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(checks, MAX_OBSERVATION_WINDOW_FILES + 1);
-    }
-
     #[cfg(unix)]
     #[test]
     fn observation_window_refuses_file_rebound_after_remembered_observation() {
@@ -25134,29 +23800,6 @@ mod tests {
             result.is_err(),
             "Window returned a rebound file observation"
         );
-    }
-
-    #[test]
-    fn observation_window_remembers_opened_file_without_rechecking_its_binding() {
-        use std::sync::atomic::Ordering;
-
-        let temporary = crate::test_tempdir().unwrap();
-        let (session, root, bucket) = observation_window_fixture(&temporary);
-        std::fs::write(temporary.path().join("assets/objects/aa/file"), b"file").unwrap();
-        let name = LeafName::new("file").unwrap();
-        let authority = root.authority().unwrap();
-        authority.file_binding_checks.store(0, Ordering::Relaxed);
-        root.observe_validated(|| {
-            bucket.open_file(&name).unwrap().revision().unwrap();
-        })
-        .unwrap();
-        let windowed = authority.file_binding_checks.swap(0, Ordering::Relaxed);
-        bucket.open_file(&name).unwrap();
-        let unwindowed = authority.file_binding_checks.load(Ordering::Relaxed);
-        drop((bucket, root, authority));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(windowed, 0);
-        assert_eq!(unwindowed, 1);
     }
 
     #[test]
@@ -25666,7 +24309,6 @@ mod tests {
             },
             None,
             None,
-            None,
         )
         .expect("checked-out park must not block an unrelated sibling");
         unrelated
@@ -25737,7 +24379,6 @@ mod tests {
             },
             None,
             None,
-            None,
         )
         .expect_err("checked-out stage create must retain its leaf");
         assert_eq!(stage_conflict.kind(), io::ErrorKind::WouldBlock);
@@ -25752,7 +24393,6 @@ mod tests {
                 parent: root.clone(),
                 name: LeafName::new("stage-unrelated-destination").expect("destination"),
             },
-            None,
             None,
             None,
         )
@@ -25782,7 +24422,6 @@ mod tests {
             },
             None,
             None,
-            None,
         )
         .expect_err("checked-out directory create must retain its leaf");
         assert_eq!(directory_conflict.kind(), io::ErrorKind::WouldBlock);
@@ -25797,7 +24436,6 @@ mod tests {
                 parent: root.clone(),
                 name: LeafName::new("directory-unrelated-destination").expect("destination"),
             },
-            None,
             None,
             None,
         )
@@ -25815,7 +24453,6 @@ mod tests {
                 parent: root.clone(),
                 name: LeafName::new("directory-unrelated-destination").expect("destination"),
             },
-            None,
             None,
             None,
         )
@@ -25843,7 +24480,6 @@ mod tests {
             },
             None,
             None,
-            None,
         )
         .expect_err("checked-out directory park must retain its original leaf");
         assert_eq!(park_conflict.kind(), io::ErrorKind::WouldBlock);
@@ -25858,7 +24494,6 @@ mod tests {
                 parent: root.clone(),
                 name: LeafName::new("park-unrelated-destination").expect("destination"),
             },
-            None,
             None,
             None,
         )

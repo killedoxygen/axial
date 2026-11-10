@@ -1,3 +1,4 @@
+use crate::ROOT_LEASE_NAME;
 use crate::control_frame::{self, Cursor, Domain, Envelope, Probe, generation_side};
 use crate::platform;
 use crate::successor::{
@@ -30,7 +31,6 @@ const MAX_NAME_UTF16_UNITS: usize = 255;
 const MAX_RECORD_PAYLOAD_BYTES: usize = 24 + MAX_COMPONENTS * (2 + MAX_NAME_BYTES) + 2 * 40;
 pub(crate) const MAX_RECOVERABLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_LIVE_PROOF_BYTES: u64 = 128 * 1024 * 1024;
-const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 const RECOVERY_STAGE_PREFIX: &str = ".axial-rstage-";
 const RECOVERY_PARK_PREFIX: &str = ".axial-rpark-";
 

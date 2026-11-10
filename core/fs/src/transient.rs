@@ -3300,7 +3300,6 @@ mod tests {
                 namespace_leaf(&root, "Destination.bin"),
                 None,
                 None,
-                None,
             )
             .expect("move-first reservation");
             let conflict = reserve_test_transient(&authority, &operation, &root, "destination.BIN");
@@ -3331,7 +3330,6 @@ mod tests {
                 &operation,
                 namespace_leaf(&root, "source.BIN"),
                 namespace_leaf(&root, "other.bin"),
-                None,
                 None,
                 None,
             );
@@ -3384,7 +3382,6 @@ mod tests {
             namespace_leaf(&move_tree, "destination.bin"),
             None,
             None,
-            None,
         )
         .expect("sibling move reservation");
         let mut transient =
@@ -3425,7 +3422,6 @@ mod tests {
                     &operation,
                     namespace_leaf(&root, "source.bin"),
                     namespace_leaf(&root, "Race.bin"),
-                    None,
                     None,
                     None,
                 );

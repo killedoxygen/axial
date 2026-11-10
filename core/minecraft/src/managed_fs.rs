@@ -10,7 +10,7 @@ use axial_fs::{
     FileMoveReceipt, FileMoveReceiptOutcome, FileParkOutcome, FilePromotionOutcome,
     FilePromotionReceipt, FilePromotionReceiptOutcome, FileRemovalOutcome, FileReplaceOutcome,
     FileReplaceReceipt, FileReplaceReceiptOutcome, LeafName, ParkedDirectory, ParkedFile,
-    ReplaceDestination, RootSession, RootSessionAcquireOutcome, SealedStagedFile,
+    ROOT_LEASE_NAME, ReplaceDestination, RootSession, RootSessionAcquireOutcome, SealedStagedFile,
     StageDiscardOutcome, StagedFile,
 };
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
@@ -56,7 +56,6 @@ const MAX_MANAGED_TREE_OPERATION_DEPTH: usize = 64;
 const MAX_MANAGED_TREE_NAME_CANDIDATES: usize = 100;
 const MAX_MANAGED_EFFECT_CONTINUATIONS: usize = 256;
 const MANAGED_IMPORT_SCRATCH_BYTES: u64 = 64 << 10;
-const ROOT_LEASE_NAME: &str = ".axial-root.lease";
 
 #[cfg(test)]
 thread_local! {
