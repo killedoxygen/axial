@@ -592,19 +592,8 @@ mod tests {
         let services = axial_api::start_in_profile(directory.path().join("rewrite"), None)
             .await
             .unwrap();
-        let skin_files = crate::native_skin::NativeSkinFiles::new(
-            services.library.clone(),
-            services.tasks.clone(),
-            services.skins.library.clone(),
-        );
-        let lifecycle = DesktopLifecycle::new(
-            services.tasks.clone(),
-            services.server,
-            crate::discord_presence::PresenceObserver::disabled_for_test(),
-            skin_files,
-            services.skins,
-        )
-        .without_interface_preferences_for_test();
+        let lifecycle =
+            DesktopLifecycle::for_test(&services).without_interface_preferences_for_test();
         (directory, lifecycle, services.tasks)
     }
 

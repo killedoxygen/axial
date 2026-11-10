@@ -1,6 +1,9 @@
 //! OS-selected files are captured once, read through exact filesystem authority,
 //! and reduced to bounded validated bytes before the frontend can consume them.
-use crate::bootstrap::DesktopBootstrap;
+use crate::{
+    bootstrap::DesktopBootstrap,
+    native_files::{self, FileTarget, Files, Phase},
+};
 use axial_app::{
     library::{
         ApplicationRootPin, LibraryLifecycle, NativeFileAdmission, NativeFileDestination,
@@ -16,27 +19,21 @@ use axial_app::{
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
 };
-use tauri::{AppHandle, DragDropEvent, Emitter, PhysicalPosition, State, WebviewWindow, Window};
+use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 
-const DRAG_EVENT: &str = "axial:desktop:skin-drag";
 const CLOSED: &str = "Skin file selection is unavailable while Axial is closing.";
 
 #[derive(Clone)]
 pub struct NativeSkinFiles {
     library: LibraryLifecycle,
     export: Arc<StdMutex<ExportState>>,
-    tasks: TaskOwner,
+    files: Files<()>,
     admission: NativeSkinAdmission,
     scope: NativeSkinScope,
-    picker: Arc<Mutex<()>>,
-    drag_eligible: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -73,7 +70,7 @@ impl SkinExportError {
 const EXPORT_UNKNOWN: &str =
     "Skin PNG export outcome is unknown. Check the chosen destination before trying again.";
 
-struct SelectedSkin {
+pub struct SelectedSkin {
     selection: NativeSelection,
     name: String,
     file: NativeFileAdmission,
@@ -87,17 +84,14 @@ impl NativeSkinFiles {
                 saved: Some(saved),
                 ..ExportState::default()
             })),
-            tasks,
+            files: Files::new(tasks),
             admission: NativeSkinAdmission::new(),
             scope: NativeSkinScope::for_window(crate::window::MAIN_WINDOW)
                 .expect("fixed main window scope"),
-            picker: Arc::new(Mutex::new(())),
-            drag_eligible: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn close(&self) {
-        self.drag_eligible.store(false, Ordering::Release);
         self.admission.close();
         self.export
             .lock()
@@ -108,7 +102,7 @@ impl NativeSkinFiles {
     pub async fn drain(&self) -> Result<(), String> {
         self.admission.drain().await;
         // The original accepted task retains this lease through the dialog and write.
-        let _picker = self.picker.lock().await;
+        let _picker = self.files.picker.lock().await;
         let export = self.export.clone();
         tokio::task::spawn_blocking(move || {
             let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
@@ -283,105 +277,6 @@ impl NativeSkinFiles {
             .consume(&self.scope, token)
             .map_err(media_message)
     }
-
-    pub fn handle_drag(&self, window: &Window, event: &DragDropEvent) {
-        match event {
-            DragDropEvent::Enter { paths, position } => {
-                let eligible = matches!(drop_selection(paths), DropSelection::One(_))
-                    && !self.tasks.status().closing;
-                self.drag_eligible.store(eligible, Ordering::Release);
-                emit(window, "enter", eligible, None, Some(*position), None);
-            }
-            DragDropEvent::Over { position } => emit(
-                window,
-                "over",
-                self.drag_eligible.load(Ordering::Acquire) && !self.tasks.status().closing,
-                None,
-                Some(*position),
-                None,
-            ),
-            DragDropEvent::Leave => {
-                self.drag_eligible.store(false, Ordering::Release);
-                // Moving out of the drop zone does not revoke an issued token.
-                emit(window, "leave", false, None, None, None);
-            }
-            DragDropEvent::Drop { paths, position } => {
-                self.drag_eligible.store(false, Ordering::Release);
-                let selection = match self.admission.begin(&self.scope) {
-                    Ok(selection) => selection,
-                    Err(error) => {
-                        emit(
-                            window,
-                            "drop",
-                            false,
-                            None,
-                            Some(*position),
-                            Some(media_message(error)),
-                        );
-                        return;
-                    }
-                };
-                let path = match drop_selection(paths) {
-                    DropSelection::One(path) => path,
-                    DropSelection::None => {
-                        emit(window, "drop", false, None, Some(*position), None);
-                        return;
-                    }
-                    DropSelection::Multiple => {
-                        emit(
-                            window,
-                            "drop",
-                            false,
-                            None,
-                            Some(*position),
-                            Some("Drop one PNG skin file.".into()),
-                        );
-                        return;
-                    }
-                };
-                let selected = match self.capture(selection, path) {
-                    Ok(selected) => selected,
-                    Err(error) => {
-                        emit(window, "drop", false, None, Some(*position), Some(error));
-                        return;
-                    }
-                };
-                let window = window.clone();
-                let failed_window = window.clone();
-                let position = *position;
-                // The accepted read and its captured file outlive any event listener.
-                if self
-                    .tasks
-                    .try_spawn((), move |cancel| async move {
-                        let result = if cancel.is_cancelled() {
-                            Err(CLOSED.to_string())
-                        } else {
-                            read_selection(selected).await
-                        };
-                        match result {
-                            Ok(token) => {
-                                emit(&window, "drop", true, Some(token), Some(position), None)
-                            }
-                            Err(error) => {
-                                emit(&window, "drop", false, None, Some(position), Some(error))
-                            }
-                        }
-                    })
-                    .is_err()
-                {
-                    emit(
-                        &failed_window,
-                        "drop",
-                        false,
-                        None,
-                        Some(position),
-                        Some(CLOSED.into()),
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 async fn wait_for_picker(
@@ -420,22 +315,11 @@ pub async fn pick_skin_file(
     skin: State<'_, NativeSkinFiles>,
 ) -> Result<Option<AdmittedSkinFile>, String> {
     crate::window::require_main_window(&window, &bootstrap)?;
-    let skin = skin.inner().clone();
-    let permit = skin
-        .picker
-        .clone()
-        .try_lock_owned()
-        .map_err(|_| "The skin file picker is already open.")?;
-    let tasks = skin.tasks.clone();
-    tasks
-        .try_spawn(
-            permit,
-            move |cancel| async move { skin.pick(app, cancel).await },
-        )
-        .map_err(|_| CLOSED.to_string())?
-        .join()
-        .await
-        .map_err(|_| "Skin file selection stopped before it could finish.".to_string())?
+    let owner = skin.inner().clone();
+    native_files::pick(skin.inner(), move |cancel| async move {
+        owner.pick(app, cancel).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -449,14 +333,14 @@ pub async fn export_saved_skin_png(
     crate::window::require_main_window(&window, &bootstrap).map_err(SkinExportError::Refused)?;
     let skin = skin.inner().clone();
     let permit =
-        skin.picker.clone().try_lock_owned().map_err(|_| {
+        skin.files.picker.clone().try_lock_owned().map_err(|_| {
             SkinExportError::Refused("The skin file dialog is already open.".into())
         })?;
     let root = skin
         .library
         .admit_application_root()
         .map_err(|_| SkinExportError::Refused(CLOSED.into()))?;
-    let tasks = skin.tasks.clone();
+    let tasks = skin.files.tasks.clone();
     let export = skin.export.clone();
     let handle = {
         let state = export.lock().unwrap_or_else(|error| error.into_inner());
@@ -570,64 +454,64 @@ pub fn consume_skin_drop(
     skin.consume(&token)
 }
 
-enum DropSelection<'a> {
-    None,
-    Multiple,
-    One(&'a Path),
+/// Paths without a PNG are not for this target; several files are refused.
+fn drop_selection(paths: &[PathBuf]) -> Result<&Path, Option<String>> {
+    match paths {
+        _ if !paths.iter().any(|path| has_png_extension(path)) => Err(None),
+        [path] => Ok(path),
+        _ => Err(Some("Drop one PNG skin file.".into())),
+    }
 }
 
-fn drop_selection(paths: &[PathBuf]) -> DropSelection<'_> {
-    if !paths.iter().any(|path| has_png_extension(path)) {
-        return DropSelection::None;
+#[derive(Clone, Serialize)]
+pub struct DragFields {
+    eligible: bool,
+    token: Option<String>,
+}
+
+impl FileTarget for NativeSkinFiles {
+    const EVENT: &'static str = "axial:desktop:skin-drag";
+    const CLOSED: &'static str = CLOSED;
+    const PICKER_BUSY: &'static str = "The skin file picker is already open.";
+    const PICKER_STOPPED: &'static str = "Skin file selection stopped before it could finish.";
+    type Kind = ();
+    type Captured = SelectedSkin;
+    type Selection = String;
+    type Fields = DragFields;
+
+    fn files(&self) -> &Files<()> {
+        &self.files
     }
-    if paths.len() != 1 {
-        return DropSelection::Multiple;
+
+    fn classify(&self, paths: &[PathBuf]) -> Result<(), Option<String>> {
+        drop_selection(paths).map(|_| ())
     }
-    DropSelection::One(paths[0].as_path())
+
+    fn capture(&self, _: (), paths: &[PathBuf]) -> Result<SelectedSkin, String> {
+        let path = drop_selection(paths).map_err(Option::unwrap_or_default)?;
+        self.admit_selection(path)
+    }
+
+    async fn read(&self, selected: SelectedSkin) -> Result<String, String> {
+        read_selection(selected).await
+    }
+
+    /// A drop is eligible only once it has produced a token.
+    fn fields(phase: Phase, kind: Option<()>, token: Option<String>) -> DragFields {
+        DragFields {
+            eligible: match phase {
+                Phase::Drop => token.is_some(),
+                _ => kind.is_some(),
+            },
+            token,
+        }
+    }
 }
 
 fn has_png_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("png"))
-}
-
-#[derive(Clone, Serialize)]
-struct DragPayload {
-    r#type: &'static str,
-    eligible: bool,
-    token: Option<String>,
-    position: Option<DragPosition>,
-    error: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-struct DragPosition {
-    x: f64,
-    y: f64,
-}
-
-fn emit(
-    window: &Window,
-    kind: &'static str,
-    eligible: bool,
-    token: Option<String>,
-    position: Option<PhysicalPosition<f64>>,
-    error: Option<String>,
-) {
-    let _ = window.emit(
-        DRAG_EVENT,
-        DragPayload {
-            r#type: kind,
-            eligible,
-            token,
-            position: position.map(|position| DragPosition {
-                x: position.x,
-                y: position.y,
-            }),
-            error,
-        },
-    );
 }
 
 fn read_message(error: std::io::Error) -> String {
@@ -735,10 +619,11 @@ mod tests {
             Some(root.admit_native_destination(&path).unwrap());
         let export = skin.export.clone();
         let expected = bytes.clone();
-        let permit = skin.picker.clone().try_lock_owned().unwrap();
+        let permit = skin.files.picker.clone().try_lock_owned().unwrap();
         let (start, started) = oneshot::channel();
         let (settled, result) = oneshot::channel();
         let handle = skin
+            .files
             .tasks
             .try_spawn((permit, root), move |_cancel| async move {
                 started.await.unwrap();
@@ -755,7 +640,8 @@ mod tests {
         drop(handle);
         start.send(()).unwrap();
         assert_eq!(result.await.unwrap().unwrap(), SkinExportResult::Published);
-        skin.tasks
+        skin.files
+            .tasks
             .shutdown(std::time::Duration::from_secs(2))
             .await
             .unwrap();
@@ -874,34 +760,11 @@ mod tests {
 
     #[test]
     fn drop_selection_preserves_single_png_and_rejects_mixed_or_multiple_files() {
-        assert!(matches!(
-            drop_selection(&[PathBuf::from("skin.PNG")]),
-            DropSelection::One(_)
-        ));
-        assert!(matches!(
-            drop_selection(&[PathBuf::from("skin.png"), PathBuf::from("other.txt")]),
-            DropSelection::Multiple
-        ));
-        assert!(matches!(
-            drop_selection(&[PathBuf::from("notes.txt")]),
-            DropSelection::None
-        ));
-    }
-
-    #[test]
-    fn drag_payload_matches_the_retained_frontend_contract() {
-        let payload = DragPayload {
-            r#type: "drop",
-            eligible: true,
-            token: Some("token".into()),
-            position: Some(DragPosition { x: 20.0, y: 40.0 }),
-            error: None,
-        };
+        assert!(drop_selection(&[PathBuf::from("skin.PNG")]).is_ok());
         assert_eq!(
-            serde_json::to_value(payload).unwrap(),
-            serde_json::json!({
-                "type": "drop", "eligible": true, "token": "token", "position": { "x": 20.0, "y": 40.0 }, "error": null,
-            })
+            drop_selection(&[PathBuf::from("skin.png"), PathBuf::from("other.txt")]),
+            Err(Some("Drop one PNG skin file.".into()))
         );
+        assert_eq!(drop_selection(&[PathBuf::from("notes.txt")]), Err(None));
     }
 }

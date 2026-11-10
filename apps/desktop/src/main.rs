@@ -3,10 +3,11 @@
 
 mod auth;
 mod bootstrap;
-mod discord_presence;
 mod lifecycle;
 mod native_content;
+mod native_files;
 mod native_skin;
+mod presence;
 #[cfg(debug_assertions)]
 mod reset;
 mod startup;
@@ -15,6 +16,7 @@ mod termination;
 mod update;
 mod window;
 
+use axial_app::tasks::retry_until_settled;
 use bootstrap::DesktopBootstrap;
 use lifecycle::DesktopLifecycle;
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -87,8 +89,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Err(std::io::Error::other(message).into());
         }
     };
-    let presence = match discord_presence::PresenceObserver::start(
-        services.settings.clone(),
+    let presence = match presence::Presence::start(
+        &services.settings,
         services.instances.clone(),
         services.sessions.clone(),
     ) {
@@ -96,7 +98,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => {
             tracing::error!(%error, "Could not start desktop presence; settling application services");
             services.telemetry.report_startup_failure();
-            lifecycle::shutdown_server_after_failure(&services.server).await;
+            if let Err(error) = services.server.shutdown_until_settled().await {
+                tracing::warn!(%error, "Local API shutdown settled after a worker error");
+            }
             let message = startup::report(context, error.into()).await;
             return Err(std::io::Error::other(message).into());
         }
@@ -108,13 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let content_files =
         native_content::NativeContentFiles::new(services.library.clone(), services.tasks.clone());
-    let lifecycle = DesktopLifecycle::new(
-        services.tasks.clone(),
-        services.server.clone(),
-        presence,
-        skin_files.clone(),
-        services.skins.clone(),
-    );
+    let lifecycle = DesktopLifecycle::new(&services, presence, skin_files.clone());
     #[cfg(debug_assertions)]
     let reset = match reset::NativeReset::new(services.library.clone(), services.tasks.clone()) {
         Ok(reset) => reset,
@@ -213,8 +211,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         crate::window::require_main_window(&webview, &event_bootstrap).is_ok()
                     })
                 {
-                    event_skin_files.handle_drag(window, event);
-                    event_content_files.handle_drag(window, event);
+                    native_files::handle_drag(&event_skin_files, window, event);
+                    native_files::handle_drag(&event_content_files, window, event);
                 }
             }
         })
@@ -334,10 +332,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(observer) = observer {
         let _ = observer.await;
     }
-    while let Err(error) = lifecycle.release_services_after_exit() {
-        tracing::warn!(%error, "Native services remain retained after event-loop shutdown");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
+    retry_until_settled("Native service release", || async {
+        lifecycle.release_services_after_exit()
+    })
+    .await;
     #[cfg(debug_assertions)]
     let pending_reset = reset.take_after_exit();
     let restart_after_exit = lifecycle.restart_after_exit();

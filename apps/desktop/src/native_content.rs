@@ -1,7 +1,10 @@
 //! OS-selected mod jars and modpack archives are captured once through exact
 //! filesystem authority and held for one bounded frontend read. The frontend
 //! hands the bytes to the local API, which owns validation and import.
-use crate::bootstrap::DesktopBootstrap;
+use crate::{
+    bootstrap::DesktopBootstrap,
+    native_files::{self, FileTarget, Files, Phase},
+};
 use axial_app::{library::LibraryLifecycle, tasks::TaskOwner};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,11 +12,10 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, DragDropEvent, Emitter, PhysicalPosition, State, WebviewWindow, Window};
+use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 
-const DRAG_EVENT: &str = "axial:desktop:content-drag";
 const CLOSED: &str = "File selection is unavailable while Axial is closing.";
 /// The native admission bound for one OS-selected file.
 const MAX_FILE_BYTES: u64 = 32 << 20;
@@ -68,13 +70,11 @@ struct Pending {
 #[derive(Clone)]
 pub struct NativeContentFiles {
     library: LibraryLifecycle,
-    tasks: TaskOwner,
+    files: Files<ContentFileKind>,
     pending: Arc<StdMutex<Option<Pending>>>,
-    picker: Arc<Mutex<()>>,
-    drag: Arc<StdMutex<Option<ContentFileKind>>>,
 }
 
-struct Captured {
+pub struct Captured {
     kind: ContentFileKind,
     files: Vec<(String, axial_app::library::NativeFileAdmission)>,
 }
@@ -83,40 +83,9 @@ impl NativeContentFiles {
     pub fn new(library: LibraryLifecycle, tasks: TaskOwner) -> Self {
         Self {
             library,
-            tasks,
+            files: Files::new(tasks),
             pending: Arc::new(StdMutex::new(None)),
-            picker: Arc::new(Mutex::new(())),
-            drag: Arc::new(StdMutex::new(None)),
         }
-    }
-
-    /// Capture each handle synchronously, before any async read can race a rename.
-    fn capture(&self, kind: ContentFileKind, paths: &[PathBuf]) -> Result<Captured, String> {
-        if ContentFileKind::of(paths) != Some(kind) {
-            return Err(match kind {
-                ContentFileKind::Mod => format!("Choose up to {MAX_FILES} .jar mod files."),
-                ContentFileKind::Modpack => "Choose one .mrpack modpack file.".into(),
-            });
-        }
-        let root = self
-            .library
-            .admit_application_root()
-            .map_err(|_| CLOSED.to_string())?;
-        let files = paths
-            .iter()
-            .map(|path| {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .ok_or_else(|| "A selected file name is not valid.".to_string())?
-                    .to_owned();
-                let file = root
-                    .admit_native_file(path, MAX_FILE_BYTES)
-                    .map_err(|error| read_message(&name, error))?;
-                Ok((name, file))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Captured { kind, files })
     }
 
     fn publish(
@@ -124,7 +93,7 @@ impl NativeContentFiles {
         kind: ContentFileKind,
         files: Vec<(String, Vec<u8>)>,
     ) -> Result<ContentSelection, String> {
-        if self.tasks.status().closing {
+        if self.files.tasks.status().closing {
             return Err(CLOSED.into());
         }
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -198,6 +167,59 @@ impl NativeContentFiles {
             None => Ok(None),
         }
     }
+}
+
+#[derive(Clone, Serialize)]
+pub struct DragFields {
+    kind: Option<ContentFileKind>,
+    selection: Option<ContentSelection>,
+}
+
+impl FileTarget for NativeContentFiles {
+    const EVENT: &'static str = "axial:desktop:content-drag";
+    const CLOSED: &'static str = CLOSED;
+    const PICKER_BUSY: &'static str = "A file picker is already open.";
+    const PICKER_STOPPED: &'static str = "File selection stopped before it could finish.";
+    type Kind = ContentFileKind;
+    type Captured = Captured;
+    type Selection = ContentSelection;
+    type Fields = DragFields;
+
+    fn files(&self) -> &Files<ContentFileKind> {
+        &self.files
+    }
+
+    fn classify(&self, paths: &[PathBuf]) -> Result<ContentFileKind, Option<String>> {
+        ContentFileKind::of(paths).ok_or(None)
+    }
+
+    fn capture(&self, kind: ContentFileKind, paths: &[PathBuf]) -> Result<Captured, String> {
+        if ContentFileKind::of(paths) != Some(kind) {
+            return Err(match kind {
+                ContentFileKind::Mod => format!("Choose up to {MAX_FILES} .jar mod files."),
+                ContentFileKind::Modpack => "Choose one .mrpack modpack file.".into(),
+            });
+        }
+        let root = self
+            .library
+            .admit_application_root()
+            .map_err(|_| CLOSED.to_string())?;
+        let files = paths
+            .iter()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| "A selected file name is not valid.".to_string())?
+                    .to_owned();
+                let file = root
+                    .admit_native_file(path, MAX_FILE_BYTES)
+                    .map_err(|error| read_message(&name, error))?;
+                Ok((name, file))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Captured { kind, files })
+    }
 
     async fn read(&self, captured: Captured) -> Result<ContentSelection, String> {
         let kind = captured.kind;
@@ -221,87 +243,12 @@ impl NativeContentFiles {
         self.publish(kind, files)
     }
 
-    pub fn handle_drag(&self, window: &Window, event: &DragDropEvent) {
-        match event {
-            DragDropEvent::Enter { paths, position } => {
-                let kind = ContentFileKind::of(paths).filter(|_| !self.tasks.status().closing);
-                *self.drag.lock().unwrap_or_else(|error| error.into_inner()) = kind;
-                emit(window, "enter", kind, None, Some(*position), None);
-            }
-            DragDropEvent::Over { position } => {
-                let kind = *self.drag.lock().unwrap_or_else(|error| error.into_inner());
-                emit(window, "over", kind, None, Some(*position), None);
-            }
-            DragDropEvent::Leave => {
-                self.drag
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take();
-                emit(window, "leave", None, None, None, None);
-            }
-            DragDropEvent::Drop { paths, position } => {
-                self.drag
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .take();
-                let position = *position;
-                let Some(kind) = ContentFileKind::of(paths) else {
-                    emit(window, "drop", None, None, Some(position), None);
-                    return;
-                };
-                let captured = match self.capture(kind, paths) {
-                    Ok(captured) => captured,
-                    Err(error) => {
-                        emit(
-                            window,
-                            "drop",
-                            Some(kind),
-                            None,
-                            Some(position),
-                            Some(error),
-                        );
-                        return;
-                    }
-                };
-                let owner = self.clone();
-                let window = window.clone();
-                let failed = window.clone();
-                if self
-                    .tasks
-                    .try_spawn((), move |_cancel| async move {
-                        match owner.read(captured).await {
-                            Ok(selection) => emit(
-                                &window,
-                                "drop",
-                                Some(kind),
-                                Some(selection),
-                                Some(position),
-                                None,
-                            ),
-                            Err(error) => emit(
-                                &window,
-                                "drop",
-                                Some(kind),
-                                None,
-                                Some(position),
-                                Some(error),
-                            ),
-                        }
-                    })
-                    .is_err()
-                {
-                    emit(
-                        &failed,
-                        "drop",
-                        Some(kind),
-                        None,
-                        Some(position),
-                        Some(CLOSED.into()),
-                    );
-                }
-            }
-            _ => {}
-        }
+    fn fields(
+        _: Phase,
+        kind: Option<ContentFileKind>,
+        selection: Option<ContentSelection>,
+    ) -> DragFields {
+        DragFields { kind, selection }
     }
 }
 
@@ -319,44 +266,6 @@ fn read_message(name: &str, error: std::io::Error) -> String {
     }
 }
 
-#[derive(Clone, Serialize)]
-struct DragPayload {
-    r#type: &'static str,
-    kind: Option<ContentFileKind>,
-    selection: Option<ContentSelection>,
-    position: Option<DragPosition>,
-    error: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-struct DragPosition {
-    x: f64,
-    y: f64,
-}
-
-fn emit(
-    window: &Window,
-    kind_name: &'static str,
-    kind: Option<ContentFileKind>,
-    selection: Option<ContentSelection>,
-    position: Option<PhysicalPosition<f64>>,
-    error: Option<String>,
-) {
-    let _ = window.emit(
-        DRAG_EVENT,
-        DragPayload {
-            r#type: kind_name,
-            kind,
-            selection,
-            position: position.map(|position| DragPosition {
-                x: position.x,
-                y: position.y,
-            }),
-            error,
-        },
-    );
-}
-
 #[tauri::command]
 pub async fn pick_content_files(
     app: AppHandle,
@@ -366,21 +275,11 @@ pub async fn pick_content_files(
     kind: ContentFileKind,
 ) -> Result<Option<ContentSelection>, String> {
     crate::window::require_main_window(&window, &bootstrap)?;
-    let content = content.inner().clone();
-    let permit = content
-        .picker
-        .clone()
-        .try_lock_owned()
-        .map_err(|_| "A file picker is already open.")?;
-    let tasks = content.tasks.clone();
-    tasks
-        .try_spawn(permit, move |_cancel| async move {
-            content.pick(app, kind).await
-        })
-        .map_err(|_| CLOSED.to_string())?
-        .join()
-        .await
-        .map_err(|_| "File selection stopped before it could finish.".to_string())?
+    let owner = content.inner().clone();
+    native_files::pick(content.inner(), move |_cancel| async move {
+        owner.pick(app, kind).await
+    })
+    .await
 }
 
 /// Raw bytes, so a large jar is not inflated into a JSON number array.

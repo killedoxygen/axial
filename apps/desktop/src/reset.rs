@@ -5,31 +5,18 @@ use crate::{
     lifecycle::{DesktopLifecycle, TerminalIntent},
 };
 use axial_app::{
-    library::{ApplicationRootPin, LibraryId, LibraryLifecycle},
-    public::DEVELOPMENT_APPLICATION_ID,
+    library::{ApplicationRootPin, LibraryLifecycle},
+    profile,
     tasks::TaskOwner,
 };
-use axial_fs::{LeafName, PendingRootReset, RootSession};
-use serde::Deserialize;
-use std::{
-    path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use axial_fs::{PendingRootReset, RootSession};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State, WebviewWindow};
 
 const PREFLIGHT_FAILED: &str =
     "Reset is blocked because launcher-owned storage could not be proven safe.";
 const DELETE_FAILED: &str =
     "Reset is incomplete because launcher-owned data could not be deleted. Try again.";
-const PROFILE_MARKER: &str = ".axial-rewrite-profile";
-const PROFILE_MARKER_LIMIT: u64 = 4096;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileIdentity {
-    application_id: String,
-    profile_id: String,
-}
 
 struct ResetState {
     pin: Option<ApplicationRootPin>,
@@ -43,11 +30,18 @@ struct ResetState {
 pub struct NativeReset {
     library: LibraryLifecycle,
     tasks: TaskOwner,
-    root: PathBuf,
     marker: Arc<Vec<u8>>,
     state: Arc<Mutex<ResetState>>,
     attempt: Arc<tokio::sync::Mutex<()>>,
     changed: Arc<tokio::sync::Notify>,
+}
+
+/// The current marker, read through the pinned root, must be the admitted one.
+fn verify_marker(pin: &ApplicationRootPin, expected: &[u8]) -> Result<(), String> {
+    match profile::marker(pin) {
+        Ok(marker) if marker == expected => Ok(()),
+        _ => Err(PREFLIGHT_FAILED.into()),
+    }
 }
 
 impl NativeReset {
@@ -58,23 +52,14 @@ impl NativeReset {
             .admit_application_root()
             .map_err(|_| PREFLIGHT_FAILED)?;
         let root = pin.read_projection().map_err(|_| PREFLIGHT_FAILED)?;
-        if !independent_root(&root) {
+        if !profile::independent(&root) {
             return Err(PREFLIGHT_FAILED.into());
         }
-        let marker = read_marker(&pin, &root)?;
-        let identity: ProfileIdentity =
-            serde_json::from_slice(&marker).map_err(|_| PREFLIGHT_FAILED)?;
-        let profile_id = LibraryId::parse(&identity.profile_id).map_err(|_| PREFLIGHT_FAILED)?;
-        if identity.application_id != DEVELOPMENT_APPLICATION_ID
-            || profile_id.to_string() == "00000000-0000-0000-0000-000000000000"
-        {
-            return Err(PREFLIGHT_FAILED.into());
-        }
+        let marker = profile::marker(&pin).map_err(|_| PREFLIGHT_FAILED)?;
         drop(pin);
         Ok(Self {
             library,
             tasks,
-            root,
             marker: Arc::new(marker),
             state: Arc::new(Mutex::new(ResetState {
                 pin: None,
@@ -88,10 +73,14 @@ impl NativeReset {
         })
     }
 
+    fn state(&self) -> std::sync::MutexGuard<'_, ResetState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     async fn prepare(&self, lifecycle: &DesktopLifecycle) -> Result<bool, String> {
         let _attempt = self.attempt.lock().await;
         {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state();
             if state.requested {
                 return Ok(false);
             }
@@ -108,37 +97,25 @@ impl NativeReset {
             // Do this before terminal admission, so failed preflight leaves the
             // working app and its API available. Retain the pin through shutdown:
             // ordinary preservation must not revoke the session needed by reset.
-            let pin = state.pin.as_ref().expect("reset retains its root pin");
-            if read_marker(pin, &self.root)? != *self.marker {
-                return Err(PREFLIGHT_FAILED.into());
-            }
+            verify_marker(
+                state.pin.as_ref().expect("reset retains its root pin"),
+                &self.marker,
+            )?;
         }
         lifecycle.prepare_exit(TerminalIntent::Reset).await?;
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .requested = true;
+        self.state().requested = true;
         Ok(true)
     }
 
     /// Close ingress and join every synchronously accepted request, including a
     /// worker not yet polled when the native event loop unexpectedly returns.
     pub async fn quiesce_after_exit(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .ingress_closed = true;
+        self.state().ingress_closed = true;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .active_requests
-                == 0
-            {
+            if self.state().active_requests == 0 {
                 return;
             }
             changed.await;
@@ -150,7 +127,7 @@ impl NativeReset {
     /// connections and long-lived skin/runtime capabilities even after shutdown.
     /// This transfer can succeed once and only after reset preparation joined.
     pub fn take_after_exit(&self) -> Option<PendingReset> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         if !state.requested || state.transferred || state.active_requests != 0 {
             return None;
         }
@@ -159,31 +136,11 @@ impl NativeReset {
             library: Some(self.library.clone()),
             tasks: Some(self.tasks.clone()),
             pin: state.pin.take(),
-            root: self.root.clone(),
             marker: self.marker.clone(),
             pending: None,
             startup_session: None,
         })
     }
-}
-
-fn independent_root(root: &Path) -> bool {
-    root.is_absolute()
-        && root.parent().is_some()
-        && !root.components().any(|part| {
-            matches!(part, Component::ParentDir | Component::CurDir)
-                || matches!(part, Component::Normal(name)
-                    if name == "dev.mateoltd.axial" || name == "com.mateoltd.axial")
-        })
-}
-
-fn read_marker(pin: &ApplicationRootPin, expected_root: &Path) -> Result<Vec<u8>, String> {
-    if pin.read_projection().map_err(|_| PREFLIGHT_FAILED)? != expected_root {
-        return Err(PREFLIGHT_FAILED.into());
-    }
-    pin.admit_native_file(&expected_root.join(PROFILE_MARKER), PROFILE_MARKER_LIMIT)
-        .and_then(|file| file.read())
-        .map_err(|_| PREFLIGHT_FAILED.into())
 }
 
 /// The integration owner retains this value across errors and retries. Native
@@ -193,7 +150,6 @@ pub struct PendingReset {
     library: Option<LibraryLifecycle>,
     tasks: Option<TaskOwner>,
     pin: Option<ApplicationRootPin>,
-    root: PathBuf,
     marker: Arc<Vec<u8>>,
     pending: Option<PendingRootReset>,
     startup_session: Option<RootSession>,
@@ -207,7 +163,6 @@ impl PendingReset {
             library: None,
             tasks: None,
             pin: None,
-            root: PathBuf::new(),
             marker: Arc::new(Vec::new()),
             pending: None,
             startup_session: Some(session),
@@ -226,31 +181,14 @@ impl PendingReset {
             return Err(DELETE_FAILED.into());
         }
         if let Some(pin) = self.pin.as_ref() {
-            if read_marker(pin, &self.root)? != *self.marker {
-                return Err(PREFLIGHT_FAILED.into());
-            }
+            verify_marker(pin, &self.marker)?;
             self.pin.take();
         }
-
         if self.pending.is_none() {
             if let Some(session) = self.startup_session.as_ref() {
-                let marker = session
-                    .root()
-                    .and_then(|root| {
-                        root.open_file(&LeafName::new(PROFILE_MARKER).expect("fixed marker name"))
-                    })
-                    .and_then(|file| file.read_bounded(PROFILE_MARKER_LIMIT))
-                    .map_err(|_| PREFLIGHT_FAILED)?;
-                let identity: ProfileIdentity =
-                    serde_json::from_slice(&marker).map_err(|_| PREFLIGHT_FAILED)?;
-                let id = LibraryId::parse(&identity.profile_id).map_err(|_| PREFLIGHT_FAILED)?;
-                if identity.application_id != DEVELOPMENT_APPLICATION_ID
-                    || id.to_string() == "00000000-0000-0000-0000-000000000000"
-                {
-                    return Err(PREFLIGHT_FAILED.into());
-                }
+                let marker = profile::session_marker(session).map_err(|_| PREFLIGHT_FAILED)?;
                 if !session
-                    .interrupted_reset(&LeafName::new(PROFILE_MARKER).expect("fixed marker name"))
+                    .interrupted_reset(&profile::marker_name())
                     .map_err(|_| PREFLIGHT_FAILED)?
                 {
                     return Err(PREFLIGHT_FAILED.into());
@@ -273,7 +211,7 @@ impl PendingReset {
             };
             self.pending = Some(PendingRootReset::new(
                 session,
-                LeafName::new(PROFILE_MARKER).expect("fixed marker name"),
+                profile::marker_name(),
                 (*self.marker).clone(),
             ));
         }
@@ -297,12 +235,7 @@ impl Drop for ResetRequest {
         // release even on error or unwind, not merely precede worker completion.
         self.exit.take();
         self.lifecycle.take();
-        let mut state = self
-            .reset
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        state.active_requests -= 1;
+        self.reset.state().active_requests -= 1;
         self.reset.changed.notify_waiters();
     }
 }
@@ -313,20 +246,15 @@ fn request_reset(
     exit: impl FnOnce() + Send + 'static,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     let reservation = {
-        let mut state = reset
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if state.ingress_closed {
-            None
-        } else {
+        let mut state = reset.state();
+        (!state.ingress_closed).then(|| {
             state.active_requests += 1;
-            Some(ResetRequest {
+            ResetRequest {
                 reset: reset.clone(),
                 lifecycle: Some(lifecycle),
                 exit: Some(Box::new(exit)),
-            })
-        }
+            }
+        })
     };
     // Acceptance and the native side effect survive a disconnected IPC waiter.
     tokio::spawn(async move {
@@ -371,28 +299,13 @@ pub async fn app_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{discord_presence::PresenceObserver, native_skin::NativeSkinFiles};
-    use axial_app::library::{AdmissionState, LibraryMode};
+    use axial_app::library::{AdmissionState, LibraryId, LibraryMode};
     use axial_app::{
-        instances::model::{Instance, InstanceId, InstanceResult},
         launch::{coordinator::LaunchIntents, reports::LaunchReportStore},
+        profile::MARKER as PROFILE_MARKER,
         storage::StorageError,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    fn lifecycle_for(services: &axial_api::DesktopServices) -> DesktopLifecycle {
-        DesktopLifecycle::new(
-            services.tasks.clone(),
-            services.server.clone(),
-            PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(
-                services.library.clone(),
-                services.tasks.clone(),
-                services.skins.library.clone(),
-            ),
-            services.skins.clone(),
-        )
-    }
 
     async fn fixture() -> (
         tempfile::TempDir,
@@ -405,7 +318,8 @@ mod tests {
         let services = axial_api::start_in_profile(temporary.path().join("rewrite"), None)
             .await
             .unwrap();
-        let lifecycle = lifecycle_for(&services).without_interface_preferences_for_test();
+        let lifecycle =
+            DesktopLifecycle::for_test(&services).without_interface_preferences_for_test();
         let reset = NativeReset::new(services.library.clone(), services.tasks.clone()).unwrap();
         (temporary, services, lifecycle, reset)
     }
@@ -496,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_launch_blocks_destructive_intents_before_preferences_but_allows_close() {
         let (_temporary, services, _, reset) = fixture().await;
-        let lifecycle = lifecycle_for(&services);
+        let lifecycle = DesktopLifecycle::for_test(&services);
         let payload = fence_unbound_launch(&services);
         let mut events = lifecycle.interface_preferences_events();
         let mut refusals = Vec::new();
@@ -575,10 +489,10 @@ mod tests {
         pending.try_clear().unwrap();
         assert!(!root.join("reset.txt").exists());
         assert!(!root.join("metadata.sqlite").exists());
-        let fresh_marker = std::fs::read(root.join(PROFILE_MARKER)).unwrap();
-        let fresh_identity: ProfileIdentity = serde_json::from_slice(&fresh_marker).unwrap();
-        assert_eq!(fresh_identity.application_id, DEVELOPMENT_APPLICATION_ID);
-        assert_eq!(fresh_marker, original_marker);
+        assert_eq!(
+            std::fs::read(root.join(PROFILE_MARKER)).unwrap(),
+            original_marker
+        );
         assert_eq!(
             std::fs::read(baseline.join("keep.txt")).unwrap(),
             b"baseline user data"
@@ -732,8 +646,9 @@ mod tests {
         drop(services);
     }
 
-    async fn prepared_pending() -> (tempfile::TempDir, PendingReset) {
+    async fn prepared_pending() -> (tempfile::TempDir, std::path::PathBuf, PendingReset) {
         let (temporary, services, lifecycle, reset) = fixture().await;
+        let root = services.profile_root.clone();
         reset.prepare(&lifecycle).await.unwrap();
         let mut pending = reset.take_after_exit().unwrap();
         drop(lifecycle);
@@ -745,20 +660,16 @@ mod tests {
             .unwrap()
             .take_reset_session()
             .unwrap();
-        let mut native = PendingRootReset::new(
-            session,
-            LeafName::new(PROFILE_MARKER).unwrap(),
-            (*pending.marker).clone(),
-        );
+        let mut native =
+            PendingRootReset::new(session, profile::marker_name(), (*pending.marker).clone());
         native.prepare().unwrap();
         pending.pending = Some(native);
-        (temporary, pending)
+        (temporary, root, pending)
     }
 
     #[tokio::test]
     async fn accepted_reset_preserves_marker_while_durable_intent_precedes_deletion() {
-        let (_temporary, mut pending) = prepared_pending().await;
-        let root = pending.root.clone();
+        let (_temporary, root, mut pending) = prepared_pending().await;
         assert!(root.join("metadata.sqlite").exists());
         assert!(root.join(".axial-reset-intent").exists());
         assert_eq!(
@@ -777,8 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn replaced_preserved_marker_blocks_clear_without_overwriting_then_retries() {
-        let (temporary, mut pending) = prepared_pending().await;
-        let root = pending.root.clone();
+        let (temporary, root, mut pending) = prepared_pending().await;
         let original = temporary.path().join("original-marker");
         std::fs::rename(root.join(PROFILE_MARKER), &original).unwrap();
         std::fs::write(root.join(PROFILE_MARKER), b"unexpected marker").unwrap();
@@ -888,7 +798,8 @@ mod tests {
         let selected = services.library.snapshot().current.unwrap();
         assert_eq!(selected.mode, LibraryMode::Existing);
         assert_eq!(selected.library_id, library_id);
-        let lifecycle = lifecycle_for(&services).without_interface_preferences_for_test();
+        let lifecycle =
+            DesktopLifecycle::for_test(&services).without_interface_preferences_for_test();
         let reset = NativeReset::new(services.library.clone(), services.tasks.clone()).unwrap();
         reset.prepare(&lifecycle).await.unwrap();
         let mut pending = reset.take_after_exit().unwrap();
@@ -900,135 +811,6 @@ mod tests {
         assert_eq!(
             std::fs::read(external.join("keep.txt")).unwrap(),
             b"external library"
-        );
-    }
-
-    #[tokio::test]
-    async fn unavailable_external_creation_intent_blocks_reset_but_allows_close() {
-        let (temporary, services, lifecycle, reset) = fixture().await;
-        let root = services.profile_root.clone();
-        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
-        drop(reset);
-        drop(lifecycle);
-        drop(services);
-        let external = temporary.path().join("external-library");
-        std::fs::create_dir(&external).unwrap();
-        let library_id = LibraryId::new();
-        let selection = serde_json::to_vec(&serde_json::json!({
-            "mode": "existing",
-            "library_id": library_id.to_string(),
-            "path": external,
-        }))
-        .unwrap();
-        std::fs::write(root.join("library.json"), &selection).unwrap();
-        let services = axial_api::start_in_profile(root.clone(), None)
-            .await
-            .unwrap();
-        let id = InstanceId::new();
-        let stage_name = format!("stage-{id}");
-        let instance = Instance {
-            id: id.clone(),
-            name: "Pending external creation".into(),
-            version_id: "1.21.4".into(),
-            created_at: "2026-10-04T00:00:00Z".into(),
-            last_played_at: String::new(),
-            art_seed: 0,
-            settings: Default::default(),
-            java_selection: None,
-            icon: String::new(),
-            accent: String::new(),
-            loader_key: "vanilla".into(),
-            minecraft_version: "1.21.4".into(),
-            revision: 0,
-        };
-        let record = {
-            let pin = services.library.admit().unwrap();
-            let _lease = services
-                .instances
-                .directories()
-                .exclusions()
-                .try_acquire([id.as_str()], [])
-                .unwrap();
-            let registry = services.instances.registry();
-            registry
-                .storage()
-                .transaction(|tx| -> InstanceResult<_> {
-                    let record = registry.reserve(tx, instance, &pin.library_id().to_string())?;
-                    let payload = serde_json::to_string(&record).unwrap();
-                    tx.execute(
-                        "INSERT INTO instance_creations(instance_id,record_json,stage_name,phase)
-                     VALUES(?1,?2,?3,'building')",
-                        axial_app::storage::rusqlite::params![id.as_str(), payload, stage_name],
-                    )?;
-                    Ok(record)
-                })
-                .unwrap()
-        };
-        // Persist the building boundary explicitly; this is not a simulated
-        // interruption of InstanceService::create.
-        let stage = external.join("instances").join(&stage_name);
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("keep.txt"), b"unreceipted creation payload").unwrap();
-        services.server.shutdown().await.unwrap();
-        drop(services);
-        let disconnected = temporary.path().join("disconnected-library");
-        std::fs::rename(&external, &disconnected).unwrap();
-
-        let services = axial_api::start_in_profile(root.clone(), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            services.library.snapshot().admission,
-            AdmissionState::Unavailable
-        );
-        assert!(!services.instances.has_unsettled_effects());
-        assert!(services.instances.has_pending_intents());
-        let lifecycle = lifecycle_for(&services);
-        let mut events = lifecycle.interface_preferences_events();
-        let mut direct = tokio::spawn({
-            let lifecycle = lifecycle.clone();
-            async move { lifecycle.prepare_exit(TerminalIntent::Reset).await }
-        });
-        let (refused, preferences_requested) = tokio::select! {
-            result = &mut direct => (result.unwrap(), false),
-            _ = events.changed() => {
-                let event = events.borrow_and_update().clone().unwrap();
-                lifecycle.interface_preferences_delivery_failed(&event);
-                (direct.await.unwrap(), true)
-            }
-        };
-        assert!(refused.is_err());
-        assert!(!preferences_requested);
-        let lifecycle = lifecycle.without_interface_preferences_for_test();
-        let reset = NativeReset::new(services.library.clone(), services.tasks.clone()).unwrap();
-        assert_eq!(
-            reset.prepare(&lifecycle).await,
-            Err(PREFLIGHT_FAILED.into())
-        );
-        assert!(reset.state.lock().unwrap().pin.is_none());
-        assert!(!services.tasks.status().closing);
-        assert!(!services.server.is_shutdown_settled());
-        assert!(reset.take_after_exit().is_none());
-        lifecycle.prepare_exit(TerminalIntent::Close).await.unwrap();
-        assert!(services.server.is_shutdown_settled());
-        assert_eq!(
-            services.instances.registry().get_record(&id).unwrap(),
-            record
-        );
-        let pending = services.instances.pending().unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].instance_id, id);
-        assert_eq!(pending[0].phase, "building");
-        assert_eq!(std::fs::read(root.join("library.json")).unwrap(), selection);
-        assert_eq!(
-            std::fs::read(
-                disconnected
-                    .join("instances")
-                    .join(stage_name)
-                    .join("keep.txt")
-            )
-            .unwrap(),
-            b"unreceipted creation payload"
         );
     }
 

@@ -1,17 +1,13 @@
 //! A failed filesystem admission may still own a native preservation obligation.
 //! Keep it alive outside the error UI until preservation explicitly succeeds.
 use axial_api::StartupError;
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-    },
-    time::Duration,
+use axial_app::tasks::retry_until_settled;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-
-const PRESERVATION_RETRY: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct ResetDecision(AtomicU8);
@@ -45,20 +41,25 @@ struct Failure {
     attempts: AtomicU64,
 }
 
+impl Failure {
+    fn new(message: String, error: Option<StartupError>, resetting: bool) -> Self {
+        Self {
+            message,
+            error: Mutex::new(error),
+            #[cfg(debug_assertions)]
+            reset: Mutex::new(None),
+            resetting,
+            safe_message: Mutex::new(None),
+            preserved: AtomicBool::new(false),
+            attempts: AtomicU64::new(0),
+        }
+    }
+}
+
 pub async fn report(context: tauri::Context<tauri::Wry>, error: StartupError) -> String {
     let message = error.to_string();
     tracing::error!(error = %message, "Desktop startup failed; preserving application ownership");
-    let failure = Arc::new(Failure {
-        message,
-        error: Mutex::new(Some(error)),
-        #[cfg(debug_assertions)]
-        reset: Mutex::new(None),
-        resetting: false,
-        safe_message: Mutex::new(None),
-        preserved: AtomicBool::new(false),
-        attempts: AtomicU64::new(0),
-    });
-    report_failure(context, failure).await
+    report_failure(context, Arc::new(Failure::new(message, Some(error), false))).await
 }
 
 /// Reuse the retained retry owner after the old desktop/services have dropped.
@@ -66,16 +67,15 @@ pub async fn report(context: tauri::Context<tauri::Wry>, error: StartupError) ->
 /// retains exact authority and logs retries until restart is safe.
 #[cfg(debug_assertions)]
 pub async fn complete_reset(pending: crate::reset::PendingReset) {
-    let failure = Arc::new(Failure {
-        message: "Reset is incomplete because launcher-owned data could not be deleted. Axial will retry.".into(),
-        error: Mutex::new(None),
+    let failure = Failure {
         reset: Mutex::new(Some(pending)),
-        resetting: true,
-        safe_message: Mutex::new(None),
-        preserved: AtomicBool::new(false),
-        attempts: AtomicU64::new(0),
-    });
-    preserve(failure).await;
+        ..Failure::new(
+            "Reset is incomplete because launcher-owned data could not be deleted. Axial will retry.".into(),
+            None,
+            true,
+        )
+    };
+    preserve(Arc::new(failure)).await;
 }
 
 async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failure>) -> String {
@@ -181,16 +181,12 @@ async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failur
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take();
-            let retained = Arc::new(Failure {
-                message: "Reset is incomplete. Axial will retain the profile and retry.".into(),
-                error: Mutex::new(error),
-                reset: Mutex::new(None),
-                resetting: true,
-                safe_message: Mutex::new(None),
-                preserved: AtomicBool::new(false),
-                attempts: AtomicU64::new(0),
-            });
-            preserve(retained).await;
+            let retained = Failure::new(
+                "Reset is incomplete. Axial will retain the profile and retry.".into(),
+                error,
+                true,
+            );
+            preserve(Arc::new(retained)).await;
             tauri::process::restart(&restart_environment);
         }
         #[cfg(not(debug_assertions))]
@@ -243,29 +239,25 @@ fn show_preservation_dialog(app: tauri::AppHandle, failure: Arc<Failure>) {
 }
 
 async fn preserve(failure: Arc<Failure>) -> String {
-    loop {
+    let message = retry_until_settled("Startup file preservation", || {
         failure.attempts.fetch_add(1, Ordering::Relaxed);
         let retained = failure.clone();
-        match tokio::task::spawn_blocking(move || try_preserve(&retained)).await {
-            Ok(Some(message)) => {
-                failure.preserved.store(true, Ordering::Release);
-                if failure.resetting {
-                    tracing::info!("Development profile reset completed; restart is permitted");
-                } else {
-                    tracing::error!(error = %message, "Startup failed; application files have been preserved");
-                }
-                return message;
-            }
-            Ok(None) => tracing::warn!(
-                resetting = failure.resetting,
-                "Filesystem settlement is incomplete; application ownership remains retained"
-            ),
-            Err(_) => {
-                tracing::error!("Startup preservation attempt was interrupted; retaining ownership")
+        async move {
+            match tokio::task::spawn_blocking(move || try_preserve(&retained)).await {
+                Ok(Some(message)) => Ok(message),
+                Ok(None) => Err("filesystem settlement is incomplete"),
+                Err(_) => Err("the preservation attempt was interrupted"),
             }
         }
-        tokio::time::sleep(PRESERVATION_RETRY).await;
+    })
+    .await;
+    failure.preserved.store(true, Ordering::Release);
+    if failure.resetting {
+        tracing::info!("Development profile reset completed; restart is permitted");
+    } else {
+        tracing::error!(error = %message, "Startup failed; application files have been preserved");
     }
+    message
 }
 
 fn startup_navigation_allowed(url: &tauri::Url) -> bool {
@@ -393,16 +385,11 @@ mod tests {
 
     #[tokio::test]
     async fn simple_startup_failure_is_not_exitable_until_preservation_is_explicit() {
-        let failure = Arc::new(Failure {
-            message: "Existing <files> remain & protected.".into(),
-            error: Mutex::new(Some(StartupError::from("Safe startup failure."))),
-            #[cfg(debug_assertions)]
-            reset: Mutex::new(None),
-            resetting: false,
-            safe_message: Mutex::new(None),
-            preserved: AtomicBool::new(false),
-            attempts: AtomicU64::new(0),
-        });
+        let failure = Arc::new(Failure::new(
+            "Existing <files> remain & protected.".into(),
+            Some(StartupError::from("Safe startup failure.")),
+            false,
+        ));
         assert!(!failure.preserved.load(Ordering::Acquire));
         let blocked = failure_page(&failure);
         assert!(blocked.contains("&lt;files&gt; remain &amp; protected"));

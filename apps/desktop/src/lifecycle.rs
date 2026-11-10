@@ -1,8 +1,11 @@
 use crate::bootstrap::DesktopBootstrap;
-use crate::discord_presence::PresenceObserver;
 use crate::native_skin::NativeSkinFiles;
-use axial_api::ServerHandle;
-use axial_app::{skins::ProfileMedia, tasks::TaskOwner};
+use crate::presence::Presence;
+use axial_api::{DesktopServices, ServerHandle};
+use axial_app::{
+    skins::ProfileMedia,
+    tasks::{TaskOwner, retry_until_settled},
+};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -76,7 +79,7 @@ pub struct DesktopLifecycle {
     preferences_disabled_for_test: bool,
     preferences_timeout: Duration,
     exit_allowed: Arc<AtomicBool>,
-    presence: PresenceObserver,
+    presence: Presence,
     skin_files: NativeSkinFiles,
 }
 
@@ -88,15 +91,16 @@ struct LifecycleServices {
 
 impl DesktopLifecycle {
     pub fn new(
-        tasks: TaskOwner,
-        server: Arc<ServerHandle>,
-        presence: PresenceObserver,
+        services: &DesktopServices,
+        presence: Presence,
         skin_files: NativeSkinFiles,
-        skins: Arc<ProfileMedia>,
     ) -> Self {
         Self {
-            tasks,
-            services: Arc::new(Mutex::new(Some(LifecycleServices { server, skins }))),
+            tasks: services.tasks.clone(),
+            services: Arc::new(Mutex::new(Some(LifecycleServices {
+                server: services.server.clone(),
+                skins: services.skins.clone(),
+            }))),
             terminal: Arc::new(Mutex::new(TerminalState::default())),
             terminal_changed: Arc::new(Notify::new()),
             preferences_events: Arc::new(watch::channel(None).0),
@@ -117,8 +121,13 @@ impl DesktopLifecycle {
             .ok_or_else(|| SHUTDOWN_INCOMPLETE.to_string())
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn ensure_reset_allowed(&self) -> TerminalResult {
-        self.retained_services()?.server.ensure_reset_allowed()
+        Ok(self
+            .retained_services()?
+            .server
+            .recovery()
+            .ensure_reset_allowed()?)
     }
 
     /// Tauri plugins and late IPC resolvers can retain managed facades after
@@ -225,6 +234,16 @@ impl DesktopLifecycle {
     }
 
     #[cfg(test)]
+    pub fn for_test(services: &DesktopServices) -> Self {
+        let skin_files = NativeSkinFiles::new(
+            services.library.clone(),
+            services.tasks.clone(),
+            services.skins.library.clone(),
+        );
+        Self::new(services, Presence::disabled(), skin_files)
+    }
+
+    #[cfg(test)]
     pub fn without_interface_preferences_for_test(mut self) -> Self {
         self.preferences_disabled_for_test = true;
         self
@@ -315,13 +334,13 @@ impl DesktopLifecycle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .admitted;
+        let recovery = services.server.recovery();
         if !admitted {
-            if intent == TerminalIntent::Reset {
-                services.server.ensure_reset_allowed()?;
-            } else if intent == TerminalIntent::Update {
-                services.server.ensure_update_allowed()?;
-            } else if intent != TerminalIntent::Close {
-                services.server.ensure_no_interrupted_launch()?;
+            match intent {
+                TerminalIntent::Close => {}
+                TerminalIntent::Restart => recovery.ensure_no_interrupted_launch()?,
+                TerminalIntent::Reset => recovery.ensure_reset_allowed()?,
+                TerminalIntent::Update => recovery.ensure_update_allowed()?,
             }
             self.prepare_interface_preferences(intent).await?;
             // Preference HTTP writes and accepted skin intents must finish
@@ -354,10 +373,10 @@ impl DesktopLifecycle {
         }
         self.settle(&services, intent != TerminalIntent::Update)
             .await?;
-        if intent == TerminalIntent::Reset {
-            services.server.ensure_reset_settled()?;
-        } else if intent == TerminalIntent::Update {
-            services.server.ensure_update_allowed()?;
+        match intent {
+            TerminalIntent::Reset => recovery.ensure_reset_settled()?,
+            TerminalIntent::Update => recovery.ensure_update_allowed()?,
+            TerminalIntent::Close | TerminalIntent::Restart => {}
         }
         Ok(())
     }
@@ -500,28 +519,7 @@ impl DesktopLifecycle {
             changed.await;
         }
         self.close_native_admission();
-        let presence = async {
-            loop {
-                match self.presence.shutdown().await {
-                    Ok(()) => break,
-                    Err(error) => {
-                        tracing::error!(%error, "Desktop presence shutdown remains incomplete; retaining its owner");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        };
-        // The API owner asks domain services to stop before joining their work.
-        // Both owners survive until their actual shutdown has settled.
-        let (_, skin_result, _) = tokio::join!(
-            presence,
-            self.skin_files.drain(),
-            shutdown_server_after_failure(&services.server)
-        );
-        if let Err(error) = skin_result {
-            tracing::error!(%error, "Native skin publication remains retained after event-loop shutdown");
-            return;
-        }
+        retry_until_settled("Desktop shutdown", || self.settle(&services, true)).await;
         self.terminal
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -529,6 +527,8 @@ impl DesktopLifecycle {
         self.terminal_changed.notify_waiters();
     }
 
+    /// The one desktop shutdown order: accepted work, native skin effects,
+    /// presence, then the API owner, which stops domain services and HTTP.
     async fn settle(&self, services: &LifecycleServices, stop_api: bool) -> TerminalResult {
         self.tasks
             .shutdown(TASK_SHUTDOWN_TIMEOUT)
@@ -602,24 +602,6 @@ pub fn complete_interface_preferences(
 ) -> TerminalResult {
     crate::window::require_main_window(&window, &bootstrap)?;
     lifecycle.complete_interface_preferences(&request_id, saved)
-}
-
-/// Also used before a desktop lifecycle owner has been constructed. A transport
-/// error can be reported only after the API owner proves domain settlement.
-pub async fn shutdown_server_after_failure(server: &ServerHandle) {
-    loop {
-        match server.shutdown().await {
-            Ok(()) => return,
-            Err(error) if server.is_shutdown_settled() => {
-                tracing::warn!(%error, "Local API shutdown settled after a worker error");
-                return;
-            }
-            Err(error) => {
-                tracing::error!(%error, "Desktop shutdown remains incomplete; retaining application services");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        }
-    }
 }
 
 /// Setup callbacks must not return an error: Tauri would panic before retained
@@ -756,19 +738,8 @@ mod tests {
             .unwrap();
         let url = tauri::Url::parse(&services.server.bootstrap().base_url).unwrap();
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], url.port().unwrap()));
-        let skin_files = NativeSkinFiles::new(
-            services.library.clone(),
-            services.tasks.clone(),
-            services.skins.library.clone(),
-        );
-        let lifecycle = DesktopLifecycle::new(
-            services.tasks,
-            services.server,
-            PresenceObserver::disabled_for_test(),
-            skin_files,
-            services.skins,
-        )
-        .without_interface_preferences_for_test();
+        let lifecycle =
+            DesktopLifecycle::for_test(&services).without_interface_preferences_for_test();
         (directory, lifecycle, address)
     }
 
@@ -1167,17 +1138,7 @@ mod tests {
         let services = axial_api::start_in_profile(root.clone(), None)
             .await
             .unwrap();
-        let lifecycle = DesktopLifecycle::new(
-            services.tasks.clone(),
-            services.server.clone(),
-            PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(
-                services.library.clone(),
-                services.tasks.clone(),
-                services.skins.library.clone(),
-            ),
-            services.skins.clone(),
-        );
+        let lifecycle = DesktopLifecycle::for_test(&services);
         let mut events = lifecycle.interface_preferences_events();
         let reset = start_terminal(&lifecycle, TerminalIntent::Reset);
         let request = preference_event(&mut events).await;
@@ -1371,18 +1332,8 @@ mod tests {
             Err(axial_app::content::install::MutationError::Pending)
         ));
         assert!(services.content_mutations.has_unsettled_effects());
-        let lifecycle = DesktopLifecycle::new(
-            services.tasks.clone(),
-            services.server.clone(),
-            PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(
-                services.library.clone(),
-                services.tasks.clone(),
-                services.skins.library.clone(),
-            ),
-            services.skins.clone(),
-        )
-        .without_interface_preferences_for_test();
+        let lifecycle =
+            DesktopLifecycle::for_test(&services).without_interface_preferences_for_test();
         assert!(lifecycle.prepare_update().await.is_err());
         assert!(!services.tasks.status().closing);
         assert!(!lifecycle.terminal.lock().unwrap().admitted);
@@ -1439,17 +1390,7 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os(PENDING_CONTENT_PROFILE).unwrap());
         assert_eq!(std::fs::canonicalize(&root).unwrap(), root);
         let services = axial_api::start_in_profile(root, None).await.unwrap();
-        let lifecycle = DesktopLifecycle::new(
-            services.tasks.clone(),
-            services.server.clone(),
-            PresenceObserver::disabled_for_test(),
-            NativeSkinFiles::new(
-                services.library.clone(),
-                services.tasks.clone(),
-                services.skins.library.clone(),
-            ),
-            services.skins.clone(),
-        );
+        let lifecycle = DesktopLifecycle::for_test(&services);
         let mut events = lifecycle.interface_preferences_events();
         let update = start_terminal(&lifecycle, TerminalIntent::Update);
         let request = preference_event(&mut events).await;
