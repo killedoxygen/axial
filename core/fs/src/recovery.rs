@@ -1,10 +1,6 @@
 use crate::ROOT_LEASE_NAME;
-use crate::control_frame::{self, Cursor, Domain, Envelope, Probe, generation_side};
+use crate::control_frame::{self, Cursor, Envelope, Probe, generation_side};
 use crate::platform;
-use crate::successor::{
-    self, FrameProbe as SuccessorProbe, SelectedSuccessorFrame, SuccessorAcknowledgement,
-    SuccessorFrame, SuccessorRecord,
-};
 use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -15,13 +11,8 @@ use unicode_normalization::UnicodeNormalization as _;
 const RECOVERY_SLOT_COUNT: usize = 64;
 const RECOVERY_FRAMES_PER_SLOT: usize = 2;
 const RECOVERY_FRAME_BYTES: usize = control_frame::FRAME_BYTES;
-const RECOVERY_REGION_BYTES: u64 =
+pub(crate) const RECOVERY_CONTROL_BYTES: u64 =
     RECOVERY_SLOT_COUNT as u64 * RECOVERY_FRAMES_PER_SLOT as u64 * RECOVERY_FRAME_BYTES as u64;
-const SUCCESSOR_AGGREGATE_SLOT_COUNT: usize = 64;
-pub(crate) const RECOVERY_CONTROL_BYTES: u64 = RECOVERY_REGION_BYTES
-    + SUCCESSOR_AGGREGATE_SLOT_COUNT as u64
-        * RECOVERY_FRAMES_PER_SLOT as u64
-        * RECOVERY_FRAME_BYTES as u64;
 
 const HEADER_BYTES: usize = control_frame::HEADER_BYTES;
 const FRAME_BODY_BYTES: usize = control_frame::BODY_BYTES;
@@ -416,16 +407,6 @@ struct RecoveryFrameReceipt {
     digest: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StateSuccessorDescriptor {
-    pub(crate) owner_schema: u16,
-    pub(crate) owner_id: Vec<u8>,
-    pub(crate) recoveries: Vec<RegisteredRecovery>,
-    owner_key: SuccessorOwnerKey,
-}
-
-type RegisteredRecovery = (RecoveryRegistration, RecoveryRecord);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryRegistration {
     pub(crate) slot: u8,
@@ -433,31 +414,11 @@ pub(crate) struct RecoveryRegistration {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum PendingWrite {
-    Recovery {
-        registration: RecoveryRegistration,
-        intended: Option<RecoveryFrame>,
-        offset: u64,
-        encoded: Box<[u8; RECOVERY_FRAME_BYTES]>,
-    },
-    Successor {
-        slot: u8,
-        intended: Option<SuccessorFrame>,
-        offset: u64,
-        encoded: Box<[u8; RECOVERY_FRAME_BYTES]>,
-    },
-}
-
-type SuccessorOwnerKey = (u8, u64, [u8; 16]);
-
-#[derive(Debug)]
-pub(crate) struct SuccessorOwner(Option<SuccessorOwnerKey>);
-impl Drop for SuccessorOwner {
-    fn drop(&mut self) {
-        if self.0.is_some() {
-            std::process::abort();
-        }
-    }
+struct PendingWrite {
+    registration: RecoveryRegistration,
+    intended: Option<RecoveryFrame>,
+    offset: u64,
+    encoded: Box<[u8; RECOVERY_FRAME_BYTES]>,
 }
 
 #[derive(Debug)]
@@ -465,7 +426,6 @@ pub(crate) struct RecoveryJournal {
     pub(crate) lane_nonce: [u8; 16],
     slots: [Option<RecoveryFrame>; RECOVERY_SLOT_COUNT],
     physical: [[Option<RecoveryFrameReceipt>; RECOVERY_FRAMES_PER_SLOT]; RECOVERY_SLOT_COUNT],
-    successors: [Option<SelectedSuccessorFrame>; successor::SUCCESSOR_SLOT_COUNT],
     pending: Option<PendingWrite>,
     checked_out: bool,
 }
@@ -514,14 +474,15 @@ impl RecoveryJournal {
     }
 
     pub(crate) fn has_live_or_uncertain(&self) -> bool {
-        self.checked_out
-            || self.pending.is_some()
-            || self.has_live_successor()
-            || self.records().next().is_some()
+        self.checked_out || self.pending.is_some() || self.records().next().is_some()
     }
 
     pub(crate) fn is_uncertain(&self) -> bool {
         self.checked_out || self.pending.is_some()
+    }
+
+    pub(crate) fn is_checked_out(&self) -> bool {
+        self.checked_out
     }
 
     pub(crate) fn take_for_replay(&mut self) -> io::Result<Self> {
@@ -535,7 +496,6 @@ impl RecoveryJournal {
                 lane_nonce,
                 slots: std::array::from_fn(|_| None),
                 physical: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-                successors: std::array::from_fn(|_| None),
                 pending: None,
                 checked_out: true,
             },
@@ -545,289 +505,6 @@ impl RecoveryJournal {
     pub(crate) fn restore_after_replay(&mut self, replayed: Self) {
         assert!(self.checked_out && !replayed.checked_out && replayed.pending.is_none());
         *self = replayed;
-    }
-
-    pub(crate) fn has_live_successor(&self) -> bool {
-        self.successors
-            .iter()
-            .any(|selected| selected.as_ref().is_some_and(|s| s.frame.record.is_some()))
-    }
-
-    fn state_recoveries(&self, record: &SuccessorRecord) -> Result<Vec<RegisteredRecovery>> {
-        let mut manifest = Cursor(record.new_payload.as_deref().ok_or(RecoveryCodecError)?);
-        let mut virtual_slots = self.slots.clone();
-        let header: [u8; 3] = manifest.array()?;
-        let acknowledged = record
-            .acknowledgements
-            .iter()
-            .fold(0_u64, |slots, ack| slots | 1_u64 << ack.recovery_slot);
-        ensure(
-            record.old_payload.is_none()
-                && header[..2] == record.owner_schema.to_le_bytes()
-                && usize::from(header[2]) == record.acknowledgements.len()
-                && !self
-                    .records()
-                    .any(|(registration, _)| acknowledged & (1_u64 << registration.slot) == 0),
-        )?;
-        let mut previous = None;
-        let mut recoveries = Vec::with_capacity(record.acknowledgements.len());
-        for ack in &record.acknowledgements {
-            let op = manifest.array()?;
-            ensure(ack.operation_id == op && previous.replace(op).is_none_or(|prior| prior < op))?;
-            let receipt = self.physical[usize::from(ack.recovery_slot)]
-                [usize::from(ack.recovery_side)]
-            .as_ref()
-            .ok_or(RecoveryCodecError)?;
-            let recovery = receipt.frame.record.as_ref().ok_or(RecoveryCodecError)?;
-            ensure(
-                receipt.frame.generation == ack.recovery_generation
-                    && receipt.digest == ack.frame_sha256
-                    && recovery.operation_id == op
-                    && recovery.phase == RecoveryPhase::StagePrepared
-                    && recovery.new.is_none(),
-            )?;
-            let mut desired = recovery.clone();
-            desired.phase = RecoveryPhase::RemoveCommitted;
-            desired.new = Some(decode_proof(&mut manifest)?);
-            desired.validate()?;
-            virtual_slots[usize::from(ack.recovery_slot)] = Some(RecoveryFrame {
-                generation: receipt.frame.generation,
-                record: Some(desired.clone()),
-            });
-            let registration = RecoveryRegistration {
-                slot: ack.recovery_slot,
-                operation_id: op,
-            };
-            recoveries.push((registration, desired));
-        }
-        validate_lane_slots(&virtual_slots, None)?;
-        ensure(manifest.0.is_empty())?;
-        Ok(recoveries)
-    }
-
-    pub(crate) fn state_successor(&self) -> io::Result<Option<StateSuccessorDescriptor>> {
-        ensure(!self.checked_out)?;
-        let mut live = self
-            .successors
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, selected)| {
-                let selected = selected.as_ref()?;
-                let record = selected.frame.record.as_ref()?;
-                Some((slot, selected, record))
-            });
-        let Some((slot, selected, record)) = live.next() else {
-            return Ok(None);
-        };
-        if record.owner_class != successor::SuccessorOwnerClass::State || live.next().is_some() {
-            return Err(codec_io_error());
-        }
-        let recoveries = self.state_recoveries(record)?;
-        Ok(Some(StateSuccessorDescriptor {
-            owner_schema: record.owner_schema,
-            owner_id: record.owner_id.clone(),
-            recoveries,
-            owner_key: (
-                u8::try_from(slot).map_err(|_| codec_io_error())?,
-                selected.frame.generation,
-                record.transfer_id,
-            ),
-        }))
-    }
-
-    pub(crate) fn claim_state_successor(
-        &self,
-    ) -> io::Result<(StateSuccessorDescriptor, SuccessorOwner)> {
-        let descriptor = self.state_successor()?.ok_or_else(codec_io_error)?;
-        let owner = SuccessorOwner(Some(descriptor.owner_key));
-        Ok((descriptor, owner))
-    }
-
-    pub(crate) fn create_successor(
-        &mut self,
-        lease: &platform::LeaseHandle,
-        mut record: SuccessorRecord,
-        registrations: &[RecoveryRegistration],
-    ) -> std::result::Result<SuccessorOwner, (io::Error, Option<SuccessorOwner>)> {
-        let build = (|| {
-            if self.checked_out || self.pending.is_some() {
-                return Err(codec_io_error());
-            }
-            let mut acks = Vec::with_capacity(registrations.len());
-            for reg in registrations {
-                let index = usize::from(reg.slot);
-                let frame = self
-                    .slots
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(codec_io_error)?;
-                let side = usize::from(generation_side(frame.generation));
-                let receipt = self.physical[index][side]
-                    .as_ref()
-                    .ok_or_else(codec_io_error)?;
-                if frame.record.as_ref().map(|record| record.operation_id) != Some(reg.operation_id)
-                    || receipt.frame.generation != frame.generation
-                    || receipt
-                        .frame
-                        .record
-                        .as_ref()
-                        .map(|record| record.operation_id)
-                        != Some(reg.operation_id)
-                {
-                    return Err(codec_io_error());
-                }
-                acks.push(SuccessorAcknowledgement {
-                    recovery_slot: reg.slot,
-                    recovery_side: u8::try_from(side).map_err(|_| codec_io_error())?,
-                    recovery_generation: receipt.frame.generation,
-                    operation_id: reg.operation_id,
-                    frame_sha256: receipt.digest,
-                });
-            }
-            let index = self
-                .successors
-                .iter()
-                .position(|selected| {
-                    selected
-                        .as_ref()
-                        .is_none_or(|selected| selected.frame.record.is_none())
-                })
-                .ok_or_else(codec_io_error)?;
-            let slot = u8::try_from(index).map_err(|_| codec_io_error())?;
-            let generation = successor::next_successor_generation(
-                self.successors[index]
-                    .as_ref()
-                    .map(|selected| selected.frame.generation),
-            )
-            .map_err(|_| codec_io_error())?;
-            let transfer = random_nonzero_id();
-            record.transfer_id = transfer;
-            record.acknowledgements = acks;
-            if record.owner_class == successor::SuccessorOwnerClass::State {
-                self.state_recoveries(&record)
-                    .map_err(|_| codec_io_error())?;
-            }
-            let frame = SuccessorFrame {
-                generation,
-                record: Some(record),
-            };
-            Ok((
-                slot,
-                generation,
-                transfer,
-                self.successor_pending(slot, frame)?,
-            ))
-        })();
-        let (slot, generation, transfer, pending) = build.map_err(|error| (error, None))?;
-        let owner = SuccessorOwner(Some((slot, generation, transfer)));
-        self.pending = Some(pending);
-        match self.write_pending(lease) {
-            Ok(()) => Ok(owner),
-            Err(error) => Err((error, Some(owner))),
-        }
-    }
-
-    pub(crate) fn validate_live_successor(&self, owner: &SuccessorOwner) -> io::Result<()> {
-        if self.checked_out || self.pending.is_some() {
-            return Err(codec_io_error());
-        }
-        owner
-            .0
-            .and_then(|key| self.selected_live_successor(key))
-            .map(|_| ())
-            .ok_or_else(codec_io_error)
-    }
-
-    pub(crate) fn tombstone_successor(
-        &mut self,
-        lease: &platform::LeaseHandle,
-        mut owner: SuccessorOwner,
-    ) -> std::result::Result<(), (io::Error, SuccessorOwner)> {
-        if self.checked_out {
-            return Err((codec_io_error(), owner));
-        }
-        let Some((slot, generation, transfer)) = owner.0 else {
-            return Err((codec_io_error(), owner));
-        };
-        let completing = matches!(
-            (&self.pending, self.successors[usize::from(slot)].as_ref()),
-            (
-                Some(PendingWrite::Successor {
-                    slot: pending_slot,
-                    intended: Some(intended),
-                    ..
-                }),
-                Some(selected),
-            ) if *pending_slot == slot
-                && intended.generation == generation + 1
-                && intended.record.is_none()
-                && selected.frame.generation == generation
-                && selected.frame.record.as_ref().is_some_and(|record| record.transfer_id == transfer)
-        );
-        if let Err(error) = self.reconcile_uncertain(lease) {
-            return Err((error, owner));
-        }
-        let selected = self.successors[usize::from(slot)].as_ref();
-        if completing
-            && selected.is_some_and(|selected| {
-                selected.frame.generation == generation + 1 && selected.frame.record.is_none()
-            })
-        {
-            owner.0 = None;
-            return Ok(());
-        }
-        let Some(record) = self.selected_live_successor((slot, generation, transfer)) else {
-            return Err((codec_io_error(), owner));
-        };
-        let ready = record.acknowledgements.iter().all(|ack| {
-            let index = usize::from(ack.recovery_slot);
-            self.slots[index].as_ref().is_some_and(|frame| {
-                frame.generation == ack.recovery_generation + 1 && frame.record.is_none()
-            })
-        });
-        if !ready {
-            return Err((codec_io_error(), owner));
-        }
-        let pending = self.successor_pending(
-            slot,
-            SuccessorFrame {
-                generation: generation + 1,
-                record: None,
-            },
-        );
-        if pending.is_err() {
-            return Err((codec_io_error(), owner));
-        }
-        self.pending = Some(pending.expect("validated successor tombstone"));
-        if let Err(error) = self.write_pending(lease) {
-            return Err((error, owner));
-        }
-        owner.0 = None;
-        Ok(())
-    }
-
-    fn selected_live_successor(
-        &self,
-        (slot, generation, transfer): (u8, u64, [u8; 16]),
-    ) -> Option<&SuccessorRecord> {
-        let selected = self.successors.get(usize::from(slot))?.as_ref()?;
-        let record = selected.frame.record.as_ref()?;
-        (selected.frame.generation == generation && record.transfer_id == transfer)
-            .then_some(record)
-    }
-
-    fn successor_pending(&self, slot: u8, frame: SuccessorFrame) -> io::Result<PendingWrite> {
-        self.validate_successor_transition(slot, &frame)?;
-        let side = generation_side(frame.generation);
-        let encoded = successor::encode_successor_frame(&frame, self.lane_nonce, slot)
-            .map_err(|_| codec_io_error())?;
-        let offset = successor::successor_frame_offset(slot, side).map_err(|_| codec_io_error())?;
-        Ok(PendingWrite::Successor {
-            slot,
-            intended: Some(frame),
-            offset,
-            encoded: Box::new(encoded),
-        })
     }
 
     pub(crate) fn reconcile_uncertain(&mut self, lease: &platform::LeaseHandle) -> io::Result<()> {
@@ -860,28 +537,12 @@ impl RecoveryJournal {
             .filter(|record| record.operation_id == registration.operation_id)
     }
 
-    pub(crate) fn admits_state_batch(&self, required: usize) -> bool {
-        !self.checked_out
-            && self.pending.is_none()
-            && self
-                .slots
-                .iter()
-                .filter(|frame| recovery_slot_reusable(frame.as_ref()))
-                .take(required)
-                .count()
-                == required
-    }
-
     pub(crate) fn reserve(&self, record: &RecoveryRecord) -> io::Result<RecoveryRegistration> {
         ensure(!self.checked_out)?;
         let mut available = None;
         for (slot, frame) in self.slots.iter().enumerate() {
             let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
-            if recovery_slot_reusable(frame.as_ref())
-                && successor::recovery_pin_side(self.lane_nonce, &self.successors, slot)
-                    .map_err(|_| codec_io_error())?
-                    .is_none()
-            {
+            if recovery_slot_reusable(frame.as_ref()) {
                 available = Some(slot);
                 break;
             }
@@ -942,7 +603,7 @@ impl RecoveryJournal {
         let side = generation_side(frame.generation);
         let address = RecoveryFrameAddress::new(self.lane_nonce, registration.slot, side)
             .map_err(|_| codec_io_error())?;
-        let pending = PendingWrite::Recovery {
+        let pending = PendingWrite {
             registration,
             offset: recovery_frame_offset(registration.slot, side)?,
             encoded: Box::new(encode_recovery_frame(&frame, address)?),
@@ -958,6 +619,9 @@ impl RecoveryJournal {
             || {
                 #[cfg(test)]
                 if sync_test_support::take_pre_barrier_sync_failure() {
+                    if sync_test_support::exits_at_failure() {
+                        std::process::exit(sync_test_support::CRASH_EXIT_CODE);
+                    }
                     return Err((io::Error::other("injected recovery sync failure"), false));
                 }
                 platform::recovery_control_sync(lease)
@@ -1013,60 +677,28 @@ impl RecoveryJournal {
     }
 
     fn pending_io(&self) -> (u64, &[u8; RECOVERY_FRAME_BYTES]) {
-        match self.pending.as_ref().expect("pending control write") {
-            PendingWrite::Recovery {
-                offset, encoded, ..
-            }
-            | PendingWrite::Successor {
-                offset, encoded, ..
-            } => (*offset, encoded),
-        }
+        let pending = self.pending.as_ref().expect("pending control write");
+        (pending.offset, &pending.encoded)
     }
 
     fn accept_pending(&mut self) {
-        let nonce = self.lane_nonce;
-        match self.pending.as_mut().expect("pending control write") {
-            PendingWrite::Recovery {
-                registration,
-                intended,
-                encoded,
-                ..
-            } => {
-                let frame = intended.take().expect("validated pending recovery frame");
-                let slot = usize::from(registration.slot);
-                let side = usize::from(generation_side(frame.generation));
-                self.physical[slot][side] = Some(RecoveryFrameReceipt {
-                    frame: frame.clone(),
-                    digest: Sha256::digest(encoded.as_slice()).into(),
-                });
-                self.slots[slot] = Some(frame);
-            }
-            PendingWrite::Successor { slot, intended, .. } => {
-                let frame = intended.take().expect("validated pending successor frame");
-                self.successors[usize::from(*slot)] = Some(SelectedSuccessorFrame {
-                    lane_nonce: nonce,
-                    frame,
-                });
-            }
-        }
-        self.pending = None;
+        let pending = self.pending.take().expect("pending control write");
+        let frame = pending.intended.expect("validated pending recovery frame");
+        let slot = usize::from(pending.registration.slot);
+        let side = usize::from(generation_side(frame.generation));
+        self.physical[slot][side] = Some(RecoveryFrameReceipt {
+            frame: frame.clone(),
+            digest: Sha256::digest(pending.encoded.as_slice()).into(),
+        });
+        self.slots[slot] = Some(frame);
     }
 
     fn validate_pending(&self) -> io::Result<()> {
-        match self.pending.as_ref().ok_or_else(codec_io_error)? {
-            PendingWrite::Recovery {
-                registration,
-                intended,
-                ..
-            } => self.validate_recovery_transition(
-                *registration,
-                intended.as_ref().ok_or_else(codec_io_error)?,
-            ),
-            PendingWrite::Successor { slot, intended, .. } => self.validate_successor_transition(
-                *slot,
-                intended.as_ref().ok_or_else(codec_io_error)?,
-            ),
-        }
+        let pending = self.pending.as_ref().ok_or_else(codec_io_error)?;
+        self.validate_recovery_transition(
+            pending.registration,
+            pending.intended.as_ref().ok_or_else(codec_io_error)?,
+        )
     }
 
     fn accept_pending_control(&mut self, observed: RecoveryJournal) {
@@ -1105,35 +737,7 @@ impl RecoveryJournal {
         }
         validate_recovery_advance(previous, frame)?;
         validate_lane_slots(&self.slots, Some((slot, frame)))?;
-        let write_side = generation_side(frame.generation);
-        let selected_side =
-            previous.map_or(write_side ^ 1, |frame| generation_side(frame.generation));
-        if successor::recovery_pin_side(self.lane_nonce, &self.successors, registration.slot)
-            .map_err(|_| codec_io_error())?
-            .is_some_and(|pin| frame.record.is_some() || pin != selected_side || pin == write_side)
-        {
-            return Err(codec_io_error());
-        }
         Ok(())
-    }
-
-    fn validate_successor_transition(&self, slot: u8, frame: &SuccessorFrame) -> io::Result<()> {
-        let index = usize::from(slot);
-        successor::validate_successor_advance(
-            self.successors
-                .get(index)
-                .and_then(Option::as_ref)
-                .map(|selected| &selected.frame),
-            frame,
-        )
-        .and_then(|()| {
-            successor::validate_successor_lane(
-                self.lane_nonce,
-                &self.successors,
-                Some((index, frame)),
-            )
-        })
-        .map_err(|_| codec_io_error())
     }
 }
 
@@ -1167,7 +771,7 @@ fn decode_control(
             }
         }
         let first_write_side = retained.and_then(|journal| match journal.pending.as_ref() {
-            Some(PendingWrite::Recovery {
+            Some(PendingWrite {
                 registration,
                 intended,
                 ..
@@ -1193,55 +797,6 @@ fn decode_control(
             slots[slot] = Some(selected.frame);
         }
     }
-    let mut successors = std::array::from_fn(|_| None);
-    for (slot, entry) in successors.iter_mut().enumerate() {
-        let slot = u8::try_from(slot).map_err(|_| codec_io_error())?;
-        let first = control_region(
-            control,
-            successor::successor_frame_offset(slot, 0).map_err(|_| codec_io_error())?,
-        )?;
-        let second = control_region(
-            control,
-            successor::successor_frame_offset(slot, 1).map_err(|_| codec_io_error())?,
-        )?;
-        let selected = match successor::select_successor_frame(first, second, slot) {
-            Ok(selected) => selected,
-            Err(_) if retained.is_some_and(|journal| {
-                matches!(journal.pending.as_ref(), Some(PendingWrite::Successor { slot: pending, .. })
-                    if *pending == slot && journal.successors[usize::from(slot)].is_none())
-            }) => {
-                let PendingWrite::Successor { intended, .. } = retained
-                    .and_then(|journal| journal.pending.as_ref())
-                    .ok_or_else(codec_io_error)?
-                else {
-                    return Err(codec_io_error());
-                };
-                let side = usize::from(u8::from(
-                    intended
-                        .as_ref()
-                        .ok_or_else(codec_io_error)?
-                        .generation
-                        .is_multiple_of(2),
-                ));
-                let probes = [
-                    successor::probe_frame(first, slot, 0).map_err(|_| codec_io_error())?,
-                    successor::probe_frame(second, slot, 1).map_err(|_| codec_io_error())?,
-                ];
-                if matches!(&probes[side], SuccessorProbe::Empty | SuccessorProbe::Torn)
-                    && matches!(&probes[side ^ 1], SuccessorProbe::Empty)
-                {
-                    None
-                } else {
-                    return Err(codec_io_error());
-                }
-            }
-            Err(_) => return Err(codec_io_error()),
-        };
-        if let Some(frame) = selected {
-            admit_lane_nonce(&mut nonce, frame.lane_nonce)?;
-            *entry = Some(frame);
-        }
-    }
     let lane_nonce = nonce
         .or(retained.map(|journal| journal.lane_nonce))
         .unwrap_or_else(random_nonzero_id);
@@ -1249,45 +804,10 @@ fn decode_control(
         return Err(codec_io_error());
     }
     validate_lane_slots(&slots, None)?;
-    successor::validate_successor_lane(lane_nonce, &successors, None)
-        .map_err(|_| codec_io_error())?;
-    for acknowledgement in successors
-        .iter()
-        .filter_map(Option::as_ref)
-        .filter_map(|selected| selected.frame.record.as_ref())
-        .flat_map(|record| &record.acknowledgements)
-    {
-        let selected = slots[usize::from(acknowledgement.recovery_slot)]
-            .as_ref()
-            .ok_or_else(codec_io_error)?;
-        let receipt = physical[usize::from(acknowledgement.recovery_slot)]
-            [usize::from(acknowledgement.recovery_side)]
-        .as_ref()
-        .ok_or_else(codec_io_error)?;
-        if !(matches!(
-            (selected.generation, selected.record.as_ref()),
-            (generation, Some(record))
-                if generation == acknowledgement.recovery_generation
-                    && record.operation_id == acknowledgement.operation_id
-        ) || (selected.generation == acknowledgement.recovery_generation + 1
-            && selected.record.is_none()))
-            || receipt.frame.generation != acknowledgement.recovery_generation
-            || receipt
-                .frame
-                .record
-                .as_ref()
-                .map(|record| record.operation_id)
-                != Some(acknowledgement.operation_id)
-            || receipt.digest != acknowledgement.frame_sha256
-        {
-            return Err(codec_io_error());
-        }
-    }
     let observed = RecoveryJournal {
         lane_nonce,
         slots,
         physical,
-        successors,
         pending: None,
         checked_out: false,
     };
@@ -1295,57 +815,28 @@ fn decode_control(
         cached.validate_pending()?;
         let (offset, encoded) = cached.pending_io();
         let raw_is_intended = control_region(control, offset)? == encoded.as_slice();
-        match cached.pending.as_ref().ok_or_else(codec_io_error)? {
-            PendingWrite::Recovery {
-                registration,
-                intended,
-                ..
-            } => {
-                let slot = usize::from(registration.slot);
-                let side = usize::from(generation_side(
-                    intended.as_ref().ok_or_else(codec_io_error)?.generation,
-                ));
-                if observed.successors != cached.successors
-                    || observed
-                        .slots
-                        .iter()
-                        .enumerate()
-                        .any(|(index, frame)| index != slot && frame != &cached.slots[index])
-                    || observed.physical.iter().enumerate().any(|(index, sides)| {
-                        sides.iter().enumerate().any(|(candidate, receipt)| {
-                            (index != slot || candidate != side)
-                                && receipt != &cached.physical[index][candidate]
-                        })
-                    })
-                {
-                    return Err(codec_io_error());
-                }
-                match observed.slots[slot].as_ref() {
-                    frame if frame == cached.slots[slot].as_ref() => false,
-                    Some(frame) if Some(frame) == intended.as_ref() && raw_is_intended => true,
-                    _ => return Err(codec_io_error()),
-                }
-            }
-            PendingWrite::Successor { slot, intended, .. } => {
-                let slot = usize::from(*slot);
-                if observed.slots != cached.slots
-                    || observed.physical != cached.physical
-                    || observed
-                        .successors
-                        .iter()
-                        .enumerate()
-                        .any(|(index, frame)| index != slot && frame != &cached.successors[index])
-                {
-                    return Err(codec_io_error());
-                }
-                match observed.successors[slot].as_ref() {
-                    frame if frame == cached.successors[slot].as_ref() => false,
-                    Some(frame) if Some(&frame.frame) == intended.as_ref() && raw_is_intended => {
-                        true
-                    }
-                    _ => return Err(codec_io_error()),
-                }
-            }
+        let pending = cached.pending.as_ref().ok_or_else(codec_io_error)?;
+        let intended = pending.intended.as_ref().ok_or_else(codec_io_error)?;
+        let slot = usize::from(pending.registration.slot);
+        let side = usize::from(generation_side(intended.generation));
+        if observed
+            .slots
+            .iter()
+            .enumerate()
+            .any(|(index, frame)| index != slot && frame != &cached.slots[index])
+            || observed.physical.iter().enumerate().any(|(index, sides)| {
+                sides.iter().enumerate().any(|(candidate, receipt)| {
+                    (index != slot || candidate != side)
+                        && receipt != &cached.physical[index][candidate]
+                })
+            })
+        {
+            return Err(codec_io_error());
+        }
+        match observed.slots[slot].as_ref() {
+            frame if frame == cached.slots[slot].as_ref() => false,
+            Some(frame) if frame == intended && raw_is_intended => true,
+            _ => return Err(codec_io_error()),
         }
     } else {
         false
@@ -1508,7 +999,7 @@ fn footprint_keys(record: &RecoveryRecord) -> Vec<String> {
 }
 
 fn recovery_frame_offset(slot: u8, frame: u8) -> Result<u64> {
-    control_frame::offset(Domain::Recovery, slot, frame).map_err(Into::into)
+    control_frame::offset(slot, frame).map_err(Into::into)
 }
 
 fn encode_recovery_frame(
@@ -1524,7 +1015,6 @@ fn encode_recovery_frame(
         0
     };
     Ok(control_frame::encode(
-        Domain::Recovery,
         address,
         frame.generation,
         kind,
@@ -1553,16 +1043,14 @@ enum RecoveryProbe {
     Valid(SelectedRecoveryFrame),
 }
 fn probe_recovery_frame(encoded: &[u8], slot: u8, side: u8) -> Result<RecoveryProbe> {
-    Ok(
-        match control_frame::probe(Domain::Recovery, encoded, slot, side)? {
-            Probe::Empty => RecoveryProbe::Empty,
-            Probe::Torn => RecoveryProbe::Torn,
-            Probe::Valid(envelope) => RecoveryProbe::Valid(SelectedRecoveryFrame {
-                lane_nonce: envelope.address.lane,
-                frame: decode_recovery_envelope(envelope)?,
-            }),
-        },
-    )
+    Ok(match control_frame::probe(encoded, slot, side)? {
+        Probe::Empty => RecoveryProbe::Empty,
+        Probe::Torn => RecoveryProbe::Torn,
+        Probe::Valid(envelope) => RecoveryProbe::Valid(SelectedRecoveryFrame {
+            lane_nonce: envelope.address.lane,
+            frame: decode_recovery_envelope(envelope)?,
+        }),
+    })
 }
 
 fn select_recovery_probes(
@@ -1774,7 +1262,7 @@ mod tests {
             let side = generation_side(frame.generation);
             let address = RecoveryFrameAddress::new(self.lane_nonce, registration.slot, side)
                 .map_err(|_| codec_io_error())?;
-            self.pending = Some(PendingWrite::Recovery {
+            self.pending = Some(PendingWrite {
                 registration,
                 offset: recovery_frame_offset(registration.slot, side)?,
                 encoded: Box::new(encode_recovery_frame(&frame, address)?),
@@ -1785,15 +1273,14 @@ mod tests {
     }
 
     fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
-        control_frame::checksum(Domain::Recovery, body, side)
+        control_frame::checksum(body, side)
     }
 
     fn decode_recovery_frame(
         encoded: &[u8],
         address: RecoveryFrameAddress,
     ) -> Result<RecoveryFrame> {
-        let Probe::Valid(envelope) =
-            control_frame::probe(Domain::Recovery, encoded, address.slot, address.side)?
+        let Probe::Valid(envelope) = control_frame::probe(encoded, address.slot, address.side)?
         else {
             return Err(RecoveryCodecError);
         };
@@ -1986,7 +1473,6 @@ mod tests {
             lane_nonce: LANE,
             slots: std::array::from_fn(|_| None),
             physical: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            successors: std::array::from_fn(|_| None),
             pending: None,
             checked_out: false,
         }
@@ -2001,45 +1487,6 @@ mod tests {
         let offset = usize::try_from(recovery_frame_offset(slot, side).unwrap()).unwrap();
         control[offset..offset + RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
         control
-    }
-
-    fn successor_record(control: &[u8], operation_id: [u8; 16]) -> SuccessorRecord {
-        let raw = control_region(control, recovery_frame_offset(0, 0).unwrap()).unwrap();
-        SuccessorRecord {
-            owner_class: successor::SuccessorOwnerClass::Performance,
-            owner_schema: 1,
-            owner_id: vec![0x51],
-            transfer_id: [0x52; 16],
-            old_payload: Some(vec![1]),
-            new_payload: Some(vec![2]),
-            acknowledgements: vec![SuccessorAcknowledgement {
-                recovery_slot: 0,
-                recovery_side: 0,
-                recovery_generation: 1,
-                operation_id,
-                frame_sha256: Sha256::digest(raw).into(),
-            }],
-        }
-    }
-
-    fn successor_draft() -> SuccessorRecord {
-        SuccessorRecord {
-            owner_class: successor::SuccessorOwnerClass::Performance,
-            owner_schema: 1,
-            owner_id: vec![0x51],
-            transfer_id: [0; 16],
-            old_payload: Some(vec![1]),
-            new_payload: Some(vec![2]),
-            acknowledgements: Vec::new(),
-        }
-    }
-
-    fn put_successor(control: &mut [u8], slot: u8, lane: [u8; 16], frame: &SuccessorFrame) {
-        let side = generation_side(frame.generation);
-        let encoded = successor::encode_successor_frame(frame, lane, slot).unwrap();
-        let offset =
-            usize::try_from(successor::successor_frame_offset(slot, side).unwrap()).unwrap();
-        control[offset..offset + RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
     }
 
     fn encoded(generation: u64, phase: RecoveryPhase, side: u8) -> [u8; RECOVERY_FRAME_BYTES] {
@@ -2328,10 +1775,9 @@ mod tests {
         assert_eq!(recovery_frame_offset(0, 0), Ok(0));
         assert_eq!(
             recovery_frame_offset(63, 1),
-            Ok(RECOVERY_REGION_BYTES - RECOVERY_FRAME_BYTES as u64)
+            Ok(RECOVERY_CONTROL_BYTES - RECOVERY_FRAME_BYTES as u64)
         );
-        assert_eq!(RECOVERY_REGION_BYTES, 2 * 1024 * 1024);
-        assert_eq!(RECOVERY_CONTROL_BYTES, 4 * 1024 * 1024);
+        assert_eq!(RECOVERY_CONTROL_BYTES, 2 * 1024 * 1024);
         assert!(recovery_frame_offset(64, 0).is_err());
         assert!(recovery_frame_offset(0, 2).is_err());
 
@@ -2906,241 +2352,6 @@ mod tests {
     }
 
     #[test]
-    fn combined_control_binds_successor_to_the_exact_recovery_predecessor() {
-        let operation = record(RecoveryPhase::StagePrepared);
-        let live = RecoveryFrame {
-            generation: 1,
-            record: Some(operation.clone()),
-        };
-        let mut control = control_with(0, &live);
-        let successor = successor_record(&control, operation.operation_id);
-        put_successor(
-            &mut control,
-            0,
-            LANE,
-            &SuccessorFrame {
-                generation: 1,
-                record: Some(successor),
-            },
-        );
-        assert!(
-            decode_control(&control, None)
-                .unwrap()
-                .0
-                .has_live_successor()
-        );
-
-        let mut mixed = control_with(0, &live);
-        put_successor(
-            &mut mixed,
-            0,
-            [0x22; 16],
-            &SuccessorFrame {
-                generation: 1,
-                record: Some(successor_record(&control, operation.operation_id)),
-            },
-        );
-        assert!(decode_control(&mixed, None).is_err());
-
-        let mut successor = successor_record(&control, operation.operation_id);
-        successor.acknowledgements[0].frame_sha256[0] ^= 1;
-        let mut wrong_digest = control_with(0, &live);
-        put_successor(
-            &mut wrong_digest,
-            0,
-            LANE,
-            &SuccessorFrame {
-                generation: 1,
-                record: Some(successor),
-            },
-        );
-        assert!(decode_control(&wrong_digest, None).is_err());
-
-        let mut tombstoned = control;
-        let tombstone = RecoveryFrame {
-            generation: 2,
-            record: None,
-        };
-        let encoded =
-            encode_recovery_frame(&tombstone, RecoveryFrameAddress::new(LANE, 0, 1).unwrap())
-                .unwrap();
-        tombstoned[RECOVERY_FRAME_BYTES..2 * RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
-        assert!(decode_control(&tombstoned, None).is_ok());
-
-        let sealed = RecoveryFrame {
-            generation: 2,
-            record: Some(record(RecoveryPhase::StageSealed)),
-        };
-        let encoded =
-            encode_recovery_frame(&sealed, RecoveryFrameAddress::new(LANE, 0, 1).unwrap()).unwrap();
-        tombstoned[RECOVERY_FRAME_BYTES..2 * RECOVERY_FRAME_BYTES].copy_from_slice(&encoded);
-        assert!(
-            decode_control(&tombstoned, None).is_err(),
-            "a pinned recovery predecessor cannot advance to another live frame"
-        );
-    }
-
-    #[test]
-    fn first_successor_torn_write_retries_but_intact_invalid_frame_is_fatal() {
-        let operation = record(RecoveryPhase::StagePrepared);
-        let recovery = RecoveryFrame {
-            generation: 1,
-            record: Some(operation.clone()),
-        };
-        let mut control = control_with(0, &recovery);
-        let mut journal = decode_control(&control, None).unwrap().0;
-        let pending = journal
-            .successor_pending(
-                0,
-                SuccessorFrame {
-                    generation: 1,
-                    record: Some(successor_record(&control, operation.operation_id)),
-                },
-            )
-            .unwrap();
-        let (offset, encoded) = match &pending {
-            PendingWrite::Successor {
-                offset, encoded, ..
-            } => (usize::try_from(*offset).unwrap(), encoded.clone()),
-            _ => unreachable!(),
-        };
-        journal.pending = Some(pending);
-        control[offset..offset + 128].copy_from_slice(&encoded[..128]);
-        assert!(!decode_control(&control, Some(&journal)).unwrap().1);
-
-        let mut invalid = *encoded;
-        invalid[30] = 1;
-        let checksum = control_frame::checksum(Domain::Successor, &invalid[..FRAME_BODY_BYTES], 0);
-        invalid[FRAME_BODY_BYTES..].copy_from_slice(&checksum);
-        control[offset..offset + RECOVERY_FRAME_BYTES].copy_from_slice(&invalid);
-        assert!(decode_control(&control, Some(&journal)).is_err());
-    }
-
-    #[test]
-    fn successor_owner_retries_uncertainty_and_releases_the_exact_pin() {
-        let temporary = crate::test_tempdir().unwrap();
-        let mut outcome = crate::RootSession::acquire(temporary.path());
-        let session = loop {
-            match outcome {
-                crate::RootSessionAcquireOutcome::Acquired(session) => break session,
-                crate::RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
-                    outcome = obligation.reconcile();
-                }
-                crate::RootSessionAcquireOutcome::NoEffect(error) => {
-                    panic!("test root acquisition failed: {error}")
-                }
-            }
-        };
-        let operation = record(RecoveryPhase::StagePrepared);
-        let registration = {
-            let mut state = session.authority.operations.lock().unwrap();
-            let registration = state.recovery.reserve(&operation).unwrap();
-            state
-                .recovery
-                .create_reserved(&session.authority.lease, registration, operation.clone())
-                .unwrap();
-            let mut invalid = successor_draft();
-            invalid.old_payload = None;
-            invalid.new_payload = None;
-            assert!(matches!(
-                state
-                    .recovery
-                    .create_successor(&session.authority.lease, invalid, &[registration]),
-                Err((_, None))
-            ));
-            registration
-        };
-        let failure = install_pre_barrier_sync_failure();
-        let mut owner = {
-            let mut state = session.authority.operations.lock().unwrap();
-            match state.recovery.create_successor(
-                &session.authority.lease,
-                successor_draft(),
-                &[registration],
-            ) {
-                Err((_, Some(owner))) => owner,
-                Err((error, None)) => panic!("post-arm create lost its owner: {error}"),
-                Ok(mut owner) => {
-                    owner.0 = None;
-                    panic!("injected successor create uncertainty was not retained")
-                }
-            }
-        };
-        drop(failure);
-
-        owner = {
-            let mut state = session.authority.operations.lock().unwrap();
-            match state
-                .recovery
-                .tombstone_successor(&session.authority.lease, owner)
-            {
-                Err((_, owner)) => owner,
-                Ok(()) => panic!("successor tombstoned before its recovery record"),
-            }
-        };
-        let mut next = operation;
-        next.operation_id = [0x12; 16];
-        next.destination_leaf = name("next.bin");
-        {
-            let mut state = session.authority.operations.lock().unwrap();
-            state
-                .recovery
-                .clear(&session.authority.lease, registration)
-                .unwrap();
-            assert_ne!(
-                state.recovery.reserve(&next).unwrap().slot,
-                registration.slot
-            );
-        }
-
-        let failure = install_pre_barrier_sync_failure();
-        owner = {
-            let mut state = session.authority.operations.lock().unwrap();
-            match state
-                .recovery
-                .tombstone_successor(&session.authority.lease, owner)
-            {
-                Err((_, owner)) => owner,
-                Ok(()) => panic!("injected successor uncertainty was not retained"),
-            }
-        };
-        drop(failure);
-        {
-            let mut state = session.authority.operations.lock().unwrap();
-            state
-                .recovery
-                .tombstone_successor(&session.authority.lease, owner)
-                .unwrap();
-            assert_eq!(
-                state.recovery.reserve(&next).unwrap().slot,
-                registration.slot
-            );
-        }
-        assert!(matches!(
-            session.revoke(),
-            crate::RootRevokeOutcome::Revoked
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn armed_successor_owner_drop_aborts() {
-        const CHILD: &str = "AXIAL_TEST_DROP_ARMED_SUCCESSOR_OWNER";
-        if std::env::var_os(CHILD).is_some() {
-            drop(SuccessorOwner(Some((0, 1, [1; 16]))));
-            panic!("dropping an armed successor owner returned");
-        }
-        use std::os::unix::process::ExitStatusExt as _;
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("armed_successor_owner_drop_aborts")
-            .arg("--nocapture")
-            .env(CHILD, "1")
-            .status()
-            .unwrap();
-        assert_eq!(status.signal(), Some(6));
-    }
-
-    #[test]
     fn uncertain_readback_accepts_only_the_exact_predecessor_or_intended_lane() {
         let prepared = record(RecoveryPhase::StagePrepared);
         let intended = RecoveryFrame {
@@ -3157,7 +2368,7 @@ mod tests {
             RecoveryFrameAddress::new(LANE, 0, generation_side(intended.generation)).unwrap(),
         )
         .unwrap();
-        journal.pending = Some(PendingWrite::Recovery {
+        journal.pending = Some(PendingWrite {
             registration,
             intended: Some(intended.clone()),
             offset: 0,
@@ -3198,13 +2409,17 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) use sync_test_support::{
-    install_pre_barrier_sync_failure, install_pre_barrier_sync_failure_after,
+    CRASH_EXIT_CODE, install_pre_barrier_crash_after, install_pre_barrier_sync_failure,
+    install_pre_barrier_sync_failure_after,
 };
 
 #[cfg(test)]
 mod sync_test_support {
+    pub(crate) const CRASH_EXIT_CODE: i32 = 86;
+
     thread_local! {
         static FAIL_SYNC_BEFORE_BARRIER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+        static EXIT_AT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     pub(crate) struct RecoverySyncFailureTestGuard {
@@ -3216,6 +2431,7 @@ mod sync_test_support {
         fn drop(&mut self) {
             assert_eq!(self.thread, std::thread::current().id());
             FAIL_SYNC_BEFORE_BARRIER.set(None);
+            EXIT_AT_FAILURE.set(false);
         }
     }
 
@@ -3234,6 +2450,19 @@ mod sync_test_support {
         }
     }
 
+    /// Ends the process after the given number of synced journal writes, once the next
+    /// frame is written but before its barrier, so the test observes a real crash.
+    pub(crate) fn install_pre_barrier_crash_after(
+        successful_syncs: usize,
+    ) -> RecoverySyncFailureTestGuard {
+        EXIT_AT_FAILURE.set(true);
+        install_pre_barrier_sync_failure_after(successful_syncs)
+    }
+
+    pub(super) fn exits_at_failure() -> bool {
+        EXIT_AT_FAILURE.get()
+    }
+
     pub(super) fn take_pre_barrier_sync_failure() -> bool {
         FAIL_SYNC_BEFORE_BARRIER.with(|slot| match slot.get() {
             Some(0) => {
@@ -3247,9 +2476,4 @@ mod sync_test_support {
             None => false,
         })
     }
-}
-
-#[cfg(test)]
-pub(crate) fn disarm_successor_owner_for_restart(mut owner: SuccessorOwner) {
-    owner.0 = None;
 }

@@ -3595,10 +3595,10 @@ mod tests {
     }
 
     #[test]
-    fn state_successor_refuses_competing_recovery_without_legacy_residue() {
+    fn state_replacement_refuses_competing_recovery_without_residue() {
         use axial_fs::{FileCreateOutcome, LeafName, StageDiscardOutcome, StageDiscardResolution};
 
-        let root = test_root("state-successor-contention");
+        let root = test_root("state-replacement-contention");
         fs::create_dir_all(&root).expect("create root");
         let storage = TestManagedStorage::new(&root);
         let original = test_state(Vec::new());

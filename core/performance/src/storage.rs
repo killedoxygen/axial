@@ -2,14 +2,14 @@ use axial_fs::{
     Directory, DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryEntry,
     DirectoryIdentity, DirectoryListing, DirectoryMoveOutcome, DirectoryMoveReceipt,
     DirectoryMoveReceiptOutcome, DirectoryMoveResolution, DirectoryParkOutcome,
-    DirectoryParkResolution, DirectoryRemovalOutcome, DirectoryRemovalResolution, EffectOwner,
-    EffectOwnerRetentionError, EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome,
-    FileCreateResolution, FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome,
-    FileMoveResolution, FileParkOutcome, FileParkRequest, FileParkResolution, FilePromotionOutcome,
-    FilePromotionReceipt, FilePromotionReceiptOutcome, FilePromotionResolution, FileRemovalOutcome,
+    DirectoryParkResolution, DirectoryRemovalOutcome, DirectoryRemovalResolution,
+    DurableReplaceObligation, DurableReplaceOutcome, EffectOwner, EffectOwnerRetentionError,
+    EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome, FileCreateResolution,
+    FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome, FileMoveResolution, FileParkOutcome,
+    FileParkRequest, FileParkResolution, FilePromotionOutcome, FilePromotionReceipt,
+    FilePromotionReceiptOutcome, FilePromotionResolution, FileRemovalOutcome,
     FileRemovalResolution, FileRevision, LeafName, ParkedDirectory, ParkedFile, ReplaceDestination,
     SealedStagedFile, StageDiscardOutcome, StageDiscardResolution, StagedFile,
-    StateFileBatchObligation, StateFileBatchOutcome, StateFileSuccessorRequest,
     TransientDestination,
 };
 use axial_minecraft::download::ManagedTransferEffectAuthority;
@@ -41,7 +41,7 @@ enum ManagedEffectContinuation {
     FilePromotion(FilePromotionReceipt),
     FileMove(FileMoveReceipt),
     DirectoryMove(DirectoryMoveReceipt),
-    StateFileBatch(StateFileBatchObligation),
+    StateReplace(DurableReplaceObligation),
     ArtifactTransfer(crate::install::ManagedArtifactTransferRecovery),
 }
 
@@ -238,20 +238,11 @@ impl ManagedInstanceEffectAuthority {
                     None
                 }
             },
-            ManagedEffectContinuation::StateFileBatch(obligation) => match obligation.reconcile() {
-                StateFileBatchOutcome::Replaced(files) => {
-                    require_single_state_file(files);
-                    None
-                }
-                StateFileBatchOutcome::NoEffect {
-                    error,
-                    replacements,
-                } => {
-                    drop(replacements);
-                    return Err(error);
-                }
-                StateFileBatchOutcome::AppliedUnverified(obligation) => {
-                    Some(ManagedEffectContinuation::StateFileBatch(obligation))
+            ManagedEffectContinuation::StateReplace(obligation) => match obligation.reconcile() {
+                DurableReplaceOutcome::Replaced => None,
+                DurableReplaceOutcome::NoEffect(error) => return Err(error),
+                DurableReplaceOutcome::AppliedUnverified(obligation) => {
+                    Some(ManagedEffectContinuation::StateReplace(obligation))
                 }
             },
             ManagedEffectContinuation::ArtifactTransfer(recovery) => match recovery.reconcile() {
@@ -608,27 +599,12 @@ impl ManagedStorageDirectory {
             },
             Err(error) => return Err(error),
         };
-        match parent.directory.replace_state_batch_durable(
-            StateFileSuccessorRequest::new(
-                crate::PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_SCHEMA,
-                crate::PERFORMANCE_COMPOSITION_STATE_SUCCESSOR_OWNER,
-            )?,
-            vec![(destination, contents.to_vec())],
-        ) {
-            StateFileBatchOutcome::Replaced(files) => {
-                require_single_state_file(files);
-                Ok(())
-            }
-            StateFileBatchOutcome::NoEffect {
-                error,
-                replacements,
-            } => {
-                drop(replacements);
-                Err(error)
-            }
-            StateFileBatchOutcome::AppliedUnverified(obligation) => {
+        match parent.directory.replace_durable(destination, contents) {
+            DurableReplaceOutcome::Replaced => Ok(()),
+            DurableReplaceOutcome::NoEffect(error) => Err(error),
+            DurableReplaceOutcome::AppliedUnverified(obligation) => {
                 self.effects
-                    .store_continuation(ManagedEffectContinuation::StateFileBatch(obligation));
+                    .store_continuation(ManagedEffectContinuation::StateReplace(obligation));
                 Err(pending_effect_error())
             }
         }
@@ -1128,13 +1104,6 @@ fn pending_effect_error() -> io::Error {
         io::ErrorKind::WouldBlock,
         "managed storage effect remains retained and indeterminate",
     )
-}
-
-fn require_single_state_file(mut files: Vec<FileCapability>) {
-    if files.len() != 1 {
-        fail_stop_linear_carrier(files);
-    }
-    drop(files.pop());
 }
 
 fn fail_stop_linear_carrier<T>(_carrier: T) -> ! {

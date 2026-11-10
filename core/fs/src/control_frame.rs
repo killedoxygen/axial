@@ -12,19 +12,8 @@ pub(crate) const PLATFORM: u8 = 2;
 pub(crate) const PLATFORM: u8 = 3;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 compile_error!("control frames require a supported Linux, macOS, or Windows target");
-#[derive(Clone, Copy)]
-pub(crate) enum Domain {
-    Recovery,
-    Successor,
-}
-impl Domain {
-    fn parts(&self) -> (&'static [u8; 8], &'static [u8], u64) {
-        match self {
-            Self::Recovery => (b"AXRECV01", b"axial.fs.recovery-frame.v1\0", 0),
-            Self::Successor => (b"AXSUCC01", b"axial.fs.successor-frame.v1\0", 2_097_152),
-        }
-    }
-}
+const MAGIC: &[u8; 8] = b"AXRECV01";
+const CHECKSUM_CONTEXT: &[u8] = b"axial.fs.recovery-frame.v1\0";
 #[derive(Debug)]
 pub(crate) struct Error;
 pub(crate) type Result<T> = std::result::Result<T, Error>;
@@ -51,12 +40,11 @@ pub(crate) enum Probe<'a> {
     Torn,
     Valid(Envelope<'a>),
 }
-pub(crate) fn offset(domain: Domain, slot: u8, side: u8) -> Result<u64> {
+pub(crate) fn offset(slot: u8, side: u8) -> Result<u64> {
     Address::new([1; 16], slot, side)?;
-    Ok(domain.parts().2 + (usize::from(slot) * 2 + usize::from(side)) as u64 * FRAME_BYTES as u64)
+    Ok((usize::from(slot) * 2 + usize::from(side)) as u64 * FRAME_BYTES as u64)
 }
 pub(crate) fn encode(
-    domain: Domain,
     address: Address,
     generation: u64,
     kind: u8,
@@ -66,7 +54,7 @@ pub(crate) fn encode(
     require(generation != 0 && address.side == generation_side(generation))?;
     require(HEADER_BYTES.checked_add(payload.len()).ok_or(Error)? <= BODY_BYTES)?;
     let mut output = [0; FRAME_BYTES];
-    output[..8].copy_from_slice(domain.parts().0);
+    output[..8].copy_from_slice(MAGIC);
     output[8..10].copy_from_slice(&SCHEMA.to_le_bytes());
     output[10..12].copy_from_slice(&[PLATFORM, kind]);
     output[12..28].copy_from_slice(&address.lane);
@@ -75,21 +63,21 @@ pub(crate) fn encode(
     let payload_len = u32::try_from(payload.len()).map_err(|_| Error)?;
     output[44..48].copy_from_slice(&payload_len.to_le_bytes());
     output[HEADER_BYTES..HEADER_BYTES + payload.len()].copy_from_slice(payload);
-    let digest = checksum(domain, &output[..BODY_BYTES], address.side);
+    let digest = checksum(&output[..BODY_BYTES], address.side);
     output[BODY_BYTES..].copy_from_slice(&digest);
     Ok(output)
 }
-pub(crate) fn probe(domain: Domain, bytes: &[u8], slot: u8, side: u8) -> Result<Probe<'_>> {
+pub(crate) fn probe(bytes: &[u8], slot: u8, side: u8) -> Result<Probe<'_>> {
     require(bytes.len() == FRAME_BYTES)?;
     if bytes.iter().all(|byte| *byte == 0) {
         return Ok(Probe::Empty);
     }
     let (body, observed) = bytes.split_at(BODY_BYTES);
     let declared_side = bytes[29];
-    if observed != checksum(domain, body, declared_side) {
+    if observed != checksum(body, declared_side) {
         return Ok(Probe::Torn);
     }
-    require(&body[..8] == domain.parts().0 && body[8..10] == SCHEMA.to_le_bytes())?;
+    require(&body[..8] == MAGIC && body[8..10] == SCHEMA.to_le_bytes())?;
     let kind = body[11];
     let lane = body[12..28].try_into().map_err(|_| Error)?;
     let address = Address::new(lane, body[28], body[29])?;
@@ -117,9 +105,9 @@ pub(crate) fn probe(domain: Domain, bytes: &[u8], slot: u8, side: u8) -> Result<
 pub(crate) fn generation_side(generation: u64) -> u8 {
     u8::from(generation.is_multiple_of(2))
 }
-pub(crate) fn checksum(domain: Domain, body: &[u8], side: u8) -> [u8; 32] {
+pub(crate) fn checksum(body: &[u8], side: u8) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(domain.parts().1);
+    hash.update(CHECKSUM_CONTEXT);
     hash.update([side]);
     hash.update(body);
     hash.finalize().into()
