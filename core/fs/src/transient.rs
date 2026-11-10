@@ -195,10 +195,7 @@ impl TransientEffectToken {
         tokens
             .try_reserve_exact(plan.names.len())
             .map_err(|_| io::Error::other("transient effect token capacity is exhausted"))?;
-        let mut state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = authority.state()?;
         if state.phase != AUTHORITY_LIVE || state.active == 0 {
             return Err(stale_capability());
         }
@@ -210,7 +207,7 @@ impl TransientEffectToken {
                 ));
             }
         }
-        let first_id = state.next_transient_id;
+        let first_id = state.next_id;
         let count = u64::try_from(plan.names.len())
             .map_err(|_| io::Error::other("transient destination batch size overflowed"))?;
         let next_id = first_id
@@ -231,7 +228,7 @@ impl TransientEffectToken {
             .try_reserve(plan.names.len())
             .map_err(|_| io::Error::other("transient effect registry capacity is exhausted"))?;
         state.reserve_effects(plan.names.len())?;
-        state.next_transient_id = next_id;
+        state.next_id = next_id;
         for (offset, record) in records.into_iter().enumerate() {
             let offset =
                 u64::try_from(offset).expect("bounded transient destination offset fits in u64");
@@ -270,10 +267,7 @@ impl TransientEffectToken {
                 return Err(stale_capability());
             }
         }
-        let mut state =
-            first.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = first.authority.state()?;
         if state.active == 0 {
             return Err(stale_capability());
         }
@@ -385,10 +379,7 @@ impl TransientEffectToken {
         identity: platform::Identity,
         #[cfg(not(target_os = "linux"))] stage_id: u64,
     ) -> io::Result<()> {
-        let mut state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = self.authority.state()?;
         let record = state
             .transients
             .get_mut(&self.id)
@@ -407,10 +398,7 @@ impl TransientEffectToken {
     }
 
     fn mark_disposition(&self, disposition: TransientEffectDisposition) -> io::Result<()> {
-        let mut state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = self.authority.state()?;
         let record = state
             .transients
             .get_mut(&self.id)
@@ -426,10 +414,7 @@ impl TransientEffectToken {
     }
 
     fn reset_reserved(&self) -> io::Result<()> {
-        let mut state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = self.authority.state()?;
         let record = state
             .transients
             .get_mut(&self.id)
@@ -540,10 +525,7 @@ impl CapabilityAuthority {
         if !std::ptr::eq(operation.authority.as_ref(), self) {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let terminal = state.transients.get(&id).is_some_and(|record| {
             record.retained.is_none()
                 && matches!(
@@ -579,9 +561,7 @@ impl CapabilityAuthority {
         #[cfg(not(target_os = "linux"))]
         let _settlement = crate::TerminalEffectSettlementScope::begin(self, 0)?;
         let (record, operation) = {
-            let mut state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = self.state()?;
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
@@ -2550,10 +2530,7 @@ impl crate::AdmittedAbsoluteDirectory {
             .token
             .as_ref()
             .expect("reservation retains effect token");
-        let mut state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = authority.state()?;
         state
             .transients
             .get_mut(&token.id)
@@ -2567,10 +2544,7 @@ impl crate::AdmittedAbsoluteDirectory {
 impl TransientEffectToken {
     fn preservation_operation(&self) -> io::Result<CapabilityOperation> {
         let operation = self.authority.enter()?;
-        let state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let state = self.authority.state()?;
         let record = state
             .transients
             .get(&self.id)
@@ -2595,10 +2569,7 @@ impl TransientEffectToken {
     }
 
     fn finish_preservation(&mut self, operation: &CapabilityOperation) -> io::Result<()> {
-        let mut state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = self.authority.state()?;
         let record = state
             .transients
             .get(&self.id)
@@ -2624,10 +2595,7 @@ impl TransientEffectToken {
     #[cfg(not(target_os = "linux"))]
     fn preserve_named_stage(&mut self, token: &mut crate::StageToken) -> io::Result<()> {
         let operation = self.preservation_operation()?;
-        let mut state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = self.authority.state()?;
         let header = state
             .transients
             .get(&self.id)
@@ -2677,10 +2645,7 @@ impl TransientEffectToken {
     #[cfg(not(target_os = "linux"))]
     fn preserve_named_creation(&mut self, token: &mut crate::StageCreateToken) -> io::Result<()> {
         let operation = self.preservation_operation()?;
-        let mut state =
-            self.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+        let mut state = self.authority.state()?;
         let header = state
             .transients
             .get(&self.id)

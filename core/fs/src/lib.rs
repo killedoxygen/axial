@@ -1756,9 +1756,7 @@ impl ParkedFile {
             return Err(identity_changed("parked file capability changed"));
         }
         let registered = {
-            let state = operation.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let state = operation.authority.state()?;
             state.file_parks.get(&self.token.id).is_some_and(|record| {
                 record.phase == FileParkRegistryPhase::Live
                     && record.identity == self.identity
@@ -4629,10 +4627,7 @@ impl MoveEffectToken {
         if !Arc::ptr_eq(authority, &operation.authority) {
             return Err(stale_capability());
         }
-        let mut state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = authority.state()?;
         if state.phase != AUTHORITY_LIVE || state.active == 0 {
             return Err(stale_capability());
         }
@@ -4642,19 +4637,17 @@ impl MoveEffectToken {
             moved_directory,
             moved_file,
         };
-        if state.namespace_footprint_is_reserved(
-            &[
+        if state.namespace_footprint_is_reserved(FootprintQuery {
+            leaves: &[
                 (&record.source.parent, &record.source.name),
                 (&record.destination.parent, &record.destination.name),
             ],
-            record
+            subtree: record
                 .moved_directory
                 .map(|identity| (identity, &record.source.parent)),
-            moved_file,
-            None,
-            None,
-            None,
-        ) {
+            file: moved_file,
+            ..FootprintQuery::default()
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "filesystem move conflicts with an unsettled namespace effect",
@@ -4979,6 +4972,12 @@ impl fmt::Debug for StageToken {
 }
 
 impl CapabilityAuthority {
+    fn state(&self) -> io::Result<std::sync::MutexGuard<'_, OperationState>> {
+        self.operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))
+    }
+
     fn validate_retained_process_image_outside_root(&self) -> io::Result<()> {
         platform::validate_process_image_outside_root(&self.process_image, &self.root)
     }
@@ -4991,10 +4990,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if (state.phase != AUTHORITY_LIVE
             && !(state.phase == AUTHORITY_QUIESCING && terminal_effect_settlement_admits(self)))
             || state.active == 0
@@ -5066,10 +5062,7 @@ impl CapabilityAuthority {
     }
 
     fn admit_operation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_LIVE
             && !(matches!(state.phase, AUTHORITY_QUIESCING | AUTHORITY_DRAINING)
                 && terminal_effect_settlement_admits(self))
@@ -5109,10 +5102,7 @@ impl CapabilityAuthority {
         owner_id: u64,
         terminal: bool,
     ) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let expected_phase = if terminal {
             AUTHORITY_QUIESCING
         } else {
@@ -5143,10 +5133,7 @@ impl CapabilityAuthority {
     }
 
     fn enter_effect_retention(self: &Arc<Self>, owner_id: u64) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_LIVE || !state.effect_owner_handles.contains_key(&owner_id) {
             return Err(stale_capability());
         }
@@ -5176,10 +5163,7 @@ impl CapabilityAuthority {
             return Err(stale_capability());
         }
         anchor.validate(operation)?;
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
@@ -5192,11 +5176,7 @@ impl CapabilityAuthority {
                 "filesystem effect-owner capacity is exhausted",
             ));
         }
-        let id = state.next_effect_owner_id;
-        state.next_effect_owner_id = state
-            .next_effect_owner_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("filesystem effect-owner id overflowed"))?;
+        let id = state.allocate_id()?;
         let owner = Arc::new(EffectOwnerState {
             id,
             authority: Arc::downgrade(self),
@@ -5328,10 +5308,7 @@ impl CapabilityAuthority {
         self: &Arc<Self>,
         token: &FileParkRegistryToken,
     ) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let admitted = token.armed
             && token.authority.as_ptr() == Arc::as_ptr(self)
             && state
@@ -5363,10 +5340,7 @@ impl CapabilityAuthority {
         permit: &DrainRecoveryPermit,
         token: &FileParkRegistryToken,
     ) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let admitted = Arc::ptr_eq(self, &permit.authority)
             && token.armed
             && token.authority.as_ptr() == Arc::as_ptr(self)
@@ -5397,10 +5371,7 @@ impl CapabilityAuthority {
         self: &Arc<Self>,
         token: &DirectoryParkRegistryToken,
     ) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let admitted = token.armed
             && token.authority.as_ptr() == Arc::as_ptr(self)
             && state
@@ -5432,10 +5403,7 @@ impl CapabilityAuthority {
         permit: &DrainRecoveryPermit,
         token: &DirectoryParkRegistryToken,
     ) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let admitted = Arc::ptr_eq(self, &permit.authority)
             && token.armed
             && token.authority.as_ptr() == Arc::as_ptr(self)
@@ -5467,10 +5435,7 @@ impl CapabilityAuthority {
         permit: &DrainRecoveryPermit,
         token: &DirectoryCreateEffectToken,
     ) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let admitted = Arc::ptr_eq(self, &permit.authority)
             && token.armed
             && token.authority.as_ptr() == Arc::as_ptr(self)
@@ -5504,10 +5469,7 @@ impl CapabilityAuthority {
         permit: &DrainRecoveryPermit,
         token: &mut DirectoryCreateEffectToken,
     ) -> io::Result<()> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let admitted = Arc::ptr_eq(self, &permit.authority)
             && token.armed
             && token.authority.as_ptr() == Arc::as_ptr(self)
@@ -5532,10 +5494,7 @@ impl CapabilityAuthority {
     }
 
     fn cancel_reset_pending_directory_creates(&self) -> io::Result<()> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_DRAINING {
             return Err(stale_capability());
         }
@@ -5548,10 +5507,7 @@ impl CapabilityAuthority {
     }
 
     fn enter_reset_operation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_RESETTING || state.active != 0 {
             return Err(stale_capability());
         }
@@ -5598,10 +5554,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_RESETTING || state.active == 0 {
             return Err(stale_capability());
         }
@@ -5639,10 +5592,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = self.state()?;
         if state.directory_creations.values().any(|record| {
             record.parent.inner.identity == parent.inner.identity
                 && leaf_names_equivalent(record.name.as_os_str(), name.as_os_str())
@@ -5716,10 +5666,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = self.state()?;
         if transient::transient_leaf_is_reserved(&state, parent, name) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -5738,10 +5685,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = self.state()?;
         if parent.inner.identity.physical == state.root_identity
             && leaf_names_equivalent(name.as_os_str(), OsStr::new(ROOT_LEASE_NAME))
         {
@@ -5768,10 +5712,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
         }
@@ -5785,24 +5726,18 @@ impl CapabilityAuthority {
             return Err(stale_capability());
         }
         let recovery = creation_header.recovery;
-        if state.namespace_footprint_is_reserved(
-            &[(&parent, &name)],
-            None,
-            Some(identity),
-            None,
-            Some(creation.id),
-            None,
-        ) {
+        if state.namespace_footprint_is_reserved(FootprintQuery {
+            leaves: &[(&parent, &name)],
+            file: Some(identity),
+            excluded_stage_create: Some(creation.id),
+            ..FootprintQuery::default()
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "stage name is reserved by an unsettled filesystem effect",
             ));
         }
-        let id = state.next_stage_id;
-        state.next_stage_id = state
-            .next_stage_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("stage registry identity overflowed"))?;
+        let id = state.allocate_id()?;
         debug_assert!(state.outstanding_effects > 0);
         state.stages.insert(
             id,
@@ -5840,10 +5775,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
         }
@@ -5853,11 +5785,7 @@ impl CapabilityAuthority {
                 "stage name is reserved by an unsettled filesystem effect",
             ));
         }
-        let id = state.next_stage_create_id;
-        state.next_stage_create_id = state
-            .next_stage_create_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("stage create registry identity overflowed"))?;
+        let id = state.allocate_id()?;
         state.reserve_effect()?;
         state.stage_creations.insert(
             id,
@@ -5904,10 +5832,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let header = state.stage_creations.get_mut(&token.id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
         })?;
@@ -5955,10 +5880,7 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
             return Err(stale_capability());
         }
@@ -5968,11 +5890,7 @@ impl CapabilityAuthority {
                 "directory name is reserved by an unsettled filesystem effect",
             ));
         }
-        let id = state.next_directory_create_id;
-        state.next_directory_create_id = state
-            .next_directory_create_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("directory create registry identity overflowed"))?;
+        let id = state.allocate_id()?;
         state.reserve_effect()?;
         state.directory_creations.insert(
             id,
@@ -6055,10 +5973,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let header = state
             .directory_creations
             .get_mut(&token.id)
@@ -6121,27 +6036,42 @@ impl CapabilityAuthority {
         if !Arc::ptr_eq(self, &operation.authority) {
             return Err(stale_capability());
         }
-        let state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = self.state()?;
         if state.phase != AUTHORITY_LIVE {
             return Err(stale_capability());
         }
-        if state.namespace_footprint_is_reserved(
-            &[(parent, original_name), (parent, park_name)],
-            directory_identity.map(|identity| (identity, parent)),
-            None,
-            None,
-            None,
-            None,
-        ) {
+        if state.namespace_footprint_is_reserved(FootprintQuery {
+            leaves: &[(parent, original_name), (parent, park_name)],
+            subtree: directory_identity.map(|identity| (identity, parent)),
+            ..FootprintQuery::default()
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "park ownership is already retained",
             ));
         }
         Ok(())
+    }
+
+    fn reserve_park_registration(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        footprint: FootprintQuery<'_>,
+        conflict: &'static str,
+    ) -> io::Result<(std::sync::MutexGuard<'_, OperationState>, u64)> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self.state()?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        if state.namespace_footprint_is_reserved(footprint) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, conflict));
+        }
+        let id = state.allocate_id()?;
+        state.reserve_effect()?;
+        Ok((state, id))
     }
 
     fn reserve_file_park(
@@ -6179,35 +6109,15 @@ impl CapabilityAuthority {
         cleanup: platform::FileCleanupHandle,
         phase: FileParkRegistryPhase,
     ) -> io::Result<FileParkRegistryToken> {
-        if !Arc::ptr_eq(self, &operation.authority) {
-            return Err(stale_capability());
-        }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        if state.phase != AUTHORITY_LIVE {
-            return Err(stale_capability());
-        }
-        if state.namespace_footprint_is_reserved(
-            &[(parent, &original_name), (parent, &park_name)],
-            None,
-            Some(identity),
-            None,
-            None,
-            None,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "file park name is reserved by an unsettled filesystem effect",
-            ));
-        }
-        let id = state.next_file_park_id;
-        state.next_file_park_id = state
-            .next_file_park_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("file park registry identity overflowed"))?;
-        state.reserve_effect()?;
+        let (mut state, id) = self.reserve_park_registration(
+            operation,
+            FootprintQuery {
+                leaves: &[(parent, &original_name), (parent, &park_name)],
+                file: Some(identity),
+                ..FootprintQuery::default()
+            },
+            "file park name is reserved by an unsettled filesystem effect",
+        )?;
         assert!(
             state
                 .file_parks
@@ -6246,10 +6156,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let header = state
             .file_parks
             .get_mut(&token.id)
@@ -6296,10 +6203,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let record = state
             .file_parks
             .remove(&token.id)
@@ -6347,35 +6251,15 @@ impl CapabilityAuthority {
         cleanup: platform::DirectoryCleanupHandle,
         phase: DirectoryParkRegistryPhase,
     ) -> io::Result<DirectoryParkRegistryToken> {
-        if !Arc::ptr_eq(self, &operation.authority) {
-            return Err(stale_capability());
-        }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
-        if state.phase != AUTHORITY_LIVE {
-            return Err(stale_capability());
-        }
-        if state.namespace_footprint_is_reserved(
-            &[(parent, &original_name), (parent, &park_name)],
-            Some((identity, parent)),
-            None,
-            None,
-            None,
-            None,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "directory park name is reserved by an unsettled filesystem effect",
-            ));
-        }
-        let id = state.next_directory_park_id;
-        state.next_directory_park_id = state
-            .next_directory_park_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("directory park registry identity overflowed"))?;
-        state.reserve_effect()?;
+        let (mut state, id) = self.reserve_park_registration(
+            operation,
+            FootprintQuery {
+                leaves: &[(parent, &original_name), (parent, &park_name)],
+                subtree: Some((identity, parent)),
+                ..FootprintQuery::default()
+            },
+            "directory park name is reserved by an unsettled filesystem effect",
+        )?;
         assert!(
             state
                 .directory_parks
@@ -6410,10 +6294,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let header = state.directory_parks.get_mut(&token.id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
         })?;
@@ -6450,10 +6331,7 @@ impl CapabilityAuthority {
         {
             return Err(stale_capability());
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let record = state.directory_parks.remove(&token.id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
         })?;
@@ -6500,10 +6378,7 @@ impl CapabilityAuthority {
     }
 
     fn update_stage(&self, id: u64, phase: StageRegistryPhase) -> io::Result<()> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let displaced_park = state
             .stages
             .get(&id)
@@ -6545,10 +6420,7 @@ impl CapabilityAuthority {
         displaced_park: Option<&FileParkRegistryToken>,
         expected_recovery: Option<&RecoveryRecord>,
     ) -> io::Result<()> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if !(matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING)
             || state.phase == AUTHORITY_QUIESCING && terminal_effect_settlement_admits(self))
         {
@@ -6569,14 +6441,12 @@ impl CapabilityAuthority {
             },
             None,
         )?;
-        if state.namespace_footprint_is_reserved(
-            &[(&destination, &name)],
-            None,
-            None,
-            displaced_park_id,
-            None,
-            Some(id),
-        ) {
+        if state.namespace_footprint_is_reserved(FootprintQuery {
+            leaves: &[(&destination, &name)],
+            excluded_file_park_original: displaced_park_id,
+            excluded_recovery_target_stage: Some(id),
+            ..FootprintQuery::default()
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "promotion destination is reserved by an unsettled filesystem effect",
@@ -6651,10 +6521,7 @@ impl CapabilityAuthority {
         attempt_id: u64,
         receipt: &platform::PublicationReceipt,
     ) -> io::Result<()> {
-        let state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = self.state()?;
         let record = state.stages.get(&id).ok_or_else(stale_capability)?;
         let promotion = record.promotion.as_ref().ok_or_else(stale_capability)?;
         if record.phase != StageRegistryPhase::PromotionAttempted
@@ -6668,10 +6535,7 @@ impl CapabilityAuthority {
     }
 
     fn allocate_stage_publication_attempt(&self, id: u64) -> io::Result<u64> {
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let record = state.stages.get(&id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent")
         })?;
@@ -6681,19 +6545,12 @@ impl CapabilityAuthority {
                 "stage is not ready for a new publication attempt",
             ));
         }
-        let attempt_id = state.next_publication_attempt_id;
-        state.next_publication_attempt_id = attempt_id
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("publication attempt identity overflowed"))?;
-        Ok(attempt_id)
+        state.allocate_id()
     }
 
     fn disarm_stage(self: &Arc<Self>, id: u64, operation: &CapabilityOperation) -> io::Result<()> {
         assert!(Arc::ptr_eq(&operation.authority, self));
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         let record = state.stages.get(&id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent")
         })?;
@@ -6732,9 +6589,7 @@ impl CapabilityAuthority {
 
     fn cleanup_stage(self: &Arc<Self>, id: u64) -> io::Result<()> {
         let (mut record, operation) = {
-            let mut state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = self.state()?;
             if !(matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING)
                 || state.phase == AUTHORITY_QUIESCING && terminal_effect_settlement_admits(self))
             {
@@ -6959,9 +6814,7 @@ impl CapabilityAuthority {
 
     fn cleanup_abandoned_stage_create(self: &Arc<Self>, id: u64) -> io::Result<()> {
         let (mut record, operation) = {
-            let mut state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = self.state()?;
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
@@ -7094,9 +6947,7 @@ impl CapabilityAuthority {
 
     fn cleanup_abandoned_directory_create(self: &Arc<Self>, id: u64) -> io::Result<()> {
         let (mut record, operation) = {
-            let mut state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = self.state()?;
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
@@ -7224,9 +7075,7 @@ impl CapabilityAuthority {
 
     fn begin_terminal_drain(&self, require_empty_recovery: bool) -> io::Result<()> {
         {
-            let mut state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = self.state()?;
             if state.phase != AUTHORITY_LIVE {
                 return Err(stale_capability());
             }
@@ -7250,9 +7099,7 @@ impl CapabilityAuthority {
         let mut quiescing = TerminalQuiescingRollback::new(self);
 
         let owners = {
-            let state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let state = self.state()?;
             if state.phase != AUTHORITY_QUIESCING {
                 return Err(stale_capability());
             }
@@ -7268,9 +7115,7 @@ impl CapabilityAuthority {
         drop(owners);
 
         let disposal = {
-            let mut state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = self.state()?;
             if state.phase != AUTHORITY_QUIESCING {
                 return Err(stale_capability());
             }
@@ -7323,10 +7168,7 @@ impl CapabilityAuthority {
         };
         drop(disposal);
 
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_QUIESCING {
             return Err(stale_capability());
         }
@@ -7358,9 +7200,7 @@ impl CapabilityAuthority {
         validate_owned_root: bool,
     ) -> io::Result<SessionDrainSettlement> {
         let (cleanup_ids, create_cleanup_ids, directory_create_cleanup_ids, transient_cleanup_ids) = {
-            let state = self.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let state = self.state()?;
             if state.phase != AUTHORITY_DRAINING {
                 return Err(stale_capability());
             }
@@ -7427,10 +7267,7 @@ impl CapabilityAuthority {
                 transient_cleanup_blocked = true;
             }
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.active != 0
             || !state.moves.is_empty()
             || !state.stages.is_empty()
@@ -7584,10 +7421,7 @@ impl CapabilityAuthority {
         if validate_owned_root {
             self.validate_retained_process_image_outside_root()?;
         }
-        let mut state = self
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = self.state()?;
         if state.phase != AUTHORITY_DRAINING {
             return Err(stale_capability());
         }
@@ -7621,28 +7455,41 @@ impl CapabilityAuthority {
     }
 }
 
+/// A namespace footprint to test against every unsettled effect's reservations. The
+/// exclusions name the caller's own registry entry whose reservation it inherits.
+#[derive(Default)]
+struct FootprintQuery<'a> {
+    leaves: &'a [(&'a Directory, &'a LeafName)],
+    subtree: Option<(platform::Identity, &'a Directory)>,
+    file: Option<platform::Identity>,
+    excluded_file_park_original: Option<u64>,
+    excluded_stage_create: Option<u64>,
+    excluded_recovery_target_stage: Option<u64>,
+}
+
+impl<'a> FootprintQuery<'a> {
+    fn leaves(leaves: &'a [(&'a Directory, &'a LeafName)]) -> Self {
+        Self {
+            leaves,
+            ..Self::default()
+        }
+    }
+}
+
 struct OperationState {
     phase: u8,
     root_identity: platform::Identity,
     active: usize,
     outstanding_effects: usize,
-    next_move_id: u64,
+    next_id: u64,
     moves: HashMap<u64, MoveEffectRecord>,
-    next_effect_owner_id: u64,
     effect_owner_handles: HashMap<u64, Weak<EffectOwnerState>>,
     active_effect_owners: HashMap<u64, Arc<EffectOwnerState>>,
-    next_stage_id: u64,
-    next_publication_attempt_id: u64,
     stages: HashMap<u64, StageRecord>,
-    next_stage_create_id: u64,
     stage_creations: HashMap<u64, StageCreateRecord>,
-    next_directory_create_id: u64,
     directory_creations: HashMap<u64, DirectoryCreateEffectRecord>,
-    next_file_park_id: u64,
     file_parks: HashMap<u64, FileParkRegistryRecord>,
-    next_directory_park_id: u64,
     directory_parks: HashMap<u64, DirectoryParkRegistryRecord>,
-    next_transient_id: u64,
     transients: HashMap<u64, transient::TransientEffectRecord>,
     state_batch: Option<u64>,
     recovery: recovery::RecoveryJournal,
@@ -7690,15 +7537,15 @@ impl OperationState {
         Ok(Some(token.id))
     }
 
-    fn namespace_footprint_is_reserved(
-        &self,
-        candidate_leaves: &[(&Directory, &LeafName)],
-        candidate_subtree: Option<(platform::Identity, &Directory)>,
-        candidate_file: Option<platform::Identity>,
-        excluded_file_park_original: Option<u64>,
-        excluded_stage_create: Option<u64>,
-        excluded_recovery_target_stage: Option<u64>,
-    ) -> bool {
+    fn namespace_footprint_is_reserved(&self, query: FootprintQuery<'_>) -> bool {
+        let FootprintQuery {
+            leaves: candidate_leaves,
+            subtree: candidate_subtree,
+            file: candidate_file,
+            excluded_file_park_original,
+            excluded_stage_create,
+            excluded_recovery_target_stage,
+        } = query;
         if candidate_leaves.iter().any(|(directory, name)| {
             directory.inner.identity.physical == self.root_identity
                 && leaf_names_equivalent(name.as_os_str(), OsStr::new(ROOT_LEASE_NAME))
@@ -7848,14 +7695,10 @@ impl OperationState {
         candidate_directory: &Directory,
         candidate_name: &LeafName,
     ) -> bool {
-        self.namespace_footprint_is_reserved(
-            &[(candidate_directory, candidate_name)],
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        self.namespace_footprint_is_reserved(FootprintQuery::leaves(&[(
+            candidate_directory,
+            candidate_name,
+        )]))
     }
 
     fn reserve_effect(&mut self) -> io::Result<()> {
@@ -7876,13 +7719,17 @@ impl OperationState {
         Ok(())
     }
 
-    fn reserve_move_effect(&mut self, record: MoveEffectRecord) -> io::Result<u64> {
-        let id = self.next_move_id;
-        let next_id = id
+    fn allocate_id(&mut self) -> io::Result<u64> {
+        let id = self.next_id;
+        self.next_id = id
             .checked_add(1)
-            .ok_or_else(|| io::Error::other("filesystem move effect id overflowed"))?;
+            .ok_or_else(|| io::Error::other("filesystem registry identity overflowed"))?;
+        Ok(id)
+    }
+
+    fn reserve_move_effect(&mut self, record: MoveEffectRecord) -> io::Result<u64> {
+        let id = self.allocate_id()?;
         self.reserve_effect()?;
-        self.next_move_id = next_id;
         assert!(self.moves.insert(id, record).is_none());
         Ok(id)
     }
@@ -8193,10 +8040,7 @@ fn selected_recovery_stage_record(
     let Some(registration) = registration else {
         return Ok(None);
     };
-    let state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let state = authority.state()?;
     Ok(Some(live_recovery_record(&state, registration)?))
 }
 
@@ -8207,10 +8051,7 @@ fn prepare_recovery_stage_removal(
     let Some(registration) = stage.recovery else {
         return Ok(None);
     };
-    let mut state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let mut state = authority.state()?;
     let current = live_recovery_record(&state, registration)?;
     let expected_stage = recovery_stage_leaf(current.operation_id);
     if recovery_parent_components(&stage.parent)? != current.destination_parent
@@ -8298,10 +8139,7 @@ fn settle_removed_recovery(
     #[cfg(unix)]
     {
         let _ = target;
-        let state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = authority.state()?;
         match state.recovery.record(registration) {
             None => return Ok(()),
             Some(current) if current == expected => {}
@@ -8310,10 +8148,7 @@ fn settle_removed_recovery(
         drop(state);
         platform::sync_publication_directory(parent.inner.handle())?;
         parent.validate(operation)?;
-        let mut state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = authority.state()?;
         parent.validate(operation)?;
         if state.recovery.record(registration) != Some(expected) {
             return Err(stale_capability());
@@ -8323,10 +8158,7 @@ fn settle_removed_recovery(
     #[cfg(windows)]
     {
         parent.validate(operation)?;
-        let mut state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = authority.state()?;
         parent.validate(operation)?;
         let current = live_recovery_record(&state, registration)?;
         let mut successor = expected.clone();
@@ -8446,9 +8278,7 @@ fn settle_removed_recovery_stage_create(
     match record.recovery {
         Some(registration) => {
             let expected = authority
-                .operations
-                .lock()
-                .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?
+                .state()?
                 .recovery
                 .record(registration)
                 .cloned()
@@ -8478,10 +8308,7 @@ fn validate_recovery_stage_writable(
     {
         return Err(stale_capability());
     }
-    let state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let state = authority.state()?;
     let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
     if stage.phase != StageRegistryPhase::Writing
         || stage.carrier != StageCarrierState::Live
@@ -8513,10 +8340,7 @@ fn stage_has_recovery(
     authority: &Arc<CapabilityAuthority>,
     token: &StageToken,
 ) -> io::Result<bool> {
-    let state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let state = authority.state()?;
     Ok(state
         .stages
         .get(&token.id)
@@ -8552,10 +8376,7 @@ fn seal_recovery_stage(
         return Err(stale_capability());
     }
     let registration = {
-        let state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = authority.state()?;
         let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
         if stage.phase != StageRegistryPhase::Writing
             || stage.carrier != StageCarrierState::Live
@@ -8580,10 +8401,7 @@ fn seal_recovery_stage(
     if proof.size != revision.size {
         return Err(identity_changed("recoverable stage revision changed"));
     }
-    let mut state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let mut state = authority.state()?;
     let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
     if stage.phase != StageRegistryPhase::Writing
         || stage.carrier != StageCarrierState::Live
@@ -8613,14 +8431,9 @@ fn seal_recovery_stage(
     match current.phase {
         RecoveryPhase::StagePrepared if current.new.is_none() => {
             let destination = recovery_leaf(&current.destination_leaf)?;
-            if state.namespace_footprint_is_reserved(
-                &[(&parent, &destination)],
-                None,
-                None,
-                None,
-                None,
-                None,
-            ) {
+            if state
+                .namespace_footprint_is_reserved(FootprintQuery::leaves(&[(&parent, &destination)]))
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "recoverable publication destination is reserved",
@@ -8652,10 +8465,7 @@ fn validate_recovery_publication(
     if !Arc::ptr_eq(authority, &operation.authority) {
         return Err(stale_capability());
     }
-    let state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let state = authority.state()?;
     let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
     let Some(registration) = stage.recovery else {
         return Ok(None);
@@ -8745,10 +8555,7 @@ fn complete_recovery_publication(
         return Err(stale_capability());
     }
     let registration = {
-        let state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = authority.state()?;
         let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
         let promotion = stage.promotion.as_ref().ok_or_else(stale_capability)?;
         if stage.identity != file.identity
@@ -8783,10 +8590,7 @@ fn complete_recovery_publication(
         ));
     }
     let expected = {
-        let state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let state = authority.state()?;
         let stage = state.stages.get(&token.id).ok_or_else(stale_capability)?;
         let promotion = stage.promotion.as_ref().ok_or_else(stale_capability)?;
         if stage.recovery != Some(registration)
@@ -8891,10 +8695,7 @@ fn reconcile_recovery_stage_create(
     authority: &Arc<CapabilityAuthority>,
     token: &mut StageCreateToken,
 ) -> io::Result<Option<(Directory, LeafName)>> {
-    let mut state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let mut state = authority.state()?;
     let (parent, stage, registration, intent) = {
         let header = state
             .stage_creations
@@ -8985,9 +8786,7 @@ impl Directory {
                     "State batch prior content exceeds the recovery bound",
                 ));
             }
-            let mut state = authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let mut state = authority.state()?;
             if state.phase != AUTHORITY_LIVE
                 || state.recovery.is_uncertain()
                 || state.recovery.records().next().is_some()
@@ -9005,10 +8804,7 @@ impl Directory {
                     "State batch recovery capacity is exhausted",
                 ));
             }
-            let id = state.next_stage_create_id;
-            state.next_stage_create_id = id
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("State batch identity overflowed"))?;
+            let id = state.allocate_id()?;
             state.state_batch = Some(id);
             Ok((id, declarations))
         })();
@@ -9099,13 +8895,9 @@ impl Directory {
                 old,
                 new: None,
             };
-            let mut state = match authority.operations.lock() {
+            let mut state = match authority.state() {
                 Ok(state) => state,
-                Err(_) => {
-                    return FileCreateOutcome::NoEffect(io::Error::other(
-                        "filesystem capability operation lock was poisoned",
-                    ));
-                }
+                Err(error) => return FileCreateOutcome::NoEffect(error),
             };
             if state.phase != AUTHORITY_LIVE || state.recovery.is_uncertain() {
                 return FileCreateOutcome::NoEffect(stale_capability());
@@ -9128,7 +8920,7 @@ impl Directory {
             } else {
                 vec![(self, &stage)]
             };
-            if state.namespace_footprint_is_reserved(&leaves, None, None, None, None, None) {
+            if state.namespace_footprint_is_reserved(FootprintQuery::leaves(&leaves)) {
                 continue;
             }
             if let Err(error) =
@@ -9143,14 +8935,13 @@ impl Directory {
                 Ok(registration) => registration,
                 Err(error) => return FileCreateOutcome::NoEffect(error),
             };
-            let id = state.next_stage_create_id;
-            let Some(next_id) = id.checked_add(1) else {
-                return FileCreateOutcome::NoEffect(io::Error::other("stage create id overflowed"));
+            let id = match state.allocate_id() {
+                Ok(id) => id,
+                Err(error) => return FileCreateOutcome::NoEffect(error),
             };
             if let Err(error) = state.reserve_effect() {
                 return FileCreateOutcome::NoEffect(error);
             }
-            state.next_stage_create_id = next_id;
             state.stage_creations.insert(
                 id,
                 StageCreateRecord {
@@ -10294,9 +10085,7 @@ impl ParkedDirectory {
             return Err(identity_changed("parked directory capability changed"));
         }
         let registered = {
-            let state = operation.authority.operations.lock().map_err(|_| {
-                io::Error::other("filesystem capability operation lock was poisoned")
-            })?;
+            let state = operation.authority.state()?;
             state
                 .directory_parks
                 .get(&self.token.id)
@@ -13393,10 +13182,7 @@ fn cancel_state_file_batch(
     let authority = preparation.parent.authority()?;
     let operation = authority.enter()?;
     preparation.parent.validate(&operation)?;
-    let mut state = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+    let mut state = authority.state()?;
     if state.state_batch != Some(preparation.id)
         || state.recovery.records().next().is_some()
         || state.recovery.has_live_successor()
@@ -13450,10 +13236,7 @@ fn prepare_state_file_batch(
                 .validate_revision_in(&operation, &staged.revision)?;
             observations.push(observe_state_batch_stage(&authority, staged)?);
         }
-        let mut state = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut state = authority.state()?;
         if state.phase != AUTHORITY_LIVE
             || state.state_batch != Some(preparation.id)
             || state.recovery.records().count() != preparation.members.len()
@@ -13624,9 +13407,7 @@ fn replay_state_file_batch(
         Err(error) => return Err((error, replay)),
     };
     let marker_valid = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))
+        .state()
         .is_ok_and(|state| state.state_batch == Some(replay.id));
     if !marker_valid {
         return Err((stale_capability(), replay));
@@ -13719,10 +13500,7 @@ fn finalize_state_file_batch(
             ));
         }
         finalization.parent.validate_for_authority(&authority)?;
-        let mut operations = authority
-            .operations
-            .lock()
-            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let mut operations = authority.state()?;
         if operations.phase != AUTHORITY_LIVE
             || platform::directory_revision(finalization.parent.inner.handle())? != directory_stamp
             || operations.state_batch != Some(finalization.id)
@@ -14655,23 +14433,15 @@ fn finish_root_session_with_recovery(
                 root_identity: identity,
                 active: 0,
                 outstanding_effects: 0,
-                next_move_id: 1,
+                next_id: 1,
                 moves: HashMap::new(),
-                next_effect_owner_id: 1,
                 effect_owner_handles: HashMap::new(),
                 active_effect_owners: HashMap::new(),
-                next_stage_id: 1,
-                next_publication_attempt_id: 1,
                 stages: HashMap::new(),
-                next_stage_create_id: 1,
                 stage_creations: HashMap::new(),
-                next_directory_create_id: 1,
                 directory_creations: HashMap::new(),
-                next_file_park_id: 1,
                 file_parks: HashMap::new(),
-                next_directory_park_id: 1,
                 directory_parks: HashMap::new(),
-                next_transient_id: 1,
                 transients: HashMap::new(),
                 state_batch: None,
                 recovery,

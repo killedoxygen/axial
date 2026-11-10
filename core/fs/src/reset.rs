@@ -339,12 +339,7 @@ fn intent_bytes(
 ) -> io::Result<Vec<u8>> {
     platform::validate_root(&authority.root)?;
     platform::validate_lease(&authority.lease)?;
-    let lane = authority
-        .operations
-        .lock()
-        .map_err(|_| io::Error::other("filesystem operation lock was poisoned"))?
-        .recovery
-        .lane_nonce;
+    let lane = authority.state()?.recovery.lane_nonce;
     let mut encoded = MAGIC.to_vec();
     encoded.extend_from_slice(&platform::identity_witness(
         marker.parent.inner.identity.physical,
