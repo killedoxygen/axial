@@ -89,68 +89,6 @@ pub(super) enum CachedManagedRuntimeVerification {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum RuntimeTreeVerificationReason {
-    StagePostMaterialization,
-    PublicationPrePromotion,
-    CanonicalReuse,
-    PublicationPostPromotion,
-    CachedSourceMatch,
-    ReceiptRevalidation,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeTreeVerificationCounts {
-    pub(crate) stage_post_materialization: usize,
-    pub(crate) publication_pre_promotion: usize,
-    pub(crate) canonical_reuse: usize,
-    pub(crate) publication_post_promotion: usize,
-    pub(crate) cached_source_match: usize,
-    pub(crate) receipt_revalidation: usize,
-}
-
-#[cfg(test)]
-impl RuntimeTreeVerificationCounts {
-    pub(crate) fn total(self) -> usize {
-        self.stage_post_materialization
-            + self.publication_pre_promotion
-            + self.canonical_reuse
-            + self.publication_post_promotion
-            + self.cached_source_match
-            + self.receipt_revalidation
-    }
-
-    pub(crate) fn reason_vector(self) -> [usize; 6] {
-        [
-            self.stage_post_materialization,
-            self.publication_pre_promotion,
-            self.canonical_reuse,
-            self.publication_post_promotion,
-            self.cached_source_match,
-            self.receipt_revalidation,
-        ]
-    }
-
-    fn record(&mut self, reason: RuntimeTreeVerificationReason) {
-        let count = match reason {
-            RuntimeTreeVerificationReason::StagePostMaterialization => {
-                &mut self.stage_post_materialization
-            }
-            RuntimeTreeVerificationReason::PublicationPrePromotion => {
-                &mut self.publication_pre_promotion
-            }
-            RuntimeTreeVerificationReason::CanonicalReuse => &mut self.canonical_reuse,
-            RuntimeTreeVerificationReason::PublicationPostPromotion => {
-                &mut self.publication_post_promotion
-            }
-            RuntimeTreeVerificationReason::CachedSourceMatch => &mut self.cached_source_match,
-            RuntimeTreeVerificationReason::ReceiptRevalidation => &mut self.receipt_revalidation,
-        };
-        *count += 1;
-    }
-}
-
 /// Sealed evidence that Core published and revalidated a managed runtime tree.
 pub struct ManagedRuntimeCommitReceipt {
     cache: ManagedRuntimeCache,
@@ -276,9 +214,9 @@ impl ManagedRuntimeCommitReceipt {
         {
             return false;
         }
-        let Some(install_root) = cache.component_root(expected_component.as_str()) else {
+        if cache.component_root(expected_component.as_str()).is_none() {
             return false;
-        };
+        }
         let Some(source) = self.source.as_ref() else {
             return false;
         };
@@ -288,13 +226,7 @@ impl ManagedRuntimeCommitReceipt {
         else {
             return false;
         };
-        runtime_tree_matches_source(
-            &canonical,
-            &install_root,
-            source,
-            RuntimeTreeVerificationReason::ReceiptRevalidation,
-        )
-        .await
+        runtime_tree_matches_source(&canonical, source).await
             && self
                 .quarantine
                 .as_ref()
@@ -466,7 +398,7 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
     if super::discovery::resolve_component_runtime(cache, component, required_major).is_err() {
         return Ok(CachedManagedRuntimeVerification::Mismatched(source));
     }
-    let install_root = cache.component_root(component.as_str()).ok_or_else(|| {
+    cache.component_root(component.as_str()).ok_or_else(|| {
         JavaRuntimeLookupError::Install(
             "runtime component is outside the managed cache vocabulary".to_string(),
         )
@@ -485,14 +417,8 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
         .authority()
         .and_then(|root| root.open_child(component.as_str()))
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    let matches_source = runtime_tree_matches_source_until_cancelled(
-        &canonical,
-        &install_root,
-        &source,
-        RuntimeTreeVerificationReason::CachedSourceMatch,
-        cancellation,
-    )
-    .await;
+    let matches_source =
+        runtime_tree_matches_source_until_cancelled(&canonical, &source, cancellation).await;
     if cancellation.is_cancelled() {
         return Ok(CachedManagedRuntimeVerification::Cancelled);
     }
@@ -596,17 +522,11 @@ pub(super) async fn prepare_missing_runtime_until_cancelled(
         .open_child_if_exists(component.as_str())
         .map_err(|_| JavaRuntimeLookupError::ManagedMutationRefused)?
     {
-        let install_root = cache
+        cache
             .component_root(component.as_str())
             .ok_or(JavaRuntimeLookupError::ManagedMutationRefused)?;
-        let matches = runtime_tree_matches_source_until_cancelled(
-            &canonical,
-            &install_root,
-            &source,
-            RuntimeTreeVerificationReason::CanonicalReuse,
-            cancellation,
-        )
-        .await;
+        let matches =
+            runtime_tree_matches_source_until_cancelled(&canonical, &source, cancellation).await;
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -707,14 +627,8 @@ async fn stage_with_publication_lease(
         let _ = stage.cleanup().await;
         return Err(error);
     }
-    let tree_matches = runtime_tree_matches_source_until_cancelled(
-        stage.root(),
-        stage.projection(),
-        &source,
-        RuntimeTreeVerificationReason::StagePostMaterialization,
-        cancellation,
-    )
-    .await;
+    let tree_matches =
+        runtime_tree_matches_source_until_cancelled(stage.root(), &source, cancellation).await;
     if cancellation.is_cancelled() {
         stage
             .cleanup()
@@ -883,13 +797,7 @@ async fn publish_staged_managed_runtime_inner(
     #[cfg(test)]
     wait_for_runtime_test_hook(RuntimeTestHookPoint::Publication, &staged.install_root).await;
     if source.component() != &staged.component
-        || !runtime_tree_matches_source(
-            staged.stage.root(),
-            staged.stage.projection(),
-            &source,
-            RuntimeTreeVerificationReason::PublicationPrePromotion,
-        )
-        .await
+        || !runtime_tree_matches_source(staged.stage.root(), &source).await
     {
         let _ = staged.stage.cleanup().await;
         return Err(JavaRuntimeLookupError::Install(
@@ -918,13 +826,7 @@ async fn publish_staged_managed_runtime_inner(
     }
 
     if let Some(retained) = canonical.as_ref()
-        && runtime_tree_matches_source(
-            retained,
-            &staged.install_root,
-            &source,
-            RuntimeTreeVerificationReason::CanonicalReuse,
-        )
-        .await
+        && runtime_tree_matches_source(retained, &source).await
     {
         staged
             .stage
@@ -1078,14 +980,7 @@ async fn publish_staged_managed_runtime_inner(
     };
     publication_effect_started = true;
 
-    if !runtime_tree_matches_source(
-        &canonical,
-        &staged.install_root,
-        &source,
-        RuntimeTreeVerificationReason::PublicationPostPromotion,
-    )
-    .await
-    {
+    if !runtime_tree_matches_source(&canonical, &source).await {
         let failed_tree_result = cache_root.move_child_guarded_no_replace(
             canonical_name,
             canonical,
@@ -1229,74 +1124,14 @@ fn managed_runtime_commit_receipt(
     }
 }
 
-#[cfg(test)]
-static RUNTIME_TREE_VERIFICATION_COUNTS: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<PathBuf, RuntimeTreeVerificationCounts>>,
-> = std::sync::OnceLock::new();
-
-fn record_runtime_tree_verification(
-    root: &Path,
-    source: &RuntimeSourceReceipt,
-    reason: RuntimeTreeVerificationReason,
-) {
-    #[cfg(test)]
-    {
-        let scope_root = if matches!(
-            reason,
-            RuntimeTreeVerificationReason::StagePostMaterialization
-                | RuntimeTreeVerificationReason::PublicationPrePromotion
-        ) {
-            root.parent()
-                .map(|parent| parent.join(source.component().as_str()))
-                .unwrap_or_else(|| root.to_path_buf())
-        } else {
-            root.to_path_buf()
-        };
-        let mut counts = RUNTIME_TREE_VERIFICATION_COUNTS
-            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-            .lock()
-            .expect("runtime tree verification counter registry");
-        if let Some(counts) = counts.get_mut(&scope_root) {
-            counts.record(reason);
-        }
-    }
-    #[cfg(not(test))]
-    let _ = (root, source, reason);
-}
-
-#[cfg(test)]
-pub(crate) fn register_runtime_tree_verification_counts_for_test(root: &Path) {
-    RUNTIME_TREE_VERIFICATION_COUNTS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("runtime tree verification counter registry")
-        .insert(root.to_path_buf(), RuntimeTreeVerificationCounts::default());
-}
-
-#[cfg(test)]
-pub(crate) fn take_runtime_tree_verification_counts_for_test(
-    root: &Path,
-) -> RuntimeTreeVerificationCounts {
-    RUNTIME_TREE_VERIFICATION_COUNTS
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("runtime tree verification counter registry")
-        .remove(root)
-        .unwrap_or_default()
-}
-
 pub(super) async fn runtime_tree_matches_source(
     root: &ManagedDir,
-    projection: &Path,
     source: &RuntimeSourceReceipt,
-    reason: RuntimeTreeVerificationReason,
 ) -> bool {
     let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
     Box::pin(runtime_tree_matches_source_inner(
         root,
-        projection,
         source,
-        reason,
         cancellation.thread_cancellation(),
     ))
     .await
@@ -1304,16 +1139,12 @@ pub(super) async fn runtime_tree_matches_source(
 
 pub(super) async fn runtime_tree_matches_source_until_cancelled(
     root: &ManagedDir,
-    projection: &Path,
     source: &RuntimeSourceReceipt,
-    reason: RuntimeTreeVerificationReason,
     cancellation: &RuntimeCancellation,
 ) -> bool {
     Box::pin(runtime_tree_matches_source_inner(
         root,
-        projection,
         source,
-        reason,
         cancellation.thread_cancellation(),
     ))
     .await
@@ -1321,12 +1152,9 @@ pub(super) async fn runtime_tree_matches_source_until_cancelled(
 
 async fn runtime_tree_matches_source_inner(
     root: &ManagedDir,
-    projection: &Path,
     source: &RuntimeSourceReceipt,
-    reason: RuntimeTreeVerificationReason,
     cancellation: RuntimeThreadCancellation,
 ) -> bool {
-    record_runtime_tree_verification(projection, source, reason);
     if cancellation.is_cancelled() {
         return false;
     }

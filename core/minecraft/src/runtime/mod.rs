@@ -35,11 +35,6 @@ pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError,
 };
-#[cfg(test)]
-pub(crate) use install::{
-    register_runtime_tree_verification_counts_for_test,
-    take_runtime_tree_verification_counts_for_test,
-};
 pub(crate) use layout::runtime_java_relative_path;
 pub use layout::{
     ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeLaunchReceipt, RuntimeAbsence,

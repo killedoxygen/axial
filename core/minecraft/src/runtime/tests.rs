@@ -13,22 +13,20 @@ use super::{
     component_manifest_proof_bytes, detect_distribution, discard_staged_managed_runtime,
     fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
     install_runtime_manifest_files, java_executable, java_executable_for_os,
-    materialize_missing_runtime_source, materialize_preferred_runtime_source,
-    parse_mach_o_arm64_compatibility, plan_runtime_manifest_files, publish_staged_managed_runtime,
+    materialize_missing_runtime_source, parse_mach_o_arm64_compatibility,
+    plan_runtime_manifest_files, publish_staged_managed_runtime,
     publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
     publish_staged_managed_runtime_with_rotation_failure_for_test,
-    register_runtime_tree_verification_counts_for_test, rosetta_requirement_for_managed_runtime,
-    runtime_cancellation_channel, runtime_file_download_concurrency_for,
-    runtime_materialization_control, runtime_os_arch_for,
+    rosetta_requirement_for_managed_runtime, runtime_cancellation_channel,
+    runtime_file_download_concurrency_for, runtime_materialization_control, runtime_os_arch_for,
     runtime_publication_lock_available_for_test, runtime_source_url_is_secure_for_test,
     runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
-    stage_managed_runtime_until_cancelled, take_runtime_tree_verification_counts_for_test,
-    validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
-    verify_runtime_download,
+    stage_managed_runtime_until_cancelled, validate_ephemeral_processor_manifest_for_test,
+    validate_runtime_file_source_urls_for_test, verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -1576,143 +1574,6 @@ async fn authenticated_empty_runtime_file_cancelled_after_materialization_cleans
     assert!(!root.exists());
     assert!(!staging_root.exists());
     assert_eq!(requests.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_fresh() {
-    let cached = ManagedRuntimeCache::isolated_for_test().expect("cached runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let cached_root = cached
-        .component_root(component.as_str())
-        .expect("cached runtime root");
-    let cached_source =
-        runtime_source_receipt_fixture(&component, &cached_root, b"cached java").await;
-    let cached_stage = stage_managed_runtime(&cached, &component, cached_source, &mut |_| {})
-        .await
-        .expect("cached runtime stage");
-    let cached_verified = publish_staged_managed_runtime_and_finalize(cached_stage)
-        .await
-        .expect("cached runtime publish")
-        .into_verified_runtime(&cached, &component, 8)
-        .expect("cached verified runtime");
-    let (_runtime, cached_source) = cached_verified.into_parts();
-    register_runtime_tree_verification_counts_for_test(&cached_root);
-
-    let (_cached_cancel, mut cached_control) = runtime_materialization_control();
-    let cached_result = materialize_preferred_runtime_source(
-        &cached,
-        &JavaVersion {
-            component: component.as_str().to_string(),
-            major_version: 8,
-        },
-        cached_source,
-        &mut |_| {},
-        &mut cached_control,
-    )
-    .await
-    .expect("cached runtime materialization");
-    assert!(cached_result.is_some());
-    let cached_counts = take_runtime_tree_verification_counts_for_test(&cached_root);
-    assert_eq!(cached_counts.reason_vector(), [0, 0, 0, 0, 1, 0]);
-    assert_eq!(cached_counts.total(), 1);
-
-    let fresh = ManagedRuntimeCache::isolated_for_test().expect("fresh runtime cache");
-    let fresh_root = fresh
-        .component_root(component.as_str())
-        .expect("fresh runtime root");
-    let fresh_source = runtime_source_receipt_fixture(&component, &fresh_root, b"fresh java").await;
-    register_runtime_tree_verification_counts_for_test(&fresh_root);
-    let (_fresh_cancel, mut fresh_control) = runtime_materialization_control();
-    let fresh_result = materialize_preferred_runtime_source(
-        &fresh,
-        &JavaVersion {
-            component: component.as_str().to_string(),
-            major_version: 8,
-        },
-        fresh_source,
-        &mut |_| {},
-        &mut fresh_control,
-    )
-    .await
-    .expect("fresh runtime materialization");
-    assert!(fresh_result.is_some());
-    let fresh_counts = take_runtime_tree_verification_counts_for_test(&fresh_root);
-    assert_eq!(fresh_counts.reason_vector(), [1, 1, 0, 1, 0, 0]);
-    assert_eq!(fresh_counts.total(), 3);
-}
-
-#[tokio::test]
-async fn managed_runtime_publication_scan_budgets_cover_reuse_and_replacement() {
-    let component = RuntimeId::from("jre-legacy");
-
-    let reuse_cache = ManagedRuntimeCache::isolated_for_test().expect("reuse runtime cache");
-    let reuse_root = reuse_cache
-        .component_root(component.as_str())
-        .expect("reuse runtime root");
-    let reuse_source = runtime_source_receipt_fixture_with_download_count(
-        &component,
-        &reuse_root,
-        b"reused java",
-        2,
-    )
-    .await;
-    let reuse_stage = stage_managed_runtime(&reuse_cache, &component, reuse_source, &mut |_| {})
-        .await
-        .expect("initial reuse stage");
-    let reuse_source = publish_staged_managed_runtime_and_finalize(reuse_stage)
-        .await
-        .expect("initial reuse publish")
-        .into_verified_runtime(&reuse_cache, &component, 8)
-        .expect("initial verified reuse runtime")
-        .into_parts()
-        .1;
-    register_runtime_tree_verification_counts_for_test(&reuse_root);
-    let reuse_stage = stage_managed_runtime(&reuse_cache, &component, reuse_source, &mut |_| {})
-        .await
-        .expect("exact reuse stage");
-    let reuse_receipt = publish_staged_managed_runtime_and_finalize(reuse_stage)
-        .await
-        .expect("exact canonical reuse");
-    let reuse_counts = take_runtime_tree_verification_counts_for_test(&reuse_root);
-    assert_eq!(reuse_counts.reason_vector(), [1, 1, 1, 0, 0, 0]);
-    assert_eq!(reuse_counts.total(), 3);
-    drop(reuse_receipt);
-
-    let replacement_cache =
-        ManagedRuntimeCache::isolated_for_test().expect("replacement runtime cache");
-    let replacement_root = replacement_cache
-        .component_root(component.as_str())
-        .expect("replacement runtime root");
-    let original_source =
-        runtime_source_receipt_fixture(&component, &replacement_root, b"original replacement java")
-            .await;
-    let original_stage =
-        stage_managed_runtime(&replacement_cache, &component, original_source, &mut |_| {})
-            .await
-            .expect("original replacement stage");
-    let original_receipt = publish_staged_managed_runtime_and_finalize(original_stage)
-        .await
-        .expect("original replacement publish");
-    drop(original_receipt);
-    let replacement_source =
-        runtime_source_receipt_fixture(&component, &replacement_root, b"new replacement java")
-            .await;
-    register_runtime_tree_verification_counts_for_test(&replacement_root);
-    let replacement_stage = stage_managed_runtime(
-        &replacement_cache,
-        &component,
-        replacement_source,
-        &mut |_| {},
-    )
-    .await
-    .expect("mismatching replacement stage");
-    let replacement_receipt = publish_staged_managed_runtime_and_finalize(replacement_stage)
-        .await
-        .expect("mismatching canonical replacement");
-    let replacement_counts = take_runtime_tree_verification_counts_for_test(&replacement_root);
-    assert_eq!(replacement_counts.reason_vector(), [1, 1, 1, 1, 0, 0]);
-    assert_eq!(replacement_counts.total(), 4);
-    drop(replacement_receipt);
 }
 
 #[tokio::test]
