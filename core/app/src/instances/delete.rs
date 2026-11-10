@@ -79,6 +79,21 @@ pub struct DeletionSnapshot {
     pub status: DeletionStatus,
 }
 
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct DeletionResponse {
+    pub deletion: DeletionSnapshot,
+    pub status: DeletionStatus,
+}
+
+impl From<DeletionSnapshot> for DeletionResponse {
+    fn from(deletion: DeletionSnapshot) -> Self {
+        Self {
+            status: deletion.status,
+            deletion,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeletionError {
     #[error("The deletion request does not match its accepted intent.")]

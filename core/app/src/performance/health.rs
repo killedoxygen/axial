@@ -1,7 +1,9 @@
 //! Public health is derived from exact admitted leaf inspection.
 
-use super::model::*;
-use axial_performance::{ManagedCompositionInspection, ManagedResolvedInspection};
+use super::{model::*, mutation::PerformanceOperationStatus};
+use axial_performance::{
+    ManagedCompositionInspection, ManagedResolvedInspection, RollbackSnapshotSummary,
+};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -125,5 +127,131 @@ pub fn health_response(inspection: ManagedCompositionInspection) -> PerformanceH
         state: inspection.state,
         health: inspection.health,
         warnings: inspection.warnings,
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PerformanceOperationView {
+    #[serde(flatten)]
+    pub operation: PerformanceOperationStatus,
+    pub view_model: PerformanceOperationViewModel,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PerformanceOperationViewModel {
+    pub state_label: String,
+    pub tone: &'static str,
+    pub title: &'static str,
+    pub detail: String,
+    pub progress: PerformanceOperationProgress,
+    pub is_terminal: bool,
+    pub is_complete: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PerformanceOperationProgress {
+    pub phase: String,
+    pub current: u8,
+    pub total: u8,
+    pub done: bool,
+}
+
+impl From<PerformanceOperationStatus> for PerformanceOperationView {
+    fn from(operation: PerformanceOperationStatus) -> Self {
+        let complete = operation.state == "complete";
+        let terminal = matches!(
+            operation.state.as_str(),
+            "complete" | "failed" | "interrupted"
+        );
+        let view_model = PerformanceOperationViewModel {
+            state_label: operation.state.clone(),
+            tone: if complete {
+                "ok"
+            } else if terminal {
+                "warn"
+            } else {
+                "mute"
+            },
+            title: "Performance operation",
+            detail: operation.error.clone().unwrap_or_default(),
+            progress: PerformanceOperationProgress {
+                phase: operation.state.clone(),
+                current: terminal.into(),
+                total: 1,
+                done: terminal,
+            },
+            is_terminal: terminal,
+            is_complete: complete,
+        };
+        Self {
+            operation,
+            view_model,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PerformanceInstanceOperationResponse {
+    pub operation: Option<PerformanceOperationView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PerformanceRollbackResponse {
+    pub snapshots: Vec<RollbackSnapshotSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PerformanceInstallResponse {
+    pub active: bool,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_id: Option<String>,
+    pub health: BundleHealth,
+    pub composition_id: String,
+    pub tier: &'static str,
+    pub installed_count: usize,
+    pub managed_artifacts: Vec<PerformanceManagedArtifactSummary>,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<PerformanceOperationView>,
+}
+
+impl PerformanceInstallResponse {
+    /// Accepted durable work; its operation reports progress.
+    pub fn queued(operation: PerformanceOperationStatus) -> Self {
+        Self {
+            active: true,
+            status: "queued",
+            install_id: Some(operation.id.clone()),
+            health: BundleHealth::Disabled,
+            composition_id: String::new(),
+            tier: "",
+            installed_count: 0,
+            managed_artifacts: Vec::new(),
+            warnings: Vec::new(),
+            operation: Some(operation.into()),
+        }
+    }
+
+    pub fn complete(inspection: ManagedCompositionInspection) -> Self {
+        let state = inspection.state.as_ref();
+        Self {
+            active: state.is_some(),
+            status: "complete",
+            install_id: None,
+            health: inspection.health,
+            composition_id: state
+                .map(|state| state.composition_id.clone())
+                .unwrap_or_default(),
+            tier: state.map_or("", |state| match state.tier {
+                CompositionTier::Core => "core",
+                CompositionTier::Extended => "extended",
+                CompositionTier::VanillaEnhanced => "vanilla_enhanced",
+            }),
+            installed_count: state.map_or(0, |state| state.installed_mods.len()),
+            warnings: inspection.warnings.clone(),
+            managed_artifacts: health_response(inspection).managed_artifacts,
+            operation: None,
+        }
     }
 }

@@ -372,6 +372,27 @@ impl LaunchCoordinator {
         self.intents.snapshot(key)
     }
 
+    pub fn intent_view(&self, key: &str) -> Result<Option<LaunchIntentView>, LaunchError> {
+        Ok(self.intent(key)?.map(|status| match status {
+            LaunchIntentStatus::Preparing => LaunchIntentView::Preparing,
+            LaunchIntentStatus::Accepted { session } => LaunchIntentView::Accepted {
+                session: self
+                    .sessions
+                    .snapshot_by_session_id(&session.session_id)
+                    .unwrap_or(session),
+            },
+            LaunchIntentStatus::Rejected { error } => LaunchIntentView::Rejected {
+                error: error.error,
+                code: error.code,
+            },
+            LaunchIntentStatus::Interrupted { session_id } => LaunchIntentView::Interrupted {
+                session_id,
+                error: LaunchError::Interrupted.to_string(),
+                code: LaunchError::Interrupted,
+            },
+        }))
+    }
+
     #[cfg(test)]
     pub(crate) async fn observe_unstarted_benchmark_for_test(
         &self,
@@ -1871,6 +1892,25 @@ pub enum LaunchIntentStatus {
     Accepted { session: SessionSnapshot },
     Rejected { error: LaunchErrorResponse },
     Interrupted { session_id: String },
+}
+
+/// The public form of an intent; an accepted session is its latest observation.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LaunchIntentView {
+    Preparing,
+    Accepted {
+        session: SessionSnapshot,
+    },
+    Rejected {
+        error: String,
+        code: LaunchError,
+    },
+    Interrupted {
+        session_id: String,
+        error: String,
+        code: LaunchError,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

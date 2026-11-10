@@ -148,6 +148,12 @@ fn outcome_name(outcome: &SessionOutcome) -> &'static str {
     }
 }
 
+/// Recent launch proofs with their history view models.
+#[derive(Clone, Debug, Serialize)]
+pub struct LaunchReportsResponse {
+    pub reports: Vec<serde_json::Value>,
+}
+
 /// Synchronous, bounded metadata methods. Async adapters run them on spawn_blocking.
 #[derive(Clone)]
 pub struct LaunchReportStore {

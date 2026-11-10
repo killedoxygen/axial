@@ -1,14 +1,19 @@
 //! Retained content preview shapes shared by discovery and instance setup.
 
 use super::{
-    catalog::ContentService,
-    model::{CanonicalId, ContentDependency, ContentKind},
+    catalog::{ContentResult, ContentService},
+    install::ContentMutations,
+    model::{
+        CanonicalContent, CanonicalId, ContentDependency, ContentKind, ContentQuery, Page,
+        ProviderId,
+    },
     provenance::{ContentManifest, LiveManagedContent},
     resolve::{
         self, ContentResolution, ResolutionConflictKind, ResolutionConflictReason, ResolutionError,
         ResolutionReason, ResolutionSelection, ResolutionTarget, TargetedPlan,
     },
 };
+use crate::instances::model::InstanceId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -211,4 +216,136 @@ pub async fn preview_draft(
         &LiveManagedContent::default(),
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallState {
+    Installed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SearchItem {
+    #[serde(flatten)]
+    pub content: CanonicalContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_state: Option<InstallState>,
+}
+
+/// A provider page marking results the instance has live. An unreadable or
+/// unknown instance only omits the marks; discovery stays available.
+pub async fn search(
+    service: &ContentService,
+    mutations: &ContentMutations,
+    query: &ContentQuery,
+    instance: Option<&InstanceId>,
+) -> ContentResult<Page<SearchItem>> {
+    let context = instance.and_then(|id| mutations.instance_context(id).ok());
+    let installed = |content: &CanonicalContent| {
+        context.as_ref().is_some_and(|(_, manifest, live)| {
+            manifest
+                .find(&content.canonical_id)
+                .is_some_and(|entry| live.contains(entry))
+        })
+    };
+    let page = service.search(query).await?;
+    Ok(Page {
+        items: page
+            .items
+            .into_iter()
+            .map(|content| SearchItem {
+                install_state: installed(&content).then_some(InstallState::Installed),
+                content,
+            })
+            .collect(),
+        offset: page.offset,
+        limit: page.limit,
+        total: page.total,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InstalledContent {
+    pub entries: Vec<InstalledEntry>,
+    pub packs: Vec<InstalledPack>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InstalledEntry {
+    pub canonical_id: CanonicalId,
+    pub kind: ContentKind,
+    pub provider: ProviderId,
+    pub project_id: String,
+    pub version_id: String,
+    pub filename: String,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub required_by: Vec<CanonicalId>,
+}
+
+/// Pack provenance owns no file; its recorded paths only mark membership.
+#[derive(Clone, Debug, Serialize)]
+pub struct InstalledPack {
+    pub canonical_id: CanonicalId,
+    pub provider: ProviderId,
+    pub project_id: String,
+    pub version_id: String,
+    pub paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_number: Option<String>,
+}
+
+/// Live managed files and the packs that placed them.
+pub fn installed(manifest: &ContentManifest, live: &LiveManagedContent) -> InstalledContent {
+    let entries = manifest
+        .entries()
+        .iter()
+        .filter(|entry| live.contains(entry))
+        .filter_map(|entry| {
+            Some(InstalledEntry {
+                canonical_id: entry.canonical_id().clone(),
+                kind: entry.kind(),
+                provider: entry.provider(),
+                project_id: entry.project_id().into(),
+                version_id: entry.version_id().into(),
+                filename: entry.managed_filename()?.as_str().into(),
+                enabled: entry.enabled(),
+                title: entry.title().map(Into::into),
+                required_by: manifest
+                    .dependents(live, std::slice::from_ref(entry.canonical_id()))
+                    .into_iter()
+                    .map(|dependent| dependent.canonical_id().clone())
+                    .collect(),
+            })
+        })
+        .collect();
+    let packs = manifest
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == ContentKind::Modpack)
+        .map(|entry| InstalledPack {
+            canonical_id: entry.canonical_id().clone(),
+            provider: entry.provider(),
+            project_id: entry.project_id().into(),
+            version_id: entry.version_id().into(),
+            paths: entry.pack_paths().map(Into::into).collect(),
+            title: entry.title().map(Into::into),
+            version_number: entry.version_number().map(Into::into),
+        })
+        .collect();
+    InstalledContent { entries, packs }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompatibilityResponse {
+    pub candidates: Vec<super::compatibility::CompatCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UpdatesResponse {
+    pub updates: Vec<resolve::AvailableUpdate>,
 }

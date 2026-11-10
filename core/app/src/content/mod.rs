@@ -7,6 +7,7 @@ pub mod model;
 pub mod packs;
 pub mod provenance;
 mod provider;
+mod queue;
 mod requirements;
 pub mod resolve;
 pub mod view;

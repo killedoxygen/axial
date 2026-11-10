@@ -217,38 +217,6 @@ impl From<rusqlite::Error> for MutationError {
     }
 }
 
-impl MutationError {
-    pub fn status_code(&self) -> u16 {
-        match self {
-            Self::Changed
-            | Self::Conflict
-            | Self::Pending
-            | Self::Required
-            | Self::Managed
-            | Self::Duplicate(_)
-            | Self::Incompatible(_) => 409,
-            Self::NotFound | Self::Pack(super::packs::PackError::NoMatchingVersion) => 404,
-            Self::Cancelled => 409,
-            Self::Capacity => 413,
-            Self::Unavailable => 503,
-            Self::Integrity => 422,
-            Self::StreamingUnsupported => 501,
-            Self::Pack(super::packs::PackError::TooLarge) => 413,
-            Self::Pack(
-                super::packs::PackError::Cancelled
-                | super::packs::PackError::SelectionChanged
-                | super::packs::PackError::Conflict(_),
-            ) => 409,
-            Self::Pack(super::packs::PackError::Integrity) => 422,
-            Self::Pack(super::packs::PackError::Download | super::packs::PackError::Provider) => {
-                503
-            }
-            Self::Pack(_) | Self::Content(_) => 400,
-            Self::Files | Self::Storage(_) => 500,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proof {

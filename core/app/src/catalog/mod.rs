@@ -5,12 +5,14 @@
 
 mod installed;
 mod model;
+mod service;
 
 pub(crate) use installed::{InstalledSnapshot, installed_snapshot};
 pub use installed::{VersionScanViewModel, VersionsResponse, installed_versions};
 pub use model::{
     CatalogError, CatalogFailure, CatalogSnapshot, CatalogState, CatalogStateId, VersionDescriptor,
 };
+pub use service::{CatalogService, LoaderBuildsResponse, LoaderVersionsResponse, Unavailable};
 
 use crate::network::{
     DownloadError, DownloadRequest, DownloadedBytes, IntegrityPolicy, OriginPolicy, ProviderClient,

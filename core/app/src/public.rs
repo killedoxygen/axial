@@ -18,6 +18,12 @@ impl ErrorResponse {
     }
 }
 
+/// What a completed command means to the person.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
+pub struct CommandSummary {
+    pub summary: &'static str,
+}
+
 /// Separate identity prevents development builds from admitting the legacy profile.
 pub const DEVELOPMENT_APPLICATION_ID: &str = "com.mateoltd.axial.rewrite";
 

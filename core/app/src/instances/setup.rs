@@ -1007,6 +1007,17 @@ impl SetupService {
         self.enrich_preflight(instance, versions, preflight)
     }
 
+    /// Display of a committed instance; inspection failure never refuses the write.
+    pub async fn enrich_committed(&self, instance: Instance) -> EnrichedInstance {
+        if let Ok(projected) = self.enrich_all(vec![instance.clone()]).await
+            && let Ok([enriched]) = <[_; 1]>::try_from(projected)
+        {
+            return enriched;
+        }
+        let versions = self.installed().await.unwrap_or_default();
+        self.enrich(instance, &versions).await
+    }
+
     pub async fn list(&self) -> InstanceResult<ListResponse> {
         let mut budget = crate::install::artifacts::InventoryBudget::projection();
         let (records, scratch) = self.instances.registry().list_admitted(&mut budget)?;

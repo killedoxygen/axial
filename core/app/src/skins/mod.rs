@@ -6,6 +6,7 @@ pub mod lookup;
 pub mod pending;
 pub mod profile_change;
 pub mod store;
+pub mod view;
 
 pub use profile_change::{ProfileMedia, SkinError};
 

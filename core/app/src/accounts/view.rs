@@ -4,11 +4,13 @@ use super::{
     credential_store::CredentialError,
     credentials::Credentials,
     microsoft::MinecraftProfile,
-    model::{AccountId, AccountKind, AccountRecord, LaunchAuthMode},
+    model::{AccountError, AccountId, AccountKind, AccountRecord, AccountSnapshot, LaunchAuthMode},
+    selection::CapturedAccount,
     session::{AuthError, AuthService, now_seconds},
 };
 use crate::{
     media::SkinVariant,
+    public::CommandSummary,
     skins::delivery::{active_cape, current_skin},
 };
 use serde::Serialize;
@@ -94,6 +96,94 @@ pub struct AccountListResponse {
     /// Whether this build can open the Microsoft sign-in window.
     pub sign_in_available: bool,
     pub accounts: Vec<AccountView>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct AccountCommandResponse {
+    pub status: &'static str,
+    #[ts(type = "number")]
+    pub selection_revision: u64,
+    pub account: AccountRecord,
+    pub view_model: CommandSummary,
+}
+
+impl AccountCommandResponse {
+    /// Names the account the command left at `account_id` in its committed snapshot.
+    pub fn new(
+        snapshot: AccountSnapshot,
+        account_id: &str,
+        status: &'static str,
+        summary: &'static str,
+    ) -> Result<Self, AccountError> {
+        let account = snapshot
+            .accounts
+            .into_iter()
+            .find(|account| account.account_id.as_str() == account_id)
+            .ok_or(AccountError::NotFound)?;
+        Ok(Self {
+            status,
+            selection_revision: snapshot.selection_revision,
+            account,
+            view_model: CommandSummary { summary },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct AccountRemovedResponse {
+    pub account_id: String,
+    #[ts(type = "number")]
+    pub selection_revision: u64,
+    pub status: &'static str,
+    pub view_model: CommandSummary,
+}
+
+impl AccountRemovedResponse {
+    pub fn new(account_id: String, snapshot: &AccountSnapshot) -> Self {
+        Self {
+            account_id,
+            selection_revision: snapshot.selection_revision,
+            status: "account_removed",
+            view_model: CommandSummary {
+                summary: "Account removed.",
+            },
+        }
+    }
+}
+
+/// The selected Microsoft account after a provider refresh or profile sync.
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct ProfileRefreshResponse {
+    pub account_id: String,
+    pub minecraft_ownership_verified: bool,
+    pub minecraft_profile: Option<MinecraftProfile>,
+    pub minecraft_profile_ready: bool,
+    #[ts(type = "number")]
+    pub selection_revision: u64,
+    pub status: &'static str,
+    pub view_model: CommandSummary,
+}
+
+impl ProfileRefreshResponse {
+    pub fn refreshed(capture: &CapturedAccount) -> Self {
+        Self::new(capture, "refreshed", "Microsoft sign-in refreshed.")
+    }
+
+    pub fn synced(capture: &CapturedAccount) -> Self {
+        Self::new(capture, "profile_synced", "Minecraft profile synced.")
+    }
+
+    fn new(capture: &CapturedAccount, status: &'static str, summary: &'static str) -> Self {
+        Self {
+            account_id: capture.account_id().into(),
+            minecraft_ownership_verified: capture.owns_minecraft_java(),
+            minecraft_profile: capture.profile().cloned(),
+            minecraft_profile_ready: true,
+            selection_revision: capture.selection_revision(),
+            status,
+            view_model: CommandSummary { summary },
+        }
+    }
 }
 
 impl AuthService {

@@ -1,10 +1,12 @@
 //! Export only reviewed public DTOs, never runtime commands or credentials.
 
 use axial_app::{
-    accounts::view::AccountListResponse,
+    accounts::view::{
+        AccountCommandResponse, AccountListResponse, AccountRemovedResponse, ProfileRefreshResponse,
+    },
     content::provenance::RequiredRefusal,
     instances::{
-        delete::DeletionSnapshot,
+        delete::{DeletionResponse, DeletionSnapshot},
         model::JavaSelection,
         setup::{CreateLoaderBuildsView, CreateNotice},
     },
@@ -20,7 +22,10 @@ use axial_app::{
         InterfacePreferencesUpdate,
     },
     skins::{
-        library::SkinNormalizeResponse, lookup::UsernameProfile, profile_change::SavedSkinsResponse,
+        library::SkinNormalizeResponse,
+        lookup::UsernameProfile,
+        profile_change::SavedSkinsResponse,
+        view::{ProfileResetResponse, SkinApplyResponse, SkinCancelResponse, SkinFlushResponse},
     },
     system::SystemResourceResponse,
     update::UpdateSnapshot,
@@ -79,10 +84,18 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     InstancePackInfo::export_all(&config)?;
     ModImportResponse::export_all(&config)?;
     AccountListResponse::export_all(&config)?;
+    AccountCommandResponse::export_all(&config)?;
+    AccountRemovedResponse::export_all(&config)?;
+    ProfileRefreshResponse::export_all(&config)?;
     SavedSkinsResponse::export_all(&config)?;
     SkinNormalizeResponse::export_all(&config)?;
+    SkinApplyResponse::export_all(&config)?;
+    SkinFlushResponse::export_all(&config)?;
+    SkinCancelResponse::export_all(&config)?;
+    ProfileResetResponse::export_all(&config)?;
     UsernameProfile::export_all(&config)?;
     DeletionSnapshot::export_all(&config)?;
+    DeletionResponse::export_all(&config)?;
     JavaSelection::export_all(&config)?;
     CreateLoaderBuildsView::export_all(&config)?;
     CreateNotice::export_all(&config)?;

@@ -50,18 +50,6 @@ pub enum FolderError {
     Pending,
 }
 
-impl FolderError {
-    pub fn status_code(self) -> u16 {
-        match self {
-            Self::InvalidFolder => 400,
-            Self::NotFound => 404,
-            Self::Busy | Self::Pending => 409,
-            Self::Capacity | Self::Closed => 503,
-            Self::Prepare | Self::Spawn => 500,
-        }
-    }
-}
-
 /// An exact prepared directory and its registered instance admission. This has
 /// no public constructor or deserializer; a native adapter cannot accept paths.
 pub struct AdmittedFolder {

@@ -4,6 +4,7 @@
 mod flags;
 mod model;
 mod preferences;
+mod service;
 
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagStage, FlagViewModel, FlagsResponse, STATE_INSPECTOR_FLAG,
@@ -18,6 +19,7 @@ pub use preferences::{
     InterfacePreferencesSnapshot, InterfacePreferencesUpdate, InterfaceRoute, LocalPreferences,
     MAX_INTERFACE_PREFERENCES_BYTES, OverlayPosition, ShortcutBinding,
 };
+pub use service::SettingsService;
 
 use std::{
     collections::BTreeMap,

@@ -72,19 +72,6 @@ pub enum ModImportError {
     Files,
 }
 
-impl ModImportError {
-    pub fn status_code(&self) -> u16 {
-        match self {
-            Self::Count | Self::NotJar | Self::InvalidArchive(_) => 400,
-            Self::TooLarge(_) => 413,
-            Self::Repeated(_) | Self::Duplicate(_) | Self::Busy | Self::Pending | Self::Changed => {
-                409
-            }
-            Self::Files => 500,
-        }
-    }
-}
-
 /// An enabled `.jar` selector whose bytes are a readable zip archive.
 pub(crate) fn validate_import(
     name: &str,

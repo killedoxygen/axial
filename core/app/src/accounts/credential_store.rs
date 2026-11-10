@@ -157,11 +157,17 @@ impl CredentialStore {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn isolated_for_tests() -> Self {
+        Self::isolated_with_task_owner(TaskOwner::new(64).unwrap())
+    }
+
+    /// In-memory entries under the composition's own shutdown owner.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn isolated_with_task_owner(tasks: TaskOwner) -> Self {
         Self {
             profile: Uuid::new_v4(),
             keyring: Arc::new(memory::MemoryEntries::default()),
             gate: Arc::default(),
-            tasks: TaskOwner::new(64).unwrap(),
+            tasks,
         }
     }
 

@@ -165,6 +165,18 @@ impl CreateTarget {
     }
 }
 
+/// Interrupted creations and deletions awaiting recovery.
+#[derive(Clone, Debug, Serialize)]
+pub struct PendingInstancesResponse {
+    pub creations: Vec<PendingCreation>,
+    pub deletions: Vec<super::delete::DeletionSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecoveredCreationResponse {
+    pub instance: Option<Instance>,
+}
+
 /// These are status records, never permission to reopen serialized paths.
 #[derive(Clone, Debug, Serialize)]
 pub struct PendingCreation {

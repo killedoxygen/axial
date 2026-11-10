@@ -112,6 +112,16 @@ pub struct SessionNotice {
     pub tone: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionsResponse {
+    pub sessions: Vec<SessionSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionLogsResponse {
+    pub entries: Vec<LogEntry>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SessionSnapshot {
     pub session_id: String,

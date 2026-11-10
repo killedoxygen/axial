@@ -30,6 +30,8 @@ pub enum ResourceError {
     Busy,
     #[error("resource exceeds safe filesystem limits")]
     Limit,
+    #[error("instance resources contain unsupported filesystem entries")]
+    Unsupported,
     #[error("managed content must be removed through content operations")]
     Managed,
     #[error("resource files could not be read or updated")]
@@ -40,14 +42,50 @@ pub enum ResourceError {
     Required(RequiredRefusal),
 }
 
-impl ResourceError {
-    pub fn status_code(&self) -> u16 {
-        match self {
-            Self::InvalidName => 400,
-            Self::NotFound => 404,
-            Self::Conflict | Self::Busy | Self::Managed | Self::Pending | Self::Required(_) => 409,
-            Self::Limit => 413,
-            Self::Files => 500,
+impl From<worlds::WorldError> for ResourceError {
+    fn from(error: worlds::WorldError) -> Self {
+        use worlds::WorldError;
+        match error {
+            WorldError::InvalidName => Self::InvalidName,
+            WorldError::NotFound | WorldError::IconNotFound => Self::NotFound,
+            WorldError::AlreadyExists | WorldError::Changed => Self::Conflict,
+            WorldError::Busy => Self::Busy,
+            WorldError::Capacity => Self::Limit,
+            WorldError::UnsupportedEntry => Self::Unsupported,
+            WorldError::SettlementRequired => Self::Pending,
+            WorldError::Io => Self::Files,
+        }
+    }
+}
+
+impl From<mods::ModFilesError> for ResourceError {
+    fn from(error: mods::ModFilesError) -> Self {
+        use mods::ModFilesError;
+        match error {
+            ModFilesError::InvalidName => Self::InvalidName,
+            ModFilesError::InstanceNotFound | ModFilesError::NotFound => Self::NotFound,
+            ModFilesError::Busy | ModFilesError::Unavailable => Self::Busy,
+            ModFilesError::AlreadyExists | ModFilesError::Changed => Self::Conflict,
+            ModFilesError::Managed => Self::Managed,
+            ModFilesError::ScanLimit => Self::Limit,
+            ModFilesError::UnsupportedEntry => Self::Unsupported,
+            ModFilesError::SettlementRequired => Self::Pending,
+            ModFilesError::Read | ModFilesError::Write => Self::Files,
+        }
+    }
+}
+
+impl From<screenshots::ScreenshotError> for ResourceError {
+    fn from(error: screenshots::ScreenshotError) -> Self {
+        use screenshots::ScreenshotError;
+        match error {
+            ScreenshotError::InvalidName | ScreenshotError::FileTypeChange => Self::InvalidName,
+            ScreenshotError::NotFound => Self::NotFound,
+            ScreenshotError::AlreadyExists | ScreenshotError::Changed => Self::Conflict,
+            ScreenshotError::Pending => Self::Pending,
+            ScreenshotError::TooLarge | ScreenshotError::ScanLimit => Self::Limit,
+            ScreenshotError::UnsupportedEntry => Self::Unsupported,
+            ScreenshotError::Read | ScreenshotError::Write => Self::Files,
         }
     }
 }
@@ -144,10 +182,9 @@ impl ResourceService {
 
     pub fn resources(&self, id: &InstanceId) -> Result<InstanceResourcesResponse, ResourceError> {
         self.read_list(id, |game| {
-            let worlds = worlds::list_worlds(game).map_err(|_| ResourceError::Files)?;
-            let mods = mods::list_mods(game).map_err(|_| ResourceError::Files)?;
-            let screenshots =
-                screenshots::list_screenshots(game).map_err(|_| ResourceError::Files)?;
+            let worlds = worlds::list_worlds(game)?;
+            let mods = mods::list_mods(game)?;
+            let screenshots = screenshots::list_screenshots(game)?;
             let logs = list_logs(game)?;
             Ok(InstanceResourcesResponse {
                 worlds_count: worlds.len(),
@@ -163,24 +200,18 @@ impl ResourceService {
     }
 
     pub fn mods(&self, id: &InstanceId) -> Result<Vec<mods::InstanceModInfo>, ResourceError> {
-        self.read_list(id, |game| {
-            mods::list_mods(game).map_err(|_| ResourceError::Files)
-        })
+        self.read_list(id, |game| Ok(mods::list_mods(game)?))
     }
 
     pub fn worlds(&self, id: &InstanceId) -> Result<Vec<worlds::InstanceWorldInfo>, ResourceError> {
-        self.read_list(id, |game| {
-            worlds::list_worlds(game).map_err(|_| ResourceError::Files)
-        })
+        self.read_list(id, |game| Ok(worlds::list_worlds(game)?))
     }
 
     pub fn screenshots(
         &self,
         id: &InstanceId,
     ) -> Result<Vec<screenshots::InstanceScreenshotInfo>, ResourceError> {
-        self.read_list(id, |game| {
-            screenshots::list_screenshots(game).map_err(|_| ResourceError::Files)
-        })
+        self.read_list(id, |game| Ok(screenshots::list_screenshots(game)?))
     }
 
     pub fn logs(&self, id: &InstanceId) -> Result<Vec<InstanceLogInfo>, ResourceError> {
@@ -212,15 +243,7 @@ impl ResourceService {
             .directories
             .admit_read(id)
             .map_err(|_| ResourceError::Busy)?;
-        let media =
-            screenshots::screenshot_media(instance.game_directory(), name).map_err(|error| {
-                match error {
-                    screenshots::ScreenshotError::InvalidName => ResourceError::InvalidName,
-                    screenshots::ScreenshotError::NotFound => ResourceError::NotFound,
-                    screenshots::ScreenshotError::TooLarge => ResourceError::Limit,
-                    _ => ResourceError::Files,
-                }
-            })?;
+        let media = screenshots::screenshot_media(instance.game_directory(), name)?;
         instance
             .validate_current()
             .map_err(|_| ResourceError::Busy)?;
@@ -233,7 +256,7 @@ impl ResourceService {
         id: &InstanceId,
     ) -> Result<Vec<mods::InstanceModMetadata>, ResourceError> {
         self.read_list(id, |game| {
-            let listed = mods::list_mods(game).map_err(|_| ResourceError::Files)?;
+            let listed = mods::list_mods(game)?;
             if listed.is_empty() {
                 return Ok(Vec::new());
             }
@@ -911,7 +934,7 @@ fn list_logs(game: &ScopedDirectory) -> Result<Vec<InstanceLogInfo>, ResourceErr
             entry.kind(),
             axial_fs::EntryKind::Link | axial_fs::EntryKind::Other
         ) {
-            return Err(ResourceError::Conflict);
+            return Err(ResourceError::Unsupported);
         }
         if entry.kind() != axial_fs::EntryKind::File {
             continue;
@@ -1052,6 +1075,38 @@ mod tests {
         raw.extend_from_slice(b"\n ");
         std::fs::write(game.join(crate::content::provenance::MANIFEST_FILE), &raw).unwrap();
         raw
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn linked_resource_folder_refuses_its_listing_without_following_or_blocking_others() {
+        let (root, service, id) = fixture().await;
+        let game = root.path().join("instances").join(id.as_str());
+        std::fs::create_dir_all(game.join("logs")).unwrap();
+        std::fs::write(game.join("mods/local.jar"), b"regular mod").unwrap();
+        std::fs::write(game.join("logs/latest.log"), b"fixture log\n").unwrap();
+        let outside = root.path().join("outside-screenshots");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("canary.png"), b"untouched").unwrap();
+        if game.join("screenshots").exists() {
+            std::fs::remove_dir(game.join("screenshots")).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, game.join("screenshots")).unwrap();
+        assert!(matches!(
+            service.screenshots(&id),
+            Err(ResourceError::Files)
+        ));
+        assert!(matches!(service.resources(&id), Err(ResourceError::Files)));
+        assert_eq!(service.mods(&id).unwrap()[0].name, "local.jar");
+        assert_eq!(service.logs(&id).unwrap()[0].size, 12);
+        assert_eq!(
+            std::fs::read_link(game.join("screenshots")).unwrap(),
+            outside
+        );
+        assert_eq!(
+            std::fs::read(outside.join("canary.png")).unwrap(),
+            b"untouched"
+        );
     }
 
     #[tokio::test]

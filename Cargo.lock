@@ -319,6 +319,7 @@ dependencies = [
  "axial-minecraft",
  "axial-performance",
  "axial-resource",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "core-foundation 0.10.1",

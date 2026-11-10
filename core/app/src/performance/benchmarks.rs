@@ -1564,6 +1564,31 @@ impl BenchmarkService {
         Ok(driver)
     }
 
+    /// Driver payloads whose resume hint reflects every stored driver.
+    pub fn driver_views(
+        &self,
+        drivers: Vec<BenchmarkSuiteDriverStatus>,
+    ) -> Result<Vec<serde_json::Value>, BenchmarkError> {
+        let mut actions = self.resume_actions(&drivers)?;
+        drivers
+            .into_iter()
+            .map(|driver| {
+                let can_resume = actions
+                    .remove(&driver.id)
+                    .ok_or(BenchmarkError::Unavailable)?;
+                Ok(driver_payload(driver, can_resume))
+            })
+            .collect()
+    }
+
+    pub fn driver_view(
+        &self,
+        driver: BenchmarkSuiteDriverStatus,
+    ) -> Result<serde_json::Value, BenchmarkError> {
+        let mut views = self.driver_views(vec![driver])?;
+        views.pop().ok_or(BenchmarkError::Unavailable)
+    }
+
     /// One bounded projection shares driver activity. These hints never
     /// replace exact command admission.
     pub fn resume_actions(
@@ -1774,13 +1799,18 @@ fn validate_suite(suite: &BenchmarkSuiteManifest) -> Result<(), BenchmarkError> 
     Ok(())
 }
 
-pub fn driver_payload(driver: BenchmarkSuiteDriverStatus) -> serde_json::Value {
+fn driver_payload(driver: BenchmarkSuiteDriverStatus, can_resume: bool) -> serde_json::Value {
     let running = matches!(driver.state.as_str(), "running" | "waiting");
-    let resumable = matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted");
     serde_json::json!({"status":"ok","suite":{"suite_id":driver.suite_id,"mode":driver.mode,"run_count":driver.run_count,
         "launched_run_count":driver.launched_run_count,"pending_run_index":driver.pending_run_index},
         "view_model":{"state_label":driver.state,"state_tone":if driver.state=="complete" {"ok"} else if matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted") {"warn"} else {"neutral"},
-            "can_stop":running,"can_resume":resumable,"can_check_family_c_qualification":driver.mode=="release_validation"},"driver":driver})
+            "can_stop":running,"can_resume":can_resume,"can_check_family_c_qualification":driver.mode=="release_validation"},"driver":driver})
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BenchmarkDriversResponse {
+    pub status: &'static str,
+    pub drivers: Vec<serde_json::Value>,
 }
 
 pub fn qualification_preview() -> serde_json::Value {
