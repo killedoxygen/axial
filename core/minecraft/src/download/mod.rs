@@ -15,21 +15,14 @@ mod test_support;
 mod transfer;
 mod transient_transfer;
 
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) use asset_source::AssetSourcePool;
-pub(crate) use asset_source::{
-    AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource, RetainedAssetSourceSet,
-};
-pub use assets::repair_virtual_assets_from_index_retained;
-pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
-#[cfg(feature = "test-support")]
-pub use assets::{VirtualAssetRepairTestGate, arm_virtual_asset_repair_test_pause};
+pub(crate) use crate::asset_index::parse_asset_index;
+pub(crate) use assets::ASSET_OBJECT_BASE_URL;
+pub use assets::materialize_virtual_assets;
 pub(crate) use client::standard_minecraft_download_client;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
     AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
     ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
-    RegisteredVersionBundleSourceError, RetainedVersionBundleReconstructionSources,
     prepare_local_managed_install, publish_prepared_managed_install,
 };
 pub use install::{
@@ -41,18 +34,18 @@ pub use install::{
 #[cfg(test)]
 pub(crate) use install::{
     ManagedInstallSettlementForTest, checkpoint_and_ack_managed_install_for_test,
+    version_bundle_publication_fixture_for_test,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use install::{
     publish_managed_install_fixture_for_test, publish_managed_install_fixture_with_client_for_test,
 };
 pub(crate) use install::{
-    reconstruct_game_library_sources, reconstruct_installer_library_declarations,
-    reconstruct_installer_processor_sources, reconstruct_profile_library_declarations,
+    reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
+    reconstruct_profile_library_declarations,
 };
-pub use integrity::LauncherManagedArtifactReadiness;
 pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts;
-pub(crate) use libraries::{DownloadJob, ExactLibraryCacheAdmission};
+pub(crate) use libraries::{DownloadJob, ExactLibraryCacheAdmission, decode_sha1};
 pub(crate) use libraries::{
     LibraryArtifactPlan, download_profile_retained_libraries_with_declarations_and_facts,
     library_artifact_plans_for,
@@ -62,12 +55,12 @@ pub use libraries::{
 };
 pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
-    DownloadError, DownloadFileFailureClass, DownloadProgress, ExecutionDownloadError,
-    ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
-    KnownGoodActivationRejected, LibraryPlanError, ManagedInstallAcknowledgementOutcome,
-    ManagedInstallAcknowledgementRecovery, ManagedInstallActivationContractId,
-    ManagedInstallActivationContractIdError, ManagedInstallCheckpointVerificationFailure,
-    ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
+    DownloadError, DownloadFileFailureClass, DownloadProgress, ExecutionDownloadFact,
+    ExecutionDownloadFactKind, ExpectedIntegrity, KnownGoodActivationRejected, LibraryPlanError,
+    ManagedInstallAcknowledgementOutcome, ManagedInstallAcknowledgementRecovery,
+    ManagedInstallActivationContractId, ManagedInstallActivationContractIdError,
+    ManagedInstallCheckpointVerificationFailure, ManagedInstallCommittedEvidence,
+    ManagedInstallDurableOutcome, ManagedInstallDurableRecovery,
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallPublicationRecovery,

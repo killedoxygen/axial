@@ -27,28 +27,26 @@ pub mod managed_path {
     #[cfg(feature = "test-support")]
     pub use crate::managed_fs::ManagedLibraryTestAuthority;
     pub use crate::managed_fs::{
-        FileAbsence, FileObservation,
-        ManagedContentCancelReceipt, ManagedContentCheckpointError, ManagedContentCommitReceipt,
-        ManagedContentCompleteTransfers,
-        ManagedContentDeferredManifest, ManagedContentEncodedManifest,
-        ManagedContentIssuedTransfer, ManagedContentManifestBindOutcome,
+        FileAbsence, FileObservation, ManagedContentCancelReceipt, ManagedContentCheckpointError,
+        ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
+        ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
         ManagedContentManifestObservationFailure, ManagedContentMutationPlan,
         ManagedContentObservationError, ManagedContentObservedState, ManagedContentPathMutation,
         ManagedContentPathObservation, ManagedContentPathResult, ManagedContentPayloadId,
-        ManagedContentPayloadPlan, ManagedContentPlanError, ManagedContentPlanningBinding,
+        ManagedContentPayloadPlan, ManagedContentPlanError,
         ManagedContentPlanningObservationFailure, ManagedContentPlanningSession,
         ManagedContentPreparationError, ManagedContentPreparationOutcome,
-        ManagedContentPreparedTransaction, ManagedContentReadyTransaction,
-        ManagedContentRecovery, ManagedContentStageOutcome, ManagedContentStagingCheckpoint,
-        ManagedContentTransactionFailure,
-        ManagedContentTransactionOutcome, ManagedContentTransactionRoot,
-        ManagedContentTransactionSession, ManagedContentTransferAdvance,
-        ManagedContentTransferBatch, ManagedContentTransferSettlement, ManagedContentTransferStep,
-        ManagedContentTransferTask, ManagedLibraryAdmissionRebindFailure, ManagedLibraryBinding,
-        ManagedLibraryFile, ManagedLibraryFileBatch, ManagedNativeDirectory, ManagedNativePublicationFailure, ManagedLibraryOperation, ManagedLibraryRetirement, ManagedLibraryRetirementBinding,
-        ManagedLibraryRoot, ManagedLibraryWitness, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
+        ManagedContentPreparedTransaction, ManagedContentReadyTransaction, ManagedContentRecovery,
+        ManagedContentStageOutcome, ManagedContentStagingCheckpoint,
+        ManagedContentTransactionFailure, ManagedContentTransactionOutcome,
+        ManagedContentTransactionRoot, ManagedContentTransactionSession,
+        ManagedContentTransferAdvance, ManagedContentTransferBatch,
+        ManagedContentTransferSettlement, ManagedContentTransferStep, ManagedContentTransferTask,
+        ManagedLibraryBinding, ManagedLibraryFile, ManagedLibraryFileBatch,
+        ManagedLibraryOperation, ManagedLibraryRoot, ManagedLibraryWitness, ManagedNativeDirectory,
+        ManagedNativePublicationFailure, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
         ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement,
-        ManagedTreeRoot, PreparedManagedLibraryAdmissionRebind,
+        ManagedTreeRoot,
     };
 }
 mod managed_publication;
@@ -61,7 +59,9 @@ pub mod version;
 mod version_bundle_publication;
 pub mod version_meta;
 
-pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
+pub use asset_index::{
+    AssetIndexError, LegacyAssetFile, LegacyAssetLayout, LegacyAssets, legacy_assets,
+};
 #[cfg(feature = "test-support")]
 pub use download::publish_managed_install_fixture_for_test;
 pub use download::{
@@ -89,37 +89,13 @@ pub use known_good::{
     managed_install_reconstruction_receipt_fixture_for_test,
     managed_version_bundle_activation_source_fixture_for_test,
 };
-pub use known_good_reconstruction::{
-    KnownGoodReconstructionError, ManagedAssetsCommitReceipt, ManagedAssetsRebuildError,
-    ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
-    ManagedLibrariesRebuildError, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
-    ManagedVersionBundleAcknowledgementOutcome, ManagedVersionBundleAcknowledgementRecovery,
-    ManagedVersionBundleCommitReceipt, ManagedVersionBundleExpectedSettlement,
-    ManagedVersionBundleOrphanOutcome, ManagedVersionBundleOrphanRecovery,
-    ManagedVersionBundleOrphanSettlement, ManagedVersionBundleRebuildError,
-    ManagedVersionBundleRebuildRecovery, ManagedVersionBundleRollbackEffect,
-    ManagedVersionBundleRollbackReceipt, ManagedVersionBundleSettlementOutcome,
-    rebuild_managed_assets, rebuild_managed_libraries, rebuild_managed_version_bundle,
-    reconstruct_known_good, recover_guardian_version_bundle_orphan,
-    recover_managed_version_bundle_acknowledgement,
-};
-#[cfg(feature = "test-support")]
-pub use known_good_reconstruction::{
-    rebuild_managed_assets_fixture_for_test, rebuild_managed_libraries_fixture_for_test,
-    rebuild_managed_version_bundle_fixture_for_source_test,
-    rebuild_managed_version_bundle_fixture_for_test,
-    rebuild_managed_version_bundle_rollback_fixture_for_source_test,
-    rebuild_managed_version_bundle_rollback_fixture_for_test,
-    rebuild_registered_managed_assets_fixture_for_test,
-    rebuild_registered_managed_libraries_fixture_for_test,
-};
+pub use known_good_reconstruction::{KnownGoodReconstructionError, reconstruct_known_good};
 pub use launch::{
-    JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
-    client_jar_path, effective_java_version_for, java_component_for_major,
-    java_major_for_component, load_version_json, offline_uuid, resolve_arguments,
-    resolve_libraries, resolve_version, resolve_version_managed,
+    JavaVersion, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
+    effective_java_version_for, java_component_for_major, java_major_for_component, offline_uuid,
+    resolve_arguments, resolve_libraries,
 };
-pub use lifecycle::{LifecycleChannel, LifecycleLabel, LifecycleMeta};
+pub use lifecycle::LifecycleChannel;
 pub use loaders::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderArtifactKind, LoaderAvailability, LoaderBuildId,
     LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderCatalogState,
@@ -147,36 +123,26 @@ pub use manifest::persist_version_manifest_cache_fixture_for_test;
 pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
 pub use paths::{libraries_dir, versions_dir};
 pub use rules::default_environment;
+#[cfg(feature = "test-support")]
+pub use runtime::runtime_publication_lock_available_for_test;
 pub use runtime::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
-    JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
+    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeResult,
     ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeComponent,
     ManagedRuntimeFailureReceipt, ManagedRuntimeLaunchReceipt, ManagedRuntimeMarkerState,
     ManagedRuntimeMutationRefused, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError, RuntimeEnsureEvent,
     RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
     RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
-    RuntimeSourceFailureKind, ensure_runtime_with_events, is_known_runtime_component,
-    list_java_runtimes, parse_runtime_override, preferred_runtime_component,
-    probe_java_runtime_receipt, rebuild_managed_runtime_component, resolve_java_runtime_probe,
-    runtime_component_executable_present_without_probe,
-    runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
-    runtime_requirement, snapshot_java_runtime,
-};
-#[cfg(feature = "test-support")]
-pub use runtime::{
-    ManagedRuntimeRebuildFixture, ensure_runtime_with_persisted_manifest_for_test,
-    persist_managed_runtime_source_fixture_for_test,
-    prepare_managed_runtime_rebuild_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
-    rebuild_managed_runtime_prepared_fixture_for_test, runtime_publication_lock_available_for_test,
+    RuntimeSourceFailureKind, is_known_runtime_component, list_java_runtimes,
+    parse_runtime_override, preferred_runtime_component, probe_java_runtime_receipt,
+    runtime_requirement,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 #[cfg(feature = "test-support")]
 pub use version::VersionBundlePublicationGuardForTest;
 pub use version::{
     VersionBundleReadGuard, VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind,
-    VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
-    scan_versions_snapshot,
+    VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions_snapshot,
 };
 #[cfg(feature = "test-support")]
 pub use version_bundle_publication::fail_after_promotions_for_test;

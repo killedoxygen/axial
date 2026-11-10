@@ -1,4 +1,4 @@
-use super::assets::{repair_virtual_assets_from_index_retained, unique_asset_object_jobs};
+use super::assets::unique_asset_object_jobs;
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::execution_download_fact;
 use super::install::{
@@ -485,80 +485,6 @@ async fn behavior_contract_reconstruction_matches_install_without_touching_seede
     }
     let reconstructed = reconstruction.into_activation_source().into_parts();
 
-    let guarded_root = authority
-        .managed_directory()
-        .expect("project retained reconstruction root");
-    let retained_context = ManagedReconstructionContext::bind_libraries(guarded_root.clone())
-        .await
-        .expect("retained reconstruction context");
-    let prepared = timeout(
-        DURABLE_OPERATION_TIMEOUT,
-        downloader.reconstruct_version_authority("reconstruction", &retained_context),
-    )
-    .await
-    .expect("retained reconstruction must not deadlock the shared source pool")
-    .expect("reconstruct retained vanilla sources")
-    .bind_managed_libraries(guarded_root, retained_context.take_library_cache_proofs())
-    .expect("bind retained vanilla sources to final projection");
-    assert_eq!(prepared.version_id(), "reconstruction");
-    assert_eq!(prepared.library_entry_count(), 3);
-    assert_eq!(prepared.retained_source_count(), 3);
-    assert_eq!(
-        prepared.expected_content_byte_count(),
-        prepared.retained_content_byte_count()
-    );
-    assert_eq!(snapshot_tree(&root), before);
-    let retained_requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
-    for path in [
-        "/version.json",
-        "/libraries/exact.jar",
-        "/libraries/observed.jar",
-        "/libraries/observed-two.jar",
-        "/asset-index.json",
-    ] {
-        assert_eq!(
-            retained_requests
-                .iter()
-                .filter(|request| request.as_str() == path)
-                .count(),
-            1,
-            "retained reconstruction must fetch {path} exactly once"
-        );
-    }
-    drop(prepared);
-
-    let version_bundle = timeout(
-        DURABLE_OPERATION_TIMEOUT,
-        downloader.reconstruct_version_authority(
-            "reconstruction",
-            &ManagedReconstructionContext::version_bundle(),
-        ),
-    )
-    .await
-    .expect("VersionBundle reconstruction must not deadlock")
-    .expect("retain exact vanilla VersionBundle sources");
-    assert!(version_bundle.retained_version_bundle_sources_match_projection());
-    assert_eq!(snapshot_tree(&root), before);
-    let version_bundle_requests =
-        std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
-    for path in [
-        "/version.json",
-        "/client.jar",
-        "/libraries/observed.jar",
-        "/libraries/observed-two.jar",
-        "/asset-index.json",
-        "/log-config.xml",
-    ] {
-        assert_eq!(
-            version_bundle_requests
-                .iter()
-                .filter(|request| request.as_str() == path)
-                .count(),
-            1,
-            "VersionBundle reconstruction must fetch {path} exactly once"
-        );
-    }
-
     let installed = timeout(
         DURABLE_OPERATION_TIMEOUT,
         downloader.install_version("reconstruction", |_| {}),
@@ -922,76 +848,6 @@ async fn registered_known_good_bootstrap_refuses_committed_publication_without_a
             .await,
         ManagedInstallDurableOutcome::Committed(_)
     ));
-
-    drop(authority);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_refuses_guardian_settlement_and_releases_lane() {
-    let version_id = "registered-reconstruction-guardian-owned";
-    let root = temp_dir(version_id);
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open foreign reconstruction authority");
-    let source =
-        crate::known_good::managed_version_bundle_activation_source_fixture_for_test(version_id)
-            .expect("Guardian activation source");
-    let guardian_receipt =
-        crate::known_good_reconstruction::rebuild_managed_version_bundle_fixture_for_test(
-            authority.operation().clone(),
-            version_id,
-        )
-        .await
-        .expect("publish Guardian-owned settlement");
-    drop(guardian_receipt);
-    let reconstruction =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
-            .expect("matching reconstruction receipt");
-
-    let failure =
-        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
-            .await
-            .expect_err("Guardian-owned settlement must refuse install bootstrap");
-    assert_eq!(
-        failure.kind(),
-        RegisteredKnownGoodBootstrapVerificationFailureKind::MismatchedPublication
-    );
-    let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
-        failure.into_recovery()
-    else {
-        panic!("mismatch refusal must retain publication result");
-    };
-    assert_eq!(receipt.version_id(), version_id);
-    assert!(matches!(outcome, ManagedInstallDurableOutcome::Mismatch));
-    drop((receipt, outcome));
-
-    let guardian_settlement =
-        match crate::known_good_reconstruction::recover_guardian_version_bundle_orphan(
-            authority.operation().clone(),
-            &source,
-        )
-        .await
-        {
-            crate::known_good_reconstruction::ManagedVersionBundleOrphanOutcome::Settled(
-                settlement,
-            ) => settlement,
-            _ => panic!("terminal install mismatch must release the Guardian publication lane"),
-        };
-    let mut acknowledgement = guardian_settlement.acknowledge().await;
-    loop {
-        match acknowledgement {
-            crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::Acknowledged => {
-                break;
-            }
-            crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::Indeterminate(recovery) => {
-                acknowledgement = recovery.retry().await;
-            }
-            crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::NoSettlement
-            | crate::known_good_reconstruction::ManagedVersionBundleAcknowledgementOutcome::Mismatch => {
-                panic!("exact Guardian settlement acknowledgement mismatched");
-            }
-        }
-    }
 
     drop(authority);
     let _ = fs::remove_dir_all(root);
@@ -1831,90 +1687,6 @@ async fn asset_cache_drift_at_lease_admission_fails_before_install_effects() {
     assert_eq!(request_count(&requests, &fixture.object_path), 0);
     assert_eq!(request_count(&requests, &fixture.distinct_path), 0);
     assert_eq!(request_count(&requests, &fixture.empty_path), 0);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn managed_assets_reconstruction_rechecks_sparse_cache_under_publication_lease() {
-    let version_id = "rebuild-asset-cache-drift";
-    let root = temp_dir(version_id);
-    let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
-    let object_path = asset_object_path(&root, &fixture.object_hash);
-    let distinct_path = asset_object_path(&root, &fixture.distinct_hash);
-    let empty_path = asset_object_path(&root, &fixture.empty_hash);
-    for (path, bytes) in [
-        (&object_path, fixture.object.as_slice()),
-        (&distinct_path, fixture.distinct.as_slice()),
-        (&empty_path, b"".as_slice()),
-    ] {
-        fs::create_dir_all(path.parent().expect("cached asset parent"))
-            .expect("create cached asset parent");
-        fs::write(path, bytes).expect("seed exact cached asset");
-    }
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open reconstruction authority");
-    let guarded_root = authority
-        .managed_directory()
-        .expect("project reconstruction root");
-    let context = ManagedReconstructionContext::bind_assets(guarded_root.clone())
-        .await
-        .expect("bind Assets reconstruction");
-    let downloader = test_manifest_downloader_from_operation(
-        authority.operation(),
-        version_id,
-        &fixture.version_url,
-        &fixture.version_sha1,
-    )
-    .with_test_asset_object_base_url(fixture.object_base_url.clone());
-    let reconstruction = downloader
-        .reconstruct_version_authority(version_id, &context)
-        .await
-        .expect("prepare sparse Assets reconstruction");
-    let (sources, cache_proofs) = context
-        .take_assets_authority()
-        .expect("take sparse Assets authority");
-    let prepared = reconstruction
-        .bind_managed_assets(guarded_root, sources, cache_proofs)
-        .expect("bind sparse Assets projection");
-    assert_eq!(prepared.asset_entry_count(), 4);
-    assert_eq!(
-        prepared.retained_source_count(),
-        1,
-        "the authenticated index is retained while all exact objects are sparse"
-    );
-    let requests = drain_request_paths(&mut fixture.requests);
-    assert_eq!(request_count(&requests, &fixture.object_path), 0);
-    assert_eq!(request_count(&requests, &fixture.distinct_path), 0);
-    assert_eq!(request_count(&requests, &fixture.empty_path), 0);
-
-    let corrupt = vec![b'x'; fixture.object.len()];
-    fs::write(&object_path, &corrupt).expect("drift sparse cached object");
-    let (managed_root, receipt, sources) = prepared.into_effect_parts();
-    let lease = ManagedRootPublicationLease::acquire(managed_root)
-        .await
-        .expect("acquire reconstruction publication lease");
-    let projection = receipt
-        .component_projection(crate::known_good::ManagedKnownGoodComponent::Assets)
-        .expect("Assets projection");
-    let result = crate::managed_component_lifecycle::publish_managed_component_effect(
-        lease,
-        projection,
-        crate::managed_component_table::ManagedComponentKind::Assets,
-        sources,
-    )
-    .await;
-
-    assert!(result.is_err());
-    assert_eq!(
-        fs::read(&object_path).expect("drifted object remains"),
-        corrupt
-    );
-    assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
-    assert!(
-        !root.join(".axial-publication/assets").exists(),
-        "stale sparse proof must fail before lifecycle intent or effects"
-    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2924,8 +2696,8 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
 }
 
 #[tokio::test]
-async fn managed_virtual_asset_repair_refreshes_stale_and_publishes_missing_copies() {
-    let root = temp_dir("virtual-asset-index-repair");
+async fn virtual_asset_tree_replaces_stale_copies_and_publishes_missing_ones() {
+    let root = temp_dir("virtual-asset-tree");
     let first = b"fresh";
     let second = b"second";
     let first_hash = write_virtual_asset_object(&root, first);
@@ -2935,24 +2707,18 @@ async fn managed_virtual_asset_repair_refreshes_stale_and_publishes_missing_copi
     fs::create_dir_all(first_virtual.parent().expect("virtual parent"))
         .expect("create virtual parent");
     fs::write(&first_virtual, b"stale").expect("write stale virtual copy");
-    write_virtual_asset_index(
-        &root,
-        "legacy",
-        true,
-        serde_json::json!({
-            "sounds/step.ogg": { "hash": first_hash, "size": first.len() },
-            "sounds/hit.ogg": { "hash": second_hash, "size": second.len() }
-        }),
-    );
+    let assets = virtual_asset_index(serde_json::json!({
+        "sounds/step.ogg": { "hash": first_hash, "size": first.len() },
+        "sounds/hit.ogg": { "hash": second_hash, "size": second.len() }
+    }));
     let managed_root =
         crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
     let operation = managed_root.try_acquire().expect("managed operation");
 
-    let repaired = repair_virtual_assets_from_index_retained(&operation, "legacy", ())
+    materialize_virtual_assets(&operation, "legacy", &assets)
         .await
-        .expect("repair virtual assets");
+        .expect("materialize virtual assets");
 
-    assert!(repaired);
     assert_eq!(fs::read(&first_virtual).expect("read first copy"), first);
     assert_eq!(fs::read(&second_virtual).expect("read second copy"), second);
     drop((operation, managed_root));
@@ -2960,24 +2726,18 @@ async fn managed_virtual_asset_repair_refreshes_stale_and_publishes_missing_copi
 }
 
 #[tokio::test]
-async fn managed_virtual_asset_repair_rejects_missing_authenticated_source() {
+async fn virtual_asset_tree_refuses_a_missing_source_object() {
     let root = temp_dir("virtual-asset-missing-source");
     let bytes = b"missing";
-    let hash = sha1_hex(bytes);
-    write_virtual_asset_index(
-        &root,
-        "legacy",
-        true,
-        serde_json::json!({
-            "sounds/step.ogg": { "hash": hash, "size": bytes.len() }
-        }),
-    );
+    let assets = virtual_asset_index(serde_json::json!({
+        "sounds/step.ogg": { "hash": sha1_hex(bytes), "size": bytes.len() }
+    }));
     fs::create_dir_all(root.join("assets/objects")).expect("objects root");
     let managed_root =
         crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
     let operation = managed_root.try_acquire().expect("managed operation");
 
-    let result = repair_virtual_assets_from_index_retained(&operation, "legacy", ()).await;
+    let result = materialize_virtual_assets(&operation, "legacy", &assets).await;
 
     assert!(matches!(
         result,
@@ -2985,29 +2745,6 @@ async fn managed_virtual_asset_repair_rejects_missing_authenticated_source() {
             if message == "virtual asset source is missing"
     ));
     assert!(!root.join("assets/virtual/legacy/sounds/step.ogg").exists());
-    drop((operation, managed_root));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn managed_virtual_asset_repair_rejects_overlong_index_identity_before_mutation() {
-    let root = temp_dir("virtual-asset-overlong-index");
-    fs::create_dir_all(&root).expect("create library root");
-    let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
-    let operation = managed_root.try_acquire().expect("managed operation");
-    let before = snapshot_tree(&root);
-    let overlong =
-        "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES - ".json".len() + 1);
-
-    let result = repair_virtual_assets_from_index_retained(&operation, &overlong, ()).await;
-
-    assert!(matches!(
-        result,
-        Err(DownloadError::Integrity(message))
-            if message == "asset index identity is invalid"
-    ));
-    assert_eq!(snapshot_tree(&root), before);
     drop((operation, managed_root));
     let _ = fs::remove_dir_all(root);
 }
@@ -3068,98 +2805,13 @@ fn managed_streamed_copy_rejects_changed_source_without_publishing_destination()
 }
 
 #[tokio::test]
-async fn managed_virtual_asset_repair_rejects_unsafe_and_aliasing_destinations_before_mutation() {
-    for (name, objects, expected) in [
-        (
-            "unsafe",
-            serde_json::json!({
-                "../escape.ogg": {
-                    "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "size": 1
-                }
-            }),
-            "unsafe virtual asset path",
-        ),
-        (
-            "alias",
-            serde_json::json!({
-                "sounds/STEP.ogg": {
-                    "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "size": 1
-                },
-                "sounds/step.ogg": {
-                    "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "size": 1
-                }
-            }),
-            "portable alias collision",
-        ),
-    ] {
-        let root = temp_dir(&format!("virtual-asset-{name}"));
-        write_virtual_asset_index(&root, "legacy", true, objects);
-        fs::create_dir_all(root.join("assets/objects")).expect("objects root");
-        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
-            .expect("managed library root");
-        let operation = managed_root.try_acquire().expect("managed operation");
-
-        assert!(matches!(
-            repair_virtual_assets_from_index_retained(&operation, "legacy", ()).await,
-            Err(DownloadError::Integrity(message)) if message.contains(expected)
-        ));
-        assert!(!root.join("assets/virtual").exists());
-        drop((operation, managed_root));
-        let _ = fs::remove_dir_all(root);
-    }
-}
-
-#[tokio::test]
-async fn managed_virtual_asset_repair_bounds_repeated_projection_work_before_mutation() {
-    let root = temp_dir("virtual-asset-projection-bound");
-    let hash = "a".repeat(40);
-    let repeated = usize::try_from(MAX_TIER2_AGGREGATE_BYTES / MAX_TIER2_ARTIFACT_BYTES)
-        .expect("job count")
-        + 1;
-    let objects = (0..repeated)
-        .map(|index| {
-            (
-                format!("sounds/{index}.ogg"),
-                serde_json::json!({
-                    "hash": hash,
-                    "size": MAX_TIER2_ARTIFACT_BYTES
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    write_virtual_asset_index(&root, "legacy", true, serde_json::Value::Object(objects));
-    let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
-    let operation = managed_root.try_acquire().expect("managed operation");
-
-    let result = repair_virtual_assets_from_index_retained(&operation, "legacy", ()).await;
-
-    assert!(matches!(
-        result,
-        Err(DownloadError::Integrity(message))
-            if message == "virtual asset repair exceeds its aggregate byte bound"
-    ));
-    assert!(!root.join("assets/virtual").exists());
-    drop((operation, managed_root));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn managed_virtual_asset_repair_preserves_wrong_kind_destination() {
+async fn virtual_asset_tree_preserves_a_wrong_kind_destination() {
     let root = temp_dir("virtual-asset-wrong-kind-destination");
     let bytes = b"asset";
     let hash = write_virtual_asset_object(&root, bytes);
-    write_virtual_asset_index(
-        &root,
-        "legacy",
-        true,
-        serde_json::json!({
-            "sounds/step.ogg": { "hash": hash, "size": bytes.len() }
-        }),
-    );
+    let assets = virtual_asset_index(serde_json::json!({
+        "sounds/step.ogg": { "hash": hash, "size": bytes.len() }
+    }));
     let destination = root.join("assets/virtual/legacy/sounds/step.ogg");
     fs::create_dir_all(&destination).expect("wrong-kind destination");
     let managed_root =
@@ -3167,30 +2819,11 @@ async fn managed_virtual_asset_repair_preserves_wrong_kind_destination() {
     let operation = managed_root.try_acquire().expect("managed operation");
 
     assert!(
-        repair_virtual_assets_from_index_retained(&operation, "legacy", ())
+        materialize_virtual_assets(&operation, "legacy", &assets)
             .await
             .is_err()
     );
     assert!(destination.is_dir());
-    drop((operation, managed_root));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn managed_virtual_asset_repair_skips_modern_index() {
-    let root = temp_dir("virtual-asset-modern");
-    write_virtual_asset_index(&root, "modern", false, serde_json::json!({}));
-    fs::create_dir_all(root.join("assets/objects")).expect("objects root");
-    let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
-    let operation = managed_root.try_acquire().expect("managed operation");
-
-    assert!(
-        !repair_virtual_assets_from_index_retained(&operation, "modern", ())
-            .await
-            .expect("modern index")
-    );
-    assert!(!root.join("assets/virtual").exists());
     drop((operation, managed_root));
     let _ = fs::remove_dir_all(root);
 }
@@ -3203,23 +2836,11 @@ fn write_virtual_asset_object(root: &Path, bytes: &[u8]) -> String {
     hash
 }
 
-fn write_virtual_asset_index(
-    root: &Path,
-    id: &str,
-    virtual_assets: bool,
-    objects: serde_json::Value,
-) {
-    let index_path = root.join("assets/indexes").join(format!("{id}.json"));
-    fs::create_dir_all(index_path.parent().expect("index parent")).expect("create index parent");
-    fs::write(
-        index_path,
-        serde_json::to_vec(&serde_json::json!({
-            "objects": objects,
-            "virtual": virtual_assets
-        }))
-        .expect("serialize asset index"),
-    )
-    .expect("write asset index");
+fn virtual_asset_index(objects: serde_json::Value) -> crate::LegacyAssets {
+    let index = serde_json::json!({ "objects": objects, "virtual": true });
+    crate::legacy_assets(&serde_json::to_vec(&index).expect("serialize asset index"))
+        .expect("valid virtual asset index")
+        .expect("virtual asset tree")
 }
 
 #[test]
