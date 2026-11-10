@@ -14002,35 +14002,20 @@ pub struct ResetDrainRecovery {
 impl_redacted_debug!(ResetDrainRecovery);
 
 impl ResetDrainRecovery {
-    pub fn file_count(&self) -> usize {
-        self.recovery.file_count()
-    }
-
-    pub fn directory_count(&self) -> usize {
-        self.recovery.directory_count()
-    }
-
-    pub fn defer_managed_reset(mut self) -> ResetStartOutcome {
-        self.recovery
-            .transfer_preserved_directory_creates_to_reset(&self.permits);
-        self.finish()
-    }
-
-    pub fn acknowledge_external(mut self) -> ResetStartOutcome {
-        self.recovery
-            .acknowledge_external_directory_creates(&self.permits);
-        self.finish()
-    }
-
-    pub fn restore_all(mut self) -> ResetStartOutcome {
-        self.recovery
-            .settle(&self.permits, DrainRecoveryDecision::Restore);
-        self.finish()
-    }
-
-    pub fn remove_all(mut self) -> ResetStartOutcome {
-        self.recovery
-            .settle(&self.permits, DrainRecoveryDecision::Remove);
+    /// Removes abandoned parks: the reset deletes the tree anyway. Once none remain,
+    /// externally created directories are acknowledged and the rest move to the reset.
+    pub(crate) fn settle(mut self) -> ResetStartOutcome {
+        if self.recovery.file_count() > 0 || self.recovery.directory_count() > 0 {
+            self.recovery
+                .settle(&self.permits, DrainRecoveryDecision::Remove);
+        } else {
+            self.recovery
+                .acknowledge_external_directory_creates(&self.permits);
+            if !self.recovery.is_empty() {
+                self.recovery
+                    .transfer_preserved_directory_creates_to_reset(&self.permits);
+            }
+        }
         self.finish()
     }
 

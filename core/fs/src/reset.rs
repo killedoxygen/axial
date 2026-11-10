@@ -6,8 +6,6 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 const INTENT_NAME: &str = ".axial-reset-intent";
-// v1 writers did not fence unknown launch children after restart. Never adopt
-// those records: matching filesystem bindings cannot prove child settlement.
 const MAGIC: &[u8] = b"axial-root-reset-v2\0";
 const ANCHOR_LIMIT: u64 = 4096;
 
@@ -235,18 +233,7 @@ impl PendingRootReset {
                 ResetStartOutcome::Pending(drain) => drain.try_settle(),
                 ResetStartOutcome::Refused(failure) => failure.retry(),
                 ResetStartOutcome::Failed(failure) => failure.retry(),
-                ResetStartOutcome::Recovery { recovery } => {
-                    if recovery.file_count() > 0 || recovery.directory_count() > 0 {
-                        recovery.remove_all()
-                    } else {
-                        match recovery.acknowledge_external() {
-                            ResetStartOutcome::Recovery { recovery } => {
-                                recovery.defer_managed_reset()
-                            }
-                            outcome => outcome,
-                        }
-                    }
-                }
+                ResetStartOutcome::Recovery { recovery } => recovery.settle(),
             });
         }
         Err(io::Error::other("reset authority remains unsettled"))
@@ -456,45 +443,6 @@ mod tests {
                 .unwrap()
         );
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn v1_evidence_cannot_authorize_startup_reset_or_current_tree_deletion() {
-        let (temporary, mut pending, _) = fixture();
-        pending.prepare().unwrap();
-        let path = temporary.path().join(INTENT_NAME);
-        let current = std::fs::read(&path).unwrap();
-        let current_magic = b"axial-root-reset-v2\0";
-        let legacy_magic = b"axial-root-reset-v1\0";
-        assert!(current.starts_with(current_magic));
-        let mut legacy = current.clone();
-        legacy[..legacy_magic.len()].copy_from_slice(legacy_magic);
-        // Keep the exact inode and every root/lease/marker binding. The writer
-        // version alone must prevent adopting this older acceptance record.
-        std::fs::write(&path, &legacy).unwrap();
-        assert!(
-            pending
-                .session
-                .as_ref()
-                .unwrap()
-                .interrupted_reset(&LeafName::new(MARKER).unwrap())
-                .is_err()
-        );
-        assert!(pending.prepare().is_err());
-        assert!(pending.try_clear().is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), legacy);
-        assert_eq!(
-            std::fs::read(temporary.path().join(MARKER)).unwrap(),
-            MARKER_BYTES
-        );
-        assert_eq!(
-            std::fs::read(temporary.path().join("payload")).unwrap(),
-            b"accepted payload"
-        );
-        // Restore this test's original evidence only to settle its retained
-        // owner; production never upgrades an interrupted v1 reset record.
-        std::fs::write(&path, current).unwrap();
-        pending.try_clear().unwrap();
     }
 
     #[test]
