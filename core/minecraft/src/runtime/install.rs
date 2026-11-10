@@ -3344,16 +3344,7 @@ fn runtime_sha1_is_valid(value: &str) -> bool {
 }
 
 fn runtime_sha1_bytes(value: &str) -> Option<[u8; 20]> {
-    if !runtime_sha1_is_valid(value) {
-        return None;
-    }
-    let mut digest = [0_u8; 20];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = (pair[0] as char).to_digit(16)? as u8;
-        let low = (pair[1] as char).to_digit(16)? as u8;
-        digest[index] = (high << 4) | low;
-    }
-    Some(digest)
+    hex::FromHex::from_hex(value).ok()
 }
 
 #[cfg(test)]

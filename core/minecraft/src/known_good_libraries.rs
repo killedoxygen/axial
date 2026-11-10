@@ -1545,7 +1545,7 @@ fn author_library_integrity(
 ) -> Result<(), SealedLibraryDeclarationError> {
     let size =
         i64::try_from(size).map_err(|_| SealedLibraryDeclarationError::InvalidExactDeclaration)?;
-    let digest = encode_sha1(sha1);
+    let digest = hex::encode(sha1);
     if !plan.is_native {
         library.sha1.clone_from(&digest);
         library.size = size;
@@ -1576,30 +1576,9 @@ fn author_library_integrity(
     Ok(())
 }
 
-fn encode_sha1(sha1: [u8; 20]) -> String {
-    let mut encoded = String::with_capacity(40);
-    use std::fmt::Write as _;
-    for byte in sha1 {
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    encoded
-}
-
 fn decode_sha1(value: &str) -> Result<[u8; 20], SealedLibraryDeclarationError> {
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(SealedLibraryDeclarationError::InvalidExactDeclaration);
-    }
-    let mut digest = [0_u8; 20];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = (pair[0] as char)
-            .to_digit(16)
-            .ok_or(SealedLibraryDeclarationError::InvalidExactDeclaration)?;
-        let low = (pair[1] as char)
-            .to_digit(16)
-            .ok_or(SealedLibraryDeclarationError::InvalidExactDeclaration)?;
-        digest[index] = ((high << 4) | low) as u8;
-    }
-    Ok(digest)
+    hex::FromHex::from_hex(value)
+        .map_err(|_| SealedLibraryDeclarationError::InvalidExactDeclaration)
 }
 
 #[cfg(test)]
@@ -1642,12 +1621,7 @@ fn validate_plan_contract(
         return Err(SealedLibraryDeclarationError::ContractDrift);
     }
     if let Some(expected) = plan.expected.sha1.as_deref() {
-        let mut observed = String::with_capacity(40);
-        use std::fmt::Write as _;
-        for byte in sha1 {
-            let _ = write!(&mut observed, "{byte:02x}");
-        }
-        if !expected.eq_ignore_ascii_case(&observed) {
+        if !expected.eq_ignore_ascii_case(&hex::encode(sha1)) {
             return Err(SealedLibraryDeclarationError::ContractDrift);
         }
     }
@@ -2000,14 +1974,14 @@ mod tests {
             )])
             .expect("observed Fabric declaration");
         let authored = &sealed.profile_contract().unwrap().0.libraries;
-        assert_eq!(authored[0].sha1, encode_sha1([0xbb; 20]));
+        assert_eq!(authored[0].sha1, hex::encode([0xbb; 20]));
         assert_eq!(authored[0].size, 17);
         let artifact = authored[0]
             .downloads
             .as_ref()
             .and_then(|downloads| downloads.artifact.as_ref())
             .unwrap();
-        assert_eq!(artifact.sha1, encode_sha1([0xbb; 20]));
+        assert_eq!(artifact.sha1, hex::encode([0xbb; 20]));
         assert_eq!(artifact.size, 17);
     }
 
@@ -2239,21 +2213,21 @@ mod tests {
             .expect("sealed Quilt declarations");
         let authored = &sealed.profile_contract().unwrap().0.libraries;
         let paired = &authored[0];
-        assert_eq!(paired.sha1, encode_sha1([0xaa; 20]));
+        assert_eq!(paired.sha1, hex::encode([0xaa; 20]));
         assert_eq!(paired.size, 11);
         let downloads = paired.downloads.as_ref().unwrap();
         assert_eq!(
             downloads.artifact.as_ref().unwrap().sha1,
-            encode_sha1([0xaa; 20])
+            hex::encode([0xaa; 20])
         );
         assert_eq!(
             downloads.classifiers[&classifier].sha1,
-            encode_sha1([0xcc; 20])
+            hex::encode([0xcc; 20])
         );
         assert_eq!(downloads.classifiers[&classifier].size, 13);
-        assert_eq!(authored[1].sha1, encode_sha1([0xbb; 20]));
+        assert_eq!(authored[1].sha1, hex::encode([0xbb; 20]));
         assert_eq!(authored[1].size, 12);
-        assert_eq!(authored[2].sha1, encode_sha1([0xdd; 20]));
+        assert_eq!(authored[2].sha1, hex::encode([0xdd; 20]));
         assert_eq!(authored[2].size, 14);
     }
 
@@ -2451,18 +2425,18 @@ mod tests {
         let embedded_sha1: [u8; 20] = Sha1::digest(&embedded_bytes).into();
         let terminal_sha1: [u8; 20] = Sha1::digest(&terminal_bytes).into();
         let libraries = vec![
-            profile_library("example:exact:1", exact_path, &encode_sha1([1; 20]), 7),
+            profile_library("example:exact:1", exact_path, &hex::encode([1; 20]), 7),
             profile_library("example:fresh:1", fresh_path, "", 0),
             without_download_source(profile_library(
                 "example:embedded:1",
                 embedded_path.as_str(),
-                &encode_sha1(embedded_sha1),
+                &hex::encode(embedded_sha1),
                 embedded_bytes.len() as i64,
             )),
             without_download_source(profile_library(
                 "example:terminal:1",
                 terminal_path.as_str(),
-                &encode_sha1(terminal_sha1),
+                &hex::encode(terminal_sha1),
                 terminal_bytes.len() as i64,
             )),
         ];
@@ -2532,14 +2506,14 @@ mod tests {
             profile_library(
                 "example:exact:1",
                 "example/exact/1/exact-1.jar",
-                &encode_sha1([1; 20]),
+                &hex::encode([1; 20]),
                 7,
             ),
             profile_library("example:fresh:1", fresh_path.as_str(), "", 0),
             without_download_source(profile_library(
                 "example:terminal:1",
                 terminal_path.as_str(),
-                &encode_sha1(terminal_sha1),
+                &hex::encode(terminal_sha1),
                 9,
             )),
         ];
@@ -2593,7 +2567,7 @@ mod tests {
                 vec![without_download_source(profile_library(
                     "example:terminal:1",
                     terminal_path.as_str(),
-                    &encode_sha1([4; 20]),
+                    &hex::encode([4; 20]),
                     0,
                 ))],
                 Vec::new(),
@@ -2618,13 +2592,13 @@ mod tests {
         let first = profile_library(
             "example:first:1",
             "Example/shared/1/shared-1.jar",
-            &encode_sha1([1; 20]),
+            &hex::encode([1; 20]),
             7,
         );
         let second = profile_library(
             "example:second:1",
             "example/shared/1/shared-1.jar",
-            &encode_sha1([2; 20]),
+            &hex::encode([2; 20]),
             8,
         );
         assert!(matches!(
@@ -2645,7 +2619,7 @@ mod tests {
         let selected = without_download_source(profile_library(
             "example:selected:1",
             selected_path.as_str(),
-            &encode_sha1(sha1),
+            &hex::encode(sha1),
             bytes.len() as i64,
         ));
         assert!(matches!(
@@ -2696,7 +2670,7 @@ mod tests {
                 vec![without_download_source(profile_library(
                     "example:embedded:1",
                     embedded_path.as_str(),
-                    &encode_sha1(embedded_sha1),
+                    &hex::encode(embedded_sha1),
                     embedded_bytes.len() as i64,
                 ))],
                 vec![(embedded_path, embedded_bytes)],
@@ -2806,7 +2780,7 @@ mod tests {
                     vec![profile_library(
                         "example:exact:1",
                         path,
-                        &encode_sha1([7; 20]),
+                        &hex::encode([7; 20]),
                         7,
                     )],
                     Vec::new(),
@@ -2832,7 +2806,7 @@ mod tests {
             let library = without_download_source(profile_library(
                 "example:embedded:1",
                 path.as_str(),
-                &encode_sha1(sha1),
+                &hex::encode(sha1),
                 bytes.len() as i64,
             ));
             let bound = bind_installer_library_declarations(
@@ -2935,7 +2909,7 @@ mod tests {
         let library = profile_library(
             "example:terminal:1",
             path.as_str(),
-            &encode_sha1(sha1),
+            &hex::encode(sha1),
             bytes.len() as i64,
         );
         let bound = bind_installer_library_declarations(
@@ -3003,7 +2977,7 @@ mod tests {
                 )
             } else {
                 (
-                    encode_sha1(sha1),
+                    hex::encode(sha1),
                     BoundProcessorOutputExpectation::ProviderSha1(sha1),
                 )
             };
@@ -3195,7 +3169,7 @@ mod tests {
                 vec![without_download_source(profile_library(
                     "example:terminal:1",
                     path.as_str(),
-                    &encode_sha1([3; 20]),
+                    &hex::encode([3; 20]),
                     8,
                 ))],
                 Vec::new(),

@@ -1327,10 +1327,7 @@ mod tests {
     }
 
     fn digest_hex(value: [u8; 32]) -> String {
-        value
-            .into_iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        hex::encode(value)
     }
 
     fn path(value: &str) -> PortableRelativePath {

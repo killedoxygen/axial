@@ -1,7 +1,7 @@
 use super::{
     FileRemovalFailure, MAX_MANAGED_DIRECTORY_ENTRIES, ManagedCreateOnlyWriteFailure, ManagedDir,
     ManagedExactChildCleanup, ManagedFileGuard, ManagedGuardedFileMoveFailure,
-    ManagedTreeDirectory, hex_lower,
+    ManagedTreeDirectory,
 };
 use crate::download::{
     CreateOnlyTransferTarget, ManagedTransferAuthority, ManagedTransferTerminalAuthority,
@@ -475,7 +475,7 @@ fn contract_matches_observation(
         && contract
             .digests()
             .expected_sha512()
-            .is_some_and(|expected| hex_lower(expected) == sha512.as_ref())
+            .is_some_and(|expected| hex::encode(expected) == sha512.as_ref())
 }
 
 fn transfer_contract_limit(contract: &TransferContract) -> u64 {
@@ -1175,7 +1175,7 @@ fn observe_file(
         let bytes = parent
             .read_guarded_file_bounded(name, &guard, max_bytes)
             .map_err(|_| FileObservationFailure::Unavailable)?;
-        let sha512 = hex_lower(&<[u8; 64]>::from(Sha512::digest(&bytes)));
+        let sha512 = hex::encode(Sha512::digest(&bytes));
         (sha512, Some(bytes.into_boxed_slice()))
     } else {
         (
@@ -3561,7 +3561,7 @@ fn append_staging_payloads(
     for payload in &state.payloads[record.payloads.len()..] {
         let guard = payload.guard.as_ref().ok_or(changed)?;
         let sha512 = match payload.report.digests().sha512() {
-            Some(hash) => hex_lower(hash),
+            Some(hash) => hex::encode(hash),
             None => state
                 .stage
                 .sha512_guarded_file(payload.name.as_str(), guard, MAX_CONTENT_FILE_BYTES)
@@ -6235,7 +6235,7 @@ fn payload_guard_matches_report(
     let sha512_matches = digests.sha512().is_none_or(|expected| {
         directory
             .sha512_guarded_file(name, guard, MAX_CONTENT_FILE_BYTES)
-            .is_ok_and(|observed| observed == hex_lower(expected))
+            .is_ok_and(|observed| observed == hex::encode(expected))
     });
     (digests.sha1().is_some() || digests.sha512().is_some()) && sha1_matches && sha512_matches
 }

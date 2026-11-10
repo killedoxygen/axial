@@ -1514,12 +1514,7 @@ impl PendingInstallerReceipt {
 }
 
 fn sha1_array_digest(value: &[u8; 20]) -> Sha1Digest {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(40);
-    for byte in value {
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    Sha1Digest(encoded)
+    Sha1Digest(hex::encode(value))
 }
 
 impl KnownGoodInstallReceipt {
@@ -2851,19 +2846,7 @@ impl Sha1Digest {
     }
 
     pub(crate) fn to_bytes(&self) -> [u8; 20] {
-        let mut decoded = [0_u8; 20];
-        for (index, pair) in self.0.as_bytes().chunks_exact(2).enumerate() {
-            decoded[index] = (sha1_hex_nibble(pair[0]) << 4) | sha1_hex_nibble(pair[1]);
-        }
-        decoded
-    }
-}
-
-fn sha1_hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        _ => unreachable!("Sha1Digest stores canonical lowercase hexadecimal"),
+        hex::FromHex::from_hex(&self.0).expect("Sha1Digest stores canonical hexadecimal")
     }
 }
 

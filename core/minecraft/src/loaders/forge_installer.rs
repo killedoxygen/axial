@@ -5,7 +5,7 @@ use super::types::{
     LoaderArtifactKind, LoaderBuildRecord, LoaderComponentId, LoaderInstallSource,
     LoaderInstallStrategy,
 };
-use crate::download::{DownloadError, library_artifact_plans_for};
+use crate::download::{DownloadError, decode_sha1, library_artifact_plans_for};
 use crate::known_good_libraries::{
     BoundInstallerLibraryDeclarations, ClassifiedLibraryDownload, ClassifiedLibraryReconstruction,
     PendingInstallerNetworkDeclarations, PendingInstallerReconstructionDeclarations,
@@ -2002,9 +2002,7 @@ fn bind_generated_runtime_library(
             downloads: Some(LibraryDownload {
                 artifact: Some(LibraryArtifact {
                     path: artifact.relative_path.as_str().to_string(),
-                    sha1: sha1
-                        .map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect())
-                        .unwrap_or_default(),
+                    sha1: sha1.map(hex::encode).unwrap_or_default(),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2718,28 +2716,6 @@ fn resolve_processor_output_sha1(
             .ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)?
     };
     decode_sha1(declared).ok_or(ForgeInstallerError::InvalidForgeProcessorOutput)
-}
-
-fn decode_sha1(value: &str) -> Option<[u8; 20]> {
-    if value.len() != 40 {
-        return None;
-    }
-    let mut sha1 = [0_u8; 20];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        sha1[index] = hex_nibble(pair[0])
-            .checked_mul(16)?
-            .checked_add(hex_nibble(pair[1]))?;
-    }
-    Some(sha1)
-}
-
-fn hex_nibble(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => u8::MAX,
-    }
 }
 
 fn exact_delimited(value: &str, open: char, close: char) -> Option<&str> {

@@ -429,9 +429,9 @@ impl ManagedInstallPublicationEvidenceId {
         Ok(Self {
             value: value.to_string(),
             version_binding,
-            transaction_nonce: encode_evidence_hex(&transaction_nonce),
-            settlement_generation: encode_evidence_hex(&settlement_generation),
-            root_binding: encode_evidence_hex(&root_binding),
+            transaction_nonce: hex::encode(&transaction_nonce),
+            settlement_generation: hex::encode(&settlement_generation),
+            root_binding: hex::encode(&root_binding),
         })
     }
 
@@ -591,28 +591,8 @@ fn decode_evidence_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
         return None;
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        decoded[index] = (evidence_hex_nibble(pair[0]) << 4) | evidence_hex_nibble(pair[1]);
-    }
+    hex::decode_to_slice(value, &mut decoded).ok()?;
     Some(decoded)
-}
-
-fn evidence_hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        _ => unreachable!("evidence hex was validated"),
-    }
-}
-
-fn encode_evidence_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }
 
 #[cfg(test)]

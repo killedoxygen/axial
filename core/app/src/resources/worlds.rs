@@ -72,10 +72,7 @@ pub(crate) fn backup_name(
     attempt: usize,
 ) -> PortableFileName {
     let digest = Sha256::digest(world.as_str().as_bytes());
-    let digest = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let digest = hex::encode(&digest[..8]);
     let ordinal = if attempt == 1 {
         String::new()
     } else {

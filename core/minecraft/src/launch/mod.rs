@@ -502,25 +502,7 @@ pub fn offline_uuid(username: &str) -> String {
     hash[6] = (hash[6] & 0x0f) | 0x30;
     hash[8] = (hash[8] & 0x3f) | 0x80;
 
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        hash[0],
-        hash[1],
-        hash[2],
-        hash[3],
-        hash[4],
-        hash[5],
-        hash[6],
-        hash[7],
-        hash[8],
-        hash[9],
-        hash[10],
-        hash[11],
-        hash[12],
-        hash[13],
-        hash[14],
-        hash[15]
-    )
+    hex::encode(hash)
 }
 
 impl LaunchVars {

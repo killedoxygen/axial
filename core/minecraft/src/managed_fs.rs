@@ -2770,7 +2770,7 @@ impl ManagedDir {
         guard: &ManagedFileGuard,
         max_size: u64,
     ) -> Result<String, LoaderError> {
-        Ok(hex_lower(
+        Ok(hex::encode(
             &self.sha1_guarded_file_bytes(name, guard, max_size)?,
         ))
     }
@@ -2839,7 +2839,7 @@ impl ManagedDir {
                 "managed guarded hash source changed during hashing".to_string(),
             ));
         }
-        Ok(hex_lower(&digest))
+        Ok(hex::encode(&digest))
     }
 
     fn create_stage(&self) -> Result<StagedFile, LoaderError> {
@@ -4122,7 +4122,7 @@ impl ManagedDir {
         }
         let bytes = self.read_guarded_file_bounded(name, &guard, limit)?;
         if expected_sha1.is_some_and(|expected| {
-            !hex_lower(&<[u8; 20]>::from(Sha1::digest(&bytes))).eq_ignore_ascii_case(expected)
+            !hex::encode(&<[u8; 20]>::from(Sha1::digest(&bytes))).eq_ignore_ascii_case(expected)
         }) {
             return Err(LoaderError::Verify(
                 "managed authenticated file failed integrity verification".to_string(),
@@ -4842,15 +4842,6 @@ fn sha256_file_revision(
         ));
     }
     Ok(hasher.finalize().into())
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }
 
 fn unsettled(message: &'static str) -> LoaderError {
@@ -7130,7 +7121,7 @@ mod library_lifecycle_tests {
         let digest = file.sha1_bounded(3).unwrap();
         let validations = validations.load(Ordering::Relaxed);
         assert_eq!(
-            hex_lower(&digest),
+            hex::encode(&digest),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
         assert!(
