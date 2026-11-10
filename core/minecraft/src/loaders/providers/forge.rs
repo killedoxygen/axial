@@ -4,6 +4,7 @@ use super::common::{
     forge_install_source, infer_loader_build_metadata, is_prerelease_loader_version,
     parse_maven_versions, provider_installed_version_id,
 };
+use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_json;
 use crate::loaders::types::{
@@ -11,7 +12,7 @@ use crate::loaders::types::{
     LoaderInstallability, LoaderVersionIndex,
 };
 use crate::types::VersionSubjectKind;
-use crate::{LifecycleMeta, version_meta::MinecraftVersionMeta};
+use crate::version_meta::MinecraftVersionMeta;
 use serde::Deserialize;
 use std::collections::HashMap;
 
