@@ -1,4 +1,4 @@
-# Axial
+<p align="center"><img src="docs/brand/banner.svg" alt="Axial, a Minecraft launcher for vanilla and modded instances" width="100%"></p>
 
 Axial is a Minecraft launcher for vanilla and modded instances. It installs games and loaders (Fabric, Quilt, Forge, NeoForge), manages mods, resource packs, worlds and screenshots, installs modpacks, and launches the game with Microsoft or offline accounts.
 
