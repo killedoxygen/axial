@@ -1301,8 +1301,8 @@ fn retain_stage_discard_locked(
 
 fn retain_parked_file_removal_locked(transition: &ManagedEffectTransition<'_>, parked: ParkedFile) {
     match parked.remove() {
-        FileRemovalOutcome::Removed => {}
-        FileRemovalOutcome::NoEffect { parked, .. } => {
+        FileRemovalOutcome::Applied(()) => {}
+        FileRemovalOutcome::NoEffect { item: parked, .. } => {
             transition.root.retain_linear_locked(
                 transition,
                 parked,
@@ -1324,8 +1324,8 @@ fn retain_parked_directory_removal_locked(
     parked: ParkedDirectory,
 ) {
     match parked.remove_empty() {
-        DirectoryRemovalOutcome::Removed => {}
-        DirectoryRemovalOutcome::NoEffect { parked, .. } => {
+        DirectoryRemovalOutcome::Applied(()) => {}
+        DirectoryRemovalOutcome::NoEffect { item: parked, .. } => {
             transition.root.retain_linear_locked(
                 transition,
                 parked,
@@ -2930,7 +2930,10 @@ impl ManagedDir {
             FilePromotionOutcome::Applied(file) => self.guard_from_file(name, file).map_err(|_| {
                 ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
             }),
-            FilePromotionOutcome::NoEffect { error: _, staged } => {
+            FilePromotionOutcome::NoEffect {
+                error: _,
+                item: staged,
+            } => {
                 if self
                     .discard_sealed_stage_locked(&transition, staged)
                     .is_err()
@@ -3385,7 +3388,7 @@ impl ManagedDir {
                 refresh_moved_file_guard(guard, destination, destination_name.clone(), file)
                     .map_err(|()| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
             }
-            FileMoveOutcome::NoEffect { error, file } => {
+            FileMoveOutcome::NoEffect { error, item: file } => {
                 drop(error);
                 guard.identity.replace_capability(file);
                 return Err(ManagedGuardedFileMoveFailure::NoEffect);
@@ -3507,10 +3510,9 @@ impl ManagedDir {
             DirectoryMoveOutcome::Applied(directory) => destination
                 .child_from_directory_locked(&transition, destination_name, directory)
                 .map_err(|_| ManagedDirectoryMoveFailure::MoveAttempted),
-            DirectoryMoveOutcome::NoEffect {
-                error: _,
-                directory: _,
-            } => Err(ManagedDirectoryMoveFailure::MoveAttempted),
+            DirectoryMoveOutcome::NoEffect { error: _, item: _ } => {
+                Err(ManagedDirectoryMoveFailure::MoveAttempted)
+            }
             DirectoryMoveOutcome::AppliedUnverified(obligation) => {
                 let receipt = root.retain_linear_locked(
                     &transition,
@@ -3726,15 +3728,12 @@ impl ManagedDir {
             ));
         }
         match child.inner.directory.clone().park_as(park_name) {
-            DirectoryParkOutcome::Parked(parked) => {
+            DirectoryParkOutcome::Applied(parked) => {
                 retain_parked_directory_removal_locked(&transition, parked);
                 root.settle_locked(&transition)?;
                 Ok(ManagedEmptyChildRemoval::Removed)
             }
-            DirectoryParkOutcome::NoEffect {
-                error,
-                directory: _,
-            } => Err(error.into()),
+            DirectoryParkOutcome::NoEffect { error, item: _ } => Err(error.into()),
             DirectoryParkOutcome::AppliedUnverified(obligation) => {
                 root.retain_linear_locked(
                     &transition,
@@ -3774,7 +3773,7 @@ impl ManagedDir {
             ));
         }
         match child.inner.directory.clone().park() {
-            DirectoryParkOutcome::Parked(parked) => match parked.remove_tree() {
+            DirectoryParkOutcome::Applied(parked) => match parked.remove_tree() {
                 DirectoryTreeRemovalOutcome::Removed => {
                     root.settle_locked(&transition)?;
                     self.revalidate_locked(&transition)
@@ -3798,10 +3797,7 @@ impl ManagedDir {
                     Err(unsettled("managed tree removal remains unsettled"))
                 }
             },
-            DirectoryParkOutcome::NoEffect {
-                error,
-                directory: _,
-            } => Err(error.into()),
+            DirectoryParkOutcome::NoEffect { error, item: _ } => Err(error.into()),
             DirectoryParkOutcome::AppliedUnverified(obligation) => {
                 root.retain_linear_locked(
                     &transition,
@@ -3936,9 +3932,12 @@ impl ManagedDir {
             ));
         }
         match child.inner.directory.clone().park() {
-            DirectoryParkOutcome::Parked(parked) => match parked.remove_empty() {
-                DirectoryRemovalOutcome::Removed => Ok(()),
-                DirectoryRemovalOutcome::NoEffect { error, parked } => {
+            DirectoryParkOutcome::Applied(parked) => match parked.remove_empty() {
+                DirectoryRemovalOutcome::Applied(()) => Ok(()),
+                DirectoryRemovalOutcome::NoEffect {
+                    error,
+                    item: parked,
+                } => {
                     self.inner.root.retain_linear_locked(
                         transition,
                         parked,
@@ -3957,10 +3956,7 @@ impl ManagedDir {
                     Err(unsettled("managed directory removal remains unsettled"))
                 }
             },
-            DirectoryParkOutcome::NoEffect {
-                error,
-                directory: _,
-            } => Err(error.into()),
+            DirectoryParkOutcome::NoEffect { error, item: _ } => Err(error.into()),
             DirectoryParkOutcome::AppliedUnverified(obligation) => {
                 self.inner.root.retain_linear_locked(
                     transition,
@@ -3988,7 +3984,7 @@ impl ManagedDir {
             ));
         }
         match child.inner.directory.clone().park() {
-            DirectoryParkOutcome::Parked(parked) => match parked.remove_tree() {
+            DirectoryParkOutcome::Applied(parked) => match parked.remove_tree() {
                 DirectoryTreeRemovalOutcome::Removed => Ok(()),
                 DirectoryTreeRemovalOutcome::Retained { retained, .. } => {
                     self.inner.root.retain_linear_locked(
@@ -4007,10 +4003,7 @@ impl ManagedDir {
                     Ok(())
                 }
             },
-            DirectoryParkOutcome::NoEffect {
-                error,
-                directory: _,
-            } => Err(error.into()),
+            DirectoryParkOutcome::NoEffect { error, item: _ } => Err(error.into()),
             DirectoryParkOutcome::AppliedUnverified(obligation) => {
                 self.inner.root.retain_linear_locked(
                     transition,
@@ -6433,7 +6426,10 @@ impl ManagedTreeDirectory {
                 drop(directory);
                 ManagedTreeCopyOutcome::Applied(final_name)
             }
-            DirectoryMoveOutcome::NoEffect { error, directory } => {
+            DirectoryMoveOutcome::NoEffect {
+                error,
+                item: directory,
+            } => {
                 drop(directory);
                 drop(transition);
                 cleanup_tree_failure(&self.directory, &stage_name, stage, error.into())

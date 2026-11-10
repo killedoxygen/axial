@@ -640,7 +640,7 @@ impl ResourceService {
                     .into_parts();
                 match outcome {
                     axial_fs::FileParkOutcome::Parked(parked) => match parked.remove() {
-                        axial_fs::FileRemovalOutcome::Removed => Ok(ResourceCommand::ok(None)),
+                        axial_fs::FileRemovalOutcome::Applied(()) => Ok(ResourceCommand::ok(None)),
                         outcome => Err(owner.retain((instance, pin, outcome))),
                     },
                     axial_fs::FileParkOutcome::NoEffect { .. }
@@ -709,7 +709,7 @@ impl ResourceService {
                 let source = saves.open_directory(&name).map_err(read_error)?;
                 let (outcome, pin) = source.park().into_parts();
                 match outcome {
-                    axial_fs::DirectoryParkOutcome::Parked(parked) => match parked.remove_tree() {
+                    axial_fs::DirectoryParkOutcome::Applied(parked) => match parked.remove_tree() {
                         axial_fs::DirectoryTreeRemovalOutcome::Removed => {
                             Ok(ResourceCommand::ok(None))
                         }

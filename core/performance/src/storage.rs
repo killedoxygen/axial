@@ -843,12 +843,15 @@ pub(crate) fn settle_parked_file_removal(
     parked: ParkedFile,
 ) -> io::Result<()> {
     match parked.remove() {
-        FileRemovalOutcome::Removed => Ok(()),
-        FileRemovalOutcome::NoEffect { error: _, parked } => Err(owner
+        FileRemovalOutcome::Applied(()) => Ok(()),
+        FileRemovalOutcome::NoEffect {
+            error: _,
+            item: parked,
+        } => Err(owner
             .effects
             .retain(parked, EffectOwner::retain_parked_file_removal)),
         FileRemovalOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            FileRemovalResolution::Removed => Ok(()),
+            FileRemovalResolution::Applied(()) => Ok(()),
             FileRemovalResolution::NoEffect(parked) => Err(owner
                 .effects
                 .retain(parked, EffectOwner::retain_parked_file_removal)),
@@ -864,12 +867,15 @@ pub(crate) fn settle_parked_directory_removal(
     parked: ParkedDirectory,
 ) -> io::Result<()> {
     match parked.remove_empty() {
-        DirectoryRemovalOutcome::Removed => Ok(()),
-        DirectoryRemovalOutcome::NoEffect { error: _, parked } => Err(owner
+        DirectoryRemovalOutcome::Applied(()) => Ok(()),
+        DirectoryRemovalOutcome::NoEffect {
+            error: _,
+            item: parked,
+        } => Err(owner
             .effects
             .retain(parked, EffectOwner::retain_parked_directory_removal)),
         DirectoryRemovalOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            DirectoryRemovalResolution::Removed => Ok(()),
+            DirectoryRemovalResolution::Applied(()) => Ok(()),
             DirectoryRemovalResolution::NoEffect(parked) => Err(owner
                 .effects
                 .retain(parked, EffectOwner::retain_parked_directory_removal)),
@@ -944,9 +950,10 @@ fn promote_stage(
 ) -> io::Result<ManagedStorageFile> {
     match sealed.promote_no_replace(destination.directory(), destination.directory(), name) {
         FilePromotionOutcome::Applied(file) => ManagedStorageFile::new(file, effects.clone()),
-        FilePromotionOutcome::NoEffect { error, staged } => {
-            discard_sealed_after(staged, error, effects)
-        }
+        FilePromotionOutcome::NoEffect {
+            error,
+            item: staged,
+        } => discard_sealed_after(staged, error, effects),
         FilePromotionOutcome::AppliedUnverified(obligation) => match (*obligation).reconcile() {
             FilePromotionResolution::Applied(file) => {
                 ManagedStorageFile::new(file, effects.clone())
@@ -969,7 +976,7 @@ fn settle_file_move(
 ) -> io::Result<FileCapability> {
     match outcome {
         FileMoveOutcome::Applied(file) => Ok(file),
-        FileMoveOutcome::NoEffect { error, file: _ } => Err(error),
+        FileMoveOutcome::NoEffect { error, item: _ } => Err(error),
         FileMoveOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
             FileMoveResolution::Applied(file) => Ok(file),
             FileMoveResolution::NoEffect(_) => {
@@ -988,10 +995,7 @@ fn settle_directory_move(
 ) -> io::Result<Directory> {
     match outcome {
         DirectoryMoveOutcome::Applied(directory) => Ok(directory),
-        DirectoryMoveOutcome::NoEffect {
-            error,
-            directory: _,
-        } => Err(error),
+        DirectoryMoveOutcome::NoEffect { error, item: _ } => Err(error),
         DirectoryMoveOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
             DirectoryMoveResolution::Applied(directory) => Ok(directory),
             DirectoryMoveResolution::NoEffect(_) => Err(io::Error::other(
@@ -1034,13 +1038,10 @@ fn settle_directory_park(
     effects: &ManagedInstanceEffectAuthority,
 ) -> io::Result<ParkedDirectory> {
     match outcome {
-        DirectoryParkOutcome::Parked(parked) => Ok(parked),
-        DirectoryParkOutcome::NoEffect {
-            error,
-            directory: _,
-        } => Err(error),
+        DirectoryParkOutcome::Applied(parked) => Ok(parked),
+        DirectoryParkOutcome::NoEffect { error, item: _ } => Err(error),
         DirectoryParkOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            DirectoryParkResolution::Parked(parked) => Ok(parked),
+            DirectoryParkResolution::Applied(parked) => Ok(parked),
             DirectoryParkResolution::NoEffect(_) => Err(io::Error::other(
                 "managed storage directory park had no effect",
             )),

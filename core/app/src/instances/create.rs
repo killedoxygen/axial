@@ -391,12 +391,12 @@ impl InstanceService {
             }
             DirectoryMove(_, _) => None,
             DirectoryPark(outcome, pin) => match outcome {
-                axial_fs::DirectoryParkOutcome::Parked(parked) => {
+                axial_fs::DirectoryParkOutcome::Applied(parked) => {
                     self.settle_effect(DirectoryRestore(parked.restore(), pin))
                 }
                 axial_fs::DirectoryParkOutcome::AppliedUnverified(obligation) => {
                     match obligation.restore() {
-                        axial_fs::DirectoryParkResolution::Parked(parked) => {
+                        axial_fs::DirectoryParkResolution::Applied(parked) => {
                             self.settle_effect(DirectoryRestore(parked.restore(), pin))
                         }
                         axial_fs::DirectoryParkResolution::NoEffect(_) => None,
@@ -411,19 +411,19 @@ impl InstanceService {
                 axial_fs::DirectoryParkOutcome::NoEffect { .. } => None,
             },
             DirectoryRestore(outcome, pin) => match outcome {
-                axial_fs::DirectoryRestoreOutcome::Restored(_) => None,
-                axial_fs::DirectoryRestoreOutcome::NoEffect { parked, .. } => {
+                axial_fs::DirectoryRestoreOutcome::Applied(_) => None,
+                axial_fs::DirectoryRestoreOutcome::NoEffect { item: parked, .. } => {
                     match parked.restore() {
-                        axial_fs::DirectoryRestoreOutcome::Restored(_) => None,
+                        axial_fs::DirectoryRestoreOutcome::Applied(_) => None,
                         outcome => Some(DirectoryRestore(outcome, pin)),
                     }
                 }
                 axial_fs::DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
                     match obligation.reconcile() {
-                        axial_fs::DirectoryRestoreResolution::Restored(_) => None,
+                        axial_fs::DirectoryRestoreResolution::Applied(_) => None,
                         axial_fs::DirectoryRestoreResolution::NoEffect(parked) => {
                             match parked.restore() {
-                                axial_fs::DirectoryRestoreOutcome::Restored(_) => None,
+                                axial_fs::DirectoryRestoreOutcome::Applied(_) => None,
                                 outcome => Some(DirectoryRestore(outcome, pin)),
                             }
                         }
@@ -501,7 +501,7 @@ impl InstanceService {
             },
             FilePublish(outcome, pin) => match outcome {
                 axial_fs::FilePromotionOutcome::Applied(_) => None,
-                axial_fs::FilePromotionOutcome::NoEffect { staged, .. } => {
+                axial_fs::FilePromotionOutcome::NoEffect { item: staged, .. } => {
                     self.settle_effect(StageDiscard(staged.discard(), pin))
                 }
                 axial_fs::FilePromotionOutcome::AppliedUnverified(obligation) => {
@@ -541,17 +541,19 @@ impl InstanceService {
                 | axial_fs::FileParkOutcome::Preserved { .. } => None,
             },
             FileRemove(outcome, pin) => match outcome {
-                axial_fs::FileRemovalOutcome::Removed => None,
-                axial_fs::FileRemovalOutcome::NoEffect { parked, .. } => match parked.remove() {
-                    axial_fs::FileRemovalOutcome::Removed => None,
-                    outcome => Some(FileRemove(outcome, pin)),
-                },
+                axial_fs::FileRemovalOutcome::Applied(()) => None,
+                axial_fs::FileRemovalOutcome::NoEffect { item: parked, .. } => {
+                    match parked.remove() {
+                        axial_fs::FileRemovalOutcome::Applied(()) => None,
+                        outcome => Some(FileRemove(outcome, pin)),
+                    }
+                }
                 axial_fs::FileRemovalOutcome::AppliedUnverified(obligation) => {
                     match obligation.reconcile() {
-                        axial_fs::FileRemovalResolution::Removed => None,
+                        axial_fs::FileRemovalResolution::Applied(()) => None,
                         axial_fs::FileRemovalResolution::NoEffect(parked) => {
                             match parked.remove() {
-                                axial_fs::FileRemovalOutcome::Removed => None,
+                                axial_fs::FileRemovalOutcome::Applied(()) => None,
                                 outcome => Some(FileRemove(outcome, pin)),
                             }
                         }
@@ -1211,7 +1213,7 @@ impl InstanceService {
         })?;
         let (park, pin) = plan.execute().into_parts();
         match park {
-            axial_fs::DirectoryParkOutcome::Parked(parked) => self.remove_parked(parked, pin)?,
+            axial_fs::DirectoryParkOutcome::Applied(parked) => self.remove_parked(parked, pin)?,
             axial_fs::DirectoryParkOutcome::NoEffect { .. } => {
                 return Err(InstanceError::DirectoryUnavailable);
             }

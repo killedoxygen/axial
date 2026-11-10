@@ -858,10 +858,6 @@ fn pending_destination_cancel(
 }
 
 impl TransientDestinationCancelObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> TransientDestinationCancelOutcome {
         self.destination
             .take()
@@ -869,6 +865,8 @@ impl TransientDestinationCancelObligation {
             .cancel()
     }
 }
+
+impl_error_accessor!(TransientDestinationCancelObligation);
 
 impl Directory {
     pub fn admit_transient_destinations(
@@ -1003,10 +1001,6 @@ pub struct TransientCreationObligation {
 impl_redacted_debug!(TransientCreationObligation);
 
 impl TransientCreationObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> TransientStageCreateOutcome {
         match self
             .state
@@ -1039,6 +1033,8 @@ impl TransientCreationObligation {
         }
     }
 }
+
+impl_error_accessor!(TransientCreationObligation);
 
 #[must_use = "a transient stage must be sealed or explicitly discarded"]
 pub struct TransientStage {
@@ -1206,14 +1202,12 @@ pub struct TransientStageSealFailure {
 impl_redacted_debug!(TransientStageSealFailure);
 
 impl TransientStageSealFailure {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn into_stage(mut self) -> TransientStage {
         self.stage.take().expect("seal failure retains its stage")
     }
 }
+
+impl_error_accessor!(TransientStageSealFailure);
 
 #[must_use = "a sealed transient stage must be published or explicitly discarded"]
 pub struct TransientStageSealed {
@@ -1701,16 +1695,14 @@ pub struct TransientPublicationBatchCreateFailure {
 impl_redacted_debug!(TransientPublicationBatchCreateFailure);
 
 impl TransientPublicationBatchCreateFailure {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn into_stages(mut self) -> Vec<TransientStageSealed> {
         self.stages
             .take()
             .expect("publication batch creation failure retains every stage")
     }
 }
+
+impl_error_accessor!(TransientPublicationBatchCreateFailure);
 
 #[must_use = "transient publication outcomes retain every unsettled effect"]
 pub enum TransientPublicationBatchOutcome {
@@ -2353,10 +2345,6 @@ fn validate_classified_publication_members(
 }
 
 impl TransientPublicationBatchObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> TransientPublicationBatchOutcome {
         let error = std::mem::replace(&mut self.error, io::ErrorKind::Other.into());
         let mut batch = self
@@ -2370,6 +2358,8 @@ impl TransientPublicationBatchObligation {
         classify_publication_batch(error, batch, &operation)
     }
 }
+
+impl_error_accessor!(TransientPublicationBatchObligation);
 
 #[must_use = "transient discard outcomes must retain failed cleanup authority"]
 pub enum TransientDiscardOutcome {
@@ -2396,10 +2386,6 @@ enum TransientDiscardState {
 impl_redacted_debug!(TransientDiscardObligation);
 
 impl TransientDiscardObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> TransientDiscardOutcome {
         match self
             .state
@@ -2413,6 +2399,8 @@ impl TransientDiscardObligation {
         }
     }
 }
+
+impl_error_accessor!(TransientDiscardObligation);
 
 fn restore_discarded_destination(
     mut destination: TransientDestination,

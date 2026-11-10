@@ -898,7 +898,10 @@ fn publish_test_bytes_create_new(
             drop(file);
             Ok(())
         }
-        FilePromotionOutcome::NoEffect { error, staged } => {
+        FilePromotionOutcome::NoEffect {
+            error,
+            item: staged,
+        } => {
             settle_test_stage_discard(staged.discard())?;
             Err(InstallError::Io(error))
         }

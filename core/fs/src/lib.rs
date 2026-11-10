@@ -1,3 +1,13 @@
+macro_rules! impl_error_accessor {
+    ($type:ty) => {
+        impl $type {
+            pub fn error(&self) -> &std::io::Error {
+                &self.error
+            }
+        }
+    };
+}
+
 macro_rules! impl_redacted_debug {
     ($type:ty) => {
         impl std::fmt::Debug for $type {
@@ -307,6 +317,27 @@ impl DirectoryListing {
     }
 }
 
+/// An effect attempt classified at its commit boundary: applied and verified, refused
+/// before any effect with its input returned, or applied without verification and
+/// retained by an obligation that must be reconciled.
+#[must_use = "filesystem effect outcomes must be explicitly settled"]
+#[derive(Debug)]
+pub enum Outcome<A, N, O> {
+    Applied(A),
+    NoEffect { error: io::Error, item: N },
+    AppliedUnverified(O),
+}
+
+/// The reconciliation of an unverified effect, keeping the same three-way
+/// classification.
+#[must_use = "filesystem effect resolutions must be handled"]
+#[derive(Debug)]
+pub enum Resolution<A, N, O> {
+    Applied(A),
+    NoEffect(N),
+    Indeterminate(O),
+}
+
 #[must_use = "directory creation effects must be explicitly settled or preserved"]
 #[derive(Debug)]
 pub enum DirectoryCreateOutcome {
@@ -381,10 +412,6 @@ pub struct DirectoryCreateObligation {
 impl_redacted_debug!(DirectoryCreateObligation);
 
 impl DirectoryCreateObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> DirectoryCreateResolution {
         let authority = match self.token.authority.upgrade() {
             Some(authority) => authority,
@@ -400,6 +427,8 @@ impl DirectoryCreateObligation {
         }
     }
 }
+
+impl_error_accessor!(DirectoryCreateObligation);
 
 fn finish_directory_create(
     authority: &Arc<CapabilityAuthority>,
@@ -477,10 +506,6 @@ pub struct FileCreateObligation {
 impl_redacted_debug!(FileCreateObligation);
 
 impl FileCreateObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> FileCreateResolution {
         let authority = match self.token.authority.upgrade() {
             Some(authority) => authority,
@@ -511,6 +536,8 @@ impl FileCreateObligation {
         }
     }
 }
+
+impl_error_accessor!(FileCreateObligation);
 
 fn finish_stage_create(
     authority: &Arc<CapabilityAuthority>,
@@ -624,16 +651,8 @@ pub enum FileCreateResolution {
     Indeterminate(FileCreateObligation),
 }
 
-#[must_use = "file promotion effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum FilePromotionOutcome {
-    Applied(FileCapability),
-    NoEffect {
-        error: io::Error,
-        staged: SealedStagedFile,
-    },
-    AppliedUnverified(Box<FilePromotionObligation>),
-}
+pub type FilePromotionOutcome =
+    Outcome<FileCapability, SealedStagedFile, Box<FilePromotionObligation>>;
 
 #[must_use = "file promotion obligations must be reconciled"]
 pub struct FilePromotionObligation {
@@ -648,10 +667,6 @@ pub struct FilePromotionObligation {
 impl_redacted_debug!(FilePromotionObligation);
 
 impl FilePromotionObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> FilePromotionResolution {
         let authority = match self.retained.file.parent.authority() {
             Ok(authority) => authority,
@@ -778,32 +793,14 @@ impl FilePromotionObligation {
     }
 }
 
-#[must_use = "file promotion resolutions must be handled"]
-#[derive(Debug)]
-pub enum FilePromotionResolution {
-    Applied(FileCapability),
-    NoEffect(SealedStagedFile),
-    Indeterminate(Box<FilePromotionObligation>),
-}
+impl_error_accessor!(FilePromotionObligation);
 
-#[must_use = "file move effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum FileMoveOutcome {
-    Applied(FileCapability),
-    NoEffect {
-        error: io::Error,
-        file: FileCapability,
-    },
-    AppliedUnverified(FileMoveObligation),
-}
+pub type FilePromotionResolution =
+    Resolution<FileCapability, SealedStagedFile, Box<FilePromotionObligation>>;
 
-#[must_use = "file move resolutions must be handled"]
-#[derive(Debug)]
-pub enum FileMoveResolution {
-    Applied(FileCapability),
-    NoEffect(FileCapability),
-    Indeterminate(FileMoveObligation),
-}
+pub type FileMoveOutcome = Outcome<FileCapability, FileCapability, FileMoveObligation>;
+
+pub type FileMoveResolution = Resolution<FileCapability, FileCapability, FileMoveObligation>;
 
 #[must_use = "file move obligations must be reconciled"]
 pub struct FileMoveObligation {
@@ -818,10 +815,6 @@ pub struct FileMoveObligation {
 impl_redacted_debug!(FileMoveObligation);
 
 impl FileMoveObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> FileMoveResolution {
         let file = self
             .file
@@ -845,24 +838,11 @@ impl FileMoveObligation {
     }
 }
 
-#[must_use = "directory move effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum DirectoryMoveOutcome {
-    Applied(Directory),
-    NoEffect {
-        error: io::Error,
-        directory: Directory,
-    },
-    AppliedUnverified(DirectoryMoveObligation),
-}
+impl_error_accessor!(FileMoveObligation);
 
-#[must_use = "directory move resolutions must be handled"]
-#[derive(Debug)]
-pub enum DirectoryMoveResolution {
-    Applied(Directory),
-    NoEffect(Directory),
-    Indeterminate(DirectoryMoveObligation),
-}
+pub type DirectoryMoveOutcome = Outcome<Directory, Directory, DirectoryMoveObligation>;
+
+pub type DirectoryMoveResolution = Resolution<Directory, Directory, DirectoryMoveObligation>;
 
 #[must_use = "directory move obligations must be reconciled"]
 pub struct DirectoryMoveObligation {
@@ -877,10 +857,6 @@ pub struct DirectoryMoveObligation {
 impl_redacted_debug!(DirectoryMoveObligation);
 
 impl DirectoryMoveObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> DirectoryMoveResolution {
         let directory = self
             .directory
@@ -902,6 +878,8 @@ impl DirectoryMoveObligation {
         }
     }
 }
+
+impl_error_accessor!(DirectoryMoveObligation);
 
 pub enum ReplaceDestination {
     Vacant {
@@ -1033,10 +1011,6 @@ pub struct FileReplaceObligation {
 impl_redacted_debug!(FileReplaceObligation);
 
 impl FileReplaceObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> FileReplaceResolution {
         let state = *self.state.take().expect("replace obligation retains state");
         settle_file_replace(state).unwrap_or_else(|state| {
@@ -1045,6 +1019,8 @@ impl FileReplaceObligation {
         })
     }
 }
+
+impl_error_accessor!(FileReplaceObligation);
 
 #[must_use = "file park effects must be explicitly settled"]
 #[derive(Debug)]
@@ -1107,10 +1083,6 @@ pub struct FileParkObligation {
 impl_redacted_debug!(FileParkObligation);
 
 impl FileParkObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(self) -> FileParkResolution {
         settle_file_park(self, false)
     }
@@ -1119,6 +1091,8 @@ impl FileParkObligation {
         settle_file_park(self, true)
     }
 }
+
+impl_error_accessor!(FileParkObligation);
 
 #[must_use = "a parked file must be removed, restored, acknowledged as preserved, or retained as an obligation"]
 pub struct ParkedFile {
@@ -1144,33 +1118,16 @@ pub struct FileParkPreservationError {
 impl_redacted_debug!(FileParkPreservationError);
 
 impl FileParkPreservationError {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn into_parked(self) -> ParkedFile {
         self.parked
     }
 }
 
-#[must_use = "file removal effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum FileRemovalOutcome {
-    Removed,
-    NoEffect {
-        error: io::Error,
-        parked: ParkedFile,
-    },
-    AppliedUnverified(FileRemovalObligation),
-}
+impl_error_accessor!(FileParkPreservationError);
 
-#[must_use = "file removal resolutions must be handled"]
-#[derive(Debug)]
-pub enum FileRemovalResolution {
-    Removed,
-    NoEffect(ParkedFile),
-    Indeterminate(FileRemovalObligation),
-}
+pub type FileRemovalOutcome = Outcome<(), ParkedFile, FileRemovalObligation>;
+
+pub type FileRemovalResolution = Resolution<(), ParkedFile, FileRemovalObligation>;
 
 #[must_use = "file removal obligations must be reconciled"]
 pub struct FileRemovalObligation {
@@ -1181,10 +1138,6 @@ pub struct FileRemovalObligation {
 impl_redacted_debug!(FileRemovalObligation);
 
 impl FileRemovalObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> FileRemovalResolution {
         let parked = self
             .parked
@@ -1239,7 +1192,7 @@ impl FileRemovalObligation {
         ) {
             Ok(()) if parked.parent.validate(&operation).is_ok() => {
                 guard.disarm(&mut parked.token, &operation);
-                FileRemovalResolution::Removed
+                FileRemovalResolution::Applied(())
             }
             Ok(()) => {
                 drop(operation);
@@ -1260,24 +1213,11 @@ impl FileRemovalObligation {
     }
 }
 
-#[must_use = "file restore effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum FileRestoreOutcome {
-    Restored(FileCapability),
-    NoEffect {
-        error: io::Error,
-        parked: ParkedFile,
-    },
-    AppliedUnverified(FileRestoreObligation),
-}
+impl_error_accessor!(FileRemovalObligation);
 
-#[must_use = "file restore resolutions must be handled"]
-#[derive(Debug)]
-pub enum FileRestoreResolution {
-    Restored(FileCapability),
-    NoEffect(ParkedFile),
-    Indeterminate(FileRestoreObligation),
-}
+pub type FileRestoreOutcome = Outcome<FileCapability, ParkedFile, FileRestoreObligation>;
+
+pub type FileRestoreResolution = Resolution<FileCapability, ParkedFile, FileRestoreObligation>;
 
 #[must_use = "file restore obligations must be reconciled"]
 pub struct FileRestoreObligation {
@@ -1288,10 +1228,6 @@ pub struct FileRestoreObligation {
 impl_redacted_debug!(FileRestoreObligation);
 
 impl FileRestoreObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> FileRestoreResolution {
         let parked = self
             .parked
@@ -1331,7 +1267,7 @@ impl FileRestoreObligation {
         operation: CapabilityOperation,
     ) -> FileRestoreResolution {
         match settle_file_restore_admitted(parked, authority, operation) {
-            FileRestoreSettlement::Restored(file) => FileRestoreResolution::Restored(file),
+            FileRestoreSettlement::Restored(file) => FileRestoreResolution::Applied(file),
             FileRestoreSettlement::NoEffect(parked) => FileRestoreResolution::NoEffect(parked),
             FileRestoreSettlement::Indeterminate(parked) => self.retain(parked),
         }
@@ -1342,6 +1278,8 @@ impl FileRestoreObligation {
         FileRestoreResolution::Indeterminate(self)
     }
 }
+
+impl_error_accessor!(FileRestoreObligation);
 
 enum FileRestoreSettlement {
     Restored(FileCapability),
@@ -1391,40 +1329,28 @@ impl ParkedFile {
         if !self.verified {
             return FileRemovalOutcome::NoEffect {
                 error: identity_changed("unverified parked file can only be restored"),
-                parked: self,
+                item: self,
             };
         }
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return FileRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_file_park(&self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return FileRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRemovalOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.validate(&operation) {
-            return FileRemovalOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return FileRemovalOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_file_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return FileRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let removal = {
@@ -1439,7 +1365,7 @@ impl ParkedFile {
         match removal {
             Ok(()) if self.parent.validate(&operation).is_ok() => {
                 guard.disarm(&mut self.token, &operation);
-                FileRemovalOutcome::Removed
+                FileRemovalOutcome::Applied(())
             }
             Ok(()) => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
                 error: identity_changed("file removal lost its authority chain"),
@@ -1449,10 +1375,7 @@ impl ParkedFile {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        FileRemovalOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        FileRemovalOutcome::NoEffect { error, item: self }
                     }
                     _ => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
                         error,
@@ -1467,19 +1390,13 @@ impl ParkedFile {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return FileRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_file_park_recovery(permit, &self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return FileRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRemovalOutcome::NoEffect { error, item: self };
             }
         };
         self.remove_admitted(authority, operation)
@@ -1493,22 +1410,16 @@ impl ParkedFile {
         if !self.verified {
             return FileRemovalOutcome::NoEffect {
                 error: identity_changed("unverified parked file can only be restored"),
-                parked: self,
+                item: self,
             };
         }
         if let Err(error) = self.validate(&operation) {
-            return FileRemovalOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return FileRemovalOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_file_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return FileRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let removal = {
@@ -1523,7 +1434,7 @@ impl ParkedFile {
         match removal {
             Ok(()) if self.parent.validate(&operation).is_ok() => {
                 guard.disarm(&mut self.token, &operation);
-                FileRemovalOutcome::Removed
+                FileRemovalOutcome::Applied(())
             }
             Ok(()) => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
                 error: identity_changed("file removal lost its authority chain"),
@@ -1533,10 +1444,7 @@ impl ParkedFile {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        FileRemovalOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        FileRemovalOutcome::NoEffect { error, item: self }
                     }
                     _ => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
                         error,
@@ -1551,34 +1459,22 @@ impl ParkedFile {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return FileRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_file_park(&self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return FileRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRestoreOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.validate(&operation) {
-            return FileRestoreOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return FileRestoreOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_file_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return FileRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let restoration = {
@@ -1602,7 +1498,7 @@ impl ParkedFile {
                 );
                 if restored.validate(&operation).is_ok() {
                     guard.disarm(&mut self.token, &operation);
-                    FileRestoreOutcome::Restored(restored)
+                    FileRestoreOutcome::Applied(restored)
                 } else {
                     FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
                         error: identity_changed("restored file lost its authority chain"),
@@ -1614,10 +1510,7 @@ impl ParkedFile {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        FileRestoreOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        FileRestoreOutcome::NoEffect { error, item: self }
                     }
                     _ => FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
                         error,
@@ -1632,19 +1525,13 @@ impl ParkedFile {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return FileRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_file_park_recovery(permit, &self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return FileRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRestoreOutcome::NoEffect { error, item: self };
             }
         };
         self.restore_admitted(authority, operation)
@@ -1656,18 +1543,12 @@ impl ParkedFile {
         operation: CapabilityOperation,
     ) -> FileRestoreOutcome {
         if let Err(error) = self.validate(&operation) {
-            return FileRestoreOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return FileRestoreOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_file_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return FileRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return FileRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let restoration = {
@@ -1691,7 +1572,7 @@ impl ParkedFile {
                 );
                 if restored.validate(&operation).is_ok() {
                     guard.disarm(&mut self.token, &operation);
-                    FileRestoreOutcome::Restored(restored)
+                    FileRestoreOutcome::Applied(restored)
                 } else {
                     FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
                         error: identity_changed("restored file lost its authority chain"),
@@ -1703,10 +1584,7 @@ impl ParkedFile {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        FileRestoreOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        FileRestoreOutcome::NoEffect { error, item: self }
                     }
                     _ => FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
                         error,
@@ -1827,24 +1705,9 @@ fn settle_file_restore_admitted(
     }
 }
 
-#[must_use = "directory park effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum DirectoryParkOutcome {
-    Parked(ParkedDirectory),
-    NoEffect {
-        error: io::Error,
-        directory: Directory,
-    },
-    AppliedUnverified(DirectoryParkObligation),
-}
+pub type DirectoryParkOutcome = Outcome<ParkedDirectory, Directory, DirectoryParkObligation>;
 
-#[must_use = "directory park resolutions must be handled"]
-#[derive(Debug)]
-pub enum DirectoryParkResolution {
-    Parked(ParkedDirectory),
-    NoEffect(Directory),
-    Indeterminate(DirectoryParkObligation),
-}
+pub type DirectoryParkResolution = Resolution<ParkedDirectory, Directory, DirectoryParkObligation>;
 
 #[must_use = "directory park obligations must be reconciled"]
 pub struct DirectoryParkObligation {
@@ -1859,10 +1722,6 @@ pub struct DirectoryParkObligation {
 impl_redacted_debug!(DirectoryParkObligation);
 
 impl DirectoryParkObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(self) -> DirectoryParkResolution {
         settle_directory_park(self, false)
     }
@@ -1871,6 +1730,8 @@ impl DirectoryParkObligation {
         settle_directory_park(self, true)
     }
 }
+
+impl_error_accessor!(DirectoryParkObligation);
 
 #[must_use = "a parked directory must be removed, restored, or retained as an obligation"]
 pub struct ParkedDirectory {
@@ -1914,24 +1775,9 @@ impl Drop for RetainedDirectoryTreeRemoval {
     }
 }
 
-#[must_use = "directory removal effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum DirectoryRemovalOutcome {
-    Removed,
-    NoEffect {
-        error: io::Error,
-        parked: ParkedDirectory,
-    },
-    AppliedUnverified(DirectoryRemovalObligation),
-}
+pub type DirectoryRemovalOutcome = Outcome<(), ParkedDirectory, DirectoryRemovalObligation>;
 
-#[must_use = "directory removal resolutions must be handled"]
-#[derive(Debug)]
-pub enum DirectoryRemovalResolution {
-    Removed,
-    NoEffect(ParkedDirectory),
-    Indeterminate(DirectoryRemovalObligation),
-}
+pub type DirectoryRemovalResolution = Resolution<(), ParkedDirectory, DirectoryRemovalObligation>;
 
 #[must_use = "directory removal obligations must be reconciled"]
 pub struct DirectoryRemovalObligation {
@@ -1978,24 +1824,10 @@ impl Drop for DirectoryTreeRemovalObligation {
     }
 }
 
-#[must_use = "directory restore effects must be explicitly settled"]
-#[derive(Debug)]
-pub enum DirectoryRestoreOutcome {
-    Restored(Directory),
-    NoEffect {
-        error: io::Error,
-        parked: ParkedDirectory,
-    },
-    AppliedUnverified(DirectoryRestoreObligation),
-}
+pub type DirectoryRestoreOutcome = Outcome<Directory, ParkedDirectory, DirectoryRestoreObligation>;
 
-#[must_use = "directory restore resolutions must be handled"]
-#[derive(Debug)]
-pub enum DirectoryRestoreResolution {
-    Restored(Directory),
-    NoEffect(ParkedDirectory),
-    Indeterminate(DirectoryRestoreObligation),
-}
+pub type DirectoryRestoreResolution =
+    Resolution<Directory, ParkedDirectory, DirectoryRestoreObligation>;
 
 #[must_use = "directory restore obligations must be reconciled"]
 pub struct DirectoryRestoreObligation {
@@ -2039,10 +1871,6 @@ pub struct DurableReplaceObligation {
 impl_redacted_debug!(DurableReplaceObligation);
 
 impl DurableReplaceObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> DurableReplaceOutcome {
         settle_durable_replace(
             *self
@@ -2052,6 +1880,8 @@ impl DurableReplaceObligation {
         )
     }
 }
+
+impl_error_accessor!(DurableReplaceObligation);
 
 enum DurableReplaceState {
     Creating {
@@ -3618,14 +3448,14 @@ impl OwnedEffect {
             },
             Self::ParkedFileRemoval(parked) => owned_parked_file_removal(parked),
             Self::FileRemoval(obligation) => match obligation.reconcile() {
-                FileRemovalResolution::Removed => None,
+                FileRemovalResolution::Applied(()) => None,
                 FileRemovalResolution::NoEffect(parked) => owned_parked_file_removal(parked),
                 FileRemovalResolution::Indeterminate(obligation) => {
                     Some(Self::FileRemoval(obligation))
                 }
             },
             Self::DirectoryParkRemoval(obligation) => match obligation.reconcile() {
-                DirectoryParkResolution::Parked(parked) => owned_parked_directory_removal(parked),
+                DirectoryParkResolution::Applied(parked) => owned_parked_directory_removal(parked),
                 DirectoryParkResolution::NoEffect(directory) => {
                     drop(directory);
                     None
@@ -3636,7 +3466,7 @@ impl OwnedEffect {
             },
             Self::ParkedDirectoryRemoval(parked) => owned_parked_directory_removal(parked),
             Self::DirectoryRemoval(obligation) => match obligation.reconcile() {
-                DirectoryRemovalResolution::Removed => None,
+                DirectoryRemovalResolution::Applied(()) => None,
                 DirectoryRemovalResolution::NoEffect(parked) => {
                     owned_parked_directory_removal(parked)
                 }
@@ -3808,8 +3638,10 @@ fn owned_stage_discard(outcome: StageDiscardOutcome) -> Option<OwnedEffect> {
 
 fn owned_parked_file_removal(parked: ParkedFile) -> Option<OwnedEffect> {
     match parked.remove() {
-        FileRemovalOutcome::Removed => None,
-        FileRemovalOutcome::NoEffect { parked, .. } => Some(OwnedEffect::ParkedFileRemoval(parked)),
+        FileRemovalOutcome::Applied(()) => None,
+        FileRemovalOutcome::NoEffect { item: parked, .. } => {
+            Some(OwnedEffect::ParkedFileRemoval(parked))
+        }
         FileRemovalOutcome::AppliedUnverified(obligation) => {
             Some(OwnedEffect::FileRemoval(obligation))
         }
@@ -3818,8 +3650,8 @@ fn owned_parked_file_removal(parked: ParkedFile) -> Option<OwnedEffect> {
 
 fn owned_parked_directory_removal(parked: ParkedDirectory) -> Option<OwnedEffect> {
     match parked.remove_empty() {
-        DirectoryRemovalOutcome::Removed => None,
-        DirectoryRemovalOutcome::NoEffect { parked, .. } => {
+        DirectoryRemovalOutcome::Applied(()) => None,
+        DirectoryRemovalOutcome::NoEffect { item: parked, .. } => {
             Some(OwnedEffect::ParkedDirectoryRemoval(parked))
         }
         DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
@@ -8754,7 +8586,7 @@ impl Directory {
                     io::ErrorKind::InvalidInput,
                     "a root directory capability cannot be moved",
                 ),
-                directory: self,
+                item: self,
             };
         };
         let source_parent = binding.directory.clone();
@@ -8766,41 +8598,32 @@ impl Directory {
                         io::ErrorKind::InvalidInput,
                         "directory binding is not a valid native leaf",
                     ),
-                    directory: self,
+                    item: self,
                 };
             }
         };
         let authority = match source_parent.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return DirectoryMoveOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryMoveOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_directory_rebinding() {
             Ok(operation) => operation,
             Err(error) => {
-                return DirectoryMoveOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryMoveOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self
             .validate(&operation)
             .and_then(|_| destination.validate(&operation))
         {
-            return DirectoryMoveOutcome::NoEffect {
-                error,
-                directory: self,
-            };
+            return DirectoryMoveOutcome::NoEffect { error, item: self };
         }
         if !Weak::ptr_eq(&source_parent.inner.authority, &destination.inner.authority) {
             return DirectoryMoveOutcome::NoEffect {
                 error: stale_capability(),
-                directory: self,
+                item: self,
             };
         }
         if source_parent.inner.identity == destination.inner.identity
@@ -8811,7 +8634,7 @@ impl Directory {
                     io::ErrorKind::InvalidInput,
                     "directory move destination matches its source",
                 ),
-                directory: self,
+                item: self,
             };
         }
         let mut token = match MoveEffectToken::reserve(
@@ -8830,10 +8653,7 @@ impl Directory {
         ) {
             Ok(token) => token,
             Err(error) => {
-                return DirectoryMoveOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryMoveOutcome::NoEffect { error, item: self };
             }
         };
         let effect = platform::rename_directory_no_replace(
@@ -8857,7 +8677,7 @@ impl Directory {
                 error: effect.err().unwrap_or_else(|| {
                     io::Error::other("directory move reported no effect after native success")
                 }),
-                directory,
+                item: directory,
             },
             Err(directory) => DirectoryMoveOutcome::AppliedUnverified(DirectoryMoveObligation {
                 error: effect
@@ -8880,7 +8700,7 @@ impl Directory {
             match directory.park_as(park_name) {
                 DirectoryParkOutcome::NoEffect {
                     error,
-                    directory: returned,
+                    item: returned,
                 } if error.kind() == io::ErrorKind::AlreadyExists => {
                     directory = returned;
                     last_collision = Some(error);
@@ -8895,7 +8715,7 @@ impl Directory {
                     "could not reserve a unique parked directory name",
                 )
             }),
-            directory,
+            item: directory,
         }
     }
 
@@ -8906,7 +8726,7 @@ impl Directory {
                     io::ErrorKind::InvalidInput,
                     "a root directory capability cannot be parked",
                 ),
-                directory: self,
+                item: self,
             };
         };
         let parent = binding.directory.clone();
@@ -8918,7 +8738,7 @@ impl Directory {
                         io::ErrorKind::InvalidInput,
                         "directory binding is not a valid native leaf",
                     ),
-                    directory: self,
+                    item: self,
                 };
             }
         };
@@ -8928,32 +8748,23 @@ impl Directory {
                     io::ErrorKind::InvalidInput,
                     "directory park destination matches its source",
                 ),
-                directory: self,
+                item: self,
             };
         }
         let authority = match parent.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return DirectoryParkOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryParkOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_directory_rebinding() {
             Ok(operation) => operation,
             Err(error) => {
-                return DirectoryParkOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryParkOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.validate(&operation) {
-            return DirectoryParkOutcome::NoEffect {
-                error,
-                directory: self,
-            };
+            return DirectoryParkOutcome::NoEffect { error, item: self };
         }
         if let Err(error) = authority.ensure_park_available(
             &operation,
@@ -8962,10 +8773,7 @@ impl Directory {
             &park_name,
             Some(self.inner.identity.physical),
         ) {
-            return DirectoryParkOutcome::NoEffect {
-                error,
-                directory: self,
-            };
+            return DirectoryParkOutcome::NoEffect { error, item: self };
         }
         let cleanup = match platform::open_parked_directory(
             parent.inner.handle(),
@@ -8974,10 +8782,7 @@ impl Directory {
         ) {
             Ok(cleanup) => cleanup,
             Err(error) => {
-                return DirectoryParkOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryParkOutcome::NoEffect { error, item: self };
             }
         };
         let mut token = match authority.reserve_directory_park(
@@ -8990,10 +8795,7 @@ impl Directory {
         ) {
             Ok(token) => token,
             Err(error) => {
-                return DirectoryParkOutcome::NoEffect {
-                    error,
-                    directory: self,
-                };
+                return DirectoryParkOutcome::NoEffect { error, item: self };
             }
         };
         let mut guard = match authority.take_directory_park(&operation, &token) {
@@ -9032,7 +8834,7 @@ impl Directory {
                 }
                 guard.record_mut().phase = DirectoryParkRegistryPhase::Live;
                 drop(guard);
-                DirectoryParkOutcome::Parked(ParkedDirectory {
+                DirectoryParkOutcome::Applied(ParkedDirectory {
                     parent,
                     original_name,
                     park_name,
@@ -9043,10 +8845,7 @@ impl Directory {
             }
             Err(platform::ParkDirectoryError::NoEffect(error)) => {
                 guard.disarm(&mut token, &operation);
-                DirectoryParkOutcome::NoEffect {
-                    error,
-                    directory: self,
-                }
+                DirectoryParkOutcome::NoEffect { error, item: self }
             }
             Err(platform::ParkDirectoryError::AppliedUnverified(error)) => {
                 drop(guard);
@@ -9261,7 +9060,7 @@ fn settle_directory_park(
             }
             guard.record_mut().phase = DirectoryParkRegistryPhase::Live;
             drop(guard);
-            DirectoryParkResolution::Parked(ParkedDirectory {
+            DirectoryParkResolution::Applied(ParkedDirectory {
                 parent: obligation.parent,
                 original_name: obligation.original_name,
                 park_name: obligation.park_name,
@@ -9279,34 +9078,22 @@ impl ParkedDirectory {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return DirectoryRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_directory_park(&self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return DirectoryRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRemovalOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.validate(&operation) {
-            return DirectoryRemovalOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return DirectoryRemovalOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_directory_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return DirectoryRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let removal = {
@@ -9321,7 +9108,7 @@ impl ParkedDirectory {
         match removal {
             Ok(()) if self.parent.validate(&operation).is_ok() => {
                 guard.disarm(&mut self.token, &operation);
-                DirectoryRemovalOutcome::Removed
+                DirectoryRemovalOutcome::Applied(())
             }
             Ok(()) => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
                 error: identity_changed("directory removal lost its authority chain"),
@@ -9331,10 +9118,7 @@ impl ParkedDirectory {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        DirectoryRemovalOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        DirectoryRemovalOutcome::NoEffect { error, item: self }
                     }
                     _ => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
                         error,
@@ -9349,19 +9133,13 @@ impl ParkedDirectory {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return DirectoryRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_directory_park_recovery(permit, &self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return DirectoryRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRemovalOutcome::NoEffect { error, item: self };
             }
         };
         self.remove_empty_admitted(authority, operation)
@@ -9373,18 +9151,12 @@ impl ParkedDirectory {
         operation: CapabilityOperation,
     ) -> DirectoryRemovalOutcome {
         if let Err(error) = self.validate(&operation) {
-            return DirectoryRemovalOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return DirectoryRemovalOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_directory_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return DirectoryRemovalOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRemovalOutcome::NoEffect { error, item: self };
             }
         };
         let removal = {
@@ -9399,7 +9171,7 @@ impl ParkedDirectory {
         match removal {
             Ok(()) if self.parent.validate(&operation).is_ok() => {
                 guard.disarm(&mut self.token, &operation);
-                DirectoryRemovalOutcome::Removed
+                DirectoryRemovalOutcome::Applied(())
             }
             Ok(()) => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
                 error: identity_changed("directory removal lost its authority chain"),
@@ -9409,10 +9181,7 @@ impl ParkedDirectory {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        DirectoryRemovalOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        DirectoryRemovalOutcome::NoEffect { error, item: self }
                     }
                     _ => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
                         error,
@@ -9505,34 +9274,22 @@ impl ParkedDirectory {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return DirectoryRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_directory_park(&self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return DirectoryRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRestoreOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.validate(&operation) {
-            return DirectoryRestoreOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return DirectoryRestoreOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_directory_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return DirectoryRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let restoration = {
@@ -9558,7 +9315,7 @@ impl ParkedDirectory {
                 );
                 if restored.validate(&operation).is_ok() {
                     guard.disarm(&mut self.token, &operation);
-                    DirectoryRestoreOutcome::Restored(restored)
+                    DirectoryRestoreOutcome::Applied(restored)
                 } else {
                     DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
                         error: identity_changed("restored directory lost its authority chain"),
@@ -9570,10 +9327,7 @@ impl ParkedDirectory {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        DirectoryRestoreOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        DirectoryRestoreOutcome::NoEffect { error, item: self }
                     }
                     _ => DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
                         error,
@@ -9588,19 +9342,13 @@ impl ParkedDirectory {
         let authority = match self.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return DirectoryRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter_directory_park_recovery(permit, &self.token) {
             Ok(operation) => operation,
             Err(error) => {
-                return DirectoryRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRestoreOutcome::NoEffect { error, item: self };
             }
         };
         self.restore_admitted(authority, operation)
@@ -9612,18 +9360,12 @@ impl ParkedDirectory {
         operation: CapabilityOperation,
     ) -> DirectoryRestoreOutcome {
         if let Err(error) = self.validate(&operation) {
-            return DirectoryRestoreOutcome::NoEffect {
-                error,
-                parked: self,
-            };
+            return DirectoryRestoreOutcome::NoEffect { error, item: self };
         }
         let mut guard = match authority.take_directory_park(&operation, &self.token) {
             Ok(guard) => guard,
             Err(error) => {
-                return DirectoryRestoreOutcome::NoEffect {
-                    error,
-                    parked: self,
-                };
+                return DirectoryRestoreOutcome::NoEffect { error, item: self };
             }
         };
         let restoration = {
@@ -9649,7 +9391,7 @@ impl ParkedDirectory {
                 );
                 if restored.validate(&operation).is_ok() {
                     guard.disarm(&mut self.token, &operation);
-                    DirectoryRestoreOutcome::Restored(restored)
+                    DirectoryRestoreOutcome::Applied(restored)
                 } else {
                     DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
                         error: identity_changed("restored directory lost its authority chain"),
@@ -9661,10 +9403,7 @@ impl ParkedDirectory {
                 drop(guard);
                 match self.binding_state() {
                     Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
-                        DirectoryRestoreOutcome::NoEffect {
-                            error,
-                            parked: self,
-                        }
+                        DirectoryRestoreOutcome::NoEffect { error, item: self }
                     }
                     _ => DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
                         error,
@@ -9714,10 +9453,6 @@ impl ParkedDirectory {
 }
 
 impl DirectoryRemovalObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> DirectoryRemovalResolution {
         let parked = self
             .parked
@@ -9774,7 +9509,7 @@ impl DirectoryRemovalObligation {
         ) {
             Ok(()) if parked.parent.validate(&operation).is_ok() => {
                 guard.disarm(&mut parked.token, &operation);
-                DirectoryRemovalResolution::Removed
+                DirectoryRemovalResolution::Applied(())
             }
             Ok(()) => {
                 drop(operation);
@@ -9795,11 +9530,9 @@ impl DirectoryRemovalObligation {
     }
 }
 
-impl DirectoryTreeRemovalObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
+impl_error_accessor!(DirectoryRemovalObligation);
 
+impl DirectoryTreeRemovalObligation {
     pub fn reconcile(mut self) -> DirectoryTreeRemovalResolution {
         let parked = self
             .parked
@@ -9872,11 +9605,9 @@ impl DirectoryTreeRemovalObligation {
     }
 }
 
-impl DirectoryRestoreObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
+impl_error_accessor!(DirectoryTreeRemovalObligation);
 
+impl DirectoryRestoreObligation {
     pub fn reconcile(mut self) -> DirectoryRestoreResolution {
         let parked = self
             .parked
@@ -9944,7 +9675,7 @@ impl DirectoryRestoreObligation {
                 );
                 if restored.validate(&operation).is_ok() {
                     guard.disarm(&mut parked.token, &operation);
-                    DirectoryRestoreResolution::Restored(restored)
+                    DirectoryRestoreResolution::Applied(restored)
                 } else {
                     drop(guard);
                     drop(operation);
@@ -9973,6 +9704,8 @@ impl DirectoryRestoreObligation {
         DirectoryRestoreResolution::Indeterminate(self)
     }
 }
+
+impl_error_accessor!(DirectoryRestoreObligation);
 
 impl Directory {
     fn is_managed_root_descendant(&self) -> bool {
@@ -11308,22 +11041,22 @@ impl FileCapability {
         let source_parent = self.parent.clone();
         let authority = match source_parent.authority() {
             Ok(authority) => authority,
-            Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
+            Err(error) => return FileMoveOutcome::NoEffect { error, item: self },
         };
         let operation = match authority.enter() {
             Ok(operation) => operation,
-            Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
+            Err(error) => return FileMoveOutcome::NoEffect { error, item: self },
         };
         if let Err(error) = self
             .validate(&operation)
             .and_then(|_| destination.validate(&operation))
         {
-            return FileMoveOutcome::NoEffect { error, file: self };
+            return FileMoveOutcome::NoEffect { error, item: self };
         }
         if !Weak::ptr_eq(&source_parent.inner.authority, &destination.inner.authority) {
             return FileMoveOutcome::NoEffect {
                 error: stale_capability(),
-                file: self,
+                item: self,
             };
         }
         if source_parent.inner.identity == destination.inner.identity
@@ -11334,7 +11067,7 @@ impl FileCapability {
                     io::ErrorKind::InvalidInput,
                     "file move destination matches its source",
                 ),
-                file: self,
+                item: self,
             };
         }
         let mut token = match MoveEffectToken::reserve(
@@ -11352,7 +11085,7 @@ impl FileCapability {
             Some(self.identity),
         ) {
             Ok(token) => token,
-            Err(error) => return FileMoveOutcome::NoEffect { error, file: self },
+            Err(error) => return FileMoveOutcome::NoEffect { error, item: self },
         };
         let effect = platform::move_file_no_replace(
             source_parent.inner.handle(),
@@ -11375,7 +11108,7 @@ impl FileCapability {
                 error: effect.err().unwrap_or_else(|| {
                     io::Error::other("file move reported no effect after native success")
                 }),
-                file,
+                item: file,
             },
             Err(file) => FileMoveOutcome::AppliedUnverified(FileMoveObligation {
                 error: effect
@@ -12050,14 +11783,12 @@ impl StageSealFailure {
         }
     }
 
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn into_staged(mut self) -> StagedFile {
         self.staged.take().expect("failed stage is retained")
     }
 }
+
+impl_error_accessor!(StageSealFailure);
 
 #[must_use = "a sealed stage must be published, discarded, or retained as an obligation"]
 pub struct SealedStagedFile {
@@ -12107,10 +11838,6 @@ pub struct StageDiscardObligation {
 impl_redacted_debug!(StageDiscardObligation);
 
 impl StageDiscardObligation {
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn reconcile(mut self) -> StageDiscardResolution {
         let mut token = self.token.take().expect("discard obligation retains token");
         match token.discard() {
@@ -12122,6 +11849,8 @@ impl StageDiscardObligation {
         }
     }
 }
+
+impl_error_accessor!(StageDiscardObligation);
 
 impl SealedStagedFile {
     pub fn replace_nondurable(self, destination: ReplaceDestination) -> FileReplaceOutcome {
@@ -12226,49 +11955,31 @@ impl SealedStagedFile {
         let authority = match source_parent.authority() {
             Ok(authority) => authority,
             Err(error) => {
-                return FilePromotionOutcome::NoEffect {
-                    error,
-                    staged: self,
-                };
+                return FilePromotionOutcome::NoEffect { error, item: self };
             }
         };
         let operation = match authority.enter() {
             Ok(operation) => operation,
             Err(error) => {
-                return FilePromotionOutcome::NoEffect {
-                    error,
-                    staged: self,
-                };
+                return FilePromotionOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.file.validate_bound_to(source_parent, &operation) {
-            return FilePromotionOutcome::NoEffect {
-                error,
-                staged: self,
-            };
+            return FilePromotionOutcome::NoEffect { error, item: self };
         }
         if self.published.is_none() {
             match admit_publication_bytes(&self.file) {
                 Ok(handle) => self.published = Some(handle),
                 Err(error) => {
-                    return FilePromotionOutcome::NoEffect {
-                        error,
-                        staged: self,
-                    };
+                    return FilePromotionOutcome::NoEffect { error, item: self };
                 }
             }
         }
         if let Err(error) = self.file.validate_revision_in(&operation, &self.revision) {
-            return FilePromotionOutcome::NoEffect {
-                error,
-                staged: self,
-            };
+            return FilePromotionOutcome::NoEffect { error, item: self };
         }
         if let Err(error) = destination_parent.validate(&operation) {
-            return FilePromotionOutcome::NoEffect {
-                error,
-                staged: self,
-            };
+            return FilePromotionOutcome::NoEffect { error, item: self };
         }
         if !Weak::ptr_eq(
             &source_parent.inner.authority,
@@ -12276,7 +11987,7 @@ impl SealedStagedFile {
         ) {
             return FilePromotionOutcome::NoEffect {
                 error: stale_capability(),
-                staged: self,
+                item: self,
             };
         }
         let expected_recovery = match validate_recovery_publication(
@@ -12292,19 +12003,13 @@ impl SealedStagedFile {
         ) {
             Ok(expected) => expected,
             Err(error) => {
-                return FilePromotionOutcome::NoEffect {
-                    error,
-                    staged: self,
-                };
+                return FilePromotionOutcome::NoEffect { error, item: self };
             }
         };
         let attempt_id = match self.token.allocate_publication_attempt() {
             Ok(attempt_id) => attempt_id,
             Err(error) => {
-                return FilePromotionOutcome::NoEffect {
-                    error,
-                    staged: self,
-                };
+                return FilePromotionOutcome::NoEffect { error, item: self };
             }
         };
         let mut attempt = match platform::prepare_publication(
@@ -12319,10 +12024,7 @@ impl SealedStagedFile {
         ) {
             Ok(attempt) => attempt,
             Err(error) => {
-                return FilePromotionOutcome::NoEffect {
-                    error,
-                    staged: self,
-                };
+                return FilePromotionOutcome::NoEffect { error, item: self };
             }
         };
         if let Err(error) = self.token.prepare_promotion(
@@ -12333,10 +12035,7 @@ impl SealedStagedFile {
             displaced.map(|parked| &parked.token),
             expected_recovery.as_ref(),
         ) {
-            return FilePromotionOutcome::NoEffect {
-                error,
-                staged: self,
-            };
+            return FilePromotionOutcome::NoEffect { error, item: self };
         }
 
         let rename = platform::rename_no_replace(
@@ -12500,10 +12199,7 @@ impl SealedStagedFile {
                     identity_changed("promotion reported success without changing topology")
                 });
                 match self.token.update(StageRegistryPhase::Sealed) {
-                    Ok(()) => FilePromotionOutcome::NoEffect {
-                        error,
-                        staged: self,
-                    },
+                    Ok(()) => FilePromotionOutcome::NoEffect { error, item: self },
                     Err(update) => {
                         FilePromotionOutcome::AppliedUnverified(Box::new(FilePromotionObligation {
                             error: io::Error::other(format!(
@@ -12818,7 +12514,10 @@ fn continue_file_replace(
         FilePromotionOutcome::Applied(current) => {
             FileReplaceOutcome::Replaced { current, displaced }
         }
-        FilePromotionOutcome::NoEffect { error, staged } => {
+        FilePromotionOutcome::NoEffect {
+            error,
+            item: staged,
+        } => {
             let Some(displaced) = displaced else {
                 return FileReplaceOutcome::NoEffect {
                     error,
@@ -12854,21 +12553,22 @@ fn restore_displaced_after_failed_replace(
     promotion_error: io::Error,
 ) -> FileReplaceOutcome {
     match displaced.restore() {
-        FileRestoreOutcome::Restored(file) => FileReplaceOutcome::NoEffect {
+        FileRestoreOutcome::Applied(file) => FileReplaceOutcome::NoEffect {
             error: promotion_error,
             staged,
             destination: receipt.rebuild_after_restore(file),
         },
-        FileRestoreOutcome::NoEffect { error, parked } => {
-            FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
-                error,
-                state: Some(Box::new(FileReplaceObligationState::RestoreParked {
-                    parked,
-                    staged,
-                    receipt,
-                })),
-            })
-        }
+        FileRestoreOutcome::NoEffect {
+            error,
+            item: parked,
+        } => FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
+            error,
+            state: Some(Box::new(FileReplaceObligationState::RestoreParked {
+                parked,
+                staged,
+                receipt,
+            })),
+        }),
         FileRestoreOutcome::AppliedUnverified(restore) => {
             FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
                 error: io::Error::other("replacement rollback is not yet settled"),
@@ -12966,11 +12666,11 @@ fn settle_file_replace(
             staged,
             receipt,
         } => match parked.restore() {
-            FileRestoreOutcome::Restored(file) => Ok(FileReplaceResolution::NoEffect {
+            FileRestoreOutcome::Applied(file) => Ok(FileReplaceResolution::NoEffect {
                 staged,
                 destination: receipt.rebuild_after_restore(file),
             }),
-            FileRestoreOutcome::NoEffect { parked, .. } => {
+            FileRestoreOutcome::NoEffect { item: parked, .. } => {
                 Err(Box::new(FileReplaceObligationState::RestoreParked {
                     parked,
                     staged,
@@ -12990,7 +12690,7 @@ fn settle_file_replace(
             staged,
             receipt,
         } => match restore.reconcile() {
-            FileRestoreResolution::Restored(file) => Ok(FileReplaceResolution::NoEffect {
+            FileRestoreResolution::Applied(file) => Ok(FileReplaceResolution::NoEffect {
                 staged,
                 destination: receipt.rebuild_after_restore(file),
             }),
@@ -13140,7 +12840,7 @@ impl SessionDrainRecoveryState {
                 continue;
             };
             match obligation.reconcile_with_recovery(permit) {
-                FileRemovalResolution::Removed => {}
+                FileRemovalResolution::Applied(()) => {}
                 FileRemovalResolution::NoEffect(parked) => {
                     self.files.push(parked);
                 }
@@ -13161,7 +12861,7 @@ impl SessionDrainRecoveryState {
                 continue;
             };
             match obligation.reconcile_with_recovery(permit) {
-                FileRestoreResolution::Restored(_) => {}
+                FileRestoreResolution::Applied(_) => {}
                 FileRestoreResolution::NoEffect(parked) => {
                     self.files.push(parked);
                 }
@@ -13179,15 +12879,15 @@ impl SessionDrainRecoveryState {
             };
             match decision {
                 DrainRecoveryDecision::Remove => match parked.remove_with_recovery(permit) {
-                    FileRemovalOutcome::Removed => {}
-                    FileRemovalOutcome::NoEffect { parked, .. } => self.files.push(parked),
+                    FileRemovalOutcome::Applied(()) => {}
+                    FileRemovalOutcome::NoEffect { item: parked, .. } => self.files.push(parked),
                     FileRemovalOutcome::AppliedUnverified(obligation) => {
                         self.file_removals.push(obligation);
                     }
                 },
                 DrainRecoveryDecision::Restore => match parked.restore_with_recovery(permit) {
-                    FileRestoreOutcome::Restored(_) => {}
-                    FileRestoreOutcome::NoEffect { parked, .. } => self.files.push(parked),
+                    FileRestoreOutcome::Applied(_) => {}
+                    FileRestoreOutcome::NoEffect { item: parked, .. } => self.files.push(parked),
                     FileRestoreOutcome::AppliedUnverified(obligation) => {
                         self.file_restores.push(obligation);
                     }
@@ -13207,7 +12907,7 @@ impl SessionDrainRecoveryState {
                 continue;
             };
             match obligation.reconcile_with_recovery(permit) {
-                DirectoryRemovalResolution::Removed => {}
+                DirectoryRemovalResolution::Applied(()) => {}
                 DirectoryRemovalResolution::NoEffect(parked) => {
                     self.directories.push(parked);
                 }
@@ -13228,7 +12928,7 @@ impl SessionDrainRecoveryState {
                 continue;
             };
             match obligation.reconcile_with_recovery(permit) {
-                DirectoryRestoreResolution::Restored(_) => {}
+                DirectoryRestoreResolution::Applied(_) => {}
                 DirectoryRestoreResolution::NoEffect(parked) => {
                     self.directories.push(parked);
                 }
@@ -13246,8 +12946,8 @@ impl SessionDrainRecoveryState {
             };
             match decision {
                 DrainRecoveryDecision::Remove => match parked.remove_empty_with_recovery(permit) {
-                    DirectoryRemovalOutcome::Removed => {}
-                    DirectoryRemovalOutcome::NoEffect { parked, .. } => {
+                    DirectoryRemovalOutcome::Applied(()) => {}
+                    DirectoryRemovalOutcome::NoEffect { item: parked, .. } => {
                         self.directories.push(parked);
                     }
                     DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
@@ -13255,8 +12955,8 @@ impl SessionDrainRecoveryState {
                     }
                 },
                 DrainRecoveryDecision::Restore => match parked.restore_with_recovery(permit) {
-                    DirectoryRestoreOutcome::Restored(_) => {}
-                    DirectoryRestoreOutcome::NoEffect { parked, .. } => {
+                    DirectoryRestoreOutcome::Applied(_) => {}
+                    DirectoryRestoreOutcome::NoEffect { item: parked, .. } => {
                         self.directories.push(parked);
                     }
                     DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
@@ -13796,10 +13496,6 @@ impl RootRevokeStartFailure {
         }
     }
 
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn retry(mut self) -> RootRevokeOutcome {
         self.session
             .take()
@@ -13807,6 +13503,8 @@ impl RootRevokeStartFailure {
             .revoke()
     }
 }
+
+impl_error_accessor!(RootRevokeStartFailure);
 
 #[must_use = "revocation drain failure retains the draining authority and must be retried"]
 pub struct RootRevokeDrainFailure {
@@ -13824,10 +13522,6 @@ impl RootRevokeDrainFailure {
         }
     }
 
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn retry(mut self) -> RootRevokeOutcome {
         self.drain
             .take()
@@ -13835,6 +13529,8 @@ impl RootRevokeDrainFailure {
             .try_settle()
     }
 }
+
+impl_error_accessor!(RootRevokeDrainFailure);
 
 #[must_use = "reset outcome retains linear session authority until it is terminal"]
 #[derive(Debug)]
@@ -13948,10 +13644,6 @@ impl ResetStartFailure {
         }
     }
 
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn retry(mut self) -> ResetStartOutcome {
         self.session
             .take()
@@ -13965,6 +13657,8 @@ impl ResetStartFailure {
             .expect("reset start refusal retains session")
     }
 }
+
+impl_error_accessor!(ResetStartFailure);
 
 impl Drop for ResetStartFailure {
     fn drop(&mut self) {
@@ -13990,10 +13684,6 @@ impl ResetDrainFailure {
         }
     }
 
-    pub fn error(&self) -> &io::Error {
-        &self.error
-    }
-
     pub fn retry(mut self) -> ResetStartOutcome {
         self.drain
             .take()
@@ -14008,6 +13698,8 @@ impl ResetDrainFailure {
             .cancel_reset()
     }
 }
+
+impl_error_accessor!(ResetDrainFailure);
 
 impl Drop for ResetDrainFailure {
     fn drop(&mut self) {
@@ -15141,7 +14833,7 @@ mod tests {
         let name = LeafName::new("published.bin").expect("published leaf");
 
         let staged = match staged.promote_no_replace(&root, &root, &name) {
-            FilePromotionOutcome::NoEffect { staged, .. } => staged,
+            FilePromotionOutcome::NoEffect { item: staged, .. } => staged,
             FilePromotionOutcome::Applied(_) => panic!("collision replaced its destination"),
             FilePromotionOutcome::AppliedUnverified(obligation) => {
                 panic!("collision remained indeterminate: {}", obligation.error())
@@ -15171,7 +14863,7 @@ mod tests {
         let name = LeafName::new("published.bin").expect("published leaf");
 
         let staged = match staged.promote_no_replace(&root, &root, &name) {
-            FilePromotionOutcome::NoEffect { staged, .. } => staged,
+            FilePromotionOutcome::NoEffect { item: staged, .. } => staged,
             FilePromotionOutcome::Applied(_) => panic!("changed sealed stage was published"),
             FilePromotionOutcome::AppliedUnverified(obligation) => panic!(
                 "changed sealed stage became indeterminate: {}",
@@ -15198,7 +14890,10 @@ mod tests {
         let destination = LeafName::new("RESERVED.BIN").expect("portable alias");
 
         let staged = match staged.promote_no_replace(&root, &root, &destination) {
-            FilePromotionOutcome::NoEffect { error, staged } => {
+            FilePromotionOutcome::NoEffect {
+                error,
+                item: staged,
+            } => {
                 assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
                 staged
             }
@@ -15210,7 +14905,7 @@ mod tests {
         };
         assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
         let restored = match parked.restore() {
-            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::Applied(file) => file,
             FileRestoreOutcome::NoEffect { error, .. } => {
                 panic!("park restoration had no effect: {error}")
             }
@@ -15242,7 +14937,7 @@ mod tests {
             .validate_current()
             .expect("second checkout restored learned revision");
         let restored = match parked.restore() {
-            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::Applied(file) => file,
             FileRestoreOutcome::NoEffect { error, .. } => {
                 panic!("park restoration had no effect: {error}")
             }
@@ -15303,7 +14998,7 @@ mod tests {
         )
         .expect("restore first park topology");
         let restored = match first.restore() {
-            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::Applied(file) => file,
             FileRestoreOutcome::NoEffect { error, .. } => {
                 panic!("first park restoration had no effect: {error}")
             }
@@ -15462,9 +15157,12 @@ mod tests {
         displaced
             .validate_current()
             .expect("stage disarm released only the replacement handoff");
-        assert!(matches!(displaced.remove(), FileRemovalOutcome::Removed));
+        assert!(matches!(
+            displaced.remove(),
+            FileRemovalOutcome::Applied(())
+        ));
         let restored = match unrelated.restore() {
-            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::Applied(file) => file,
             FileRestoreOutcome::NoEffect { error, .. } => {
                 panic!("unrelated park restoration had no effect: {error}")
             }
@@ -15571,7 +15269,7 @@ mod tests {
             .expect("no-effect classification released park link");
         assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
         let restored = match parked.restore() {
-            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::Applied(file) => file,
             FileRestoreOutcome::NoEffect { error, .. } => {
                 panic!("park restoration had no effect: {error}")
             }
@@ -15680,7 +15378,7 @@ mod tests {
         drop((operation, authority, admitted));
 
         let restored = match parked.restore() {
-            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::Applied(directory) => directory,
             DirectoryRestoreOutcome::NoEffect { error, .. } => {
                 panic!("directory restoration had no effect: {error}")
             }
@@ -15713,11 +15411,14 @@ mod tests {
         let nested_park = park_test_file(&child, "owned.bin", "owned.park", b"payload");
 
         let tree = match tree.park_as(LeafName::new("tree.park").expect("tree park leaf")) {
-            DirectoryParkOutcome::NoEffect { error, directory } => {
+            DirectoryParkOutcome::NoEffect {
+                error,
+                item: directory,
+            } => {
                 assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
                 directory
             }
-            DirectoryParkOutcome::Parked(_) => {
+            DirectoryParkOutcome::Applied(_) => {
                 panic!("directory park ignored a nested file park owner")
             }
             DirectoryParkOutcome::AppliedUnverified(obligation) => panic!(
@@ -15726,7 +15427,7 @@ mod tests {
             ),
         };
         let nested_file = match nested_park.restore() {
-            FileRestoreOutcome::Restored(file) => file,
+            FileRestoreOutcome::Applied(file) => file,
             FileRestoreOutcome::NoEffect { error, .. } => {
                 panic!("nested file restoration had no effect: {error}")
             }
@@ -15740,7 +15441,7 @@ mod tests {
         drop((nested_file, child));
 
         let parked_tree = match tree.park_as(LeafName::new("tree.park").expect("tree park leaf")) {
-            DirectoryParkOutcome::Parked(parked) => parked,
+            DirectoryParkOutcome::Applied(parked) => parked,
             DirectoryParkOutcome::NoEffect { error, .. } => {
                 panic!("tree park had no effect: {error}")
             }
@@ -15805,7 +15506,10 @@ mod tests {
             &parked_child,
             &LeafName::new("nested-publication").expect("nested publication"),
         ) {
-            FilePromotionOutcome::NoEffect { error, staged } => {
+            FilePromotionOutcome::NoEffect {
+                error,
+                item: staged,
+            } => {
                 assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
                 staged
             }
@@ -15845,7 +15549,7 @@ mod tests {
         };
         drop((nested_file, parked_child, parked_tree_view, authority));
         let restored_tree = match parked_tree.restore() {
-            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::Applied(directory) => directory,
             DirectoryRestoreOutcome::NoEffect { error, .. } => {
                 panic!("tree restoration had no effect: {error}")
             }
@@ -17189,7 +16893,7 @@ mod tests {
             .open_directory(&LeafName::new(name).expect("directory leaf"))
             .expect("directory capability");
         match directory.park_as(LeafName::new(park_name).expect("park leaf")) {
-            DirectoryParkOutcome::Parked(parked) => parked,
+            DirectoryParkOutcome::Applied(parked) => parked,
             DirectoryParkOutcome::NoEffect { error, .. } => {
                 panic!("directory park had no effect: {error}")
             }
@@ -17498,7 +17202,10 @@ mod tests {
     fn require_test_promotion(outcome: FilePromotionOutcome) -> FileCapability {
         match outcome {
             FilePromotionOutcome::Applied(file) => file,
-            FilePromotionOutcome::NoEffect { error, staged } => {
+            FilePromotionOutcome::NoEffect {
+                error,
+                item: staged,
+            } => {
                 assert!(matches!(staged.discard(), StageDiscardOutcome::Discarded));
                 panic!("stage promotion had no effect: {error}");
             }
@@ -17523,7 +17230,7 @@ mod tests {
 
     fn require_test_promotion_no_effect(outcome: FilePromotionOutcome) -> SealedStagedFile {
         match outcome {
-            FilePromotionOutcome::NoEffect { staged, .. } => staged,
+            FilePromotionOutcome::NoEffect { item: staged, .. } => staged,
             FilePromotionOutcome::Applied(_) => panic!("stage promotion unexpectedly applied"),
             FilePromotionOutcome::AppliedUnverified(obligation) => {
                 match (*obligation).reconcile() {
@@ -18000,7 +17707,7 @@ mod tests {
         };
         assert_eq!(directory_refusal.error().kind(), io::ErrorKind::WouldBlock);
         let directory = match parked_directory.restore() {
-            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::Applied(directory) => directory,
             DirectoryRestoreOutcome::NoEffect { error, .. } => {
                 panic!("raw directory restore had no effect: {error}")
             }
@@ -18156,7 +17863,9 @@ mod tests {
         ));
 
         let directory = match directory.park_as(park_name) {
-            DirectoryParkOutcome::NoEffect { directory, .. } => directory,
+            DirectoryParkOutcome::NoEffect {
+                item: directory, ..
+            } => directory,
             outcome => panic!("case-equivalent destination was not preserved: {outcome:?}"),
         };
         assert_eq!(
@@ -19155,7 +18864,7 @@ mod tests {
             &destination,
             &LeafName::new("collision.bin").expect("collision leaf"),
         ) {
-            FileMoveOutcome::NoEffect { file, .. } => {
+            FileMoveOutcome::NoEffect { item: file, .. } => {
                 assert_eq!(file.read_bounded(16).expect("source bytes"), b"source");
             }
             FileMoveOutcome::Applied(_) => panic!("collision replaced its destination"),
@@ -19281,7 +18990,9 @@ mod tests {
             &destination,
             &LeafName::new("collision").expect("collision leaf"),
         ) {
-            DirectoryMoveOutcome::NoEffect { directory, .. } => {
+            DirectoryMoveOutcome::NoEffect {
+                item: directory, ..
+            } => {
                 directory.entries(1).expect("source remains admitted");
             }
             DirectoryMoveOutcome::Applied(_) => panic!("collision replaced its destination"),
@@ -21665,11 +21376,14 @@ mod tests {
             .expect("directory capability");
         let directory_error =
             match directory.park_as(LeafName::new("WORLD").expect("directory alias")) {
-                DirectoryParkOutcome::NoEffect { error, directory } => {
+                DirectoryParkOutcome::NoEffect {
+                    error,
+                    item: directory,
+                } => {
                     drop(directory);
                     error
                 }
-                DirectoryParkOutcome::Parked(_) => panic!("same-binding directory park applied"),
+                DirectoryParkOutcome::Applied(_) => panic!("same-binding directory park applied"),
                 DirectoryParkOutcome::AppliedUnverified(_) => {
                     panic!("same-binding directory park became indeterminate")
                 }
@@ -22998,7 +22712,7 @@ mod tests {
         drop(guard);
         drop(operation);
         let restored = match parked.restore() {
-            DirectoryRestoreOutcome::Restored(directory) => directory,
+            DirectoryRestoreOutcome::Applied(directory) => directory,
             DirectoryRestoreOutcome::NoEffect { error, .. } => {
                 panic!("directory restoration had no effect: {error}")
             }

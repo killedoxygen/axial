@@ -398,10 +398,10 @@ impl super::create::InstanceService {
             }
             let (outcome, retained_pin) = plan.execute().into_parts();
             match outcome {
-                axial_fs::DirectoryParkOutcome::Parked(parked) => {
+                axial_fs::DirectoryParkOutcome::Applied(parked) => {
                     if let Err(error) = journal.commit(&mut record) {
                         match parked.restore() {
-                            axial_fs::DirectoryRestoreOutcome::Restored(_) => {
+                            axial_fs::DirectoryRestoreOutcome::Applied(_) => {
                                 journal.restored(&mut record)?;
                             }
                             unresolved => self
@@ -504,7 +504,7 @@ impl super::create::InstanceService {
                 let (parked, pin) = retained.into_parts();
                 if record.phase == DeletionPhase::Prepared {
                     match parked.restore() {
-                        axial_fs::DirectoryRestoreOutcome::Restored(_) => {
+                        axial_fs::DirectoryRestoreOutcome::Applied(_) => {
                             journal.restored(&mut record)
                         }
                         unresolved => {

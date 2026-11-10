@@ -171,7 +171,7 @@ impl PendingRootReset {
                             self.intent = Some(intent);
                             None
                         }
-                        FilePromotionOutcome::NoEffect { staged, .. } => {
+                        FilePromotionOutcome::NoEffect { item: staged, .. } => {
                             Some(Publication::Publishing(staged))
                         }
                         FilePromotionOutcome::AppliedUnverified(effect) => {

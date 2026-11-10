@@ -493,7 +493,7 @@ fn remove_stored_archive(
     let (outcome, pin) = file.park(digest, root).into_parts();
     let effect = match outcome {
         axial_fs::FileParkOutcome::Parked(parked) => match parked.remove() {
-            axial_fs::FileRemovalOutcome::Removed => return Ok(()),
+            axial_fs::FileRemovalOutcome::Applied(()) => return Ok(()),
             outcome => NativeEffect::FileRemove(outcome, pin),
         },
         axial_fs::FileParkOutcome::NoEffect { .. }

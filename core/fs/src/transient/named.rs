@@ -326,7 +326,10 @@ pub(super) fn link_transient_file(
             });
             validate_published(file, &mut storage)
         }
-        FilePromotionOutcome::NoEffect { error, staged } => {
+        FilePromotionOutcome::NoEffect {
+            error,
+            item: staged,
+        } => {
             storage.state = Some(State::Sealed(staged));
             Err(error)
         }

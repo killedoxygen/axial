@@ -92,7 +92,7 @@ impl DirectoryParkPlan {
         let outcome = match checked {
             Err(error) => axial_fs::DirectoryParkOutcome::NoEffect {
                 error,
-                directory: self.source.directory,
+                item: self.source.directory,
             },
             Ok(()) => self.source.directory.park_as(leaf(
                 &PortableName::new_exact(&self.receipt.park_name)
