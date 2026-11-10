@@ -1,3 +1,15 @@
+macro_rules! impl_redacted_debug {
+    ($type:ty) => {
+        impl std::fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter
+                    .debug_struct(stringify!($type))
+                    .finish_non_exhaustive()
+            }
+        }
+    };
+}
+
 mod control_frame;
 mod platform;
 mod recovery;
@@ -63,18 +75,6 @@ pub const MAX_REVISION_DEPTH: usize = 256;
 const MAX_OUTSTANDING_EFFECTS: usize = 512;
 const MAX_FILE_RANGE_BYTES: usize = 128 * 1024;
 
-macro_rules! impl_redacted_debug {
-    ($type:ty) => {
-        impl fmt::Debug for $type {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter
-                    .debug_struct(stringify!($type))
-                    .finish_non_exhaustive()
-            }
-        }
-    };
-}
-
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LeafName(OsString);
 
@@ -103,13 +103,7 @@ impl Borrow<[u8]> for LeafNameEquivalenceKey {
     }
 }
 
-impl fmt::Debug for LeafNameEquivalenceKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LeafNameEquivalenceKey")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(LeafNameEquivalenceKey);
 
 /// Returns the small set of lookup keys needed to find every name that the
 /// platform or the portable spelling rules can consider equivalent.
@@ -235,13 +229,7 @@ pub struct DirectoryRevision {
 
 impl_redacted_debug!(DirectoryRevision);
 
-impl fmt::Debug for DirectoryIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DirectoryIdentity")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(DirectoryIdentity);
 
 impl DirectoryIdentity {
     /// Stable comparison evidence only. This never reconstructs a capability.
@@ -657,13 +645,7 @@ pub struct FilePromotionObligation {
     receipt: platform::PublicationReceipt,
 }
 
-impl fmt::Debug for FilePromotionObligation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FilePromotionObligation")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(FilePromotionObligation);
 
 impl FilePromotionObligation {
     pub fn error(&self) -> &io::Error {
@@ -4766,11 +4748,7 @@ impl Drop for DirectoryParkRecordGuard {
     }
 }
 
-impl fmt::Debug for StageToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("StageToken").finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(StageToken);
 
 impl CapabilityAuthority {
     fn state(&self) -> io::Result<std::sync::MutexGuard<'_, OperationState>> {
@@ -7815,11 +7793,7 @@ impl AdmittedAbsoluteDirectory {
     }
 }
 
-impl fmt::Debug for Directory {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Directory").finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(Directory);
 
 fn live_recovery_record(
     state: &OperationState,
@@ -11381,13 +11355,7 @@ impl FileParkRequest {
     }
 }
 
-impl fmt::Debug for FileCapability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FileCapability")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(FileCapability);
 
 impl FileCapability {
     pub fn validate_within(&self, anchor: &Directory) -> io::Result<()> {
@@ -12089,11 +12057,7 @@ pub struct StagedFile {
     token: StageToken,
 }
 
-impl fmt::Debug for StagedFile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("StagedFile").finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(StagedFile);
 
 impl StagedFile {
     pub fn writer(&mut self) -> io::Result<StagedWriter<'_>> {
@@ -12202,13 +12166,7 @@ pub struct StageSealFailure {
     staged: Option<StagedFile>,
 }
 
-impl fmt::Debug for StageSealFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("StageSealFailure")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(StageSealFailure);
 
 impl StageSealFailure {
     fn new(error: io::Error, staged: StagedFile) -> Self {
@@ -12237,13 +12195,7 @@ pub struct SealedStagedFile {
     published: Option<File>,
 }
 
-impl fmt::Debug for SealedStagedFile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SealedStagedFile")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(SealedStagedFile);
 
 impl SealedStagedFile {
     pub fn discard(self) -> StageDiscardOutcome {
@@ -13484,13 +13436,7 @@ impl SessionDrainRecoveryState {
     }
 }
 
-impl fmt::Debug for RootSession {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RootSession")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(RootSession);
 
 impl RootSession {
     pub fn acquire(path: &Path) -> RootSessionAcquireOutcome {
@@ -14103,13 +14049,7 @@ pub struct ResetStartFailure {
     session: Option<RootSession>,
 }
 
-impl fmt::Debug for ResetStartFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ResetStartFailure")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(ResetStartFailure);
 
 impl ResetStartFailure {
     fn new(session: RootSession, error: io::Error) -> Self {
@@ -14193,13 +14133,7 @@ pub struct RootResetAuthority {
     session: Option<RootSession>,
 }
 
-impl fmt::Debug for RootResetAuthority {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RootResetAuthority")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(RootResetAuthority);
 
 impl RootResetAuthority {
     pub fn root_identity(&self) -> DirectoryIdentity {

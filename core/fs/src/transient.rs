@@ -705,13 +705,7 @@ pub struct TransientDestination {
     token: Option<TransientDestinationToken>,
 }
 
-impl std::fmt::Debug for TransientDestination {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientDestination")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientDestination);
 
 impl TransientDestination {
     pub fn name(&self) -> &LeafName {
@@ -844,13 +838,7 @@ pub enum TransientDestinationCancelOutcome {
     Pending(TransientDestinationCancelObligation),
 }
 
-impl std::fmt::Debug for TransientDestinationCancelOutcome {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientDestinationCancelOutcome")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientDestinationCancelOutcome);
 
 #[must_use = "pending transient destination cancellation must be reconciled"]
 pub struct TransientDestinationCancelObligation {
@@ -858,13 +846,7 @@ pub struct TransientDestinationCancelObligation {
     destination: Option<TransientDestination>,
 }
 
-impl std::fmt::Debug for TransientDestinationCancelObligation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientDestinationCancelObligation")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientDestinationCancelObligation);
 
 fn pending_destination_cancel(
     error: io::Error,
@@ -1002,13 +984,7 @@ pub enum TransientStageCreateOutcome {
     Pending(TransientCreationObligation),
 }
 
-impl std::fmt::Debug for TransientStageCreateOutcome {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientStageCreateOutcome")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientStageCreateOutcome);
 
 enum TransientCreationState {
     Stage(TransientStage),
@@ -1025,13 +1001,7 @@ pub struct TransientCreationObligation {
     state: Option<TransientCreationState>,
 }
 
-impl std::fmt::Debug for TransientCreationObligation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientCreationObligation")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientCreationObligation);
 
 impl TransientCreationObligation {
     pub fn error(&self) -> &io::Error {
@@ -1234,13 +1204,7 @@ pub struct TransientStageSealFailure {
     stage: Option<TransientStage>,
 }
 
-impl std::fmt::Debug for TransientStageSealFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientStageSealFailure")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientStageSealFailure);
 
 impl TransientStageSealFailure {
     pub fn error(&self) -> &io::Error {
@@ -1258,13 +1222,7 @@ pub struct TransientStageSealed {
     read_position: u64,
 }
 
-impl std::fmt::Debug for TransientStageSealed {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientStageSealed")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientStageSealed);
 
 impl TransientStageSealed {
     pub fn size(&self) -> u64 {
@@ -1741,13 +1699,7 @@ pub struct TransientPublicationBatchCreateFailure {
     stages: Option<Vec<TransientStageSealed>>,
 }
 
-impl std::fmt::Debug for TransientPublicationBatchCreateFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientPublicationBatchCreateFailure")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientPublicationBatchCreateFailure);
 
 impl TransientPublicationBatchCreateFailure {
     pub fn error(&self) -> &io::Error {
@@ -1785,13 +1737,7 @@ pub enum TransientPublicationMember {
     Unpublished(TransientStageSealed),
 }
 
-impl std::fmt::Debug for TransientPublicationBatchOutcome {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientPublicationBatchOutcome")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientPublicationBatchOutcome);
 
 struct TransientPublicationTransition {
     stage: Option<TransientStageSealed>,
@@ -1998,13 +1944,7 @@ pub struct TransientPublicationBatchObligation {
     batch: Option<TransientPublicationBatch>,
 }
 
-impl std::fmt::Debug for TransientPublicationBatchObligation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientPublicationBatchObligation")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientPublicationBatchObligation);
 
 impl TransientPublicationBatch {
     pub fn new(
@@ -2438,13 +2378,7 @@ pub enum TransientDiscardOutcome {
     Pending(TransientDiscardObligation),
 }
 
-impl std::fmt::Debug for TransientDiscardOutcome {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientDiscardOutcome")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientDiscardOutcome);
 
 #[must_use = "pending transient discard authority must be reconciled"]
 pub struct TransientDiscardObligation {
@@ -2460,13 +2394,7 @@ enum TransientDiscardState {
     },
 }
 
-impl std::fmt::Debug for TransientDiscardObligation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TransientDiscardObligation")
-            .finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(TransientDiscardObligation);
 
 impl TransientDiscardObligation {
     pub fn error(&self) -> &io::Error {

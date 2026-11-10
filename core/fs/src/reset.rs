@@ -37,11 +37,7 @@ pub struct PendingRootReset {
     complete: bool,
 }
 
-impl fmt::Debug for PendingRootReset {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PendingRootReset").finish_non_exhaustive()
-    }
-}
+impl_redacted_debug!(PendingRootReset);
 
 impl RootSession {
     /// Inspect only after normal lease/recovery admission. A valid fence means
