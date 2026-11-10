@@ -562,15 +562,11 @@ mod tests {
     }
 
     #[test]
-    fn future_timestamp_is_not_fresh() {
+    fn future_or_negative_timestamps_are_not_fresh() {
         assert!(!is_cache_fresh(
             Utc::now().timestamp_millis() + 60_000,
             Duration::from_secs(120)
         ));
-    }
-
-    #[test]
-    fn negative_timestamp_is_not_fresh() {
         assert!(!is_cache_fresh(-1, Duration::from_secs(u64::MAX)));
     }
 

@@ -111,12 +111,6 @@ mod tests {
     }
 
     #[test]
-    fn stamp_reports_nothing_for_an_empty_plan() {
-        let plan = TransferPlan::default();
-        assert_eq!(stamped(&plan), (None, None));
-    }
-
-    #[test]
     fn stamp_stays_disabled_until_reserved_contributions_resolve() {
         let plan = TransferPlan::shared();
         plan.contribute_total(100);

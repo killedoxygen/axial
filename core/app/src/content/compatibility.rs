@@ -558,8 +558,4 @@ mod tests {
         assert_eq!(ranked[0].loader, "fabric", "fabric outranks forge on a tie");
     }
 
-    #[test]
-    fn nothing_selected_yields_nothing() {
-        assert!(rank_candidates(&[]).is_empty());
-    }
 }

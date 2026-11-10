@@ -2613,25 +2613,20 @@ fn asset_index_requires_declared_object_size_but_accepts_explicit_zero() {
 }
 
 #[test]
-fn unique_asset_object_jobs_rejects_negative_size() {
-    let hash = "abcdef1234567890abcdef1234567890abcdef12";
-    let result = unique_asset_object_jobs(16, [(hash, -1)]);
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-}
-
-#[test]
-fn unique_asset_object_jobs_rejects_one_character_hash() {
-    let result = unique_asset_object_jobs(16, [("a", 4)]);
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-}
-
-#[test]
-fn unique_asset_object_jobs_rejects_non_hex_hash() {
-    let result = unique_asset_object_jobs(16, [("abcdef1234567890abcdef1234567890abcdef1z", 4)]);
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
+fn unique_asset_object_jobs_reject_negative_sizes_and_malformed_hashes() {
+    for (hash, size) in [
+        ("abcdef1234567890abcdef1234567890abcdef12", -1),
+        ("a", 4),
+        ("abcdef1234567890abcdef1234567890abcdef1z", 4),
+    ] {
+        assert!(
+            matches!(
+                unique_asset_object_jobs(16, [(hash, size)]),
+                Err(DownloadError::Integrity(_))
+            ),
+            "{hash} {size}"
+        );
+    }
 }
 
 fn checksumless_test_jar() -> Vec<u8> {
