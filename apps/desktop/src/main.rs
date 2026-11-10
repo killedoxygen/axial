@@ -283,9 +283,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     serde_json::json!({}),
                 );
             });
-            *setup_api_observer
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(observer);
+            *lock(&setup_api_observer) = Some(observer);
             Ok(())
         })
         .build(context);
@@ -325,10 +323,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     lifecycle.shutdown_after_event_loop().await;
     #[cfg(debug_assertions)]
     reset.quiesce_after_exit().await;
-    let observer = api_observer
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take();
+    let observer = lock(&api_observer).take();
     if let Some(observer) = observer {
         let _ = observer.await;
     }
@@ -361,6 +356,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tauri::process::restart(&restart_environment);
     }
     Ok(())
+}
+
+/// Poisoning never discards retained ownership; the guarded state stays authoritative.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn request_close(app: tauri::AppHandle, lifecycle: DesktopLifecycle) {

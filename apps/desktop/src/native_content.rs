@@ -99,10 +99,7 @@ impl NativeContentFiles {
         let token = uuid::Uuid::new_v4().simple().to_string();
         let names = files.iter().map(|(name, _)| name.clone()).collect();
         // A newer selection revokes any unread one.
-        *self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(Pending {
+        *crate::lock(&self.pending) = Some(Pending {
             token: token.clone(),
             expires_at: Instant::now() + HANDLE_TTL,
             files: files.into_iter().map(|(_, bytes)| Some(bytes)).collect(),
@@ -112,10 +109,7 @@ impl NativeContentFiles {
 
     fn take(&self, token: &str, index: usize) -> Result<Vec<u8>, String> {
         let invalid = || "The selected file is no longer available. Choose it again.".to_string();
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut pending = crate::lock(&self.pending);
         let current = pending
             .as_mut()
             .filter(|pending| pending.token == token && pending.expires_at > Instant::now())

@@ -93,10 +93,7 @@ impl NativeSkinFiles {
 
     pub fn close(&self) {
         self.admission.close();
-        self.export
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .closed = true;
+        crate::lock(&self.export).closed = true;
     }
 
     pub async fn drain(&self) -> Result<(), String> {
@@ -105,7 +102,7 @@ impl NativeSkinFiles {
         let _picker = self.files.picker.lock().await;
         let export = self.export.clone();
         tokio::task::spawn_blocking(move || {
-            let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = crate::lock(&export);
             if !state.closed {
                 return Err(CLOSED.to_string());
             }
@@ -228,7 +225,7 @@ impl NativeSkinFiles {
                     if !has_png_extension(&path) {
                         return Err("Choose a destination ending in .png.".into());
                     }
-                    let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
+                    let mut state = crate::lock(&export);
                     if state.closed {
                         return Ok(false);
                     }
@@ -253,7 +250,7 @@ impl NativeSkinFiles {
         }
         let export = self.export.clone();
         tokio::task::spawn_blocking(move || {
-            let mut state = export.lock().unwrap_or_else(|error| error.into_inner());
+            let mut state = crate::lock(&export);
             let destination = state
                 .destination
                 .as_mut()
@@ -343,7 +340,7 @@ pub async fn export_saved_skin_png(
     let tasks = skin.files.tasks.clone();
     let export = skin.export.clone();
     let handle = {
-        let state = export.lock().unwrap_or_else(|error| error.into_inner());
+        let state = crate::lock(&export);
         if state.closed {
             return Err(SkinExportError::Refused(CLOSED.into()));
         }

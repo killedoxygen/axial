@@ -80,10 +80,7 @@ pub async fn complete_reset(pending: crate::reset::PendingReset) {
 
 async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failure>) -> String {
     #[cfg(debug_assertions)]
-    let reset_decision = failure
-        .error
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+    let reset_decision = crate::lock(&failure.error)
         .as_ref()
         .is_some_and(StartupError::interrupted_reset)
         .then(|| Arc::new(ResetDecision::default()));
@@ -176,11 +173,7 @@ async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failur
         let confirmed = decision.finish();
         #[cfg(debug_assertions)]
         if confirmed && callback_completion.await.is_ok() {
-            let error = failure
-                .error
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
+            let error = crate::lock(&failure.error).take();
             let retained = Failure::new(
                 "Reset is incomplete. Axial will retain the profile and retry.".into(),
                 error,
@@ -302,15 +295,9 @@ fn escape_html(text: &str) -> String {
 fn try_preserve(failure: &Failure) -> Option<String> {
     #[cfg(debug_assertions)]
     if failure.resetting {
-        let mut reset = failure
-            .reset
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut reset = crate::lock(&failure.reset);
         if reset.is_none() {
-            let mut error = failure
-                .error
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut error = crate::lock(&failure.error);
             if let Some(pending) = error.as_mut() {
                 match pending.take_interrupted_reset_session() {
                     Ok(session) => {
@@ -327,35 +314,18 @@ fn try_preserve(failure: &Failure) -> Option<String> {
             }
             reset.take();
             let message = "Development profile reset completed.".to_string();
-            *failure
-                .safe_message
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(message.clone());
+            *crate::lock(&failure.safe_message) = Some(message.clone());
             return Some(message);
         }
-        return failure
-            .safe_message
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+        return crate::lock(&failure.safe_message).clone();
     }
-    let mut error = failure
-        .error
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut error = crate::lock(&failure.error);
     let Some(pending) = error.take() else {
-        return failure
-            .safe_message
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+        return crate::lock(&failure.safe_message).clone();
     };
     match pending.try_preserve() {
         Ok(message) => {
-            *failure
-                .safe_message
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(message.clone());
+            *crate::lock(&failure.safe_message) = Some(message.clone());
             Some(message)
         }
         Err(pending) => {

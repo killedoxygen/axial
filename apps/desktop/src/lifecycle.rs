@@ -8,7 +8,7 @@ use axial_app::{
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
@@ -113,31 +113,27 @@ impl DesktopLifecycle {
         }
     }
 
+    fn state(&self) -> MutexGuard<'_, TerminalState> {
+        crate::lock(&self.terminal)
+    }
+
     fn retained_services(&self) -> Result<LifecycleServices, String> {
-        self.services
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        crate::lock(&self.services)
             .clone()
             .ok_or_else(|| SHUTDOWN_INCOMPLETE.to_string())
     }
 
     #[cfg(debug_assertions)]
     pub(crate) fn ensure_reset_allowed(&self) -> TerminalResult {
-        Ok(self
-            .retained_services()?
-            .server
-            .recovery()
-            .ensure_reset_allowed()?)
+        let recovery = self.retained_services()?.server.recovery();
+        recovery.ensure_reset_allowed().map_err(Into::into)
     }
 
     /// Tauri plugins and late IPC resolvers can retain managed facades after
     /// run_return. Release this shared payload only after actual shutdown joins;
     /// accepted effects keep their own strong captures until they return.
     pub fn release_services_after_exit(&self) -> TerminalResult {
-        let state = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state();
         if !state.event_loop_settled
             || state.active.is_some()
             || (state.admitted
@@ -147,10 +143,7 @@ impl DesktopLifecycle {
         {
             return Err(SHUTDOWN_INCOMPLETE.into());
         }
-        let mut services = self
-            .services
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut services = crate::lock(&self.services);
         if services
             .as_ref()
             .is_some_and(|services| !services.server.is_shutdown_settled())
@@ -172,10 +165,7 @@ impl DesktopLifecycle {
     /// exit. Main consumes this after cleanup and releases service owners before
     /// launching the successor process.
     pub fn restart_after_exit(&self) -> bool {
-        let state = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state();
         self.exit_allowed()
             && state.event_loop_ended
             && state.admitted
@@ -196,9 +186,7 @@ impl DesktopLifecycle {
     }
 
     pub fn pending_interface_preferences(&self) -> Option<InterfacePreferencesEvent> {
-        self.terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        self.state()
             .preferences
             .as_ref()
             .map(|request| request.event.clone())
@@ -214,10 +202,7 @@ impl DesktopLifecycle {
         if request_id.is_empty() || request_id.len() > 32 {
             return Err(PREFERENCES_ACK_INVALID.into());
         }
-        let mut state = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         if state.event_loop_ended || state.admitted || state.active.is_none() {
             return Err(PREFERENCES_ACK_INVALID.into());
         }
@@ -260,10 +245,7 @@ impl DesktopLifecycle {
 
     pub async fn prepare_exit(&self, intent: TerminalIntent) -> TerminalResult {
         let mut receiver = {
-            let mut state = self
-                .terminal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state();
             if state.event_loop_ended && (!state.admitted || state.intent != Some(intent)) {
                 return Err(SHUTDOWN_INCOMPLETE.into());
             }
@@ -329,11 +311,7 @@ impl DesktopLifecycle {
 
     async fn prepare_and_settle(&self, intent: TerminalIntent) -> TerminalResult {
         let services = self.retained_services()?;
-        let admitted = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .admitted;
+        let admitted = self.state().admitted;
         let recovery = services.server.recovery();
         if !admitted {
             match intent {
@@ -351,10 +329,7 @@ impl DesktopLifecycle {
                 .flush_pending()
                 .await
                 .map_err(|error| format!("Could not finish pending skin changes: {error}"))?;
-            let mut state = self
-                .terminal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state();
             if state.event_loop_ended || state.intent != Some(intent) {
                 return Err(SHUTDOWN_INCOMPLETE.into());
             }
@@ -387,10 +362,7 @@ impl DesktopLifecycle {
             return Ok(());
         }
         let event = {
-            let mut state = self
-                .terminal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self.state();
             if state.event_loop_ended {
                 return Err(SHUTDOWN_INCOMPLETE.into());
             }
@@ -419,10 +391,7 @@ impl DesktopLifecycle {
                 tokio::pin!(changed);
                 changed.as_mut().enable();
                 {
-                    let state = self
-                        .terminal
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
+                    let state = self.state();
                     if state.event_loop_ended {
                         return Err(SHUTDOWN_INCOMPLETE.to_string());
                     }
@@ -456,10 +425,7 @@ impl DesktopLifecycle {
     pub async fn prepare_update_process_exit(&self) -> TerminalResult {
         let services = self.retained_services()?;
         {
-            let state = self
-                .terminal
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let state = self.state();
             if state.intent != Some(TerminalIntent::Update)
                 || !state.prepared
                 || state.update_settled
@@ -472,10 +438,7 @@ impl DesktopLifecycle {
 
     /// A panic or ambiguous native installation must not call this method.
     pub fn finish_update_settled(&self) -> TerminalResult {
-        let mut state = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         if state.intent != Some(TerminalIntent::Update) || !state.prepared {
             return Err("The native update has not entered its installation phase.".into());
         }
@@ -491,10 +454,7 @@ impl DesktopLifecycle {
             // Only a previously completed post-loop shutdown can release it.
             return;
         };
-        self.terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .event_loop_ended = true;
+        self.state().event_loop_ended = true;
         self.terminal_changed.notify_waiters();
         // A native installer owns effects outside TaskOwner. An event-loop
         // failure cannot drop that owner or turn ambiguous installation into
@@ -504,10 +464,7 @@ impl DesktopLifecycle {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let installing = {
-                let state = self
-                    .terminal
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
+                let state = self.state();
                 state.admitted
                     && state.intent == Some(TerminalIntent::Update)
                     && !state.update_settled
@@ -520,10 +477,7 @@ impl DesktopLifecycle {
         }
         self.close_native_admission();
         retry_until_settled("Desktop shutdown", || self.settle(&services, true)).await;
-        self.terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .event_loop_settled = true;
+        self.state().event_loop_settled = true;
         self.terminal_changed.notify_waiters();
     }
 
@@ -555,10 +509,7 @@ impl DesktopLifecycle {
     }
 
     fn finish_attempt(&self, attempt: &Attempt, result: TerminalResult) {
-        let mut state = self
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state();
         if state
             .active
             .as_ref()
@@ -611,12 +562,7 @@ pub fn report_window_startup_failure(app: AppHandle, lifecycle: DesktopLifecycle
     show_window_failure(app, lifecycle.clone());
     tokio::spawn(async move {
         lifecycle.shutdown_after_event_loop().await;
-        if lifecycle
-            .terminal
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .event_loop_settled
-        {
+        if lifecycle.state().event_loop_settled {
             lifecycle.allow_exit();
         }
     });

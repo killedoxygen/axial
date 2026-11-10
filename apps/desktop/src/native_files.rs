@@ -67,9 +67,7 @@ impl<K> Files<K> {
     }
 
     fn hovered(&self) -> MutexGuard<'_, Option<K>> {
-        self.hovered
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        crate::lock(&self.hovered)
     }
 
     fn closing(&self) -> bool {
@@ -119,8 +117,18 @@ fn payload<T: FileTarget>(
     }
 }
 
-fn emit<T: FileTarget>(window: &Window, payload: Payload<T::Fields>) {
-    let _ = window.emit(T::EVENT, payload);
+fn emit<T: FileTarget>(
+    window: &Window,
+    phase: Phase,
+    kind: Option<T::Kind>,
+    selection: Option<T::Selection>,
+    position: Option<PhysicalPosition<f64>>,
+    error: Option<String>,
+) {
+    let _ = window.emit(
+        T::EVENT,
+        payload::<T>(phase, kind, selection, position, error),
+    );
 }
 
 pub fn handle_drag<T: FileTarget>(target: &T, window: &Window, event: &DragDropEvent) {
@@ -129,36 +137,29 @@ pub fn handle_drag<T: FileTarget>(target: &T, window: &Window, event: &DragDropE
         DragDropEvent::Enter { paths, position } => {
             let kind = target.classify(paths).ok().filter(|_| !files.closing());
             *files.hovered() = kind;
-            emit::<T>(
-                window,
-                payload::<T>(Phase::Enter, kind, None, Some(*position), None),
-            );
+            emit::<T>(window, Phase::Enter, kind, None, Some(*position), None);
         }
         DragDropEvent::Over { position } => {
             let kind = files.hovered().filter(|_| !files.closing());
-            emit::<T>(
-                window,
-                payload::<T>(Phase::Over, kind, None, Some(*position), None),
-            );
+            emit::<T>(window, Phase::Over, kind, None, Some(*position), None);
         }
         DragDropEvent::Leave => {
             // Leaving the drop zone does not revoke an already issued selection.
             files.hovered().take();
-            emit::<T>(window, payload::<T>(Phase::Leave, None, None, None, None));
+            emit::<T>(window, Phase::Leave, None, None, None, None);
         }
         DragDropEvent::Drop { paths, position } => {
             files.hovered().take();
             let position = Some(*position);
-            let dropped = |kind, selection, error| {
-                payload::<T>(Phase::Drop, kind, selection, position, error)
-            };
             let kind = match target.classify(paths) {
                 Ok(kind) => kind,
-                Err(error) => return emit::<T>(window, dropped(None, None, error)),
+                Err(error) => return emit::<T>(window, Phase::Drop, None, None, position, error),
             };
+            let refuse =
+                |error| emit::<T>(window, Phase::Drop, Some(kind), None, position, Some(error));
             let captured = match target.capture(kind, paths) {
                 Ok(captured) => captured,
-                Err(error) => return emit::<T>(window, dropped(Some(kind), None, Some(error))),
+                Err(error) => return refuse(error),
             };
             let owner = target.clone();
             let reader = window.clone();
@@ -168,18 +169,14 @@ pub fn handle_drag<T: FileTarget>(target: &T, window: &Window, event: &DragDropE
                 } else {
                     owner.read(captured).await
                 };
-                let payload = match result {
-                    Ok(selection) => {
-                        payload::<T>(Phase::Drop, Some(kind), Some(selection), position, None)
-                    }
-                    Err(error) => {
-                        payload::<T>(Phase::Drop, Some(kind), None, position, Some(error))
-                    }
+                let (selection, error) = match result {
+                    Ok(selection) => (Some(selection), None),
+                    Err(error) => (None, Some(error)),
                 };
-                emit::<T>(&reader, payload);
+                emit::<T>(&reader, Phase::Drop, Some(kind), selection, position, error);
             });
             if accepted.is_err() {
-                emit::<T>(window, dropped(Some(kind), None, Some(T::CLOSED.into())));
+                refuse(T::CLOSED.into());
             }
         }
         _ => {}
@@ -235,7 +232,7 @@ mod tests {
         let hovered = payload::<NativeSkinFiles>(Phase::Over, Some(()), None, position, None);
         assert_eq!(serde_json::to_value(&hovered).unwrap()["eligible"], true);
         let content = payload::<NativeContentFiles>(
-            Phase::Leave,
+            Phase::Enter,
             Some(ContentFileKind::Modpack),
             None,
             None,
@@ -243,7 +240,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&content).unwrap(),
-            r#"{"type":"leave","kind":"modpack","selection":null,"position":null,"error":null}"#
+            r#"{"type":"enter","kind":"modpack","selection":null,"position":null,"error":null}"#
         );
     }
 }

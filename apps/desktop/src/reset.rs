@@ -74,7 +74,7 @@ impl NativeReset {
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, ResetState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
+        crate::lock(&self.state)
     }
 
     async fn prepare(&self, lifecycle: &DesktopLifecycle) -> Result<bool, String> {

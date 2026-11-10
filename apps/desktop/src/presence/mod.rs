@@ -261,7 +261,8 @@ mod tests {
         }
 
         /// A real local Discord peer that records each connection's commands.
-        fn listen(path: &std::path::Path) -> mpsc::UnboundedReceiver<Seen> {
+        /// The first `failures` connections drop their first command unanswered.
+        fn listen(path: &std::path::Path, mut failures: usize) -> mpsc::UnboundedReceiver<Seen> {
             let listener = tokio::net::UnixListener::bind(path).unwrap();
             let (seen, events) = mpsc::unbounded_channel();
             tokio::spawn(async move {
@@ -275,6 +276,10 @@ mod tests {
                     let _ = seen.send(Seen::Connected);
                     while let Ok((OP_FRAME, command)) = read_frame(&mut stream).await {
                         let _ = seen.send(Seen::Activity(command["args"]["activity"].clone()));
+                        if failures > 0 {
+                            failures -= 1;
+                            break;
+                        }
                         let reply = json!({ "nonce": command["nonce"] });
                         write_frame(&mut stream, OP_FRAME, &reply).await.unwrap();
                     }
@@ -299,7 +304,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn absent_discord_is_retried_and_shutdown_clears_the_activity() {
+        async fn absent_or_failed_discord_is_retried_and_shutdown_clears_the_activity() {
             let (_directory, path) = socket();
             let idle = Snapshot::from_sessions(true, &[]);
             let (publish, snapshots) = watch::channel(idle.clone());
@@ -310,12 +315,11 @@ mod tests {
                 snapshots,
             ));
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let mut events = listen(&path);
-            expect(
-                &mut events,
-                &[Seen::Connected, Seen::Activity(idle.activity())],
-            )
-            .await;
+            let mut events = listen(&path, 1);
+            let published = [Seen::Connected, Seen::Activity(idle.activity())];
+            expect(&mut events, &published).await;
+            expect(&mut events, &[Seen::Closed]).await;
+            expect(&mut events, &published).await;
             drop(publish);
             worker.await.unwrap();
             expect(&mut events, &[Seen::Activity(Value::Null), Seen::Closed]).await;
@@ -324,7 +328,7 @@ mod tests {
         #[tokio::test]
         async fn disabling_clears_and_reenabling_reconnects() {
             let (_directory, path) = socket();
-            let mut events = listen(&path);
+            let mut events = listen(&path, 0);
             let idle = Snapshot::from_sessions(true, &[]);
             let (publish, snapshots) = watch::channel(idle.clone());
             let worker = tokio::spawn(run(
