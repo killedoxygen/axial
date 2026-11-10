@@ -6,11 +6,11 @@ pub mod game_libraries;
 mod http;
 pub mod index;
 mod install_flight;
-pub mod providers;
+pub(crate) mod providers;
 mod source;
 mod strategies;
 pub mod types;
-pub mod workspace;
+pub(crate) mod workspace;
 
 pub use api::{
     MaterializedLoaderProfile, build_id_for, installed_version_id_for,
