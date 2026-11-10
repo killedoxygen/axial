@@ -23,6 +23,7 @@ mod managed_component_spool;
 mod managed_component_table;
 mod managed_fs;
 pub mod portable_path;
+pub mod process;
 
 pub mod managed_path {
     #[cfg(feature = "test-support")]
@@ -127,16 +128,15 @@ pub use rules::default_environment;
 #[cfg(feature = "test-support")]
 pub use runtime::runtime_publication_lock_available_for_test;
 pub use runtime::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeResult,
-    ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeComponent,
+    JavaArchitecture, JavaProbeError, JavaProbeReceipt, JavaRuntimeInfo, JavaRuntimeLookupError,
+    JavaRuntimeResult, ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeComponent,
     ManagedRuntimeFailureReceipt, ManagedRuntimeLaunchReceipt, ManagedRuntimeMarkerState,
     ManagedRuntimeMutationRefused, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError, RuntimeEnsureEvent,
     RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
     RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
     RuntimeSourceFailureKind, is_known_runtime_component, list_java_runtimes,
-    parse_runtime_override, preferred_runtime_component, probe_java_runtime_receipt,
-    runtime_requirement,
+    parse_runtime_override, preferred_runtime_component, probe_java, runtime_requirement,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 #[cfg(feature = "test-support")]

@@ -1,11 +1,10 @@
 //! Runtime selection retains verified executable and managed-component evidence.
 
-use super::{
-    model::{JavaDiscoveryError, JavaRuntimesResponse, JavaSelectionRequirement},
-    probe::{JavaProbeReceipt, probe_java_runtime_until},
-};
+use super::model::{JavaDiscoveryError, JavaRuntimesResponse, JavaSelectionRequirement};
 use crate::tasks::{CancellationToken, TaskOwner};
-use axial_minecraft::{JavaVersion, ManagedRuntimeCache, ManagedRuntimeLaunchReceipt};
+use axial_minecraft::{
+    JavaProbeReceipt, JavaVersion, ManagedRuntimeCache, ManagedRuntimeLaunchReceipt, probe_java,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
@@ -56,7 +55,7 @@ impl RuntimeDiscovery {
         let task = self
             .tasks
             .try_spawn((), move |cancel| async move {
-                probe_java_runtime_until(&path, None, cancel.cancelled()).await
+                Ok(probe_java(&path, None, cancel.cancelled()).await?)
             })
             .map_err(|_| JavaDiscoveryError::Failed)?;
         task.join().await.map_err(|_| JavaDiscoveryError::Failed)?
@@ -204,8 +203,7 @@ impl RuntimeDiscovery {
             }
             (path.to_owned(), None)
         };
-        let probe =
-            probe_java_runtime_until(&path, component.as_deref(), cancellation.cancelled()).await?;
+        let probe = probe_java(&path, component.as_deref(), cancellation.cancelled()).await?;
         requirement.validate(probe.info(), probe.architecture())?;
         if let Some(receipt) = &managed {
             receipt
@@ -314,8 +312,14 @@ mod tests {
                 let mut changed = console_bytes.clone();
                 changed[0] ^= 1;
                 fs::write(&console, changed).map_err(|_| JavaDiscoveryError::Failed)?;
-                let console_changed = observed.probe.revalidate();
-                let prepared_console_changed = prepared.probe.revalidate();
+                let console_changed = observed
+                    .probe
+                    .revalidate()
+                    .map_err(JavaDiscoveryError::from);
+                let prepared_console_changed = prepared
+                    .probe
+                    .revalidate()
+                    .map_err(JavaDiscoveryError::from);
                 let console_refusal = discovery
                     .observe_for_preflight(&required, "", &cancel)
                     .await
@@ -329,7 +333,10 @@ mod tests {
                 let mut changed = windowed_bytes.clone();
                 changed[0] ^= 1;
                 fs::write(&windowed, changed).map_err(|_| JavaDiscoveryError::Failed)?;
-                let windowed_changed = selected.probe.revalidate();
+                let windowed_changed = selected
+                    .probe
+                    .revalidate()
+                    .map_err(JavaDiscoveryError::from);
                 let windowed_receipt_refuses = selected
                     .managed
                     .as_ref()

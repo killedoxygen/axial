@@ -19,7 +19,7 @@ use super::install::{
 use super::layout::ManagedRuntimeCache;
 use super::manifest::RuntimeSourceReceipt;
 use super::model::{JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId};
-use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
+use super::probe::{JavaProbeError, JavaProbeReceipt, probe_java};
 use crate::launch::JavaVersion;
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use std::path::{Path, PathBuf};
@@ -151,7 +151,7 @@ impl RuntimeMaterializationTaskControl {
 }
 
 pub(crate) struct ProcessorRuntime {
-    probe_receipt: JavaRuntimeProbeReceipt,
+    probe_receipt: JavaProbeReceipt,
     install_directory: crate::managed_fs::ManagedDir,
     program_guard: crate::managed_fs::ManagedExecutableGuard,
     program_path: PathBuf,
@@ -181,7 +181,10 @@ impl ProcessorRuntime {
                 "processor Java executable changed after admission".to_string(),
             ));
         }
-        let selected = self.probe_receipt.revalidate_cli_executable()?;
+        let selected = self
+            .probe_receipt
+            .revalidate_cli_executable()
+            .map_err(processor_probe_error)?;
         if selected != self.program_path {
             return Err(JavaRuntimeLookupError::Probe(
                 "processor Java probe no longer selects the retained executable".to_string(),
@@ -232,22 +235,34 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     admit_processor_program(install_directory, &java_path).inspect_err(|error| {
         trace_ephemeral_processor_runtime_failure("executable_admission", error);
     })?;
-    let probe_receipt = run_runtime_probe_work(
-        "processor runtime probe task stopped unexpectedly",
-        move || probe_java_runtime_receipt(&java_path, Some("ephemeral-processor-runtime")),
+    // Bounds concurrent executable hashing and JVM probes with other heavy work.
+    let admission = process_physical_work()
+        .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, 0))
+        .await
+        .map_err(|_| {
+            JavaRuntimeLookupError::Probe("processor runtime probe admission stopped".to_string())
+        })
+        .inspect_err(|error| {
+            trace_ephemeral_processor_runtime_failure("probe_worker", error);
+        })?;
+    let probe_receipt = probe_java(
+        &java_path,
+        Some(PROCESSOR_RUNTIME_ID),
+        std::future::pending(),
     )
-    .await
-    .inspect_err(|error| {
-        trace_ephemeral_processor_runtime_failure("probe_worker", error);
-    })?;
+    .await;
+    drop(admission);
     install_directory
         .validate_absolute_projection(install_root)
         .map_err(|error| ephemeral_processor_filesystem_failure("post_probe_projection", error))?;
-    let probe_receipt = probe_receipt.inspect_err(|error| {
-        trace_ephemeral_processor_runtime_failure("probe", error);
-    })?;
+    let probe_receipt = probe_receipt
+        .map_err(processor_probe_error)
+        .inspect_err(|error| {
+            trace_ephemeral_processor_runtime_failure("probe", error);
+        })?;
     let program_path = probe_receipt
         .revalidate_cli_executable()
+        .map_err(processor_probe_error)
         .inspect_err(|error| {
             trace_ephemeral_processor_runtime_failure("probe_receipt_validation", error);
         })?;
@@ -255,7 +270,7 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
         admit_processor_program(install_directory, &program_path).inspect_err(|error| {
             trace_ephemeral_processor_runtime_failure("probed_executable_admission", error);
         })?;
-    let observed_major = probe_receipt.major();
+    let observed_major = probe_receipt.info().major;
     let expected_major = u32::try_from(java_version.major_version).unwrap_or(u32::MAX);
     if observed_major != expected_major {
         let error = JavaRuntimeLookupError::Probe(
@@ -442,20 +457,14 @@ where
     Ok(Some(source_receipt))
 }
 
-async fn run_runtime_probe_work<T, Work>(
-    stopped: &'static str,
-    work: Work,
-) -> Result<T, JavaRuntimeLookupError>
-where
-    T: Send + 'static,
-    Work: FnOnce() -> T + Send + 'static,
-{
-    let admission = process_physical_work()
-        .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, 0))
-        .await
-        .map_err(|_| JavaRuntimeLookupError::Probe(stopped.to_string()))?;
-    admission
-        .run(move |_| work())
-        .await
-        .map_err(|_| JavaRuntimeLookupError::Probe(stopped.to_string()))
+const PROCESSOR_RUNTIME_ID: &str = "ephemeral-processor-runtime";
+
+fn processor_probe_error(error: JavaProbeError) -> JavaRuntimeLookupError {
+    match error {
+        JavaProbeError::TimedOut => JavaRuntimeLookupError::ProbeTimedOut,
+        JavaProbeError::RosettaRequired => JavaRuntimeLookupError::RosettaRequired {
+            component: PROCESSOR_RUNTIME_ID.to_string(),
+        },
+        error => JavaRuntimeLookupError::Probe(error.to_string()),
+    }
 }

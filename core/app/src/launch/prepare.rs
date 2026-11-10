@@ -380,7 +380,7 @@ pub(super) mod tests {
             std::env::consts::ARCH,
         )).unwrap();
         std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let runtime = crate::runtime::probe::probe_java_runtime(&java, None)
+        let runtime = axial_minecraft::probe_java(&java, None, std::future::pending())
             .await
             .unwrap();
         let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());

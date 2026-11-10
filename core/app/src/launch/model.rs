@@ -1,11 +1,8 @@
 //! Private launch inputs and retained command authority. None are wire DTOs.
 
-use crate::{
-    install::{queue::InstalledVersionReceipt, vanilla::PreparedNatives},
-    runtime::probe::JavaProbeReceipt,
-};
+use crate::install::{queue::InstalledVersionReceipt, vanilla::PreparedNatives};
 use axial_minecraft::managed_path::ManagedLibraryOperation;
-use axial_minecraft::{ManagedRuntimeLaunchReceipt, VersionBundleReadGuard};
+use axial_minecraft::{JavaProbeReceipt, ManagedRuntimeLaunchReceipt, VersionBundleReadGuard};
 use std::{
     collections::BTreeMap,
     ffi::OsString,

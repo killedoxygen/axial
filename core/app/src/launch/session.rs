@@ -6,7 +6,6 @@ use super::{
     logs::{LogCollector, LogEntry, LogStream, MAX_OUTPUT_CHUNK_BYTES},
     outcome::{SessionExitFacts, SessionOutcome, classify_session_outcome},
     prepare::PreparedSession,
-    process::{OwnedProcess, ProcessOutput, SpawnError},
     reports::{LaunchProofRecord, LaunchProofScenario, LaunchReportStore, SessionReportInput},
 };
 use crate::{
@@ -16,6 +15,7 @@ use crate::{
         Telemetry, TelemetryErrorKind, TelemetryEvent, TelemetryLaunchOutcome, TelemetryLoader,
     },
 };
+use axial_minecraft::process::{OwnedProcess, ProcessOutput, SpawnError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},

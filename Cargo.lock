@@ -330,7 +330,6 @@ dependencies = [
  "libc",
  "lzma-rs",
  "md5",
- "ntapi",
  "p256",
  "png 0.17.16",
  "rand 0.8.8",
@@ -356,7 +355,6 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
- "windows-sys 0.61.2",
  "zeroize",
  "zip",
 ]

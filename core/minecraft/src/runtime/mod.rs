@@ -45,7 +45,7 @@ pub use model::{
     RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
     RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
-pub use probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
+pub use probe::{JavaArchitecture, JavaProbeError, JavaProbeReceipt, probe_java};
 
 #[cfg(test)]
 use cancellation::runtime_cancellation_channel;
@@ -164,8 +164,6 @@ use manifest::{
     fetch_runtime_manifest_bytes_for_test, select_runtime_manifest,
     validate_runtime_file_source_urls_for_test,
 };
-#[cfg(test)]
-use probe::detect_distribution;
 #[cfg(test)]
 use rosetta::{
     MachOArm64Compatibility, RosettaRuntimeDecision, parse_mach_o_arm64_compatibility,

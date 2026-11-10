@@ -10,7 +10,7 @@ use super::{
     authenticated_runtime_source_from_manifest_for_test,
     block_runtime_before_publication_claim_for_test, block_runtime_decompression_for_test,
     block_runtime_publication_for_test, component_manifest_destination,
-    component_manifest_proof_bytes, detect_distribution, discard_staged_managed_runtime,
+    component_manifest_proof_bytes, discard_staged_managed_runtime,
     fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
     install_runtime_manifest_files, java_executable, java_executable_for_os,
     materialize_missing_runtime_source, parse_mach_o_arm64_compatibility,
@@ -389,62 +389,6 @@ fn expect_runtime_source_failure(
             failure
         }
         other => panic!("expected {expected_kind:?} runtime source failure, got {other:?}"),
-    }
-}
-
-#[test]
-fn detect_runtime_distribution_classifies_vendor_identity() {
-    for (text, expected) in [
-        (
-            r#"
-                java.vendor = Oracle Corporation
-                java.vm.name = GraalVM 64-Bit Server VM
-            "#,
-            "graalvm",
-        ),
-        (
-            r#"
-                java.vendor = OpenJDK
-                java.runtime.name = GraalVM Runtime Environment
-            "#,
-            "graalvm",
-        ),
-        ("java.vm.name = Eclipse OpenJ9 VM", "openj9"),
-        (
-            "java.runtime.name = IBM Semeru Runtime Open Edition",
-            "openj9",
-        ),
-        ("java.vm.vendor = IBM Corporation", "openj9"),
-        (
-            "java.runtime.name = OpenJDK Runtime Environment Temurin-21.0.2+13",
-            "temurin",
-        ),
-        ("java.vendor = Eclipse Adoptium", "temurin"),
-        ("java.vm.vendor = Eclipse Foundation", "temurin"),
-        (
-            r#"
-                java.vendor   =   Oracle Corporation
-                java.vm.name = Java HotSpot(TM) 64-Bit Server VM
-            "#,
-            "oracle",
-        ),
-        (
-            r#"
-                java.vendor = Debian
-                java.vm.name = OpenJDK 64-Bit Server VM
-                java.runtime.version = 21.0.5+11-Debian-1
-            "#,
-            "openjdk",
-        ),
-        (
-            r#"
-                java.home = /opt/java
-                sun.arch.data.model = 64
-            "#,
-            "unknown",
-        ),
-    ] {
-        assert_eq!(detect_distribution(text), expected, "{text}");
     }
 }
 

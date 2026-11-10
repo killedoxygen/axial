@@ -1,9 +1,10 @@
 //! Runtime wire compatibility and explicit selection policy.
 
 pub use axial_minecraft::{
-    JavaRuntimeInfo, JavaRuntimeResult, JavaVersion, ManagedRuntimeCache,
-    ManagedRuntimeLaunchReceipt, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId,
-    RuntimeInstallState, RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    JavaArchitecture, JavaProbeError, JavaRuntimeInfo, JavaRuntimeResult, JavaVersion,
+    ManagedRuntimeCache, ManagedRuntimeLaunchReceipt, RuntimeEnsureEvent, RuntimeEnsureResult,
+    RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeRecord, RuntimeRequirement,
+    RuntimeSource,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,26 +12,6 @@ use thiserror::Error;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JavaRuntimesResponse {
     pub runtimes: Vec<JavaRuntimeResult>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum JavaArchitecture {
-    X86,
-    X86_64,
-    Aarch64,
-    Unknown,
-}
-
-impl JavaArchitecture {
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "x86" | "i386" | "i486" | "i586" | "i686" => Self::X86,
-            "amd64" | "x86_64" | "x64" => Self::X86_64,
-            "aarch64" | "arm64" => Self::Aarch64,
-            _ => Self::Unknown,
-        }
-    }
 }
 
 /// Exact Minecraft major and native architecture unless a successful macOS
@@ -137,6 +118,24 @@ pub enum JavaDiscoveryError {
     LibraryUnavailable,
     #[error("The Java probe process has not finished shutting down.")]
     SettlementRequired,
+}
+
+impl From<JavaProbeError> for JavaDiscoveryError {
+    fn from(error: JavaProbeError) -> Self {
+        match error {
+            JavaProbeError::Missing => Self::Missing,
+            JavaProbeError::InvalidPath => Self::InvalidPath,
+            JavaProbeError::NotExecutable => Self::NotExecutable,
+            JavaProbeError::ExecutableTooLarge => Self::ExecutableTooLarge,
+            JavaProbeError::Replaced => Self::Replaced,
+            JavaProbeError::TimedOut => Self::TimedOut,
+            JavaProbeError::OutputLimit => Self::OutputLimit,
+            JavaProbeError::InvalidVersion => Self::InvalidVersion,
+            JavaProbeError::Failed => Self::Failed,
+            JavaProbeError::Cancelled => Self::Cancelled,
+            JavaProbeError::RosettaRequired => Self::RosettaRequired,
+        }
+    }
 }
 
 #[cfg(test)]

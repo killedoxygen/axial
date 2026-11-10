@@ -9,15 +9,13 @@ use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
 use crate::launch::VersionJson;
 use crate::managed_fs::ManagedTreeSnapshot;
 use crate::portable_path::PortableRelativePath;
+use crate::process::{OwnedProcess, ProcessOutput, SpawnError};
 use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io::{Cursor, Read};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -25,7 +23,7 @@ use std::sync::{
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use zip::ZipArchive;
@@ -37,471 +35,29 @@ const MAX_MAPPING_BYTES: u64 = 64 << 20;
 const MAX_MAIN_CLASS_BYTES: usize = 256;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
-#[cfg(target_os = "linux")]
-const MAX_LINUX_PROCESS_STAT_BYTES: u64 = 4096;
-#[cfg(any(target_os = "macos", test))]
-const MAX_MACOS_PROCESS_GROUP_MEMBERS: usize = 4096;
-// XNU searches zombproc for PROC_PIDTBSDINFO only when arg is nonzero.
-#[cfg(any(target_os = "macos", test))]
-const MACOS_PROC_PIDINFO_FIND_ZOMBIES_ARG: u64 = 1;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "linux")]
-const PROCESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(200);
-#[cfg(not(target_os = "linux"))]
-const PROCESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STAGE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 const STAGE_WATCH_COST_RATIO: u32 = 4;
 
-#[cfg(unix)]
-struct PendingProcessContainment;
-
-#[cfg(unix)]
-struct ProcessContainment {
-    group: rustix::process::Pid,
-}
-
-#[cfg(unix)]
-fn prepare_process_containment(
-    command: &mut Command,
-) -> Result<PendingProcessContainment, BoundProcessorError> {
-    command.process_group(0);
-    Ok(PendingProcessContainment)
-}
-
-#[cfg(unix)]
-impl PendingProcessContainment {
-    fn attach(self, child: &Child) -> Result<ProcessContainment, BoundProcessorError> {
-        let raw = i32::try_from(child.id().ok_or(BoundProcessorError::Containment)?)
-            .map_err(|_| BoundProcessorError::Containment)?;
-        let group = rustix::process::Pid::from_raw(raw).ok_or(BoundProcessorError::Containment)?;
-        Ok(ProcessContainment { group })
+async fn spawn_contained(
+    command: Command,
+) -> Result<(OwnedProcess, ProcessOutput), BoundProcessorError> {
+    match OwnedProcess::spawn(command) {
+        Ok(spawned) => Ok(spawned),
+        Err(SpawnError::BeforeSpawn(_)) => Err(BoundProcessorError::Spawn),
+        Err(SpawnError::Unsettled(mut process, _, _)) => Err(match settle(&mut process).await {
+            Ok(()) => BoundProcessorError::Containment,
+            Err(error) => error,
+        }),
     }
 }
 
-#[cfg(unix)]
-impl ProcessContainment {
-    fn terminate(&self) -> Result<(), BoundProcessorError> {
-        terminate_process_group(self.group)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn is_empty(&self) -> Result<bool, BoundProcessorError> {
-        match rustix::process::test_kill_process_group(self.group) {
-            Ok(()) => Ok(false),
-            Err(rustix::io::Errno::SRCH) => Ok(true),
-            Err(_) => Err(BoundProcessorError::Unreaped),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn terminate_process_group(group: rustix::process::Pid) -> Result<(), BoundProcessorError> {
-    match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-        Err(_) => Err(BoundProcessorError::Unreaped),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn inspect_macos_group_after_owned_kill(
-    group: rustix::process::Pid,
-) -> Result<MacosGroupSettlement, BoundProcessorError> {
-    settle_macos_group_probe(
-        rustix::process::test_kill_process_group(group),
-        || terminate_process_group(group),
-        || macos_process_group_has_only_zombies(group),
-    )
-}
-
-#[cfg(any(target_os = "macos", all(test, unix)))]
-#[derive(Debug, Eq, PartialEq)]
-enum MacosGroupSettlement {
-    Empty,
-    OnlyZombies,
-    LiveMembers,
-}
-
-#[cfg(any(target_os = "macos", all(test, unix)))]
-impl MacosGroupSettlement {
-    fn from_zombie_proof(only_zombies: bool) -> Self {
-        if only_zombies {
-            Self::OnlyZombies
-        } else {
-            Self::LiveMembers
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn settle_macos_group_probe<Terminate, ProveZombies>(
-    probe: Result<(), rustix::io::Errno>,
-    terminate: Terminate,
-    prove_only_zombies: ProveZombies,
-) -> Result<MacosGroupSettlement, BoundProcessorError>
-where
-    Terminate: FnOnce() -> Result<(), BoundProcessorError>,
-    ProveZombies: FnOnce() -> Result<bool, BoundProcessorError>,
-{
-    match probe {
-        Err(rustix::io::Errno::SRCH) => Ok(MacosGroupSettlement::Empty),
-        Ok(()) => {
-            terminate()?;
-            Ok(MacosGroupSettlement::from_zombie_proof(
-                prove_only_zombies()?
-            ))
-        }
-        // After our SIGKILL succeeds, Darwin can report EPERM while only
-        // unsignalable zombies remain. Accept only the bounded exact-group proof.
-        Err(rustix::io::Errno::PERM) => Ok(MacosGroupSettlement::from_zombie_proof(
-            prove_only_zombies()?,
-        )),
-        Err(_) => Err(BoundProcessorError::Unreaped),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_process_group_is_empty(group: rustix::process::Pid) -> Result<bool, BoundProcessorError> {
-    match inspect_macos_group_after_owned_kill(group)? {
-        MacosGroupSettlement::Empty => Ok(true),
-        MacosGroupSettlement::LiveMembers => Ok(false),
-        MacosGroupSettlement::OnlyZombies => Ok(!matches!(
-            inspect_macos_group_after_owned_kill(group)?,
-            MacosGroupSettlement::LiveMembers
-        )),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_process_group_has_only_zombies(
-    group: rustix::process::Pid,
-) -> Result<bool, BoundProcessorError> {
-    let group = group.as_raw_nonzero().get();
-    // Darwin's null-buffer sizing call reports the system-wide process count,
-    // not the selected group's size. Bound the group inventory directly.
-    let mut pids = vec![0 as libc::pid_t; MAX_MACOS_PROCESS_GROUP_MEMBERS + 1];
-    let buffer_bytes = pids
-        .len()
-        .checked_mul(std::mem::size_of::<libc::pid_t>())
-        .and_then(|bytes| i32::try_from(bytes).ok())
-        .ok_or(BoundProcessorError::Unreaped)?;
-    let listed = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), buffer_bytes) };
-    let listed = checked_macos_process_group_listing_len(listed, pids.len())?;
-    pids.truncate(listed);
-
-    let mut observed_member = false;
-    for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        let info_bytes = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
-            .map_err(|_| BoundProcessorError::Unreaped)?;
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                MACOS_PROC_PIDINFO_FIND_ZOMBIES_ARG,
-                info.as_mut_ptr().cast(),
-                info_bytes,
-            )
-        };
-        if read == 0 {
-            let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-                continue;
-            };
-            match rustix::process::test_kill_process(pid) {
-                Err(rustix::io::Errno::SRCH) => continue,
-                Ok(()) | Err(rustix::io::Errno::PERM) => return Ok(false),
-                Err(_) => return Err(BoundProcessorError::Unreaped),
-            }
-        }
-        if read != info_bytes {
-            return Err(BoundProcessorError::Unreaped);
-        }
-        let info = unsafe { info.assume_init() };
-        if !record_zombie_group_member(
-            &mut observed_member,
-            group as u32,
-            info.pbi_pgid,
-            info.pbi_status == libc::SZOMB,
-        ) {
-            return Ok(false);
-        }
-    }
-    Ok(observed_member)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn checked_macos_process_group_listing_len(
-    listed: i32,
-    capacity: usize,
-) -> Result<usize, BoundProcessorError> {
-    let listed = usize::try_from(listed).map_err(|_| BoundProcessorError::Unreaped)?;
-    if listed >= capacity {
-        return Err(BoundProcessorError::Unreaped);
-    }
-    Ok(listed)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn record_zombie_group_member(
-    observed_member: &mut bool,
-    expected_group: u32,
-    member_group: u32,
-    is_zombie: bool,
-) -> bool {
-    if member_group != expected_group {
-        return true;
-    }
-    *observed_member = true;
-    is_zombie
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_group_is_empty(group: rustix::process::Pid) -> Result<bool, BoundProcessorError> {
-    match rustix::process::test_kill_process_group(group) {
-        Err(rustix::io::Errno::SRCH) => Ok(true),
-        Ok(()) => {
-            terminate_process_group(group)?;
-            if !linux_process_group_has_only_zombies(group)? {
-                return Ok(false);
-            }
-            match rustix::process::test_kill_process_group(group) {
-                Err(rustix::io::Errno::SRCH) => Ok(true),
-                Ok(()) => {
-                    terminate_process_group(group)?;
-                    linux_process_group_has_only_zombies(group)
-                }
-                Err(_) => Err(BoundProcessorError::Unreaped),
-            }
-        }
-        Err(_) => Err(BoundProcessorError::Unreaped),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_group_has_only_zombies(
-    group: rustix::process::Pid,
-) -> Result<bool, BoundProcessorError> {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let group = group.as_raw_nonzero().get();
-    let proc_dir = std::fs::File::open("/proc").map_err(|_| BoundProcessorError::Unreaped)?;
-    let proc_stat = rustix::fs::fstatfs(&proc_dir).map_err(|_| BoundProcessorError::Unreaped)?;
-    if proc_stat.f_type != rustix::fs::PROC_SUPER_MAGIC {
-        return Err(BoundProcessorError::Unreaped);
-    }
-    let processes = std::fs::read_dir("/proc").map_err(|_| BoundProcessorError::Unreaped)?;
-    let mut observed_member = false;
-    for process in processes {
-        let process = process.map_err(|_| BoundProcessorError::Unreaped)?;
-        let file_name = process.file_name();
-        let Some(pid) = parse_linux_decimal_i32(file_name.as_bytes()).filter(|pid| *pid > 0) else {
-            continue;
-        };
-        let file = match std::fs::File::open(process.path().join("stat")) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(BoundProcessorError::Unreaped),
-        };
-        let mut stat = Vec::with_capacity(MAX_LINUX_PROCESS_STAT_BYTES as usize + 1);
-        match file
-            .take(MAX_LINUX_PROCESS_STAT_BYTES + 1)
-            .read_to_end(&mut stat)
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(BoundProcessorError::Unreaped),
-        }
-        if stat.len() as u64 > MAX_LINUX_PROCESS_STAT_BYTES {
-            return Err(BoundProcessorError::Unreaped);
-        }
-        let (state, process_group, threads) =
-            parse_linux_process_stat(&stat, pid).ok_or(BoundProcessorError::Unreaped)?;
-        if process_group == group {
-            observed_member = true;
-            if state != b'Z' || threads != 1 {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(observed_member)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_process_stat(stat: &[u8], expected_pid: i32) -> Option<(u8, i32, u64)> {
-    let pid_end = stat.iter().position(|byte| *byte == b' ')?;
-    if stat.get(pid_end + 1) != Some(&b'(')
-        || parse_linux_decimal_i32(&stat[..pid_end]) != Some(expected_pid)
-    {
-        return None;
-    }
-    let fields_start = stat.windows(2).rposition(|window| window == b") ")? + 2;
-    if fields_start <= pid_end + 2 {
-        return None;
-    }
-    let mut fields = stat[fields_start..]
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty());
-    let state = fields.next()?;
-    if state.len() != 1 {
-        return None;
-    }
-    fields.next()?;
-    let process_group = parse_linux_decimal_i32(fields.next()?)?;
-    for _ in 0..14 {
-        fields.next()?;
-    }
-    let threads = parse_linux_decimal_u64(fields.next()?)?;
-    Some((state[0], process_group, threads))
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_decimal_i32(bytes: &[u8]) -> Option<i32> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_decimal_u64(bytes: &[u8]) -> Option<u64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
-#[cfg(unix)]
-impl Drop for ProcessContainment {
-    fn drop(&mut self) {
-        let _ = rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL);
-    }
-}
-
-struct ContainedChild {
-    child: Child,
-    containment: ProcessContainment,
-}
-
-async fn spawn_contained_child(
-    command: &mut Command,
-    runtime: Option<&ProcessorRuntime>,
-) -> Result<ContainedChild, BoundProcessorError> {
-    let pending = prepare_process_containment(command)?;
-    if let Some(runtime) = runtime {
-        runtime
-            .validate_program(Path::new(command.as_std().get_program()))
-            .map_err(|_| BoundProcessorError::Runtime)?;
-    }
-    let mut child = command.spawn().map_err(|_| BoundProcessorError::Spawn)?;
-    match pending.attach(&child) {
-        Ok(containment) => Ok(ContainedChild { child, containment }),
-        Err(error) => {
-            let _ = child.start_kill();
-            match tokio::time::timeout(PROCESS_REAP_TIMEOUT, child.wait()).await {
-                Ok(Ok(_)) => Err(error),
-                _ => Err(BoundProcessorError::Unreaped),
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-struct PendingProcessContainment {
-    job: std::os::windows::io::OwnedHandle,
-}
-
-#[cfg(windows)]
-struct ProcessContainment {
-    job: std::os::windows::io::OwnedHandle,
-}
-
-#[cfg(windows)]
-fn prepare_process_containment(
-    command: &mut Command,
-) -> Result<PendingProcessContainment, BoundProcessorError> {
-    use std::os::windows::io::FromRawHandle as _;
-    use windows_sys::Win32::System::JobObjects::{
-        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
-    };
-    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
-
-    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if raw.is_null() {
-        return Err(BoundProcessorError::Containment);
-    }
-    let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw.cast()) };
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let configured = unsafe {
-        SetInformationJobObject(
-            raw,
-            JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if configured == 0 {
-        return Err(BoundProcessorError::Containment);
-    }
-    command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-    Ok(PendingProcessContainment { job })
-}
-
-#[cfg(windows)]
-impl PendingProcessContainment {
-    fn attach(self, child: &Child) -> Result<ProcessContainment, BoundProcessorError> {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-
-        let process = child.raw_handle().ok_or(BoundProcessorError::Containment)?;
-        let job = self.job.as_raw_handle();
-        if unsafe { AssignProcessToJobObject(job.cast(), process.cast()) } == 0 {
-            return Err(BoundProcessorError::Containment);
-        }
-        if unsafe { ntapi::ntpsapi::NtResumeProcess(process.cast()) } < 0 {
-            return Err(BoundProcessorError::Containment);
-        }
-        Ok(ProcessContainment { job: self.job })
-    }
-}
-
-#[cfg(windows)]
-impl ProcessContainment {
-    fn terminate(&self) -> Result<(), BoundProcessorError> {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-
-        if unsafe { TerminateJobObject(self.job.as_raw_handle().cast(), 1) } == 0 {
-            return Err(BoundProcessorError::Unreaped);
-        }
-        Ok(())
-    }
-
-    fn is_empty(&self) -> Result<bool, BoundProcessorError> {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::System::JobObjects::{
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-            QueryInformationJobObject,
-        };
-
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.job.as_raw_handle().cast(),
-                JobObjectBasicAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if queried == 0 {
-            return Err(BoundProcessorError::Unreaped);
-        }
-        Ok(accounting.ActiveProcesses == 0)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ProcessContainment {
-    fn drop(&mut self) {
-        let _ = self.terminate();
-    }
+async fn settle(process: &mut OwnedProcess) -> Result<(), BoundProcessorError> {
+    tokio::time::timeout(PROCESS_REAP_TIMEOUT, process.settle())
+        .await
+        .map_err(|_| BoundProcessorError::Unreaped)
 }
 
 #[derive(Debug, Error)]
@@ -1698,34 +1254,19 @@ async fn run_java_step(
         .arg("-cp")
         .arg(classpath)
         .arg(main_class)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .args(arguments);
     set_processor_environment(&mut command, workspace, &bootstrap_environment)?;
     check_cancel(cancel)?;
-    let mut child = spawn_contained_child(&mut command, Some(runtime)).await?;
-    let stdout = match child.child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            terminate_and_reap(&mut child).await?;
-            return Err(BoundProcessorError::Spawn);
-        }
-    };
-    let stderr = match child.child.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            terminate_and_reap(&mut child).await?;
-            return Err(BoundProcessorError::Spawn);
-        }
-    };
+    runtime
+        .validate_program(Path::new(command.as_std().get_program()))
+        .map_err(|_| BoundProcessorError::Runtime)?;
+    let (mut process, output) = spawn_contained(command).await?;
     let total = Arc::new(AtomicUsize::new(0));
     let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
-    let stdout_task = tokio::spawn(drain_pipe(stdout, total.clone(), pipe_tx.clone()));
-    let stderr_task = tokio::spawn(drain_pipe(stderr, total, pipe_tx));
+    let stdout_task = tokio::spawn(drain_pipe(output.stdout, total.clone(), pipe_tx.clone()));
+    let stderr_task = tokio::spawn(drain_pipe(output.stderr, total, pipe_tx));
     let process_result = wait_for_contained_child(
-        &mut child,
+        &mut process,
         cancel,
         &mut pipe_rx,
         Some(workspace),
@@ -2334,7 +1875,7 @@ async fn drain_pipe(
 }
 
 async fn wait_for_contained_child(
-    child: &mut ContainedChild,
+    process: &mut OwnedProcess,
     cancel: &mut oneshot::Receiver<()>,
     pipe: &mut mpsc::UnboundedReceiver<PipeEvent>,
     workspace: Option<&ProcessorWorkspace>,
@@ -2392,7 +1933,7 @@ async fn wait_for_contained_child(
                     },
                 }
             },
-            status = child.child.wait() => match status {
+            status = process.wait() => match status {
                 Ok(status) if status.success() => Ok(()),
                 Ok(_) | Err(_) => Err(BoundProcessorError::Unsuccessful),
             },
@@ -2400,7 +1941,7 @@ async fn wait_for_contained_child(
         break outcome;
     };
 
-    terminate_and_reap(child).await?;
+    settle(process).await?;
 
     let drains = async {
         while finished_pipes < 2 {
@@ -2419,58 +1960,6 @@ async fn wait_for_contained_child(
     match outcome {
         Ok(()) => drain_result,
         Err(error) => Err(error),
-    }
-}
-
-async fn terminate_and_reap(child: &mut ContainedChild) -> Result<(), BoundProcessorError> {
-    child.containment.terminate()?;
-    tokio::time::timeout(PROCESS_REAP_TIMEOUT, child.child.wait())
-        .await
-        .map_err(|_| BoundProcessorError::Unreaped)?
-        .map_err(|_| BoundProcessorError::Unreaped)?;
-    let deadline = tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT;
-    loop {
-        let empty = process_containment_is_empty(&child.containment).await?;
-        if empty {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(BoundProcessorError::Unreaped);
-        }
-        tokio::time::sleep(PROCESS_REAP_POLL_INTERVAL).await;
-    }
-}
-
-async fn process_containment_is_empty(
-    containment: &ProcessContainment,
-) -> Result<bool, BoundProcessorError> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let group = containment.group;
-        let admission = process_physical_work()
-            .admit(PhysicalWorkRequest::foreground(
-                PhysicalIoClass::Metadata,
-                0,
-            ))
-            .await
-            .map_err(|_| BoundProcessorError::Unreaped)?;
-        admission
-            .run(move |_| {
-                #[cfg(target_os = "linux")]
-                {
-                    linux_process_group_is_empty(group)
-                }
-                #[cfg(target_os = "macos")]
-                {
-                    macos_process_group_is_empty(group)
-                }
-            })
-            .await
-            .map_err(|_| BoundProcessorError::Unreaped)?
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        containment.is_empty()
     }
 }
 
@@ -2755,7 +2244,7 @@ mod tests {
         manifest_attributes, processor_main_class, reauthenticate_step_dependencies,
         valid_main_class,
     };
-    use super::{spawn_contained_child, wait_for_contained_child};
+    use super::{spawn_contained, wait_for_contained_child};
     use crate::loaders::forge_installer::{
         BoundProcessorAction, BoundProcessorArgument, BoundProcessorArgumentPart,
         BoundProcessorArtifact, BoundProcessorData, BoundProcessorOutput,
@@ -2775,25 +2264,6 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
     use zip::{ZipWriter, write::SimpleFileOptions};
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parses_linux_process_stat_with_adversarial_process_names() {
-        let zombie = b"42 (processor) worker\n\xff) Z 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0";
-        assert_eq!(
-            super::parse_linux_process_stat(zombie, 42),
-            Some((b'Z', 42, 1))
-        );
-        assert_eq!(
-            super::parse_linux_process_stat(
-                b"43 (processor) R 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 2 0",
-                43
-            ),
-            Some((b'R', 42, 2))
-        );
-        assert_eq!(super::parse_linux_process_stat(zombie, 43), None);
-        assert_eq!(super::parse_linux_process_stat(b"malformed", 42), None);
-    }
 
     #[test]
     fn parses_manifest_continuations_and_validates_binary_name() {
@@ -3879,141 +3349,9 @@ esac
         command
     }
 
-    #[test]
-    fn macos_group_listing_bounds_and_zombie_classification_fail_closed() {
-        assert_ne!(super::MACOS_PROC_PIDINFO_FIND_ZOMBIES_ARG, 0);
-        assert_eq!(
-            super::checked_macos_process_group_listing_len(
-                super::MAX_MACOS_PROCESS_GROUP_MEMBERS as i32,
-                super::MAX_MACOS_PROCESS_GROUP_MEMBERS + 1,
-            )
-            .expect("maximum bounded group"),
-            super::MAX_MACOS_PROCESS_GROUP_MEMBERS
-        );
-        assert!(matches!(
-            super::checked_macos_process_group_listing_len(-1, 1),
-            Err(BoundProcessorError::Unreaped)
-        ));
-        assert!(matches!(
-            super::checked_macos_process_group_listing_len(
-                (super::MAX_MACOS_PROCESS_GROUP_MEMBERS + 1) as i32,
-                super::MAX_MACOS_PROCESS_GROUP_MEMBERS + 1,
-            ),
-            Err(BoundProcessorError::Unreaped)
-        ));
-
-        let mut observed_member = false;
-        assert!(super::record_zombie_group_member(
-            &mut observed_member,
-            17,
-            18,
-            false,
-        ));
-        assert!(!observed_member);
-        assert!(super::record_zombie_group_member(
-            &mut observed_member,
-            17,
-            17,
-            true,
-        ));
-        assert!(observed_member);
-        assert!(!super::record_zombie_group_member(
-            &mut observed_member,
-            17,
-            17,
-            false,
-        ));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn macos_group_probe_settlement_preserves_fail_closed_branches() {
-        fn settle(
-            probe: Result<(), rustix::io::Errno>,
-            termination: Result<(), BoundProcessorError>,
-            proof: Result<bool, BoundProcessorError>,
-            calls: &std::cell::Cell<(u8, u8)>,
-        ) -> Result<super::MacosGroupSettlement, BoundProcessorError> {
-            super::settle_macos_group_probe(
-                probe,
-                || {
-                    let (_, proofs) = calls.get();
-                    calls.set((1, proofs));
-                    termination
-                },
-                || {
-                    let (terminations, proofs) = calls.get();
-                    calls.set((terminations, proofs + 1));
-                    proof
-                },
-            )
-        }
-
-        let calls = std::cell::Cell::new((0, 0));
-        assert_eq!(
-            settle(Err(rustix::io::Errno::SRCH), Ok(()), Ok(true), &calls).expect("missing group"),
-            super::MacosGroupSettlement::Empty
-        );
-        assert_eq!(calls.get(), (0, 0));
-
-        calls.set((0, 0));
-        assert_eq!(
-            settle(Ok(()), Ok(()), Ok(true), &calls).expect("signalable zombie group"),
-            super::MacosGroupSettlement::OnlyZombies
-        );
-        assert_eq!(calls.get(), (1, 1));
-
-        calls.set((0, 0));
-        assert_eq!(
-            settle(Err(rustix::io::Errno::PERM), Ok(()), Ok(true), &calls).expect("zombie proof"),
-            super::MacosGroupSettlement::OnlyZombies
-        );
-        assert_eq!(calls.get(), (0, 1));
-
-        calls.set((0, 0));
-        assert_eq!(
-            settle(Err(rustix::io::Errno::PERM), Ok(()), Ok(false), &calls,)
-                .expect("live member remains"),
-            super::MacosGroupSettlement::LiveMembers
-        );
-        assert_eq!(calls.get(), (0, 1));
-
-        calls.set((0, 0));
-        assert!(matches!(
-            settle(Err(rustix::io::Errno::INVAL), Ok(()), Ok(true), &calls,),
-            Err(BoundProcessorError::Unreaped)
-        ));
-        assert_eq!(calls.get(), (0, 0));
-
-        calls.set((0, 0));
-        assert!(matches!(
-            settle(
-                Ok(()),
-                Err(BoundProcessorError::Containment),
-                Ok(true),
-                &calls,
-            ),
-            Err(BoundProcessorError::Containment)
-        ));
-        assert_eq!(calls.get(), (1, 0));
-
-        calls.set((0, 0));
-        assert!(matches!(
-            settle(
-                Err(rustix::io::Errno::PERM),
-                Ok(()),
-                Err(BoundProcessorError::Cleanup),
-                &calls,
-            ),
-            Err(BoundProcessorError::Cleanup)
-        ));
-        assert_eq!(calls.get(), (0, 1));
-    }
-
     #[tokio::test]
     async fn contained_nonzero_cancel_and_output_limit_are_reaped() {
-        let mut command = containment_fixture_command("exit-7");
-        let mut nonzero = spawn_contained_child(&mut command, None)
+        let (mut nonzero, _output) = spawn_contained(containment_fixture_command("exit-7"))
             .await
             .expect("nonzero child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -4032,10 +3370,9 @@ esac
             .await,
             Err(BoundProcessorError::Unsuccessful)
         ));
-        assert!(nonzero.child.try_wait().expect("nonzero wait").is_some());
+        assert!(nonzero.try_wait().expect("nonzero wait").is_some());
 
-        let mut command = containment_fixture_command("wait");
-        let mut cancelled = spawn_contained_child(&mut command, None)
+        let (mut cancelled, _output) = spawn_contained(containment_fixture_command("wait"))
             .await
             .expect("cancelled child");
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -4055,10 +3392,9 @@ esac
             .await,
             Err(BoundProcessorError::Cancelled)
         ));
-        assert!(cancelled.child.try_wait().expect("cancel wait").is_some());
+        assert!(cancelled.try_wait().expect("cancel wait").is_some());
 
-        let mut command = containment_fixture_command("wait");
-        let mut flooded = spawn_contained_child(&mut command, None)
+        let (mut flooded, _output) = spawn_contained(containment_fixture_command("wait"))
             .await
             .expect("flood child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -4076,17 +3412,17 @@ esac
             .await,
             Err(BoundProcessorError::OutputLimit)
         ));
-        assert!(flooded.child.try_wait().expect("limit wait").is_some());
+        assert!(flooded.try_wait().expect("limit wait").is_some());
     }
 
     #[tokio::test]
     async fn contained_successful_leader_exit_terminates_surviving_descendants() {
         let attempts = if cfg!(target_os = "macos") { 4 } else { 1 };
         for attempt in 0..attempts {
-            let mut command = containment_fixture_command("leader-with-descendant");
-            let mut child = spawn_contained_child(&mut command, None)
-                .await
-                .expect("contained child");
+            let (mut child, _output) =
+                spawn_contained(containment_fixture_command("leader-with-descendant"))
+                    .await
+                    .expect("contained child");
             let (_cancel_tx, mut cancel_rx) = oneshot::channel();
             let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
             pipe_tx.send(PipeEvent::Finished).unwrap();
@@ -4102,19 +3438,14 @@ esac
             )
             .await
             .unwrap_or_else(|error| panic!("contained success attempt {attempt}: {error:?}"));
-            assert!(child.child.try_wait().expect("leader wait").is_some());
-            assert!(
-                super::process_containment_is_empty(&child.containment)
-                    .await
-                    .expect("empty process group")
-            );
+            assert!(child.try_wait().expect("leader wait").is_some());
+            assert!(child.tree_settled().expect("settled process group"));
         }
     }
 
     #[tokio::test]
     async fn contained_tree_timeout_is_reaped() {
-        let mut command = containment_fixture_command("wait");
-        let mut child = spawn_contained_child(&mut command, None)
+        let (mut child, _output) = spawn_contained(containment_fixture_command("wait"))
             .await
             .expect("timeout child");
         let (_cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -4133,6 +3464,6 @@ esac
             .await,
             Err(BoundProcessorError::Timeout)
         ));
-        assert!(child.child.try_wait().expect("timeout wait").is_some());
+        assert!(child.try_wait().expect("timeout wait").is_some());
     }
 }

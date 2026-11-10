@@ -1,7 +1,4 @@
-use super::super::{
-    logs::{LogCollector, LogStream},
-    process::{OwnedProcess, SpawnError},
-};
+use super::super::logs::{LogCollector, LogStream};
 use super::*;
 use crate::{
     install::artifacts::{ActivatedFile, ActivatedVersion},
@@ -13,6 +10,7 @@ use crate::{
     storage::MetadataStore,
     tasks::{Exclusions, TaskOwner},
 };
+use axial_minecraft::process::{OwnedProcess, SpawnError};
 use sha1::{Digest, Sha1};
 use std::{
     io::{Cursor, Write},
@@ -209,9 +207,10 @@ async fn real_java_loads_verified_classpath_from_canonical_windows_capabilities(
             .expect("frozen official Java 17 runtime root"),
     )
     .unwrap();
-    let runtime = crate::runtime::probe::probe_java_runtime(&source.join("bin/java.exe"), None)
-        .await
-        .unwrap();
+    let runtime =
+        axial_minecraft::probe_java(&source.join("bin/java.exe"), None, std::future::pending())
+            .await
+            .unwrap();
     let operation = instance.generation().managed_library().unwrap();
     let command = super::build(super::super::model::LaunchPlanRequest {
         version_guard: axial_minecraft::VersionBundleReadGuard::acquire(&operation).unwrap(),
