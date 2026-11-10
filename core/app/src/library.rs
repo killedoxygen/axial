@@ -278,7 +278,7 @@ enum NativeDestinationState {
     Cancellation(axial_fs::TransientDestinationCancelObligation),
     Publication(axial_fs::TransientPublicationBatchObligation),
     // Retain an unexpected singleton contract result, including during unwind.
-    Unclassified(Vec<axial_fs::TransientPublicationMember>),
+    Unclassified(#[allow(dead_code)] Vec<axial_fs::TransientPublicationMember>),
     Published,
     Cancelled,
     NoEffect,

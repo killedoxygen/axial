@@ -8,9 +8,6 @@ use axial_minecraft::download::{
     ExecutionDownloadFact, ExpectedIntegrity, LibraryVerificationIntegrity,
     library_verification_plans_for,
 };
-use axial_minecraft::known_good::{
-    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRoot,
-};
 use axial_minecraft::managed_path::{
     ManagedLibraryFile, ManagedLibraryOperation, ManagedNativeDirectory,
 };
@@ -143,53 +140,12 @@ struct NativeExtraction {
 
 /// Prepare the selected native JARs before entering the pure launch planner.
 /// The path argument is accepted only as a projection of `library`.
-pub(crate) async fn prepare_natives(
-    library: &ManagedLibraryOperation,
-    library_root: &Path,
-    version: &VersionJson,
-    environment: &Environment,
-) -> Result<Option<PreparedNatives>, NativePreparationError> {
-    prepare_natives_with_inventory(library, library_root, version, environment, None).await
-}
-
-/// Retained install inventory supplies exact observed digests for legacy library
-/// declarations that did not carry provider checksums. It must originate from
-/// the acknowledged activation source for this version, not a caller DTO.
-pub(crate) async fn prepare_natives_with_inventory(
-    library: &ManagedLibraryOperation,
-    library_root: &Path,
-    version: &VersionJson,
-    environment: &Environment,
-    inventory: Option<Arc<KnownGoodInventory>>,
-) -> Result<Option<PreparedNatives>, NativePreparationError> {
-    prepare_natives_retained(library, library_root, version, environment, inventory, None).await
-}
-
 pub(crate) async fn prepare_natives_with_exact_files(
     library: &ManagedLibraryOperation,
     library_root: &Path,
     version: &VersionJson,
     environment: &Environment,
     exact: Arc<BTreeMap<String, (String, u64)>>,
-) -> Result<Option<PreparedNatives>, NativePreparationError> {
-    prepare_natives_retained(
-        library,
-        library_root,
-        version,
-        environment,
-        None,
-        Some(exact),
-    )
-    .await
-}
-
-async fn prepare_natives_retained(
-    library: &ManagedLibraryOperation,
-    library_root: &Path,
-    version: &VersionJson,
-    environment: &Environment,
-    inventory: Option<Arc<KnownGoodInventory>>,
-    exact: Option<Arc<BTreeMap<String, (String, u64)>>>,
 ) -> Result<Option<PreparedNatives>, NativePreparationError> {
     library
         .validate_read_projection(library_root)
@@ -199,14 +155,7 @@ async fn prepare_natives_retained(
     let version = version.clone();
     let environment = environment.clone();
     let extraction = tokio::task::spawn_blocking(move || {
-        plan_native_extraction(
-            &operation,
-            &root,
-            &version,
-            &environment,
-            inventory.as_deref(),
-            exact.as_deref(),
-        )
+        plan_native_extraction(&operation, &root, &version, &environment, &exact)
     })
     .await
     .map_err(|_| NativePreparationError::Archive)??;
@@ -273,8 +222,7 @@ fn plan_native_extraction(
     library_root: &Path,
     version: &VersionJson,
     environment: &Environment,
-    inventory: Option<&KnownGoodInventory>,
-    exact: Option<&BTreeMap<String, (String, u64)>>,
+    exact: &BTreeMap<String, (String, u64)>,
 ) -> Result<Option<NativeExtraction>, NativePreparationError> {
     library
         .validate_read_projection(library_root)
@@ -312,13 +260,12 @@ fn plan_native_extraction(
         let expected = match verification.get(&selected.abs_path) {
             Some(LibraryVerificationIntegrity::Sha1(expected)) => expected.clone(),
             Some(LibraryVerificationIntegrity::MissingChecksum) => {
-                if let Some((sha1, size)) = exact.and_then(|files| files.get(relative.as_str())) {
-                    ExpectedIntegrity {
-                        size: Some(*size),
-                        sha1: Some(sha1.clone()),
-                    }
-                } else {
-                    native_inventory_integrity(inventory, &relative)?
+                let (sha1, size) = exact
+                    .get(relative.as_str())
+                    .ok_or(NativePreparationError::Integrity)?;
+                ExpectedIntegrity {
+                    size: Some(*size),
+                    sha1: Some(sha1.clone()),
                 }
             }
             None => return Err(NativePreparationError::Integrity),
@@ -386,40 +333,6 @@ fn plan_native_extraction(
         files,
         manifest,
     }))
-}
-
-fn native_inventory_integrity(
-    inventory: Option<&KnownGoodInventory>,
-    relative: &PortableRelativePath,
-) -> Result<ExpectedIntegrity, NativePreparationError> {
-    let library_relative = relative
-        .as_str()
-        .strip_prefix("libraries/")
-        .ok_or(NativePreparationError::Integrity)?;
-    let mut matching = inventory
-        .ok_or(NativePreparationError::Integrity)?
-        .entries()
-        .iter()
-        .filter(|entry| {
-            entry.root() == &KnownGoodRoot::Libraries
-                && entry.path().as_str() == library_relative
-                && matches!(
-                    entry.kind(),
-                    KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary
-                )
-        });
-    let entry = matching.next().ok_or(NativePreparationError::Integrity)?;
-    if matching.next().is_some() {
-        return Err(NativePreparationError::Integrity);
-    }
-    match entry.integrity() {
-        KnownGoodIntegrity::Sha1 { digest, size }
-        | KnownGoodIntegrity::ExactBytes { digest, size } => Ok(ExpectedIntegrity {
-            size: Some(*size),
-            sha1: Some(digest.as_str().to_owned()),
-        }),
-        _ => Err(NativePreparationError::Integrity),
-    }
 }
 
 fn extract_native_archive(

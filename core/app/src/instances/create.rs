@@ -480,7 +480,7 @@ impl InstanceService {
                 let (outcome, pin) = stage.discard().into_parts();
                 self.settle_effect(StageDiscard(outcome, pin))
             }
-            StageCreate(crate::files::StageCreateOutcome::NoEffect(_)) => None,
+            StageCreate(crate::files::StageCreateOutcome::NoEffect) => None,
             StageSeal(error) => {
                 let (outcome, pin) = error.into_staged().discard().into_parts();
                 self.settle_effect(StageDiscard(outcome, pin))

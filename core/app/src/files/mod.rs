@@ -193,7 +193,7 @@ impl ScopedDirectory {
                     started: false,
                 })
             }
-            axial_fs::FileCreateOutcome::NoEffect(error) => StageCreateOutcome::NoEffect(error),
+            axial_fs::FileCreateOutcome::NoEffect(_) => StageCreateOutcome::NoEffect,
             axial_fs::FileCreateOutcome::AppliedUnverified(obligation) => {
                 StageCreateOutcome::Unresolved {
                     obligation: Retained::new(obligation, self.pin.clone()),
@@ -274,7 +274,7 @@ impl ScopedFile {
 #[derive(Debug)]
 pub(crate) enum StageCreateOutcome {
     Created(StagedFile),
-    NoEffect(io::Error),
+    NoEffect,
     Unresolved {
         obligation: Retained<axial_fs::FileCreateObligation>,
         parent: ScopedDirectory,

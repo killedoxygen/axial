@@ -1800,11 +1800,12 @@ mod tests {
                 }}}
             }]
         })).unwrap();
-        let natives = crate::install::vanilla::prepare_natives(
+        let natives = crate::install::vanilla::prepare_natives_with_exact_files(
             authority.operation(),
             root.path(),
             &version,
             &axial_minecraft::default_environment(),
+            Arc::default(),
         )
         .await
         .unwrap()

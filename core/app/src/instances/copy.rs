@@ -119,7 +119,7 @@ pub(crate) fn copy_file(
         .map_err(|_| InstanceError::DirectoryUnavailable)?;
     let mut stage = match destination.stage(name) {
         StageCreateOutcome::Created(stage) => stage,
-        StageCreateOutcome::NoEffect(_) => return Err(InstanceError::DirectoryUnavailable),
+        StageCreateOutcome::NoEffect => return Err(InstanceError::DirectoryUnavailable),
         unresolved => {
             service.retain(NativeEffect::StageCreate(unresolved));
             return Err(InstanceError::SettlementRequired);
@@ -164,7 +164,7 @@ pub(crate) fn write_file(
 ) -> InstanceResult<()> {
     let mut stage = match destination.stage(name) {
         StageCreateOutcome::Created(stage) => stage,
-        StageCreateOutcome::NoEffect(_) => return Err(InstanceError::DirectoryUnavailable),
+        StageCreateOutcome::NoEffect => return Err(InstanceError::DirectoryUnavailable),
         unresolved => {
             service.retain(NativeEffect::StageCreate(unresolved));
             return Err(InstanceError::SettlementRequired);
