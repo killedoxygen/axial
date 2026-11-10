@@ -3,7 +3,9 @@
 //! downloader, managed-runtime, publication, queue and launch owners.
 
 use super::{
-    DesktopServices, start_in_profile, start_profile_with_performance_test_inputs,
+    DesktopServices,
+    fixture::{Api, Events},
+    start_in_profile, start_profile_with_performance_test_inputs,
     start_profile_with_test_endpoints, transport,
 };
 use axial_minecraft::download::InstallTestEndpoints;
@@ -787,144 +789,6 @@ fn performance_fixture_transfers(base: &str) -> axial_performance::ManagedArtifa
         },
         RetryPolicy::none(),
     )
-}
-
-struct Api {
-    client: reqwest::Client,
-    base: String,
-    capability: String,
-}
-
-impl Api {
-    fn new(services: &DesktopServices) -> Self {
-        let bootstrap = services.server.bootstrap();
-        Self {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(45))
-                .build()
-                .unwrap(),
-            base: bootstrap.base_url,
-            capability: bootstrap.capability,
-        }
-    }
-
-    async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
-        let kill = method == reqwest::Method::POST && path.ends_with("/kill");
-        let mut request = self
-            .client
-            .request(method, format!("{}{path}", self.base))
-            .header(transport::CAPABILITY_HEADER, &self.capability);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await;
-        let response = if kill {
-            response.unwrap_or_else(|_| {
-                panic!("Kill request failed before response headers; Stop acceptance is unknown")
-            })
-        } else {
-            response.unwrap()
-        };
-        let status = response.status();
-        let body = response.text().await.unwrap();
-        assert!(status.is_success(), "{path}: {status}: {body}");
-        serde_json::from_str(&body).unwrap()
-    }
-
-    async fn response(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> (StatusCode, Value) {
-        let mut request = self
-            .client
-            .request(method, format!("{}{path}", self.base))
-            .header(transport::CAPABILITY_HEADER, &self.capability);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await.unwrap();
-        (response.status(), response.json().await.unwrap())
-    }
-
-    async fn read(&self, path: &str) -> (StatusCode, Value) {
-        self.response(reqwest::Method::GET, path, None).await
-    }
-
-    async fn get(&self, path: &str) -> Value {
-        self.request(reqwest::Method::GET, path, None).await
-    }
-
-    async fn post(&self, path: &str, body: Value) -> Value {
-        self.request(reqwest::Method::POST, path, Some(body)).await
-    }
-
-    async fn events(&self, path: &str) -> Events {
-        let ticket = self
-            .post(
-                "/api/v1/transport/tickets",
-                json!({"audience":"stream","target":path}),
-            )
-            .await;
-        let response = self
-            .client
-            .get(format!(
-                "{}{path}?axial_ticket={}",
-                self.base,
-                ticket["ticket"].as_str().unwrap()
-            ))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
-        assert!(
-            response.headers()["content-type"]
-                .to_str()
-                .unwrap()
-                .starts_with("text/event-stream")
-        );
-        Events {
-            response,
-            buffered: Vec::new(),
-        }
-    }
-}
-
-struct Events {
-    response: reqwest::Response,
-    buffered: Vec<u8>,
-}
-
-impl Events {
-    async fn next(&mut self) -> (String, Value) {
-        loop {
-            if let Some(end) = self.buffered.windows(2).position(|bytes| bytes == b"\n\n") {
-                let frame: Vec<_> = self.buffered.drain(..end + 2).collect();
-                let frame = String::from_utf8(frame).unwrap();
-                let event = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("event:"))
-                    .unwrap_or("message")
-                    .trim();
-                if let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data:")) {
-                    return (event.to_owned(), serde_json::from_str(data.trim()).unwrap());
-                }
-                continue;
-            }
-            self.buffered.extend_from_slice(
-                &self
-                    .response
-                    .chunk()
-                    .await
-                    .unwrap()
-                    .expect("stream ended before terminal state"),
-            );
-            assert!(self.buffered.len() <= 1 << 20, "bounded fixture stream");
-        }
-    }
 }
 
 fn installed_files(root: &std::path::Path, extra: &[&str]) -> Vec<(PathBuf, Vec<u8>)> {
@@ -6020,7 +5884,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
             {
                 Ok(services) => services,
                 Err(failure) => {
-                    startup = Some(failure);
+                    startup.replace(failure);
                     panic!("Playing-edit initial startup was refused");
                 }
             },
@@ -6140,7 +6004,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
         services = Some(match start_in_profile(profile, None).await {
             Ok(services) => services,
             Err(failure) => {
-                startup = Some(failure);
+                startup.replace(failure);
                 panic!("Playing-edit reopen was refused");
             }
         });

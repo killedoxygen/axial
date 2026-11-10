@@ -1,10 +1,16 @@
+use super::error::{ApiResult, Extracted};
 use axial_app::instances::{
-    create::{CreateInstanceRequest, InstanceService},
-    delete::{DeleteIntent, DeletionError},
+    create::{
+        CreateInstanceRequest, InstanceService, PendingInstancesResponse, RecoveredCreationResponse,
+    },
+    delete::{DeleteIntent, DeletionResponse, DeletionSnapshot},
     duplicate::DuplicateRequest,
     from_pack::CreateFromModpackRequest,
-    model::{InstanceError, InstanceId, InstancePatch},
-    setup::{InstanceSetupExecuteRequest, InstanceSetupPlanRequest, ListResponse, SetupService},
+    model::{EnrichedInstance, InstanceError, InstanceId, InstancePatch},
+    setup::{
+        CreateInstanceResponse, CreateLoaderBuildsView, CreateView, InstanceSetupExecuteRequest,
+        InstanceSetupPlanRequest, InstanceSetupPlanResponse, ListResponse, SetupService,
+    },
 };
 use axial_app::launch::session::SessionManager;
 use axum::{
@@ -13,11 +19,9 @@ use axum::{
         DefaultBodyLimit, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::StatusCode,
     routing::{get, post},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -26,7 +30,6 @@ struct Services {
     setup: Arc<SetupService>,
     sessions: SessionManager,
 }
-type ApiError = (StatusCode, Json<Value>);
 
 /// Authentication and origin admission are attached once by API composition.
 pub fn router(
@@ -62,105 +65,85 @@ pub fn router(
         .layer(DefaultBodyLimit::max(32 * 1024))
         .with_state(Services {
             instances,
-            setup,
+            setup: setup.clone(),
             sessions,
         })
+        .merge(
+            Router::new()
+                .route("/api/v1/setup/init", post(initialize))
+                .with_state(setup),
+        )
 }
 
-async fn list(State(services): State<Services>) -> Result<Json<ListResponse>, ApiError> {
-    services.setup.list().await.map(Json).map_err(error)
+fn identity(value: &str) -> Result<InstanceId, InstanceError> {
+    value.parse()
+}
+
+async fn initialize(
+    State(setup): State<Arc<SetupService>>,
+) -> ApiResult<axial_app::instances::setup::SetupStatusResponse> {
+    Ok(Json(setup.initialize().await?))
+}
+
+async fn list(State(services): State<Services>) -> ApiResult<ListResponse> {
+    Ok(Json(services.setup.list().await?))
 }
 
 async fn detail(
     State(services): State<Services>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let record = services
-        .instances
-        .registry()
-        .get_live(&identity(&id)?)
-        .map_err(error)?;
-    let instances = services
-        .setup
-        .enrich_all(vec![record.instance])
-        .await
-        .map_err(error)?;
+) -> ApiResult<EnrichedInstance> {
+    let record = services.instances.registry().get_live(&identity(&id)?)?;
+    let instances = services.setup.enrich_all(vec![record.instance]).await?;
     let [instance] =
-        <[_; 1]>::try_from(instances).map_err(|_| error(InstanceError::VersionUnavailable))?;
-    Ok(Json(json!(instance)))
+        <[_; 1]>::try_from(instances).map_err(|_| InstanceError::VersionUnavailable)?;
+    Ok(Json(instance))
 }
 
 async fn create(
     State(services): State<Services>,
     body: Result<Json<CreateInstanceRequest>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Json(request) = body.map_err(|_| invalid())?;
-    services
-        .setup
-        .create(request)
-        .await
-        .map(|response| Json(json!(response)))
-        .map_err(error)
+) -> ApiResult<CreateInstanceResponse> {
+    let request = body.or_refuse(|| InstanceError::InvalidInput)?;
+    Ok(Json(services.setup.create(request).await?))
 }
 
 async fn create_modpack(
     State(services): State<Services>,
     body: Result<Json<CreateFromModpackRequest>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Json(request) = body.map_err(|_| invalid())?;
-    services
-        .setup
-        .create_from_modpack(request)
-        .await
-        .map(|response| Json(json!(response)))
-        .map_err(error)
+) -> ApiResult<CreateInstanceResponse> {
+    let request = body.or_refuse(|| InstanceError::InvalidInput)?;
+    Ok(Json(services.setup.create_from_modpack(request).await?))
 }
 
 async fn update(
     State(services): State<Services>,
     Path(id): Path<String>,
     body: Result<Json<InstancePatch>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Json(patch) = body.map_err(|_| invalid())?;
+) -> ApiResult<EnrichedInstance> {
+    let patch = body.or_refuse(|| InstanceError::InvalidInput)?;
     let instance = services
         .instances
-        .update_record_with_sessions(&identity(&id)?, patch, &services.sessions)
-        .map_err(error)?
+        .update_record_with_sessions(&identity(&id)?, patch, &services.sessions)?
         .instance;
-    // Display inspection cannot turn a committed write into a refusal.
-    if let Ok(projected) = services.setup.enrich_all(vec![instance.clone()]).await
-        && let Ok([enriched]) = <[_; 1]>::try_from(projected)
-    {
-        return Ok(Json(json!(enriched)));
-    }
-    let versions = services.setup.installed().await.unwrap_or_default();
-    Ok(Json(json!(
-        services.setup.enrich(instance, &versions).await
-    )))
+    Ok(Json(services.setup.enrich_committed(instance).await))
 }
 
 async fn duplicate(
     State(services): State<Services>,
     Path(id): Path<String>,
     body: Result<Option<Json<DuplicateRequest>>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> ApiResult<EnrichedInstance> {
     let request = body
-        .map_err(|_| invalid())?
+        .map_err(|_| InstanceError::InvalidInput)?
         .map(|Json(request)| request)
         .unwrap_or_default();
-    let work = services
-        .instances
-        .duplicate(&identity(&id)?, request)
-        .map_err(error)?;
+    let work = services.instances.duplicate(&identity(&id)?, request)?;
     let instance = work
         .join()
         .await
-        .map_err(|_| error(InstanceError::SettlementRequired))?
-        .map_err(error)?;
-    let versions = services.setup.installed().await.unwrap_or_default();
-    Ok(Json(json!(
-        services.setup.enrich(instance, &versions).await
-    )))
+        .map_err(|_| InstanceError::SettlementRequired)??;
+    Ok(Json(services.setup.enrich_committed(instance).await))
 }
 
 #[derive(Default, Deserialize)]
@@ -175,101 +158,74 @@ async fn delete(
     State(services): State<Services>,
     Path(id): Path<String>,
     query: Result<Query<DeleteQuery>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Query(query) = query.map_err(|_| invalid())?;
+) -> ApiResult<DeletionResponse> {
+    let query = query.or_refuse(|| InstanceError::InvalidInput)?;
     let intent = if query.keep_files {
         DeleteIntent::KeepFiles
     } else {
         DeleteIntent::DeleteFiles
     };
-    let work = services
-        .instances
-        .delete(
-            &identity(&id)?,
-            intent,
-            query.operation_id.unwrap_or_else(uuid::Uuid::new_v4),
-        )
-        .map_err(deletion_error)?;
+    let work = services.instances.delete(
+        &identity(&id)?,
+        intent,
+        query.operation_id.unwrap_or_else(uuid::Uuid::new_v4),
+    )?;
     let snapshot = work
         .join()
         .await
-        .map_err(|_| error(InstanceError::SettlementRequired))?
-        .map_err(deletion_error)?;
-    Ok(Json(
-        json!({ "status": snapshot.status, "deletion": snapshot }),
-    ))
+        .map_err(|_| InstanceError::SettlementRequired)??;
+    Ok(Json(snapshot.into()))
 }
 
 async fn deletion_status(
     State(services): State<Services>,
     Path(operation_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let operation_id = uuid::Uuid::parse_str(&operation_id).map_err(|_| invalid())?;
-    services
-        .instances
-        .deletion_status(operation_id)
-        .map(|snapshot| Json(json!(snapshot)))
-        .map_err(deletion_error)
+) -> ApiResult<DeletionSnapshot> {
+    let operation_id =
+        uuid::Uuid::parse_str(&operation_id).map_err(|_| InstanceError::InvalidInput)?;
+    Ok(Json(services.instances.deletion_status(operation_id)?))
 }
 
-async fn pending(State(services): State<Services>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(
-        json!({ "creations": services.instances.pending().map_err(error)?,
-        "deletions": services.instances.pending_deletions().map_err(deletion_error)? }),
-    ))
+async fn pending(State(services): State<Services>) -> ApiResult<PendingInstancesResponse> {
+    Ok(Json(PendingInstancesResponse {
+        creations: services.instances.pending()?,
+        deletions: services.instances.pending_deletions()?,
+    }))
 }
 
 async fn plan_setup(
     State(services): State<Services>,
     body: Result<Json<InstanceSetupPlanRequest>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Json(request) = body.map_err(|_| invalid())?;
-    services
-        .setup
-        .plan_setup(request)
-        .await
-        .map(|plan| Json(json!(plan)))
-        .map_err(error)
+) -> ApiResult<InstanceSetupPlanResponse> {
+    let request = body.or_refuse(|| InstanceError::InvalidInput)?;
+    Ok(Json(services.setup.plan_setup(request).await?))
 }
 
 async fn execute_setup(
     State(services): State<Services>,
     body: Result<Json<InstanceSetupExecuteRequest>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Json(request) = body.map_err(|_| invalid())?;
-    services
-        .setup
-        .execute_setup(request)
-        .await
-        .map(|result| Json(json!(result)))
-        .map_err(error)
+) -> ApiResult<CreateInstanceResponse> {
+    let request = body.or_refuse(|| InstanceError::InvalidInput)?;
+    Ok(Json(services.setup.execute_setup(request).await?))
 }
 
 async fn resume_setup(
     State(services): State<Services>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    services
-        .setup
-        .resume_setup(&identity(&id)?)
-        .await
-        .map(|result| Json(json!(result)))
-        .map_err(error)
+) -> ApiResult<CreateInstanceResponse> {
+    Ok(Json(services.setup.resume_setup(&identity(&id)?).await?))
 }
 
 async fn resume_creation(
     State(services): State<Services>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let instance = services
-        .instances
-        .recover_creation(&identity(&id)?)
-        .map_err(error)?
+) -> ApiResult<RecoveredCreationResponse> {
+    let work = services.instances.recover_creation(&identity(&id)?)?;
+    let instance = work
         .join()
         .await
-        .map_err(|_| error(InstanceError::SettlementRequired))?
-        .map_err(error)?;
-    Ok(Json(json!({"instance": instance})))
+        .map_err(|_| InstanceError::SettlementRequired)??;
+    Ok(Json(RecoveredCreationResponse { instance }))
 }
 
 #[derive(Default, Deserialize)]
@@ -280,14 +236,11 @@ struct ViewQuery {
 async fn create_view(
     State(services): State<Services>,
     query: Result<Query<ViewQuery>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Query(query) = query.map_err(|_| invalid())?;
-    services
-        .setup
-        .create_view(query.source.as_deref())
-        .await
-        .map(|view| Json(json!(view)))
-        .map_err(error)
+) -> ApiResult<CreateView> {
+    let query = query.or_refuse(|| InstanceError::InvalidInput)?;
+    Ok(Json(
+        services.setup.create_view(query.source.as_deref()).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -299,57 +252,12 @@ struct BuildsQuery {
 async fn loader_builds(
     State(services): State<Services>,
     query: Result<Query<BuildsQuery>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Query(query) = query.map_err(|_| invalid())?;
-    services
-        .setup
-        .loader_builds(&query.source, &query.minecraft_version)
-        .await
-        .map(|view| Json(json!(view)))
-        .map_err(error)
-}
-
-fn identity(value: &str) -> Result<InstanceId, ApiError> {
-    value.parse().map_err(error)
-}
-fn invalid() -> ApiError {
-    error(InstanceError::InvalidInput)
-}
-
-pub(super) fn error(failure: InstanceError) -> ApiError {
-    let status = match failure {
-        InstanceError::InvalidId
-        | InstanceError::InvalidName
-        | InstanceError::InvalidInput
-        | InstanceError::InvalidSettings => StatusCode::BAD_REQUEST,
-        InstanceError::NotFound => StatusCode::NOT_FOUND,
-        InstanceError::InstalledVersionsDegraded => StatusCode::PRECONDITION_FAILED,
-        InstanceError::Conflict
-        | InstanceError::NameConflict
-        | InstanceError::Busy
-        | InstanceError::Cancelled
-        | InstanceError::ManagedDuplicateUnavailable => StatusCode::CONFLICT,
-        InstanceError::Closed
-        | InstanceError::SetupUnavailable
-        | InstanceError::LibraryUnavailable
-        | InstanceError::VersionUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-        InstanceError::DirectoryUnavailable
-        | InstanceError::SettlementRequired
-        | InstanceError::Storage(_) => StatusCode::CONFLICT,
-    };
-    (status, Json(json!({"error": failure.to_string()})))
-}
-
-fn deletion_error(failure: DeletionError) -> ApiError {
-    match failure {
-        DeletionError::Instance(failure) => error(failure),
-        other => (
-            if matches!(other, DeletionError::NotFound) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::CONFLICT
-            },
-            Json(json!({"error": other.to_string()})),
-        ),
-    }
+) -> ApiResult<CreateLoaderBuildsView> {
+    let query = query.or_refuse(|| InstanceError::InvalidInput)?;
+    Ok(Json(
+        services
+            .setup
+            .loader_builds(&query.source, &query.minecraft_version)
+            .await?,
+    ))
 }

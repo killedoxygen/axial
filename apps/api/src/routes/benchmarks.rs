@@ -1,17 +1,20 @@
-use axial_app::performance::{
-    PerformanceService,
-    benchmarks::{
-        BenchmarkError, BenchmarkLaunchRequest, BenchmarkService, BenchmarkSuiteDriverStatus,
-        benchmark_matrix, driver_payload, qualification_preview,
+use super::error::{ApiResult, Extracted};
+use axial_app::{
+    launch::session::SessionSnapshot,
+    performance::{
+        PerformanceService,
+        benchmarks::{
+            BenchmarkDriversResponse, BenchmarkError, BenchmarkLaunchRequest, BenchmarkMatrix,
+            BenchmarkService, BenchmarkSuiteManifest, benchmark_matrix, qualification_preview,
+        },
     },
 };
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
-    http::StatusCode,
     routing::{get, post},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -19,7 +22,6 @@ struct BenchmarkApi {
     benchmarks: Arc<BenchmarkService>,
     performance: Arc<PerformanceService>,
 }
-type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 pub fn router(benchmarks: Arc<BenchmarkService>, performance: Arc<PerformanceService>) -> Router {
     Router::new()
@@ -53,158 +55,101 @@ pub fn router(benchmarks: Arc<BenchmarkService>, performance: Arc<PerformanceSer
             performance,
         })
 }
-async fn matrix() -> Json<Value> {
-    Json(json!(benchmark_matrix()))
+
+type Request = Result<Json<BenchmarkLaunchRequest>, JsonRejection>;
+
+async fn matrix() -> Json<BenchmarkMatrix> {
+    Json(benchmark_matrix())
 }
 async fn preview() -> Json<Value> {
     Json(qualification_preview())
 }
-async fn launch(
-    State(api): State<BenchmarkApi>,
-    request: Result<Json<BenchmarkLaunchRequest>, JsonRejection>,
-) -> ApiResult {
-    let Json(input) = request.map_err(|_| error(BenchmarkError::Invalid))?;
-    Ok(Json(json!(
-        api.benchmarks.launch(input).await.map_err(error)?
-    )))
+async fn launch(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<SessionSnapshot> {
+    let input = request.or_refuse(|| BenchmarkError::Invalid)?;
+    Ok(Json(api.benchmarks.launch(input).await?))
 }
-async fn tick(
-    State(api): State<BenchmarkApi>,
-    request: Result<Json<BenchmarkLaunchRequest>, JsonRejection>,
-) -> ApiResult {
-    let Json(input) = request.map_err(|_| error(BenchmarkError::Invalid))?;
-    api.benchmarks.tick(input).await.map(Json).map_err(error)
+async fn tick(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<Value> {
+    let input = request.or_refuse(|| BenchmarkError::Invalid)?;
+    Ok(Json(api.benchmarks.tick(input).await?))
 }
-async fn start(
-    State(api): State<BenchmarkApi>,
-    request: Result<Json<BenchmarkLaunchRequest>, JsonRejection>,
-) -> ApiResult {
-    let Json(input) = request.map_err(|_| error(BenchmarkError::Invalid))?;
-    let driver = api.benchmarks.start_driver(input).await.map_err(error)?;
-    project_driver(&api.benchmarks, driver)
+async fn start(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<Value> {
+    let input = request.or_refuse(|| BenchmarkError::Invalid)?;
+    let driver = api.benchmarks.start_driver(input).await?;
+    Ok(Json(api.benchmarks.driver_view(driver)?))
 }
-async fn drivers(State(api): State<BenchmarkApi>) -> ApiResult {
-    let drivers = api.benchmarks.drivers().map_err(error)?;
-    let mut actions = api.benchmarks.resume_actions(&drivers).map_err(error)?;
-    let drivers = drivers
-        .into_iter()
-        .map(|driver| {
-            let action = actions
-                .remove(&driver.id)
-                .ok_or_else(|| error(BenchmarkError::Unavailable))?;
-            Ok(driver_response(driver, action))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(json!({"status":"ok","drivers":drivers})))
+async fn drivers(State(api): State<BenchmarkApi>) -> ApiResult<BenchmarkDriversResponse> {
+    let drivers = api.benchmarks.driver_views(api.benchmarks.drivers()?)?;
+    Ok(Json(BenchmarkDriversResponse {
+        status: "ok",
+        drivers,
+    }))
 }
-async fn driver(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult {
-    project_driver(&api.benchmarks, api.benchmarks.driver(&id).map_err(error)?)
+async fn driver(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
+    Ok(Json(
+        api.benchmarks.driver_view(api.benchmarks.driver(&id)?)?,
+    ))
 }
-async fn stop(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult {
-    project_driver(
-        &api.benchmarks,
-        api.benchmarks.stop_driver(&id).map_err(error)?,
-    )
-}
-async fn resume(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult {
-    project_driver(
-        &api.benchmarks,
-        api.benchmarks.resume_driver(&id).map_err(error)?,
-    )
-}
-fn project_driver(service: &BenchmarkService, driver: BenchmarkSuiteDriverStatus) -> ApiResult {
-    let action = service
-        .resume_actions(std::slice::from_ref(&driver))
-        .map_err(error)?
-        .remove(&driver.id)
-        .ok_or_else(|| error(BenchmarkError::Unavailable))?;
-    Ok(Json(driver_response(driver, action)))
-}
-fn driver_response(driver: BenchmarkSuiteDriverStatus, can_resume: bool) -> Value {
-    let mut payload = driver_payload(driver);
-    payload["view_model"]["can_resume"] = json!(can_resume);
-    payload
-}
-async fn suite(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult {
-    Ok(Json(json!(
+async fn stop(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
+    Ok(Json(
         api.benchmarks
-            .suite(&id)
-            .map_err(error)?
-            .ok_or_else(|| error(BenchmarkError::NotFound))?
-    )))
+            .driver_view(api.benchmarks.stop_driver(&id)?)?,
+    ))
 }
-async fn qualification(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult {
-    api.benchmarks
-        .qualification(&id, &api.performance)
-        .await
-        .map(Json)
-        .map_err(error)
+async fn resume(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
+    Ok(Json(
+        api.benchmarks
+            .driver_view(api.benchmarks.resume_driver(&id)?)?,
+    ))
 }
-fn error(error: BenchmarkError) -> (StatusCode, Json<Value>) {
-    let status = match error {
-        BenchmarkError::Invalid => StatusCode::BAD_REQUEST,
-        BenchmarkError::NotFound => StatusCode::NOT_FOUND,
-        BenchmarkError::Busy | BenchmarkError::Complete => StatusCode::CONFLICT,
-        _ => StatusCode::SERVICE_UNAVAILABLE,
-    };
-    (status, Json(json!({"error":error.to_string()})))
+async fn suite(
+    State(api): State<BenchmarkApi>,
+    Path(id): Path<String>,
+) -> ApiResult<BenchmarkSuiteManifest> {
+    Ok(Json(
+        api.benchmarks.suite(&id)?.ok_or(BenchmarkError::NotFound)?,
+    ))
+}
+async fn qualification(
+    State(api): State<BenchmarkApi>,
+    Path(id): Path<String>,
+) -> ApiResult<Value> {
+    Ok(Json(
+        api.benchmarks.qualification(&id, &api.performance).await?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axial_app::{
-        instances::create::{CreateInstanceRequest, CreateTarget},
-        storage::StorageError,
-    };
-    use reqwest::Method;
+    use crate::fixture::Profile;
+    use axial_app::storage::StorageError;
+    use reqwest::{Method, StatusCode};
+    use serde_json::json;
 
     const DRIVERS: &str = "/api/v1/launch/benchmark/suite/drivers";
 
     #[tokio::test]
     async fn qualification_preview_is_descriptor_only_and_creates_no_work() {
         const PREVIEW: &str = "/api/v1/launch/benchmark/qualification/family-c-1-12-2/preview";
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let services = crate::start_in_profile(root.path().join("replacement"), None)
-            .await
-            .unwrap();
-        let bootstrap = services.server.bootstrap();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let get = |path: &str| {
-            client
-                .get(format!("{}{path}", bootstrap.base_url))
-                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
-        };
-        let unauthorized = client
+        let profile = Profile::start().await;
+        let bootstrap = profile.services.server.bootstrap();
+        let unauthorized = reqwest::Client::new()
             .get(format!("{}{PREVIEW}", bootstrap.base_url))
             .send()
             .await
             .unwrap()
             .status();
-        let response = get(PREVIEW).send().await.unwrap();
+        let response = profile
+            .api
+            .builder(Method::GET, PREVIEW)
+            .send()
+            .await
+            .unwrap();
         let status = response.status();
         let data = response.text().await.unwrap();
-        let drivers: Value = get(DRIVERS)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let sessions: Value = get("/api/v1/launch/sessions")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let drivers = profile.api.get(DRIVERS).await;
+        let sessions = profile.api.get("/api/v1/launch/sessions").await;
+        let services = &profile.services;
         services.server.shutdown().await.unwrap();
         services.server.wait().await.unwrap();
         let durable_counts = services
@@ -321,41 +266,14 @@ mod tests {
 
     #[tokio::test]
     async fn current_driver_routes_resume_the_same_driver_and_project_actions() {
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let services = crate::start_in_profile(root.path().join("replacement"), None)
-            .await
-            .unwrap();
-        let target = CreateTarget::loader_for_tests(
-            axial_minecraft::LoaderComponentId::Fabric,
-            "1.21.1",
-            "0.16.9",
-        )
-        .unwrap();
-        let instance = services
-            .instances
-            .create(
-                CreateInstanceRequest {
-                    name: "Benchmark route fixture".into(),
-                    selection_id: target.selection_id().into(),
-                    ..Default::default()
-                },
-                target,
-                services
-                    .instances
-                    .creation_admission_for_tests()
-                    .await
-                    .unwrap(),
-            )
-            .unwrap()
-            .join()
-            .await
-            .unwrap()
-            .unwrap();
+        let profile = Profile::start().await;
+        let services = &profile.services;
+        let (instance, _) = profile.create_instance().await;
         let accepted = services
             .benchmarks
             .start_driver(
                 serde_json::from_value(json!({
-                    "instance_id": instance.id,
+                    "instance_id": instance,
                     "suite_mode": "development",
                     "interval_ms": 5_000
                 }))
@@ -384,16 +302,10 @@ mod tests {
                 .unwrap()
         };
         let original_request = captured_request();
-        let bootstrap = services.server.bootstrap();
-        let client = reqwest::Client::new();
-        let request = |method, path: &str| {
-            client
-                .request(method, format!("{}{path}", bootstrap.base_url))
-                .header(crate::transport::CAPABILITY_HEADER, &bootstrap.capability)
-        };
         let path = format!("{DRIVERS}/{}", accepted.id);
+        let bootstrap = services.server.bootstrap();
         assert_eq!(
-            client
+            reqwest::Client::new()
                 .get(format!("{}{path}", bootstrap.base_url))
                 .send()
                 .await
@@ -401,56 +313,27 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        let stopped: Value = request(Method::GET, &path)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let stopped = profile.api.get(&path).await;
         assert_eq!(stopped["driver"]["id"], accepted.id);
         assert_eq!(stopped["view_model"]["state_label"], "stopped");
         assert_eq!(stopped["view_model"]["state_tone"], "warn");
         assert_eq!(stopped["view_model"]["can_stop"], false);
         assert_eq!(stopped["view_model"]["can_resume"], true);
-        let resumed: Value = request(Method::POST, &format!("{path}/resume"))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let resumed = profile
+            .api
+            .post(&format!("{path}/resume"), Value::Null)
+            .await;
         assert_eq!(resumed["driver"]["id"], accepted.id);
         assert_eq!(resumed["driver"]["suite_id"], accepted.suite_id);
         assert_eq!(resumed["driver"]["state"], "running");
         assert_eq!(resumed["view_model"]["can_stop"], true);
         assert_eq!(resumed["view_model"]["can_resume"], false);
-        let stopped: Value = request(Method::POST, &format!("{path}/stop"))
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let stopped = profile.api.post(&format!("{path}/stop"), Value::Null).await;
         assert_eq!(stopped["driver"]["id"], accepted.id);
         assert_eq!(stopped["driver"]["state"], "stopped");
         assert_eq!(stopped["view_model"]["can_stop"], false);
         assert_eq!(stopped["view_model"]["can_resume"], true);
-        let listed: Value = request(Method::GET, DRIVERS)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let listed = profile.api.get(DRIVERS).await;
         let drivers = listed["drivers"].as_array().unwrap();
         assert_eq!(drivers.len(), 1);
         assert_eq!(drivers[0]["driver"]["id"], accepted.id);

@@ -1,30 +1,36 @@
 //! HTTP adaptation only. Mount under the authenticated local transport boundary.
 
+use super::{
+    Status,
+    error::{ApiError, ApiResult, Extracted},
+    media,
+};
 use axial_app::{
-    media::{MediaError, SKIN_PNG_MAX_BYTES},
+    media::SKIN_PNG_MAX_BYTES,
     skins::{
-        ProfileMedia, SkinError,
+        ProfileMedia,
         library::{
             CapeUpdate, ReplaceSkinOptions, SaveSkinOptions, SavedSkinDeleteResult,
-            SkinLibraryError, UpdateSavedSkinRequest, normalize_upload, validate_variant,
+            SavedSkinRecord, SkinNormalizeResponse, UpdateSavedSkinRequest, normalize_upload,
+            validate_variant,
         },
-        lookup::ProfileMediaError,
+        lookup::{ProfileMediaError, UsernameProfile},
+        profile_change::SavedSkinsResponse,
+        view::{ProfileResetResponse, SkinApplyResponse, SkinCancelResponse, SkinFlushResponse},
     },
 };
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::{Path, Query, State, rejection::QueryRejection},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    http::StatusCode,
+    response::Response,
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::{Value, json};
 use std::sync::Arc;
 
-type ApiError = (StatusCode, Json<Value>);
-type ApiResult = Result<Response, ApiError>;
+type Media = Result<Response, ApiError>;
 type SkinState = Arc<ProfileMedia>;
 
 pub fn router(service: SkinState) -> Router {
@@ -42,10 +48,7 @@ pub fn router(service: SkinState) -> Router {
         .route("/api/v1/skins/from-username", post(save_username))
         .route("/api/v1/skins/pending", delete(cancel))
         .route("/api/v1/skins/{texture_key}", delete(remove).put(update))
-        .route(
-            "/api/v1/skins/{texture_key}/texture",
-            axum::routing::put(replace),
-        )
+        .route("/api/v1/skins/{texture_key}/texture", put(replace))
         .route("/api/v1/skins/{texture_key}/file", get(saved_file))
         .route("/api/v1/skins/{texture_key}/apply", post(apply))
         .route("/api/v1/skins/flush", post(flush))
@@ -120,10 +123,12 @@ struct FromUsername {
     variant: Option<String>,
 }
 
+fn invalid_request() -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "Invalid skin request.")
+}
+
 fn query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
-    query
-        .map(|Query(value)| value)
-        .map_err(|_| invalid_request())
+    query.or_refuse(invalid_request)
 }
 
 async fn json_body<T: DeserializeOwned>(body: Body) -> Result<T, ApiError> {
@@ -134,36 +139,43 @@ async fn json_body<T: DeserializeOwned>(body: Body) -> Result<T, ApiError> {
 async fn image_body(body: Body) -> Result<axum::body::Bytes, ApiError> {
     to_bytes(body, SKIN_PNG_MAX_BYTES)
         .await
-        .map_err(|_| error(StatusCode::PAYLOAD_TOO_LARGE, "Skin upload is too large."))
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "Skin upload is too large."))
+}
+
+fn variant(value: Option<&str>) -> Result<Option<axial_app::media::SkinVariant>, ApiError> {
+    Ok(value.map(validate_variant).transpose()?)
+}
+
+fn image(bytes: Vec<u8>, immutable: bool) -> Response {
+    let cache = if immutable {
+        "private, max-age=31536000, immutable"
+    } else {
+        "private, no-store"
+    };
+    media("image/png", cache, bytes)
 }
 
 async fn profile_file(
     State(service): State<SkinState>,
     parameters: Result<Query<ProfileFileQuery>, QueryRejection>,
-) -> ApiResult {
+) -> Media {
     let parameters = query(parameters)?;
-    Ok(image(
-        service
-            .profile_file_for_identity(
-                parameters.texture.as_deref(),
-                parameters.profile.as_deref(),
-                parameters.skin.as_deref(),
-            )
-            .await
-            .map_err(profile_error)?,
-        parameters.texture.is_some(),
-    ))
+    let png = service
+        .profile_file_for_identity(
+            parameters.texture.as_deref(),
+            parameters.profile.as_deref(),
+            parameters.skin.as_deref(),
+        )
+        .await?;
+    Ok(image(png, parameters.texture.is_some()))
 }
 
 async fn cape_file(
     State(service): State<SkinState>,
     parameters: Result<Query<CapeQuery>, QueryRejection>,
-) -> ApiResult {
+) -> Media {
     Ok(image(
-        service
-            .cape_file(&query(parameters)?.id)
-            .await
-            .map_err(profile_error)?,
+        service.cape_file(&query(parameters)?.id).await?,
         false,
     ))
 }
@@ -171,34 +183,26 @@ async fn cape_file(
 async fn lookup(
     State(service): State<SkinState>,
     parameters: Result<Query<LookupQuery>, QueryRejection>,
-) -> ApiResult {
-    Ok(Json(
-        service
-            .delivery
-            .lookup
-            .lookup(&query(parameters)?.username)
-            .await
-            .map_err(profile_error)?,
-    )
-    .into_response())
+) -> ApiResult<UsernameProfile> {
+    let profile = service
+        .delivery
+        .lookup
+        .lookup(&query(parameters)?.username)
+        .await?;
+    Ok(Json(profile))
 }
 
 async fn lookup_file(
     State(service): State<SkinState>,
     parameters: Result<Query<LookupQuery>, QueryRejection>,
-) -> ApiResult {
+) -> Media {
     let profile = service
         .delivery
         .lookup
         .lookup(&query(parameters)?.username)
-        .await
-        .map_err(profile_error)?;
+        .await?;
     Ok(image(
-        service
-            .delivery
-            .skin(&profile.texture_url)
-            .await
-            .map_err(profile_error)?,
+        service.delivery.skin(&profile.texture_url).await?,
         false,
     ))
 }
@@ -206,42 +210,31 @@ async fn lookup_file(
 async fn lookup_cape(
     State(service): State<SkinState>,
     parameters: Result<Query<LookupQuery>, QueryRejection>,
-) -> ApiResult {
+) -> Media {
     let profile = service
         .delivery
         .lookup
         .lookup(&query(parameters)?.username)
-        .await
-        .map_err(profile_error)?;
-    let url = profile
-        .cape_url
-        .ok_or_else(|| profile_error(ProfileMediaError::MissingCape))?;
-    Ok(image(
-        service.delivery.cape(&url).await.map_err(profile_error)?,
-        false,
-    ))
+        .await?;
+    let url = profile.cape_url.ok_or(ProfileMediaError::MissingCape)?;
+    Ok(image(service.delivery.cape(&url).await?, false))
 }
 
-async fn normalize(body: Body) -> ApiResult {
-    Ok(Json(normalize_upload(&image_body(body).await?).map_err(library_error)?).into_response())
+async fn normalize(body: Body) -> ApiResult<SkinNormalizeResponse> {
+    Ok(Json(normalize_upload(&image_body(body).await?)?))
 }
 
-async fn list(State(service): State<SkinState>) -> ApiResult {
-    Ok(Json(service.list().map_err(skin_error)?).into_response())
+async fn list(State(service): State<SkinState>) -> ApiResult<SavedSkinsResponse> {
+    Ok(Json(service.list()?))
 }
 
 async fn save(
     State(service): State<SkinState>,
     parameters: Result<Query<SaveQuery>, QueryRejection>,
     body: Body,
-) -> ApiResult {
+) -> ApiResult<SavedSkinRecord> {
     let parameters = query(parameters)?;
-    let variant = parameters
-        .variant
-        .as_deref()
-        .map(validate_variant)
-        .transpose()
-        .map_err(library_error)?;
+    let variant = variant(parameters.variant.as_deref())?;
     let record = service
         .save_upload(
             &image_body(body).await?,
@@ -252,61 +245,46 @@ async fn save(
             },
             parameters.source.as_deref(),
         )
-        .await
-        .map_err(skin_error)?;
-    Ok(Json(record).into_response())
+        .await?;
+    Ok(Json(record))
 }
 
 async fn save_profile(
     State(service): State<SkinState>,
     parameters: Result<Query<SelectionQuery>, QueryRejection>,
     body: Body,
-) -> ApiResult {
+) -> ApiResult<SavedSkinRecord> {
     let parameters = query(parameters)?;
     let request: FromProfile = json_body(body).await?;
-    let variant = request
-        .variant
-        .as_deref()
-        .map(validate_variant)
-        .transpose()
-        .map_err(library_error)?;
-    Ok(Json(
-        service
-            .save_profile(
-                request.name,
-                variant,
-                request.mark_current.unwrap_or(false),
-                &parameters.expected_account_id,
-                parameters.expected_selection_revision,
-            )
-            .await
-            .map_err(skin_error)?,
-    )
-    .into_response())
+    let record = service
+        .save_profile(
+            request.name,
+            variant(request.variant.as_deref())?,
+            request.mark_current.unwrap_or(false),
+            &parameters.expected_account_id,
+            parameters.expected_selection_revision,
+        )
+        .await?;
+    Ok(Json(record))
 }
 
-async fn save_username(State(service): State<SkinState>, body: Body) -> ApiResult {
+async fn save_username(State(service): State<SkinState>, body: Body) -> ApiResult<SavedSkinRecord> {
     let request: FromUsername = json_body(body).await?;
-    let variant = request
-        .variant
-        .as_deref()
-        .map(validate_variant)
-        .transpose()
-        .map_err(library_error)?;
-    Ok(Json(
-        service
-            .save_username(&request.username, request.name, variant)
-            .await
-            .map_err(skin_error)?,
-    )
-    .into_response())
+    let record = service
+        .save_username(
+            &request.username,
+            request.name,
+            variant(request.variant.as_deref())?,
+        )
+        .await?;
+    Ok(Json(record))
 }
 
-async fn remove(State(service): State<SkinState>, Path(key): Path<String>) -> ApiResult {
-    match service.delete_saved(&key).await.map_err(skin_error)? {
-        SavedSkinDeleteResult::Deleted(_) => Ok(Json(json!({"status":"deleted"})).into_response()),
-        SavedSkinDeleteResult::Missing => Err(profile_error(ProfileMediaError::SavedSkinMissing)),
-        SavedSkinDeleteResult::Applied => Err(error(
+async fn remove(State(service): State<SkinState>, Path(key): Path<String>) -> ApiResult<Status> {
+    match service.delete_saved(&key).await? {
+        SavedSkinDeleteResult::Deleted(_) => Ok(Json(Status::new("deleted"))),
+        SavedSkinDeleteResult::Missing => Err(ProfileMediaError::SavedSkinMissing.into()),
+        SavedSkinDeleteResult::Applied => Err(ApiError::new(
             StatusCode::CONFLICT,
             "Reset or apply another skin before deleting the applied saved skin.",
         )),
@@ -317,14 +295,13 @@ async fn update(
     State(service): State<SkinState>,
     Path(key): Path<String>,
     body: Body,
-) -> ApiResult {
+) -> ApiResult<SavedSkinRecord> {
     let request: UpdateSavedSkinRequest = json_body(body).await?;
     let record = service
         .update_saved(&key, request)
-        .await
-        .map_err(skin_error)?
-        .ok_or_else(|| profile_error(ProfileMediaError::SavedSkinMissing))?;
-    Ok(Json(record).into_response())
+        .await?
+        .ok_or(ProfileMediaError::SavedSkinMissing)?;
+    Ok(Json(record))
 }
 
 async fn replace(
@@ -332,22 +309,14 @@ async fn replace(
     Path(key): Path<String>,
     parameters: Result<Query<ReplaceQuery>, QueryRejection>,
     body: Body,
-) -> ApiResult {
+) -> ApiResult<SavedSkinRecord> {
     let parameters = query(parameters)?;
-    if parameters.clear_cape == Some(true) && parameters.cape_id.is_some() {
-        return Err(invalid_request());
-    }
-    let cape_id = if parameters.clear_cape == Some(true) {
-        CapeUpdate::Clear
-    } else {
-        parameters.cape_id.map(CapeUpdate::Set).unwrap_or_default()
+    let cape_id = match (parameters.clear_cape, parameters.cape_id) {
+        (Some(true), Some(_)) => return Err(invalid_request()),
+        (Some(true), None) => CapeUpdate::Clear,
+        (_, cape_id) => cape_id.map(CapeUpdate::Set).unwrap_or_default(),
     };
-    let variant = parameters
-        .variant
-        .as_deref()
-        .map(validate_variant)
-        .transpose()
-        .map_err(library_error)?;
+    let variant = variant(parameters.variant.as_deref())?;
     let record = service
         .replace_saved(
             &key,
@@ -358,18 +327,16 @@ async fn replace(
                 cape_id,
             },
         )
-        .await
-        .map_err(skin_error)?
-        .ok_or_else(|| profile_error(ProfileMediaError::SavedSkinMissing))?;
-    Ok(Json(record).into_response())
+        .await?
+        .ok_or(ProfileMediaError::SavedSkinMissing)?;
+    Ok(Json(record))
 }
 
-async fn saved_file(State(service): State<SkinState>, Path(key): Path<String>) -> ApiResult {
+async fn saved_file(State(service): State<SkinState>, Path(key): Path<String>) -> Media {
     let png = service
         .library
-        .read_png(&key)
-        .map_err(library_error)?
-        .ok_or_else(|| profile_error(ProfileMediaError::SavedSkinMissing))?;
+        .read_png(&key)?
+        .ok_or(ProfileMediaError::SavedSkinMissing)?;
     Ok(image(png, true))
 }
 
@@ -377,31 +344,26 @@ async fn apply(
     State(service): State<SkinState>,
     Path(key): Path<String>,
     parameters: Result<Query<ApplyQuery>, QueryRejection>,
-) -> ApiResult {
+) -> ApiResult<SkinApplyResponse> {
     let parameters = query(parameters)?;
-    let deferred = parameters.defer.unwrap_or(false);
-    let accepted = service
-        .queue(
-            &key,
-            &parameters.expected_account_id,
-            parameters.expected_selection_revision,
-        )
-        .map_err(skin_error)?;
-    if !deferred {
-        service
-            .flush_generation(&accepted.account_id, accepted.generation)
-            .await
-            .map_err(profile_error)?;
+    let accepted = service.queue(
+        &key,
+        &parameters.expected_account_id,
+        parameters.expected_selection_revision,
+    )?;
+    if parameters.defer.unwrap_or(false) {
+        return Ok(Json(SkinApplyResponse::queued(key, accepted)));
     }
-    Ok(Json(json!({ "status": if deferred { "queued" } else { "applied" }, "texture_key": key,
-        "pending": if deferred { Some(accepted) } else { None },
-        "profile_updated": !deferred, "view_model": { "summary": if deferred { "Skin queued." } else { "Skin applied." } } })).into_response())
+    service
+        .flush_generation(&accepted.account_id, accepted.generation)
+        .await?;
+    Ok(Json(SkinApplyResponse::applied(key)))
 }
 
 async fn flush(
     State(service): State<SkinState>,
     parameters: Result<Query<PendingCommandQuery>, QueryRejection>,
-) -> ApiResult {
+) -> ApiResult<SkinFlushResponse> {
     let parameters = query(parameters)?;
     let applied = service
         .flush_selected(
@@ -409,180 +371,73 @@ async fn flush(
             parameters.expected_selection_revision,
             parameters.expected_generation,
         )
-        .await
-        .map_err(profile_error)?;
-    Ok(Json(json!({"status":"flushed","applied":applied,"view_model":{"summary":if applied > 0 {"Skin applied."} else {"No skin change queued."}}})).into_response())
+        .await?;
+    Ok(Json(SkinFlushResponse::new(applied)))
 }
 
 async fn cancel(
     State(service): State<SkinState>,
     parameters: Result<Query<PendingCommandQuery>, QueryRejection>,
-) -> ApiResult {
+) -> ApiResult<SkinCancelResponse> {
     let parameters = query(parameters)?;
-    let cleared = service
-        .cancel_selected(
-            &parameters.expected_account_id,
-            parameters.expected_selection_revision,
-            parameters.expected_generation,
-        )
-        .map_err(profile_error)?;
-    Ok(Json(json!({"status":"cleared","cleared":cleared,"view_model":{"summary":"Skin change canceled."}})).into_response())
+    let cleared = service.cancel_selected(
+        &parameters.expected_account_id,
+        parameters.expected_selection_revision,
+        parameters.expected_generation,
+    )?;
+    Ok(Json(SkinCancelResponse::new(cleared)))
 }
 
 async fn reset_skin(
     State(service): State<SkinState>,
     parameters: Result<Query<SelectionQuery>, QueryRejection>,
-) -> ApiResult {
-    let parameters = query(parameters)?;
-    service
-        .reset(
-            true,
-            &parameters.expected_account_id,
-            parameters.expected_selection_revision,
-        )
-        .await
-        .map_err(profile_error)?;
-    Ok(Json(json!({"status":"reset","profile_updated":true,"view_model":{"summary":"Profile skin reset."}})).into_response())
+) -> ApiResult<ProfileResetResponse> {
+    reset(service, parameters, true).await
 }
 
 async fn reset_cape(
     State(service): State<SkinState>,
     parameters: Result<Query<SelectionQuery>, QueryRejection>,
-) -> ApiResult {
+) -> ApiResult<ProfileResetResponse> {
+    reset(service, parameters, false).await
+}
+
+async fn reset(
+    service: SkinState,
+    parameters: Result<Query<SelectionQuery>, QueryRejection>,
+    skin: bool,
+) -> ApiResult<ProfileResetResponse> {
     let parameters = query(parameters)?;
     service
         .reset(
-            false,
+            skin,
             &parameters.expected_account_id,
             parameters.expected_selection_revision,
         )
-        .await
-        .map_err(profile_error)?;
-    Ok(Json(
-        json!({"status":"reset","profile_updated":true,"view_model":{"summary":"Cape reset."}}),
-    )
-    .into_response())
-}
-
-fn image(bytes: Vec<u8>, immutable: bool) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "image/png"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (
-                header::CACHE_CONTROL,
-                if immutable {
-                    "private, max-age=31536000, immutable"
-                } else {
-                    "private, no-store"
-                },
-            ),
-        ],
-        bytes,
-    )
-        .into_response()
-}
-
-fn invalid_request() -> ApiError {
-    error(StatusCode::BAD_REQUEST, "Invalid skin request.")
-}
-fn error(status: StatusCode, message: impl ToString) -> ApiError {
-    (status, Json(json!({"error":message.to_string()})))
-}
-fn skin_error(value: SkinError) -> ApiError {
-    match value {
-        SkinError::Library(value) => library_error(value),
-        SkinError::Profile(value) => profile_error(value),
-    }
-}
-pub(super) fn library_error(value: SkinLibraryError) -> ApiError {
-    let status = match value {
-        SkinLibraryError::Conflict => StatusCode::CONFLICT,
-        SkinLibraryError::Image(MediaError::TooLarge) => StatusCode::PAYLOAD_TOO_LARGE,
-        SkinLibraryError::Capacity | SkinLibraryError::StorageFull => {
-            StatusCode::INSUFFICIENT_STORAGE
-        }
-        SkinLibraryError::Storage
-        | SkinLibraryError::PermissionDenied
-        | SkinLibraryError::InvalidData => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::BAD_REQUEST,
-    };
-    error(status, value)
-}
-fn profile_error(value: ProfileMediaError) -> ApiError {
-    let status = match value {
-        ProfileMediaError::InvalidUsername
-        | ProfileMediaError::InvalidTexture
-        | ProfileMediaError::InvalidImage
-        | ProfileMediaError::Rejected => StatusCode::BAD_REQUEST,
-        ProfileMediaError::AccountRequired => StatusCode::UNAUTHORIZED,
-        ProfileMediaError::OwnershipMissing => StatusCode::CONFLICT,
-        ProfileMediaError::NotFound
-        | ProfileMediaError::MissingSkin
-        | ProfileMediaError::MissingCape
-        | ProfileMediaError::SavedSkinMissing => StatusCode::NOT_FOUND,
-        ProfileMediaError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-        ProfileMediaError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        ProfileMediaError::StaleIdentity
-        | ProfileMediaError::StaleIntent
-        | ProfileMediaError::Cancelled
-        | ProfileMediaError::Busy => StatusCode::CONFLICT,
-        ProfileMediaError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::BAD_GATEWAY,
-    };
-    error(status, value)
+        .await?;
+    Ok(Json(ProfileResetResponse::new(skin)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::fixture::{Api, Profile};
     use axial_app::{
         accounts::{
-            credential_store::CredentialStore, directory::AccountDirectory,
             microsoft::MinecraftProfile, model::MicrosoftIdentity, selection::CapturedAccount,
-            session::AuthService,
         },
-        library::{LibraryLifecycle, LibraryOpenOutcome},
-        skins::{library::SavedSkinLibrary, store::SavedSkinStore},
-        storage::MetadataStore,
-        tasks::TaskOwner,
+        skins::lookup::ProfileMediaError,
     };
-    use axum::http::{Method, Request};
-    use std::time::Duration;
-    use tower::ServiceExt;
+    use reqwest::{Method, StatusCode};
+    use serde_json::{Value, json};
 
     struct Fixture {
-        _root: tempfile::TempDir,
-        accounts: Arc<AccountDirectory>,
-        service: SkinState,
-        app: Router,
+        profile: Profile,
         key: String,
-        tasks: TaskOwner,
     }
 
     impl Fixture {
-        fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let roots = match LibraryLifecycle::open(&directory.path().canonicalize().unwrap()) {
-                LibraryOpenOutcome::Ready(roots) => roots,
-                _ => panic!("isolated skin root"),
-            };
-            let root = roots.admit_application_root().unwrap();
-            let metadata = Arc::new(MetadataStore::in_memory().unwrap());
-            let accounts = Arc::new(AccountDirectory::new(metadata.clone()).unwrap());
-            metadata
-                .migrate(&[axial_app::skins::store::MIGRATION])
-                .unwrap();
-            let tasks = TaskOwner::new(16).unwrap();
-            let auth = Arc::new(AuthService::new(
-                accounts.clone(),
-                Arc::new(CredentialStore::isolated_for_tests()),
-                tasks.clone(),
-            ));
-            let library = Arc::new(SavedSkinLibrary::new(
-                SavedSkinStore::new(metadata),
-                root.clone(),
-            ));
+        async fn new() -> Self {
+            let profile = Profile::start().await;
             let mut png = Vec::new();
             {
                 let mut encoder = png::Encoder::new(&mut png, 64, 64);
@@ -594,33 +449,26 @@ mod tests {
                     .write_image_data(&[11, 22, 33, 255].repeat(64 * 64))
                     .unwrap();
             }
-            let saved = library
-                .save_upload(
-                    &png,
-                    SaveSkinOptions {
-                        name: "Fixture skin".into(),
-                        variant: None,
-                        cape_id: None,
-                    },
-                    None,
-                )
-                .unwrap();
-            let service =
-                ProfileMedia::new(library, accounts.clone(), auth, tasks.clone(), root).unwrap();
+            let (status, saved) = Api::json(
+                profile
+                    .api
+                    .builder(Method::POST, "/api/v1/skins?name=Fixture%20skin")
+                    .header("content-type", "image/png")
+                    .body(png),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{saved}");
             Self {
-                _root: directory,
-                accounts,
-                app: router(service.clone()),
-                service,
-                key: saved.texture_key,
-                tasks,
+                key: saved["texture_key"].as_str().unwrap().into(),
+                profile,
             }
         }
 
         fn add_account(&self, profile_id: &str, name: &str) -> CapturedAccount {
-            self.accounts
+            let accounts = &self.profile.services.accounts;
+            accounts
                 .commit_microsoft(
-                    self.accounts.selection_revision().unwrap(),
+                    accounts.selection_revision().unwrap(),
                     MicrosoftIdentity {
                         login_id: uuid::Uuid::new_v4().to_string(),
                         profile_id: profile_id.into(),
@@ -638,6 +486,12 @@ mod tests {
                 .unwrap()
         }
 
+        fn select(&self, capture: &CapturedAccount) -> CapturedAccount {
+            let accounts = &self.profile.services.accounts;
+            accounts.select(capture.account_id()).unwrap();
+            accounts.capture_selected().unwrap()
+        }
+
         /// The selected account's queued skin, as listed with its wardrobe.
         async fn pending(&self) -> (StatusCode, Value) {
             let (status, body) = self.request(Method::GET, "/api/v1/skins").await;
@@ -650,30 +504,7 @@ mod tests {
         }
 
         async fn request(&self, method: Method, path: &str) -> (StatusCode, Value) {
-            self.request_body(method, path, Body::empty()).await
-        }
-
-        async fn request_body(
-            &self,
-            method: Method,
-            path: &str,
-            body: Body,
-        ) -> (StatusCode, Value) {
-            let response = self
-                .app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method)
-                        .uri(path)
-                        .body(body)
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let status = response.status();
-            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-            (status, serde_json::from_slice(&bytes).unwrap())
+            self.profile.api.response(method, path, None).await
         }
 
         fn apply_path(&self, capture: &CapturedAccount) -> String {
@@ -687,20 +518,19 @@ mod tests {
         async fn queue(&self, capture: &CapturedAccount) -> u64 {
             let (status, body) = self.request(Method::POST, &self.apply_path(capture)).await;
             assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["status"], "queued");
+            assert_eq!(body["view_model"], json!({"summary":"Skin queued."}));
             assert_eq!(body["pending"]["account_id"], capture.account_id());
             assert_eq!(body["pending"]["texture_key"], self.key);
             body["pending"]["generation"].as_u64().unwrap()
         }
 
-        async fn finish(&self) {
-            for account in self.accounts.snapshot().unwrap().accounts {
-                self.service.account_removed(account.account_id.as_str());
+        async fn finish(self) {
+            let services = &self.profile.services;
+            for account in services.accounts.snapshot().unwrap().accounts {
+                services.skins.account_removed(account.account_id.as_str());
             }
-            tokio::time::timeout(Duration::from_secs(2), self.service.shutdown())
-                .await
-                .unwrap()
-                .unwrap();
-            self.tasks.shutdown(Duration::from_secs(2)).await.unwrap();
+            self.profile.close().await;
         }
     }
 
@@ -721,11 +551,10 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_account_commands_cannot_affect_the_new_selection_or_a_reselected_account() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let first = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         let second = fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
-        fixture.accounts.select(first.account_id()).unwrap();
-        let first = fixture.accounts.capture_selected().unwrap();
+        let first = fixture.select(&first);
         let first_generation = fixture.queue(&first).await;
         // These requests were built by A's view but have not reached the route.
         let delayed = [
@@ -739,8 +568,7 @@ mod tests {
                 pending_path("pending", &first, first_generation),
             ),
         ];
-        fixture.accounts.select(second.account_id()).unwrap();
-        let second = fixture.accounts.capture_selected().unwrap();
+        let second = fixture.select(&second);
         fixture.queue(&second).await;
         let before = fixture.pending().await;
         for (method, path) in &delayed {
@@ -754,7 +582,12 @@ mod tests {
             );
             assert_eq!(fixture.pending().await, before);
         }
-        fixture.accounts.select(first.account_id()).unwrap();
+        fixture
+            .profile
+            .services
+            .accounts
+            .select(first.account_id())
+            .unwrap();
         let before = fixture.pending().await;
         assert_eq!(before.1["generation"], first_generation);
         for (method, path) in &delayed {
@@ -768,17 +601,31 @@ mod tests {
     }
 
     async fn assert_stale_reset_preserves_pending(route: &str, reselected: bool) {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let first = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         let second = fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
-        fixture.accounts.select(first.account_id()).unwrap();
-        let confirmed = fixture.accounts.capture_selected().unwrap();
+        let confirmed = fixture.select(&first);
         let delayed = format!("{route}?{}", selection_query(&confirmed));
-        fixture.accounts.select(second.account_id()).unwrap();
+        fixture
+            .profile
+            .services
+            .accounts
+            .select(second.account_id())
+            .unwrap();
         if reselected {
-            fixture.accounts.select(first.account_id()).unwrap();
+            fixture
+                .profile
+                .services
+                .accounts
+                .select(first.account_id())
+                .unwrap();
         }
-        let current = fixture.accounts.capture_selected().unwrap();
+        let current = fixture
+            .profile
+            .services
+            .accounts
+            .capture_selected()
+            .unwrap();
         fixture.queue(&current).await;
         let before = fixture.pending().await;
         assert_eq!(before.1["phase"], "queued");
@@ -793,22 +640,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_profile_resets_cannot_cancel_another_accounts_pending_skin() {
-        for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
-            assert_stale_reset_preserves_pending(route, false).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn stale_profile_resets_cannot_cancel_a_reselected_accounts_pending_skin() {
-        for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
-            assert_stale_reset_preserves_pending(route, true).await;
+    async fn stale_profile_resets_cannot_cancel_another_or_a_reselected_accounts_pending_skin() {
+        for reselected in [false, true] {
+            for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
+                assert_stale_reset_preserves_pending(route, reselected).await;
+            }
         }
     }
 
     #[tokio::test]
     async fn profile_reset_requires_a_complete_valid_selection_fence_before_cancelling() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let capture = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         fixture.queue(&capture).await;
         let before = fixture.pending().await;
@@ -842,18 +684,22 @@ mod tests {
     #[tokio::test]
     async fn current_profile_reset_only_cancels_its_captured_pending_skin() {
         for route in ["/api/v1/skin/profile/reset", "/api/v1/skin/cape/reset"] {
-            let fixture = Fixture::new();
+            let fixture = Fixture::new().await;
             let first = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
             fixture.queue(&first).await;
             let second = fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
             fixture.queue(&second).await;
             let other = fixture.pending().await;
-            fixture.accounts.select(first.account_id()).unwrap();
-            let current = fixture.accounts.capture_selected().unwrap();
+            let current = fixture.select(&first);
             let path = format!("{route}?{}", selection_query(&current));
             let (status, _) = fixture.request(Method::POST, &path).await;
             let after = fixture.pending().await;
-            fixture.accounts.select(second.account_id()).unwrap();
+            fixture
+                .profile
+                .services
+                .accounts
+                .select(second.account_id())
+                .unwrap();
             let other_after = fixture.pending().await;
             fixture.finish().await;
             // Admission cancels only its target before the absent fixture credentials refuse I/O.
@@ -865,20 +711,27 @@ mod tests {
 
     #[tokio::test]
     async fn profile_save_rejects_stale_selection_before_profile_access() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let confirmed = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         fixture.add_account("22345678123442348234123456789abc", "PlayerTwo");
         let path = format!("/api/v1/skins/from-profile?{}", selection_query(&confirmed));
         for reselected in [false, true] {
             if reselected {
-                fixture.accounts.select(confirmed.account_id()).unwrap();
+                fixture
+                    .profile
+                    .services
+                    .accounts
+                    .select(confirmed.account_id())
+                    .unwrap();
             }
             let before = fixture.request(Method::GET, "/api/v1/skins").await;
             let (status, body) = fixture
-                .request_body(
+                .profile
+                .api
+                .response(
                     Method::POST,
                     &path,
-                    Body::from(json!({"variant":"classic","mark_current":true}).to_string()),
+                    Some(json!({"variant":"classic","mark_current":true})),
                 )
                 .await;
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -890,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_save_requires_a_complete_valid_selection_fence() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let capture = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         let before = fixture.request(Method::GET, "/api/v1/skins").await;
         for suffix in [
@@ -910,10 +763,12 @@ mod tests {
             ),
         ] {
             let (status, _) = fixture
-                .request_body(
+                .profile
+                .api
+                .response(
                     Method::POST,
                     &format!("/api/v1/skins/from-profile{suffix}"),
-                    Body::from(json!({"variant":"classic","mark_current":true}).to_string()),
+                    Some(json!({"variant":"classic","mark_current":true})),
                 )
                 .await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -924,7 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pending_generation_cannot_cancel_or_flush_a_newer_choice() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let capture = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         let old_generation = fixture.queue(&capture).await;
         let current_generation = fixture.queue(&capture).await;
@@ -959,7 +814,7 @@ mod tests {
 
     #[tokio::test]
     async fn account_mutations_require_explicit_command_preconditions() {
-        let fixture = Fixture::new();
+        let fixture = Fixture::new().await;
         let capture = fixture.add_account("12345678123442348234123456789abc", "PlayerOne");
         for (method, path) in [
             (

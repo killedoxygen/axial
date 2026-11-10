@@ -1,19 +1,19 @@
+use super::error::{ApiError, ApiResult};
 use axial_app::system::{SystemResourceResponse, system_resource_status};
 use axum::{Json, Router, http::StatusCode, routing::get};
-use serde_json::{Value, json};
 
 pub fn router() -> Router {
     Router::new().route("/api/v1/system", get(system))
 }
 
-async fn system() -> Result<Json<SystemResourceResponse>, (StatusCode, Json<Value>)> {
+async fn system() -> ApiResult<SystemResourceResponse> {
     tokio::task::spawn_blocking(system_resource_status)
         .await
         .map(Json)
         .map_err(|_| {
-            (
+            ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "System memory information is unavailable."})),
+                "System memory information is unavailable.",
             )
         })
 }
@@ -25,6 +25,7 @@ mod tests {
         body::{Body, to_bytes},
         http::Request,
     };
+    use serde_json::Value;
     use tower::ServiceExt;
 
     #[tokio::test]

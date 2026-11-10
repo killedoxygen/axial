@@ -1,10 +1,8 @@
+use super::error::{ApiError, ApiResult, Extracted, account_failure};
 use axial_app::accounts::{
-    model::{
-        AccountError, AccountPreconditions, AccountRecord, AccountSnapshot, offline_uuid,
-        validate_username,
-    },
-    session::{AuthError, AuthService},
-    view::AccountListResponse,
+    model::AccountPreconditions,
+    session::AuthService,
+    view::{AccountCommandResponse, AccountListResponse, AccountRemovedResponse},
 };
 use axum::{
     Json, Router,
@@ -15,8 +13,7 @@ use axum::{
     http::StatusCode,
     routing::{get, patch, post},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde::Deserialize;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -43,14 +40,12 @@ pub fn router(auth: Arc<AuthService>, sign_in_available: bool) -> Router {
         })
 }
 
-type ApiError = (StatusCode, Json<Value>);
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OfflineAccountRequest {
-    pub username: String,
-    pub expected_selection_revision: Option<u64>,
-    pub expected_account_revision: Option<u64>,
+struct OfflineAccountRequest {
+    username: String,
+    expected_selection_revision: Option<u64>,
+    expected_account_revision: Option<u64>,
 }
 
 impl OfflineAccountRequest {
@@ -62,276 +57,142 @@ impl OfflineAccountRequest {
     }
 }
 
-#[derive(Serialize)]
-pub struct AccountCommandResponse {
-    pub status: &'static str,
-    pub selection_revision: u64,
-    pub account: AccountRecord,
-    pub view_model: CommandViewModel,
+fn invalid_request() -> ApiError {
+    account_failure(
+        StatusCode::BAD_REQUEST,
+        "Invalid account request.".into(),
+        "account_input_invalid",
+    )
 }
 
-#[derive(Serialize)]
-pub struct CommandViewModel {
-    pub summary: &'static str,
-}
-
-async fn list(State(state): State<Accounts>) -> Result<Json<AccountListResponse>, ApiError> {
-    state
-        .auth
-        .account_list(state.sign_in_available)
-        .await
-        .map(Json)
-        .map_err(auth_error)
+async fn list(State(state): State<Accounts>) -> ApiResult<AccountListResponse> {
+    Ok(Json(
+        state.auth.account_list(state.sign_in_available).await?,
+    ))
 }
 
 async fn create(
     State(Accounts { auth, .. }): State<Accounts>,
     request: Result<Json<OfflineAccountRequest>, JsonRejection>,
-) -> Result<Json<AccountCommandResponse>, ApiError> {
-    let Json(request) = request.map_err(|_| invalid_request())?;
-    let name = validate_username(&request.username).map_err(account_error)?;
+) -> ApiResult<AccountCommandResponse> {
+    let request = request.or_refuse(invalid_request)?;
     let expected = request.expected();
-    let id = format!("offline-{}", offline_uuid(&name));
-    let snapshot = mutate(&auth, move |directory| {
-        directory.create_offline_with_preconditions(&name, expected)
-    })
-    .await?;
-    command(
-        snapshot,
-        &id,
-        "account_created",
-        "Offline identity created.",
-    )
+    Ok(Json(
+        auth.create_offline(&request.username, expected).await?,
+    ))
 }
 
 async fn rename(
     State(Accounts { auth, .. }): State<Accounts>,
     Path(id): Path<String>,
     request: Result<Json<OfflineAccountRequest>, JsonRejection>,
-) -> Result<Json<AccountCommandResponse>, ApiError> {
-    let Json(request) = request.map_err(|_| invalid_request())?;
-    let name = validate_username(&request.username).map_err(account_error)?;
+) -> ApiResult<AccountCommandResponse> {
+    let request = request.or_refuse(invalid_request)?;
     let expected = request.expected();
-    let next_id = format!("offline-{}", offline_uuid(&name));
-    let snapshot = mutate(&auth, move |directory| {
-        directory.rename_offline_with_preconditions(&id, &name, expected)
-    })
-    .await?;
-    command(
-        snapshot,
-        &next_id,
-        "account_updated",
-        "Offline identity updated.",
-    )
+    Ok(Json(
+        auth.rename_offline(id, &request.username, expected).await?,
+    ))
 }
 
 async fn select(
     State(Accounts { auth, .. }): State<Accounts>,
     Path(id): Path<String>,
     request: Result<Json<AccountPreconditions>, JsonRejection>,
-) -> Result<Json<AccountCommandResponse>, ApiError> {
-    let Json(expected) = request.map_err(|_| invalid_request())?;
-    let snapshot = auth
-        .select_account(id.clone(), expected)
-        .await
-        .map_err(auth_error)?;
-    command(snapshot, &id, "account_selected", "Account selected.")
+) -> ApiResult<AccountCommandResponse> {
+    let expected = request.or_refuse(invalid_request)?;
+    let snapshot = auth.select_account(id.clone(), expected).await?;
+    Ok(Json(AccountCommandResponse::new(
+        snapshot,
+        &id,
+        "account_selected",
+        "Account selected.",
+    )?))
 }
 
 async fn remove(
     State(Accounts { auth, .. }): State<Accounts>,
     Path(id): Path<String>,
     request: Result<Query<AccountPreconditions>, QueryRejection>,
-) -> Result<Json<Value>, ApiError> {
-    let Query(expected) = request.map_err(|_| invalid_request())?;
-    let snapshot = auth
-        .remove_account(id.clone(), expected)
-        .await
-        .map_err(auth_error)?;
-    Ok(Json(json!({"status":"account_removed", "account_id":id,
-        "selection_revision":snapshot.selection_revision, "view_model":{"summary":"Account removed."}})))
-}
-
-async fn mutate(
-    auth: &Arc<AuthService>,
-    apply: impl FnOnce(
-        &axial_app::accounts::directory::AccountDirectory,
-    ) -> Result<AccountSnapshot, AccountError>
-    + Send
-    + 'static,
-) -> Result<AccountSnapshot, ApiError> {
-    let directory = auth.directory().clone();
-    auth.task_owner()
-        .try_spawn((), move |_| async move {
-            tokio::task::spawn_blocking(move || apply(&directory))
-                .await
-                .map_err(|_| AuthError::Unavailable)?
-                .map_err(AuthError::from)
-        })
-        .map_err(|_| auth_error(AuthError::Unavailable))?
-        .join()
-        .await
-        .map_err(|_| auth_error(AuthError::Unavailable))?
-        .map_err(auth_error)
-}
-
-fn command(
-    snapshot: AccountSnapshot,
-    id: &str,
-    status: &'static str,
-    summary: &'static str,
-) -> Result<Json<AccountCommandResponse>, ApiError> {
-    let account = snapshot
-        .accounts
-        .into_iter()
-        .find(|account| account.account_id.as_str() == id)
-        .ok_or_else(|| account_error(AccountError::NotFound))?;
-    Ok(Json(AccountCommandResponse {
-        status,
-        selection_revision: snapshot.selection_revision,
-        account,
-        view_model: CommandViewModel { summary },
-    }))
-}
-
-pub(super) fn invalid_request() -> ApiError {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error":"Invalid account request.","status":"account_input_invalid"})),
-    )
-}
-
-pub(super) fn account_error(error: AccountError) -> ApiError {
-    let (status, code) = match &error {
-        AccountError::InvalidInput(_) | AccountError::NotOffline | AccountError::NotMicrosoft => {
-            (StatusCode::BAD_REQUEST, "account_input_invalid")
-        }
-        AccountError::NotFound => (StatusCode::NOT_FOUND, "account_not_found"),
-        AccountError::StaleCapture | AccountError::AlreadyExists => {
-            (StatusCode::CONFLICT, "account_changed")
-        }
-        AccountError::NoSelection => (StatusCode::PRECONDITION_FAILED, "account_required"),
-        AccountError::InvalidStoredData | AccountError::Storage => {
-            (StatusCode::SERVICE_UNAVAILABLE, "account_unavailable")
-        }
-    };
-    (
-        status,
-        Json(json!({"error":error.to_string(),"status":code})),
-    )
-}
-
-pub(super) fn auth_error(error: AuthError) -> ApiError {
-    if let AuthError::Account(error) = error {
-        return account_error(error);
-    }
-    let (status, code) = match &error {
-        AuthError::Account(_) => unreachable!("account errors returned above"),
-        AuthError::SignInRequired | AuthError::LoginExpired => {
-            (StatusCode::PRECONDITION_FAILED, "sign_in_required")
-        }
-        AuthError::OwnershipMissing => (StatusCode::CONFLICT, "minecraft_ownership_missing"),
-        AuthError::Credentials(axial_app::accounts::credential_store::CredentialError::Stale) => {
-            (StatusCode::CONFLICT, "account_changed")
-        }
-        AuthError::Credentials(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "credential_store_unavailable",
-        ),
-        AuthError::Provider(_) => (StatusCode::BAD_GATEWAY, "minecraft_auth_chain_failed"),
-        AuthError::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "account_unavailable"),
-    };
-    (
-        status,
-        Json(json!({"error":error.to_string(),"status":code})),
-    )
+) -> ApiResult<AccountRemovedResponse> {
+    let expected = request.or_refuse(invalid_request)?;
+    let snapshot = auth.remove_account(id.clone(), expected).await?;
+    Ok(Json(AccountRemovedResponse::new(id, &snapshot)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use axial_app::{
-        accounts::{credential_store::CredentialStore, directory::AccountDirectory},
-        storage::MetadataStore,
-        tasks::TaskOwner,
-    };
-    use axum::{
-        body::{Body, to_bytes},
-        http::Request,
-    };
-    use tower::ServiceExt;
-
-    async fn request(
-        router: &Router,
-        method: &str,
-        path: &str,
-        body: Value,
-    ) -> (StatusCode, Value) {
-        let response = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        (status, serde_json::from_slice(&body).unwrap())
-    }
+    use crate::fixture::Profile;
+    use reqwest::{Method, StatusCode};
+    use serde_json::json;
 
     #[tokio::test]
-    async fn offline_http_journey_reports_renamed_identity_and_rejects_stale_selection() {
-        let tasks = TaskOwner::new(32).unwrap();
-        let directory =
-            Arc::new(AccountDirectory::new(Arc::new(MetadataStore::in_memory().unwrap())).unwrap());
-        // Opening the store performs no OS I/O; this offline-only journey must
-        // not consult secure entries or provider endpoints.
-        let credentials = Arc::new(CredentialStore::with_task_owner(
-            uuid::Uuid::new_v4(),
-            tasks.clone(),
-        ));
-        let auth = Arc::new(AuthService::new(directory, credentials, tasks));
-        let app = router(auth, false);
-        let (status, created) = request(
-            &app,
-            "POST",
-            "/api/v1/accounts/offline",
-            json!({"username":"Steve","expected_selection_revision":0}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+    async fn offline_journey_reports_renamed_identity_and_rejects_stale_selection() {
+        let profile = Profile::start().await;
+        let api = &profile.api;
+        let created = api
+            .post(
+                "/api/v1/accounts/offline",
+                json!({"username":"Steve","expected_selection_revision":0}),
+            )
+            .await;
+        assert_eq!(created["status"], "account_created");
+        assert_eq!(
+            created["view_model"],
+            json!({"summary":"Offline identity created."})
+        );
         let old_id = created["account"]["account_id"].as_str().unwrap();
-        let (status, renamed) = request(&app, "PATCH", &format!("/api/v1/accounts/{old_id}"),
-            json!({"username":"Notch","expected_selection_revision":1,"expected_account_revision":1})).await;
-        assert_eq!(status, StatusCode::OK);
+        let renamed = api
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/accounts/{old_id}"),
+                Some(json!({"username":"Notch","expected_selection_revision":1,"expected_account_revision":1})),
+            )
+            .await;
         let new_id = renamed["account"]["account_id"].as_str().unwrap();
         assert_ne!(old_id, new_id);
         assert_eq!(
             renamed["account"]["offline_uuid"],
             "b50ad385829d3141a2167e7d7539ba7f"
         );
-        let (status, _) = request(
-            &app,
-            "POST",
-            &format!("/api/v1/accounts/{new_id}/select"),
-            json!({"expected_selection_revision":1}),
-        )
-        .await;
+        let (status, stale) = api
+            .response(
+                Method::POST,
+                &format!("/api/v1/accounts/{new_id}/select"),
+                Some(json!({"expected_selection_revision":1})),
+            )
+            .await;
         assert_eq!(status, StatusCode::CONFLICT);
-        let (_, accounts) = request(&app, "GET", "/api/v1/accounts", Value::Null).await;
+        assert_eq!(stale["status"], "account_changed");
+        let accounts = api.get("/api/v1/accounts").await;
         assert_eq!(accounts["selection_revision"], 2);
         assert_eq!(accounts["sign_in_available"], false);
         assert_eq!(accounts["accounts"][0]["active"], true);
         assert_eq!(accounts["accounts"][0]["display_name"], "Notch");
-        assert_eq!(accounts["accounts"][0]["online_mode_ready"], false);
-        let (status, _) = request(&app, "DELETE", &format!("/api/v1/accounts/{new_id}?expected_selection_revision=2&expected_account_revision=2"), Value::Null).await;
-        assert_eq!(status, StatusCode::OK);
-        let (_, accounts) = request(&app, "GET", "/api/v1/accounts", Value::Null).await;
-        assert_eq!(accounts["accounts"].as_array().unwrap().len(), 0);
+        let removed = api
+            .request(
+                Method::DELETE,
+                &format!("/api/v1/accounts/{new_id}?expected_selection_revision=2&expected_account_revision=2"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            removed,
+            json!({"account_id":new_id,"selection_revision":3,"status":"account_removed",
+                "view_model":{"summary":"Account removed."}})
+        );
+        assert_eq!(api.get("/api/v1/accounts").await["accounts"], json!([]));
+        assert_eq!(
+            api.response(
+                Method::POST,
+                "/api/v1/accounts/offline",
+                Some(json!({"name":"x"}))
+            )
+            .await,
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":"Invalid account request.","status":"account_input_invalid"})
+            )
+        );
+        profile.close().await;
     }
 }

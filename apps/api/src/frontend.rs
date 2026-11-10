@@ -20,11 +20,11 @@ async fn serve_embedded_frontend(uri: Uri) -> Response {
     // The authenticated API router reserves this namespace. Keep the boundary
     // explicit here too so a future composition change cannot return HTML for API calls.
     if uri.path() == "/api" || uri.path().starts_with("/api/") {
-        return (
+        return crate::routes::error::ApiError::new(
             StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({ "error": "API route was not found" })),
+            "API route was not found",
         )
-            .into_response();
+        .into_response();
     }
     let path = uri.path().trim_start_matches('/');
     let file = EMBEDDED_FRONTEND

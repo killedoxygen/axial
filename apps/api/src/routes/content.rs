@@ -1,21 +1,21 @@
 //! Authenticated HTTP adaptation of retained content operations.
 
+use super::error::{ApiError, ApiResult, Extracted};
 use axial_app::{
     content::{
         catalog::ContentService,
         compatibility,
-        install::{ContentMutations, MutationError},
+        install::{ContentMutations, MutationError, MutationReceipt},
         model::*,
-        packs::PackVersion,
-        provenance::RequiredRefusal,
+        packs::{ModpackFilesPlan, PackError, PackVersion},
         resolve::{self, ResolutionSelection},
-        view::{self, TargetRef},
+        view::{
+            self, CompatibilityResponse, InstalledContent, ResolutionPlan, SearchItem, TargetRef,
+            UpdatesResponse,
+        },
     },
-    install::{
-        model::{InstallQueueContentActionRequest, InstallQueueRequest},
-        queue::InstallQueue,
-    },
-    instances::model::InstanceId,
+    install::{model::InstallQueueStateResponse, queue::InstallQueue},
+    instances::{from_pack::ModpackTarget, model::InstanceId},
 };
 use axum::{
     Json, Router,
@@ -27,7 +27,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub struct ContentRoutes {
@@ -35,19 +34,8 @@ pub struct ContentRoutes {
     pub mutations: ContentMutations,
     pub queue: Arc<InstallQueue>,
 }
-impl ContentRoutes {
-    pub fn new(
-        service: ContentService,
-        mutations: ContentMutations,
-        queue: Arc<InstallQueue>,
-    ) -> Self {
-        Self {
-            service,
-            mutations,
-            queue,
-        }
-    }
-}
+
+type Content = State<Arc<ContentRoutes>>;
 
 pub fn router(state: Arc<ContentRoutes>) -> Router {
     Router::new()
@@ -71,16 +59,34 @@ pub fn router(state: Arc<ContentRoutes>) -> Router {
 
 const MAX_MODPACK_FILE_BYTES: usize = 128 * 1024 * 1024;
 
+fn invalid(message: &'static str) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, message)
+}
+fn unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Content provider is unavailable. Try again later.",
+    )
+}
+fn id(value: &str) -> Result<InstanceId, ApiError> {
+    value
+        .parse()
+        .map_err(|_| invalid("Invalid instance identifier."))
+}
+const INVALID_QUERY: &str = "Invalid content query.";
+const INVALID_REQUEST: &str = "Invalid content request.";
+
 /// Read a local `.mrpack` as its published Modrinth version or as a local
 /// pack; creation then uses the ordinary modpack route.
-async fn modpack_file(
-    State(state): State<Arc<ContentRoutes>>,
-    body: axum::body::Body,
-) -> Result<Json<axial_app::instances::from_pack::ModpackTarget>, Error> {
-    use axial_app::content::packs::PackError;
+async fn modpack_file(State(state): Content, body: axum::body::Body) -> ApiResult<ModpackTarget> {
     let bytes = axum::body::to_bytes(body, MAX_MODPACK_FILE_BYTES)
         .await
-        .map_err(|_| error(413, "This modpack is larger than the 128 MB import limit."))?;
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "This modpack is larger than the 128 MB import limit.",
+            )
+        })?;
     axial_app::instances::from_pack::modpack_file_target(
         &state.service,
         &state.mutations,
@@ -89,46 +95,17 @@ async fn modpack_file(
     .await
     .map(Json)
     .map_err(|failure| match failure {
-            PackError::DisallowedHost => error(
-                422,
-                "This modpack downloads files from a site other than Modrinth, GitHub or GitLab, so it can't be imported.",
-            ),
-            PackError::Provider | PackError::Download => unavailable(),
-            PackError::TooLarge => error(413, "This modpack exceeds the supported size limit."),
-            _ => error(
-                400,
-                "This file is not a readable Modrinth modpack (.mrpack).",
-            ),
-        })
-}
-
-type Error = (StatusCode, Json<Value>);
-fn error(status: u16, message: &str) -> Error {
-    (
-        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        Json(json!({"error":message})),
-    )
-}
-fn mutation_error(value: MutationError) -> Error {
-    error(value.status_code(), &value.to_string())
-}
-fn unavailable() -> Error {
-    error(503, "Content provider is unavailable. Try again later.")
-}
-fn id(value: &str) -> Result<InstanceId, Error> {
-    value
-        .parse()
-        .map_err(|_| error(400, "Invalid instance identifier."))
-}
-fn body<T>(value: Result<Json<T>, JsonRejection>) -> Result<T, Error> {
-    value
-        .map(|Json(value)| value)
-        .map_err(|_| error(400, "Invalid content request."))
-}
-fn query<T>(value: Result<Query<T>, QueryRejection>) -> Result<T, Error> {
-    value
-        .map(|Query(value)| value)
-        .map_err(|_| error(400, "Invalid content query."))
+        PackError::DisallowedHost => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "This modpack downloads files from a site other than Modrinth, GitHub or GitLab, so it can't be imported.",
+        ),
+        PackError::Provider | PackError::Download => unavailable(),
+        PackError::TooLarge => ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "This modpack exceeds the supported size limit.",
+        ),
+        _ => invalid("This file is not a readable Modrinth modpack (.mrpack)."),
+    })
 }
 
 #[derive(Deserialize)]
@@ -144,19 +121,15 @@ struct Search {
     instance_id: Option<String>,
 }
 async fn search(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Query<Search>, QueryRejection>,
-) -> Result<Json<Value>, Error> {
-    let query = query(request)?;
-    let installed = query
-        .instance_id
-        .as_deref()
-        .map(id)
-        .transpose()?
-        .and_then(|instance| state.mutations.instance_context(&instance).ok());
-    let response = state
-        .service
-        .search(&ContentQuery {
+) -> ApiResult<Page<SearchItem>> {
+    let query = request.or_refuse(|| invalid(INVALID_QUERY))?;
+    let instance = query.instance_id.as_deref().map(id).transpose()?;
+    view::search(
+        &state.service,
+        &state.mutations,
+        &ContentQuery {
             kind: query.kind,
             search: query.query,
             loader: query.loader,
@@ -165,28 +138,12 @@ async fn search(
             sort: query.sort.unwrap_or_default(),
             offset: query.offset.unwrap_or(0),
             limit: query.limit.unwrap_or(40).clamp(1, 100),
-        })
-        .await
-        .map_err(|_| unavailable())?;
-    let items = response
-        .items
-        .into_iter()
-        .map(|content| {
-            let installed = installed.as_ref().is_some_and(|(_, manifest, live)| {
-                manifest
-                    .find(&content.canonical_id)
-                    .is_some_and(|entry| live.contains(entry))
-            });
-            let mut item = serde_json::to_value(content).expect("content DTO serializes");
-            if installed {
-                item["install_state"] = json!("installed");
-            }
-            item
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(
-        json!({"items":items,"offset":response.offset,"limit":response.limit,"total":response.total}),
-    ))
+        },
+        instance.as_ref(),
+    )
+    .await
+    .map(Json)
+    .map_err(|_| unavailable())
 }
 
 #[derive(Deserialize)]
@@ -194,10 +151,10 @@ struct ItemQuery {
     id: String,
 }
 async fn detail(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Query<ItemQuery>, QueryRejection>,
-) -> Result<Json<ContentDetail>, Error> {
-    let query = query(request)?;
+) -> ApiResult<ContentDetail> {
+    let query = request.or_refuse(|| invalid(INVALID_QUERY))?;
     state
         .service
         .detail(&CanonicalId(query.id))
@@ -214,10 +171,10 @@ struct PackQuery {
     loader: Option<String>,
 }
 async fn modpack_target(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Query<PackQuery>, QueryRejection>,
-) -> Result<Json<axial_app::instances::from_pack::ModpackTarget>, Error> {
-    let query = query(request)?;
+) -> ApiResult<ModpackTarget> {
+    let query = request.or_refuse(|| invalid(INVALID_QUERY))?;
     let filter = LoaderGameFilter {
         loader: query.loader,
         game_version: query.game_version,
@@ -229,8 +186,7 @@ async fn modpack_target(
     let pack = state
         .mutations
         .resolve_pack(&state.service, &CanonicalId(query.id), version)
-        .await
-        .map_err(mutation_error)?;
+        .await?;
     Ok(Json(
         axial_app::instances::from_pack::target_from_pack_index(
             pack.canonical_id,
@@ -248,21 +204,21 @@ struct PackFilesQuery {
     version_id: Option<String>,
 }
 async fn modpack_files(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Query<PackFilesQuery>, QueryRejection>,
-) -> Result<Json<axial_app::content::packs::ModpackFilesPlan>, Error> {
-    let query = query(request)?;
-    state
-        .mutations
-        .pack_files(
-            &state.service,
-            &id(&query.instance_id)?,
-            &CanonicalId(query.id),
-            query.version_id.as_deref(),
-        )
-        .await
-        .map(Json)
-        .map_err(mutation_error)
+) -> ApiResult<ModpackFilesPlan> {
+    let query = request.or_refuse(|| invalid(INVALID_QUERY))?;
+    Ok(Json(
+        state
+            .mutations
+            .pack_files(
+                &state.service,
+                &id(&query.instance_id)?,
+                &CanonicalId(query.id),
+                query.version_id.as_deref(),
+            )
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -281,13 +237,12 @@ fn default_true() -> bool {
 }
 
 async fn modpack_install(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Json<PackInstall>, JsonRejection>,
-) -> Result<Json<axial_app::install::model::InstallQueueStateResponse>, Error> {
-    let request = body(request)?;
+) -> ApiResult<InstallQueueStateResponse> {
+    let request = request.or_refuse(|| invalid(INVALID_REQUEST))?;
     if !request.selected_file_ids.is_empty() && request.include_overrides {
-        return Err(error(
-            400,
+        return Err(invalid(
             "Modpack overrides cannot be applied with selected files.",
         ));
     }
@@ -303,22 +258,15 @@ async fn modpack_install(
         version,
     )
     .await
-    .map_err(|failure| mutation_error(failure.into()))?;
-    state
-        .queue
-        .enqueue(InstallQueueRequest::Content {
-            instance_id: instance.to_string(),
-            label: "Install modpack files".into(),
-            action: InstallQueueContentActionRequest::Modpack {
-                canonical_id: content.canonical_id.0,
-                version_id: version.id,
-                selected_file_ids: request.selected_file_ids,
-                include_overrides: request.include_overrides,
-            },
-        })
-        .await
-        .map(Json)
-        .map_err(super::install::failure)
+    .map_err(MutationError::from)?;
+    let queued = ContentMutations::pack_files_request(
+        &instance,
+        content.canonical_id,
+        version.id,
+        request.selected_file_ids,
+        request.include_overrides,
+    );
+    Ok(Json(state.queue.enqueue(queued).await?))
 }
 
 #[derive(Deserialize)]
@@ -327,13 +275,14 @@ struct Selections {
     selections: Vec<ResolutionSelection>,
 }
 async fn compatible(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Json<Selections>, JsonRejection>,
-) -> Result<Json<Value>, Error> {
-    let candidates = compatibility::compatibility(&state.service, &body(request)?.selections)
+) -> ApiResult<CompatibilityResponse> {
+    let request = request.or_refuse(|| invalid(INVALID_REQUEST))?;
+    let candidates = compatibility::compatibility(&state.service, &request.selections)
         .await
         .map_err(|_| unavailable())?;
-    Ok(Json(json!({"candidates":candidates})))
+    Ok(Json(CompatibilityResponse { candidates }))
 }
 
 #[derive(Deserialize)]
@@ -343,17 +292,16 @@ struct PlanRequest {
     selections: Vec<ResolutionSelection>,
 }
 async fn plan(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Json<PlanRequest>, JsonRejection>,
-) -> Result<Json<view::ResolutionPlan>, Error> {
-    let request = body(request)?;
-    let result = match request.target {
+) -> ApiResult<ResolutionPlan> {
+    let request = request.or_refuse(|| invalid(INVALID_REQUEST))?;
+    Ok(Json(match request.target {
         TargetRef::Instance { instance_id } => {
             let plan = state
                 .mutations
                 .plan(&state.service, &id(&instance_id)?, &request.selections)
-                .await
-                .map_err(mutation_error)?;
+                .await?;
             view::into_instance_plan(&plan, instance_id)
         }
         TargetRef::Draft {
@@ -362,14 +310,13 @@ async fn plan(
         } => {
             let target =
                 resolve::validated_target(loader.as_deref().unwrap_or("vanilla"), &game_version)
-                    .map_err(|_| error(400, "Invalid content target."))?;
+                    .map_err(|_| invalid("Invalid content target."))?;
             let resolution = view::preview_draft(&state.service, &target, &request.selections)
                 .await
                 .map_err(|_| unavailable())?;
             view::into_plan(&resolution, None, &target)
         }
-    };
-    Ok(Json(result))
+    }))
 }
 
 #[derive(Deserialize)]
@@ -379,94 +326,38 @@ struct InstallRequest {
     selections: Vec<ResolutionSelection>,
     #[serde(default)]
     allow_incompatible: bool,
-    /// Display name for the queue entry; it carries no install authority.
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
     replace_files: Vec<String>,
 }
 async fn install(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     request: Result<Json<InstallRequest>, JsonRejection>,
-) -> Result<Json<axial_app::install::model::InstallQueueStateResponse>, Error> {
-    let request = body(request)?;
+) -> ApiResult<InstallQueueStateResponse> {
+    let request = request.or_refuse(|| invalid(INVALID_REQUEST))?;
     let instance = id(&request.instance_id)?;
-    state
-        .queue
-        .enqueue(InstallQueueRequest::Content {
-            instance_id: instance.to_string(),
-            label: install_label(&state, &instance, &request),
-            action: InstallQueueContentActionRequest::Install {
-                selections: request.selections,
-                allow_incompatible: request.allow_incompatible,
-                replace_files: request.replace_files,
-            },
-        })
-        .await
-        .map(Json)
-        .map_err(super::install::failure)
+    let queued = state.mutations.install_request(
+        &instance,
+        request.selections,
+        request.allow_incompatible,
+        request.replace_files,
+        request.label.as_deref(),
+    );
+    Ok(Json(state.queue.enqueue(queued).await?))
 }
 
-async fn installed(
-    State(state): State<Arc<ContentRoutes>>,
-    Path(raw): Path<String>,
-) -> Result<Json<Value>, Error> {
-    let (_, manifest, live) = state
-        .mutations
-        .instance_context(&id(&raw)?)
-        .map_err(mutation_error)?;
-    let entries = manifest.entries().iter().filter(|entry| {
-        entry.managed_filename().is_some() && live.contains(entry)
-    }).map(|entry| {
-        let mut value = json!({
-        "canonical_id":entry.canonical_id(),"kind":entry.kind(),"provider":entry.provider(),
-        "project_id":entry.project_id(),"version_id":entry.version_id(),
-        "filename":entry.managed_filename().map(|name| name.as_str()).unwrap_or(""),"enabled":entry.enabled(),
-        });
-        if let Some(title) = entry.title() { value["title"] = json!(title); }
-        let required_by = manifest
-            .dependents(&live, std::slice::from_ref(entry.canonical_id()))
-            .into_iter()
-            .map(|dependent| dependent.canonical_id().clone())
-            .collect::<Vec<_>>();
-        if !required_by.is_empty() { value["required_by"] = json!(required_by); }
-        value
-    }).collect::<Vec<_>>();
-    // Pack provenance owns no file; its recorded paths only mark membership.
-    let packs = manifest
-        .entries()
-        .iter()
-        .filter(|entry| entry.kind() == ContentKind::Modpack)
-        .map(|entry| {
-            let mut value = json!({
-                "canonical_id":entry.canonical_id(),"provider":entry.provider(),
-                "project_id":entry.project_id(),"version_id":entry.version_id(),
-                "paths":entry.pack_paths().collect::<Vec<_>>(),
-            });
-            if let Some(title) = entry.title() {
-                value["title"] = json!(title);
-            }
-            if let Some(version) = entry.version_number() {
-                value["version_number"] = json!(version);
-            }
-            value
-        })
-        .collect::<Vec<_>>();
-    Ok(Json(json!({"entries":entries,"packs":packs})))
+async fn installed(State(state): Content, Path(raw): Path<String>) -> ApiResult<InstalledContent> {
+    let (_, manifest, live) = state.mutations.instance_context(&id(&raw)?)?;
+    Ok(Json(view::installed(&manifest, &live)))
 }
 
-async fn updates(
-    State(state): State<Arc<ContentRoutes>>,
-    Path(raw): Path<String>,
-) -> Result<Json<Value>, Error> {
-    let (target, manifest, live) = state
-        .mutations
-        .instance_context(&id(&raw)?)
-        .map_err(mutation_error)?;
+async fn updates(State(state): Content, Path(raw): Path<String>) -> ApiResult<UpdatesResponse> {
+    let (target, manifest, live) = state.mutations.instance_context(&id(&raw)?)?;
     let updates = resolve::available_updates(&state.service, &target, &manifest, &live)
         .await
         .map_err(|_| unavailable())?;
-    Ok(Json(json!({"updates":updates})))
+    Ok(Json(UpdatesResponse { updates }))
 }
 
 #[derive(Deserialize)]
@@ -475,141 +366,69 @@ struct Uninstall {
     canonical_ids: Vec<CanonicalId>,
 }
 async fn uninstall(
-    State(state): State<Arc<ContentRoutes>>,
+    State(state): Content,
     Path(raw): Path<String>,
     request: Result<Json<Uninstall>, JsonRejection>,
-) -> Result<Json<axial_app::install::model::InstallQueueStateResponse>, Error> {
+) -> ApiResult<InstallQueueStateResponse> {
     let instance = id(&raw)?;
-    let request = body(request)?;
-    // Name the dependents before queueing; the mutation owner still refuses
-    // authoritatively if content changes in between.
-    if let Ok((_, manifest, live)) = state.mutations.instance_context(&instance) {
-        let dependents = manifest.dependents(&live, &request.canonical_ids);
-        if !dependents.is_empty() {
-            let targets = request
-                .canonical_ids
-                .iter()
-                .filter_map(|id| manifest.find(id))
-                .collect::<Vec<_>>();
-            return Err((
-                StatusCode::CONFLICT,
-                Json(json!(RequiredRefusal::new(&targets, &dependents))),
-            ));
-        }
-    }
-    state
-        .queue
-        .enqueue(InstallQueueRequest::Content {
-            instance_id: instance.to_string(),
-            label: queue_label(
-                "Remove",
-                &recorded_titles(
-                    &state,
-                    &instance,
-                    request.canonical_ids.iter().map(|id| id.0.as_str()),
-                ),
-                "Remove content",
-            ),
-            action: InstallQueueContentActionRequest::Uninstall {
-                canonical_ids: request.canonical_ids.into_iter().map(|id| id.0).collect(),
-            },
-        })
-        .await
-        .map(Json)
-        .map_err(super::install::failure)
-}
-
-/// Queue labels name what changes. Selections already recorded are updates.
-fn install_label(state: &ContentRoutes, instance: &InstanceId, request: &InstallRequest) -> String {
-    let ids = request
-        .selections
-        .iter()
-        .map(|selection| selection.canonical_id.as_str());
-    let recorded = recorded_titles(state, instance, ids);
-    if !recorded.is_empty() && recorded.len() == request.selections.len() {
-        return queue_label("Update", &recorded, "Update content");
-    }
-    let label = request.label.as_deref().and_then(display_text);
-    queue_label("Install", label.as_slice(), "Install content")
-}
-fn recorded_titles<'a>(
-    state: &ContentRoutes,
-    instance: &InstanceId,
-    ids: impl Iterator<Item = &'a str>,
-) -> Vec<String> {
-    let Ok(manifest) = state.mutations.installed(instance) else {
-        return Vec::new();
-    };
-    ids.filter_map(|id| {
-        manifest
-            .find(&CanonicalId(id.into()))?
-            .title()
-            .and_then(display_text)
-    })
-    .collect()
-}
-fn queue_label(verb: &str, names: &[String], fallback: &str) -> String {
-    match names {
-        [] => fallback.into(),
-        [name] => format!("{verb} {name}"),
-        [name, rest @ ..] => format!("{verb} {name} and {} more", rest.len()),
-    }
-}
-fn display_text(value: &str) -> Option<String> {
-    let text = value
-        .split(char::is_control)
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let text = text.chars().take(96).collect::<String>();
-    (!text.is_empty()).then_some(text)
-}
-
-async fn settle(
-    State(state): State<Arc<ContentRoutes>>,
-    Path(raw): Path<String>,
-) -> Result<Json<axial_app::content::install::MutationReceipt>, Error> {
-    state
+    let request = request.or_refuse(|| invalid(INVALID_REQUEST))?;
+    let queued = state
         .mutations
-        .resume(&id(&raw)?)
-        .map_err(mutation_error)?
-        .join()
-        .await
-        .map_err(|_| error(409, "Content operation requires settlement."))?
-        .map(Json)
-        .map_err(mutation_error)
+        .uninstall_request(&instance, request.canonical_ids)
+        .map_err(|refusal| ApiError::body(StatusCode::CONFLICT, refusal))?;
+    Ok(Json(state.queue.enqueue(queued).await?))
+}
+
+async fn settle(State(state): Content, Path(raw): Path<String>) -> ApiResult<MutationReceipt> {
+    let work = state.mutations.resume(&id(&raw)?)?;
+    let receipt = work.join().await.map_err(|_| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "Content operation requires settlement.",
+        )
+    })??;
+    Ok(Json(receipt))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{TestInputs, fixture::Profile};
     use axial_app::{
-        content::provenance::{ContentManifest, MANIFEST_FILE, ManifestEntry},
-        install::model::{InstallOutcome, InstallQueueStateResponse},
-        instances::{
-            directory::{InstanceDirectories, Registry},
-            model::Instance,
+        content::{
+            model::{CanonicalId, ContentKind, FileRef, ProviderId},
+            provenance::{ContentManifest, MANIFEST_FILE, ManifestEntry},
         },
-        library::{LibraryId, LibraryLifecycle},
-        network::{ClientConfig, OriginPolicy, ProviderClient},
-        settings::InstanceSettings,
-        storage::MetadataStore,
-        tasks::{Exclusions, TaskOwner},
+        install::model::{
+            InstallOutcome, InstallQueueContentActionRequest, InstallQueueStateResponse,
+        },
+        instances::model::InstanceId,
     };
-    use axial_fs::{LeafName, RootSession, RootSessionAcquireOutcome};
-    use axum::{body::Body, http::Request, response::IntoResponse};
-    use std::{path::PathBuf, sync::Mutex, time::Duration};
+    use axum::{Json, Router, http::StatusCode, response::IntoResponse};
+    use serde_json::{Value, json};
+    use std::{path::PathBuf, sync::Arc, sync::Mutex, time::Duration};
     use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle};
-    use tower::ServiceExt;
 
+    const SHA512_ABC: &str = concat!(
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
+        "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    );
+
+    fn release(project: &str, file: &str, dependencies: Value) -> Value {
+        json!([{
+            "project_id":project, "id":format!("{project}-v2"), "name":"Release",
+            "version_number":"2.0", "version_type":"release",
+            "game_versions":["1.20.1"], "loaders":["minecraft"], "dependencies":dependencies,
+            "files":[{"filename":file, "size":3, "url":format!("https://cdn.modrinth.com/{file}"),
+                "primary":true, "hashes":{"sha512":"a".repeat(128)}}]
+        }])
+    }
+
+    /// A production profile whose content provider is this loopback fixture.
+    /// Unknown provider paths hold until the test releases them.
     struct Fixture {
-        _root: tempfile::TempDir,
+        profile: Profile,
         id: InstanceId,
         game: PathBuf,
-        app: Router,
-        directories: InstanceDirectories,
-        queue: Arc<InstallQueue>,
-        tasks: TaskOwner,
         requested: Arc<Semaphore>,
         gate: Arc<Semaphore>,
         paths: Arc<Mutex<Vec<String>>>,
@@ -618,93 +437,15 @@ mod tests {
 
     impl Fixture {
         async fn new() -> Self {
-            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-            let id = InstanceId::new();
-            let game = root.path().join("instances").join(id.as_str());
-            std::fs::create_dir_all(game.join("resourcepacks")).unwrap();
-            let session = match RootSession::acquire(root.path()) {
-                RootSessionAcquireOutcome::Acquired(session) => session,
-                other => panic!("content route fixture: {other:?}"),
-            };
-            let authority = session.root().unwrap();
-            let directory = authority
-                .open_directory(&LeafName::new("instances").unwrap())
-                .unwrap()
-                .open_directory(&LeafName::new(id.as_str()).unwrap())
-                .unwrap();
-            let hex = |bytes: &[u8]| {
-                bytes
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            };
-            let receipt = format!(
-                "axial-dir-v1:{}:{}",
-                hex(&authority.identity().unwrap().filesystem_witness()),
-                hex(&directory.identity().unwrap().filesystem_witness()),
-            );
-            drop((directory, authority));
-            let library_id = LibraryId::new();
-            let library = LibraryLifecycle::from_root_session_at(
-                session,
-                library_id,
-                root.path().to_path_buf(),
-            )
-            .unwrap();
-            let storage = Arc::new(MetadataStore::in_memory().unwrap());
-            storage
-                .migrate(&[
-                    axial_app::instances::directory::MIGRATION,
-                    axial_app::instances::create::MIGRATION,
-                    axial_app::instances::delete::MIGRATION,
-                    axial_app::content::install::MIGRATION,
-                    axial_app::performance::mutation::MIGRATION,
-                    axial_app::install::queue::MIGRATION,
-                ])
-                .unwrap();
-            let exclusions = Exclusions::new();
-            let tasks = TaskOwner::new(16).unwrap();
-            let registry = Registry::new(storage.clone());
-            storage
-                .transaction(|tx| {
-                    let reserved = registry.reserve(
-                        tx,
-                        Instance {
-                            id: id.clone(),
-                            name: "Content route fixture".into(),
-                            version_id: "1.21.4".into(),
-                            created_at: "2026-01-01T00:00:00Z".into(),
-                            last_played_at: String::new(),
-                            art_seed: 0,
-                            settings: InstanceSettings::default(),
-                            java_selection: None,
-                            icon: String::new(),
-                            accent: String::new(),
-                            loader_key: "vanilla".into(),
-                            minecraft_version: "1.21.4".into(),
-                            revision: 1,
-                        },
-                        &library_id.to_string(),
-                    )?;
-                    registry.commit_reserved(tx, &reserved, &receipt)
-                })
-                .unwrap();
-            let directories =
-                InstanceDirectories::new(registry, library.clone(), exclusions.clone());
-            let client = ProviderClient::new(ClientConfig::default()).unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let requested = Arc::new(Semaphore::new(0));
             let gate = Arc::new(Semaphore::new(0));
             let paths = Arc::new(Mutex::new(Vec::new()));
             let provider_app = Router::new().fallback({
-                let requested = requested.clone();
-                let gate = gate.clone();
-                let paths = paths.clone();
+                let (requested, gate, paths) = (requested.clone(), gate.clone(), paths.clone());
                 move |uri: axum::http::Uri| {
-                    let requested = requested.clone();
-                    let gate = gate.clone();
-                    let paths = paths.clone();
+                    let (requested, gate, paths) = (requested.clone(), gate.clone(), paths.clone());
                     async move {
                         paths.lock().unwrap().push(uri.path().to_owned());
                         match uri.path() {
@@ -714,28 +455,20 @@ mod tests {
                                 "offset":0, "limit":1, "total_hits":1
                             }))
                             .into_response(),
-                            "/v2/project/owned/version" => Json(json!([])).into_response(),
-                            "/v2/project/updateable/version" => Json(json!([{
-                                "project_id":"updateable", "id":"v2", "name":"Release",
-                                "version_number":"2.0", "version_type":"release",
-                                "game_versions":["1.21.4"], "loaders":["minecraft"],
-                                "files":[{"filename":"updateable-v2.zip", "size":3,
-                                    "url":"https://cdn.modrinth.com/updateable-v2.zip", "primary":true,
-                                    "hashes":{"sha512":"a".repeat(128)}}]
-                            }]))
+                            "/v2/project/owned/version" | "/v2/versions" => {
+                                Json(json!([])).into_response()
+                            }
+                            "/v2/project/updateable/version" => {
+                                Json(release("updateable", "updateable-v2.zip", json!([])))
+                                    .into_response()
+                            }
+                            "/v2/project/dependent/version" => Json(release(
+                                "dependent",
+                                "dependent-v2.zip",
+                                json!([{"project_id":null,"version_id":"unresolved-pin",
+                                    "dependency_type":"incompatible"}]),
+                            ))
                             .into_response(),
-                            "/v2/project/dependent/version" => Json(json!([{
-                                "project_id":"dependent", "id":"v2", "name":"Release",
-                                "version_number":"2.0", "version_type":"release",
-                                "game_versions":["1.21.4"], "loaders":["minecraft"],
-                                "dependencies":[{"project_id":null,"version_id":"unresolved-pin",
-                                    "dependency_type":"incompatible"}],
-                                "files":[{"filename":"dependent-v2.zip", "size":3,
-                                    "url":"https://cdn.modrinth.com/dependent-v2.zip", "primary":true,
-                                    "hashes":{"sha512":"a".repeat(128)}}]
-                            }]))
-                            .into_response(),
-                            "/v2/versions" => Json(json!([])).into_response(),
                             "/v2/project/removed/version" => StatusCode::NOT_FOUND.into_response(),
                             "/v2/project/unavailable/version" => {
                                 StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -744,15 +477,9 @@ mod tests {
                                 "id":"pack", "title":"Fixture pack", "project_type":"modpack"
                             }))
                             .into_response(),
-                            "/v2/project/pack/version" => Json(json!([{
-                                "project_id":"pack", "id":"pack-v1", "name":"Release",
-                                "version_number":"1.0", "version_type":"release",
-                                "game_versions":["1.21.4"], "loaders":["minecraft"],
-                                "files":[{"filename":"fixture.mrpack", "size":3,
-                                    "url":"https://cdn.modrinth.com/fixture.mrpack", "primary":true,
-                                    "hashes":{"sha512":"a".repeat(128)}}]
-                            }]))
-                            .into_response(),
+                            "/v2/project/pack/version" => {
+                                Json(release("pack", "fixture.mrpack", json!([]))).into_response()
+                            }
                             _ => {
                                 requested.add_permits(1);
                                 gate.acquire().await.unwrap().forget();
@@ -765,37 +492,21 @@ mod tests {
             let provider = tokio::spawn(async move {
                 axum::serve(listener, provider_app).await.unwrap();
             });
-            let service = ContentService::with_base_url(
-                client.clone(),
-                format!("{origin}/v2"),
-                OriginPolicy::loopback_for_tests([origin], 0).unwrap(),
-            )
-            .unwrap();
-            let mutations = ContentMutations::new(directories.clone(), client, tasks.clone());
-            let queue = Arc::new(
-                InstallQueue::new(
-                    storage,
-                    library,
-                    exclusions,
-                    tasks.clone(),
-                    axial_minecraft::ManagedRuntimeCache::isolated_for_test().unwrap(),
-                )
-                .unwrap()
-                .with_content(Arc::new(service.clone()), Arc::new(mutations.clone())),
-            );
-            let app = router(Arc::new(ContentRoutes::new(
-                service,
-                mutations,
-                queue.clone(),
-            )));
+            let profile = Profile::start_with(TestInputs {
+                content: Some((
+                    format!("{origin}/v2"),
+                    axial_app::performance::public_transfer_resolver(),
+                )),
+                ..TestInputs::default()
+            })
+            .await;
+            let (id, game) = profile.create_instance().await;
+            std::fs::create_dir_all(game.join("resourcepacks")).unwrap();
+            paths.lock().unwrap().clear();
             Self {
-                _root: root,
+                profile,
                 id,
                 game,
-                app,
-                directories,
-                queue,
-                tasks,
                 requested,
                 gate,
                 paths,
@@ -804,40 +515,24 @@ mod tests {
         }
 
         async fn post(&self, path: &str, value: Value) -> (StatusCode, Value) {
-            let response = tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_secs(3),
-                self.app.clone().oneshot(
-                    Request::post(path)
-                        .header("content-type", "application/json")
-                        .body(Body::from(value.to_string()))
-                        .unwrap(),
-                ),
+                self.profile
+                    .api
+                    .response(reqwest::Method::POST, path, Some(value)),
             )
             .await
             .expect("content route must not await queued provider or file work")
-            .unwrap();
-            let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-                .await
-                .unwrap();
-            (status, serde_json::from_slice(&bytes).unwrap())
         }
 
         async fn get(&self, path: &str) -> (StatusCode, Value) {
-            let response = tokio::time::timeout(
-                Duration::from_secs(3),
-                self.app
-                    .clone()
-                    .oneshot(Request::get(path).body(Body::empty()).unwrap()),
-            )
-            .await
-            .expect("read-only content route completes while launch retains its lease")
-            .unwrap();
-            let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            tokio::time::timeout(Duration::from_secs(3), self.profile.api.read(path))
                 .await
-                .unwrap();
-            (status, serde_json::from_slice(&bytes).unwrap())
+                .expect("read-only content route completes while launch retains its lease")
+        }
+
+        fn queue(&self) -> &axial_app::install::queue::InstallQueue {
+            &self.profile.services.installs
         }
 
         async fn blocked_install(&self) -> InstallQueueStateResponse {
@@ -863,10 +558,10 @@ mod tests {
         }
 
         async fn terminal(&self, id: &str) -> InstallOutcome {
-            let (_, mut changed) = self.queue.subscribe();
+            let (_, mut changed) = self.queue().subscribe();
             tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
-                    let status = self.queue.status(id).unwrap();
+                    let status = self.queue().status(id).unwrap();
                     if status.done {
                         return status.outcome.unwrap();
                     }
@@ -877,53 +572,78 @@ mod tests {
             .expect("accepted content task settles")
         }
 
-        fn write_managed_resource_packs(&self, projects: &[&str]) -> Vec<u8> {
+        fn write_manifest(&self, entries: &[ManifestEntry], files: &[(&str, &[u8])]) -> Vec<u8> {
             let mut manifest = ContentManifest::default();
-            for &project in projects {
-                manifest
-                    .try_upsert(
-                        ManifestEntry::managed(
-                            CanonicalId::for_project(ProviderId::Modrinth, project),
-                            ProviderId::Modrinth,
-                            project.into(),
-                            "v1".into(),
-                            ContentKind::ResourcePack,
-                            &FileRef {
-                                filename: format!("{project}.zip"),
-                                url: format!("https://cdn.modrinth.com/{project}.zip"),
-                                size: Some(3),
-                                sha512: Some(concat!(
-                                    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
-                                    "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-                                ).into()),
-                                sha1: None,
-                                primary: true,
-                            },
-                            Vec::new(),
-                            Some(format!("Installed {project}")),
-                        )
-                        .unwrap(),
-                    )
-                    .unwrap();
-                std::fs::write(
-                    self.game.join(format!("resourcepacks/{project}.zip")),
-                    b"abc",
-                )
-                .unwrap();
+            for entry in entries {
+                manifest.try_upsert(entry.clone()).unwrap();
             }
             let raw = manifest.encode_managed().unwrap();
             std::fs::write(self.game.join(MANIFEST_FILE), &raw).unwrap();
-            std::fs::write(self.game.join("resourcepacks/user.zip"), b"untouched").unwrap();
+            for (path, bytes) in files {
+                std::fs::write(self.game.join(path), bytes).unwrap();
+            }
             raw
         }
 
+        fn write_managed_resource_packs(&self, projects: &[&str]) -> Vec<u8> {
+            let entries = projects
+                .iter()
+                .map(|project| {
+                    managed(
+                        project,
+                        ContentKind::ResourcePack,
+                        &format!("{project}.zip"),
+                        &format!("Installed {project}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let files = projects
+                .iter()
+                .map(|project| (format!("resourcepacks/{project}.zip"), b"abc".as_slice()))
+                .chain([("resourcepacks/user.zip".to_owned(), b"untouched".as_slice())])
+                .collect::<Vec<_>>();
+            let files = files
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), *bytes))
+                .collect::<Vec<_>>();
+            self.write_manifest(&entries, &files)
+        }
+
         async fn close(self) {
-            self.queue.close_admission();
             self.gate.add_permits(32);
-            self.tasks.shutdown(Duration::from_secs(3)).await.unwrap();
-            self.queue.shutdown_queued().unwrap();
+            self.profile.close().await;
             self.provider.abort();
         }
+    }
+
+    fn managed(project: &str, kind: ContentKind, filename: &str, title: &str) -> ManifestEntry {
+        ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, project),
+            ProviderId::Modrinth,
+            project.into(),
+            "v1".into(),
+            kind,
+            &FileRef {
+                filename: filename.into(),
+                url: format!("https://cdn.modrinth.com/{filename}"),
+                size: Some(3),
+                sha512: Some(SHA512_ABC.into()),
+                sha1: None,
+                primary: true,
+            },
+            Vec::new(),
+            Some(title.into()),
+        )
+        .unwrap()
+    }
+
+    fn queued_label(response: &InstallQueueStateResponse) -> &str {
+        response
+            .active
+            .as_ref()
+            .map(|active| active.label.as_str())
+            .or_else(|| response.items.first().map(|item| item.label.as_str()))
+            .expect("accepted content work is visible in the queue")
     }
 
     #[tokio::test]
@@ -941,8 +661,7 @@ mod tests {
         let (missing_status, missing_page) = fixture
             .get(&format!("{search}&instance_id={}", InstanceId::new()))
             .await;
-        let (invalid_status, invalid_response) =
-            fixture.get(&format!("{search}&instance_id=invalid")).await;
+        let (invalid_status, _) = fixture.get(&format!("{search}&instance_id=invalid")).await;
         let (read_status, read_response) = fixture
             .get(&format!("/api/v1/instances/{}/content", fixture.id))
             .await;
@@ -960,22 +679,22 @@ mod tests {
                 json!({"instance_id":fixture.id, "selections":selections}),
             )
             .await;
-        let accepted: InstallQueueStateResponse =
-            serde_json::from_value(install_response.clone()).unwrap();
+        assert_eq!(install_status, StatusCode::OK, "{install_response}");
+        let accepted: InstallQueueStateResponse = serde_json::from_value(install_response).unwrap();
         let install_id = accepted.started_install.unwrap().install_id;
-        let outcome = fixture.terminal(&install_id).await;
-        fixture.queue.close_admission();
-        fixture
-            .tasks
-            .shutdown(Duration::from_secs(3))
-            .await
-            .unwrap();
-        fixture.queue.join_observers().await.unwrap();
-        let manifest_after = std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap();
-        let owned_after = std::fs::read(fixture.game.join("resourcepacks/owned.zip")).unwrap();
-        let user_after = std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap();
-        let unsettled = fixture.queue.has_unsettled_effects();
-        fixture.close().await;
+        assert_eq!(fixture.terminal(&install_id).await, InstallOutcome::Failed);
+        assert_eq!(
+            std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap(),
+            malformed
+        );
+        assert_eq!(
+            std::fs::read(fixture.game.join("resourcepacks/owned.zip")).unwrap(),
+            b"abc"
+        );
+        assert_eq!(
+            std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap(),
+            b"untouched"
+        );
 
         assert_eq!(provider_status, StatusCode::OK, "{provider_page}");
         assert_eq!(provider_page["items"].as_array().unwrap().len(), 1);
@@ -987,84 +706,62 @@ mod tests {
         assert_eq!(installed_page["items"][0]["install_state"], "installed");
         assert_eq!(read_status, StatusCode::BAD_REQUEST, "{read_response}");
         assert_eq!(plan_status, StatusCode::BAD_REQUEST, "{plan_response}");
-        assert_eq!(install_status, StatusCode::OK, "{install_response}");
-        assert_eq!(outcome, InstallOutcome::Failed);
-        assert!(!unsettled);
-        assert_eq!(manifest_after, malformed);
-        assert_eq!(owned_after, b"abc");
-        assert_eq!(user_after, b"untouched");
-        assert_eq!(
-            invalid_status,
-            StatusCode::BAD_REQUEST,
-            "{invalid_response}"
-        );
-        assert_eq!(search_status, StatusCode::OK, "{search_page}");
-        assert_eq!(search_page, provider_page);
-        assert_eq!(missing_status, StatusCode::OK, "{missing_page}");
-        assert_eq!(missing_page, provider_page);
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+        for (status, page) in [(search_status, search_page), (missing_status, missing_page)] {
+            assert_eq!((status, page), (StatusCode::OK, provider_page.clone()));
+        }
+        fixture.close().await;
     }
 
     #[tokio::test]
     async fn content_reads_during_launch_show_only_live_files_without_rewriting_history() {
         let fixture = Fixture::new().await;
-        std::fs::create_dir(fixture.game.join("mods")).unwrap();
-        let mut manifest = ContentManifest::default();
-        for project in ["owned", "drift", "missing"] {
-            manifest
-                .try_upsert(ManifestEntry::managed(
-                    CanonicalId::for_project(ProviderId::Modrinth, project),
-                    ProviderId::Modrinth,
-                    project.into(),
-                    "v1".into(),
-                    ContentKind::Mod,
-                    &FileRef {
-                        filename: format!("{project}.jar"),
-                        url: "https://cdn.modrinth.com/fixture.jar".into(),
-                        size: Some(3),
-                        sha512: Some(concat!(
-                            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
-                            "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-                        ).into()),
-                        sha1: None,
-                        primary: true,
-                    },
-                    Vec::new(),
-                    Some(format!("Historical {project}")),
-                ).unwrap())
-                .unwrap();
-        }
-        manifest
-            .try_upsert(
-                ManifestEntry::provenance(
-                    CanonicalId("modrinth:pack".into()),
-                    ProviderId::Modrinth,
-                    "pack".into(),
-                    "v1".into(),
-                    None,
-                )
-                .unwrap(),
+        let entries = ["owned", "drift", "missing"].map(|project| {
+            managed(
+                project,
+                ContentKind::Mod,
+                &format!("{project}.jar"),
+                &format!("Historical {project}"),
             )
-            .unwrap();
-        let raw = manifest.encode_managed().unwrap();
-        std::fs::write(fixture.game.join(MANIFEST_FILE), &raw).unwrap();
-        std::fs::write(fixture.game.join("mods/owned.jar"), b"abc").unwrap();
-        std::fs::write(fixture.game.join("mods/drift.jar"), b"xyz").unwrap();
-        let launch = fixture.directories.admit(&fixture.id).unwrap();
+        });
+        let mut entries = entries.to_vec();
+        entries.push(
+            ManifestEntry::provenance(
+                CanonicalId("modrinth:pack".into()),
+                ProviderId::Modrinth,
+                "pack".into(),
+                "v1".into(),
+                None,
+            )
+            .unwrap(),
+        );
+        let raw = fixture.write_manifest(
+            &entries,
+            &[("mods/owned.jar", b"abc"), ("mods/drift.jar", b"xyz")],
+        );
+        let directories = fixture.profile.services.instances.directories();
+        let launch = directories.admit(&fixture.id).unwrap();
         let endpoint = format!("/api/v1/instances/{}/content", fixture.id);
         let (status, listing) = fixture.get(&endpoint).await;
         assert_eq!(status, StatusCode::OK, "{listing}");
-        assert_eq!(listing["entries"].as_array().unwrap().len(), 1);
-        assert_eq!(listing["entries"][0]["canonical_id"], "modrinth:owned");
-        assert_eq!(listing["entries"][0]["filename"], "owned.jar");
-        assert_eq!(listing["entries"][0]["title"], "Historical owned");
+        assert_eq!(
+            listing["entries"],
+            json!([{"canonical_id":"modrinth:owned","kind":"mod","provider":"modrinth",
+                "project_id":"owned","version_id":"v1","filename":"owned.jar","enabled":true,
+                "title":"Historical owned"}])
+        );
+        assert_eq!(
+            listing["packs"],
+            json!([{"canonical_id":"modrinth:pack","provider":"modrinth","project_id":"pack",
+                "version_id":"v1","paths":[]}])
+        );
         let (status, updates) = fixture.get(&format!("{endpoint}/updates")).await;
-        assert_eq!(status, StatusCode::OK, "{updates}");
-        assert_eq!(updates, json!({"updates":[]}));
+        assert_eq!((status, updates), (StatusCode::OK, json!({"updates":[]})));
         assert_eq!(
             *fixture.paths.lock().unwrap(),
-            vec!["/v2/project/owned/version"]
+            ["/v2/project/owned/version"]
         );
-        assert!(fixture.directories.admit(&fixture.id).is_err());
+        assert!(directories.admit(&fixture.id).is_err());
         assert_eq!(
             std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap(),
             raw
@@ -1079,57 +776,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_updates_isolate_provider_failures_without_mutating_files_or_queue() {
-        for unavailable in ["removed", "unavailable"] {
+    async fn content_updates_skip_unavailable_projects_and_unresolved_pins_without_mutation() {
+        for (other, requested) in [
+            (
+                "removed",
+                vec![
+                    "/v2/project/removed/version",
+                    "/v2/project/updateable/version",
+                ],
+            ),
+            (
+                "unavailable",
+                vec![
+                    "/v2/project/unavailable/version",
+                    "/v2/project/updateable/version",
+                ],
+            ),
+            (
+                "dependent",
+                vec![
+                    "/v2/project/dependent/version",
+                    "/v2/project/updateable/version",
+                    "/v2/versions",
+                ],
+            ),
+        ] {
             let fixture = Fixture::new().await;
-            let projects = [unavailable, "updateable"];
+            let projects = [other, "updateable"];
             let raw = fixture.write_managed_resource_packs(&projects);
-            let before_queue = serde_json::to_value(fixture.queue.snapshot()).unwrap();
+            let before_queue = serde_json::to_value(fixture.queue().snapshot()).unwrap();
             let endpoint = format!("/api/v1/instances/{}/content", fixture.id);
-            let (status, before_listing) = fixture.get(&endpoint).await;
-            assert_eq!(status, StatusCode::OK, "{before_listing}");
+            let (_, before_listing) = fixture.get(&endpoint).await;
             assert_eq!(before_listing["entries"].as_array().unwrap().len(), 2);
-
             let (status, updates) = fixture.get(&format!("{endpoint}/updates")).await;
-            assert_eq!(status, StatusCode::OK, "{unavailable}: {updates}");
+            assert_eq!(status, StatusCode::OK, "{other}: {updates}");
             assert_eq!(
                 updates,
                 json!({"updates":[{
                     "canonical_id":"modrinth:updateable", "kind":"resource_pack",
-                    "current_version_id":"v1", "latest_version_id":"v2",
+                    "current_version_id":"v1", "latest_version_id":"updateable-v2",
                     "latest_version_number":"2.0", "title":"Installed updateable"
                 }]})
             );
-            let paths = fixture.paths.lock().unwrap().clone();
-            assert!(paths.contains(&format!("/v2/project/{unavailable}/version")));
-            assert!(paths.contains(&"/v2/project/updateable/version".to_string()));
-            assert!(paths.iter().all(|path| path.ends_with("/version")));
-            let (status, after_listing) = fixture.get(&endpoint).await;
-            assert_eq!(status, StatusCode::OK, "{after_listing}");
-            assert_eq!(after_listing, before_listing);
+            let mut paths = fixture.paths.lock().unwrap().clone();
+            paths.sort();
+            assert_eq!(paths, requested, "{other}");
+            assert_eq!(fixture.get(&endpoint).await.1, before_listing);
             assert_eq!(
                 std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap(),
                 raw
             );
             for project in projects {
-                assert_eq!(
-                    std::fs::read(fixture.game.join(format!("resourcepacks/{project}.zip")))
-                        .unwrap(),
-                    b"abc"
+                let pack = fixture.game.join(format!("resourcepacks/{project}.zip"));
+                assert_eq!(std::fs::read(pack).unwrap(), b"abc");
+                assert!(
+                    !fixture
+                        .game
+                        .join(format!("resourcepacks/{project}-v2.zip"))
+                        .exists()
                 );
             }
             assert_eq!(
-                std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap(),
-                b"untouched"
-            );
-            assert!(
-                !fixture
-                    .game
-                    .join("resourcepacks/updateable-v2.zip")
-                    .exists()
-            );
-            assert_eq!(
-                serde_json::to_value(fixture.queue.snapshot()).unwrap(),
+                serde_json::to_value(fixture.queue().snapshot()).unwrap(),
                 before_queue
             );
             fixture.close().await;
@@ -1137,76 +845,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_updates_omit_unresolved_version_only_incompatibilities_without_mutation() {
-        let fixture = Fixture::new().await;
-        let projects = ["dependent", "updateable"];
-        let raw = fixture.write_managed_resource_packs(&projects);
-        let before_queue = serde_json::to_value(fixture.queue.snapshot()).unwrap();
-        let endpoint = format!("/api/v1/instances/{}/content", fixture.id);
-        let (status, before_listing) = fixture.get(&endpoint).await;
-        assert_eq!(status, StatusCode::OK, "{before_listing}");
-        assert_eq!(before_listing["entries"].as_array().unwrap().len(), 2);
-
-        let (status, updates) = fixture.get(&format!("{endpoint}/updates")).await;
-        assert_eq!(status, StatusCode::OK, "{updates}");
-        assert_eq!(
-            updates,
-            json!({"updates":[{
-                "canonical_id":"modrinth:updateable", "kind":"resource_pack",
-                "current_version_id":"v1", "latest_version_id":"v2",
-                "latest_version_number":"2.0", "title":"Installed updateable"
-            }]})
-        );
-        assert_eq!(
-            *fixture.paths.lock().unwrap(),
-            [
-                "/v2/project/dependent/version",
-                "/v2/project/updateable/version",
-                "/v2/versions"
-            ]
-        );
-        let (status, after_listing) = fixture.get(&endpoint).await;
-        assert_eq!(status, StatusCode::OK, "{after_listing}");
-        assert_eq!(after_listing, before_listing);
-        assert_eq!(
-            std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap(),
-            raw
-        );
-        for project in projects {
-            assert_eq!(
-                std::fs::read(fixture.game.join(format!("resourcepacks/{project}.zip"))).unwrap(),
-                b"abc"
-            );
-            assert!(
-                !fixture
-                    .game
-                    .join(format!("resourcepacks/{project}-v2.zip"))
-                    .exists()
-            );
-        }
-        assert_eq!(
-            std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap(),
-            b"untouched"
-        );
-        assert_eq!(
-            serde_json::to_value(fixture.queue.snapshot()).unwrap(),
-            before_queue
-        );
-        fixture.close().await;
-    }
-
-    #[tokio::test]
-    async fn install_returns_accepted_identity_before_provider_io_and_retains_failure_after_response()
-     {
+    async fn install_returns_accepted_identity_before_provider_io_and_retains_failure() {
         let fixture = Fixture::new().await;
         let accepted = fixture.blocked_install().await;
         let id = accepted.started_install.unwrap().install_id;
-        let status = fixture.queue.status(&id).unwrap();
+        let status = fixture.queue().status(&id).unwrap();
         assert!(!status.done);
         assert_eq!(status.outcome, None);
         assert_eq!(
             accepted.registry_revision,
-            fixture.queue.snapshot().registry_revision
+            fixture.queue().snapshot().registry_revision
         );
         fixture.gate.add_permits(1);
         assert_eq!(fixture.terminal(&id).await, InstallOutcome::Failed);
@@ -1215,80 +863,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uninstall_returns_owned_queue_status_and_invalidates_after_real_file_removal() {
+    async fn uninstall_names_dependents_or_removes_the_real_file() {
         let fixture = Fixture::new().await;
-        let mut manifest = ContentManifest::default();
-        manifest
-            .try_upsert(
-                ManifestEntry::managed(
-                    CanonicalId("modrinth:owned".into()),
-                    ProviderId::Modrinth,
-                    "owned".into(),
-                    "v1".into(),
-                    ContentKind::ResourcePack,
-                    &FileRef {
-                        filename: "owned.zip".into(),
-                        url: "https://cdn.modrinth.com/owned.zip".into(),
-                        size: Some(3),
-                        sha512: Some(
-                            concat!(
-                                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2",
-                                "192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-                            )
-                            .into(),
-                        ),
-                        sha1: None,
-                        primary: true,
-                    },
-                    Vec::new(),
-                    Some("Owned pack".into()),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        std::fs::write(
-            fixture.game.join(MANIFEST_FILE),
-            manifest.encode_managed().unwrap(),
+        let mut dependent = managed(
+            "dependent",
+            ContentKind::ResourcePack,
+            "dependent.zip",
+            "Dependent pack",
+        );
+        dependent = ManifestEntry::managed(
+            dependent.canonical_id().clone(),
+            ProviderId::Modrinth,
+            "dependent".into(),
+            "v1".into(),
+            ContentKind::ResourcePack,
+            &FileRef {
+                filename: "dependent.zip".into(),
+                url: "https://cdn.modrinth.com/dependent.zip".into(),
+                size: Some(3),
+                sha512: Some(SHA512_ABC.into()),
+                sha1: None,
+                primary: true,
+            },
+            vec![axial_app::content::model::ContentDependency {
+                project_id: Some("owned".into()),
+                version_id: None,
+                kind: axial_app::content::model::DependencyKind::Required,
+            }],
+            Some("Dependent pack".into()),
         )
         .unwrap();
-        std::fs::write(fixture.game.join("resourcepacks/owned.zip"), b"abc").unwrap();
-        std::fs::write(fixture.game.join("resourcepacks/user.zip"), b"untouched").unwrap();
-        let before = fixture.queue.snapshot().registry_revision;
+        fixture.write_manifest(
+            &[
+                managed(
+                    "owned",
+                    ContentKind::ResourcePack,
+                    "owned.zip",
+                    "Owned pack",
+                ),
+                dependent,
+            ],
+            &[
+                ("resourcepacks/owned.zip", b"abc"),
+                ("resourcepacks/dependent.zip", b"abc"),
+                ("resourcepacks/user.zip", b"untouched"),
+            ],
+        );
+        let uninstall = format!("/api/v1/instances/{}/content/uninstall", fixture.id);
+        let (status, refusal) = fixture
+            .post(&uninstall, json!({"canonical_ids":["modrinth:owned"]}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        assert_eq!(
+            refusal["required_by"],
+            json!([{"canonical_id":"modrinth:dependent","title":"Dependent pack"}])
+        );
+        assert!(fixture.queue().snapshot().items.is_empty());
+        let before = fixture.queue().snapshot().registry_revision;
         let (status, value) = fixture
             .post(
-                &format!("/api/v1/instances/{}/content/uninstall", fixture.id),
-                json!({"canonical_ids":["modrinth:owned"]}),
+                &uninstall,
+                json!({"canonical_ids":["modrinth:owned", "modrinth:dependent"]}),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{value}");
         let accepted: InstallQueueStateResponse = serde_json::from_value(value).unwrap();
-        assert_eq!(queued_label(&accepted), "Remove Owned pack");
+        assert_eq!(queued_label(&accepted), "Remove Owned pack and 1 more");
         let id = accepted.started_install.unwrap().install_id;
         assert_eq!(fixture.terminal(&id).await, InstallOutcome::Succeeded);
-        assert!(fixture.queue.snapshot().registry_revision > before);
+        assert!(fixture.queue().snapshot().registry_revision > before);
         assert!(!fixture.game.join("resourcepacks/owned.zip").exists());
         assert_eq!(
             std::fs::read(fixture.game.join("resourcepacks/user.zip")).unwrap(),
             b"untouched"
         );
+        let manifest = std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap();
         assert!(
-            ContentManifest::decode_managed(Some(
-                &std::fs::read(fixture.game.join(MANIFEST_FILE)).unwrap()
-            ))
-            .unwrap()
-            .is_empty()
+            ContentManifest::decode_managed(Some(&manifest))
+                .unwrap()
+                .is_empty()
         );
         assert!(fixture.paths.lock().unwrap().is_empty());
         fixture.close().await;
-    }
-
-    fn queued_label(response: &InstallQueueStateResponse) -> &str {
-        response
-            .active
-            .as_ref()
-            .map(|active| active.label.as_str())
-            .or_else(|| response.items.first().map(|item| item.label.as_str()))
-            .expect("accepted content work is visible in the queue")
     }
 
     #[tokio::test]
@@ -1313,29 +969,18 @@ mod tests {
             action,
             &InstallQueueContentActionRequest::Modpack {
                 canonical_id: "modrinth:pack".into(),
-                version_id: "pack-v1".into(),
+                version_id: "pack-v2".into(),
                 selected_file_ids: Vec::new(),
                 include_overrides: true,
             }
         );
         let paths = fixture.paths.lock().unwrap().clone();
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|path| path.as_str() == "/v2/project/pack")
-                .count(),
-            1
-        );
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|path| path.as_str() == "/v2/project/pack/version")
-                .count(),
-            1
-        );
+        for requested in ["/v2/project/pack", "/v2/project/pack/version"] {
+            assert_eq!(paths.iter().filter(|path| *path == requested).count(), 1);
+        }
         assert!(paths.iter().all(|path| !path.ends_with(".mrpack")));
         fixture
-            .queue
+            .queue()
             .remove(&accepted.items[0].queue_id)
             .await
             .unwrap();
@@ -1343,7 +988,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_content_requests_do_not_enqueue_or_contact_the_provider() {
+    async fn invalid_content_requests_are_fixed_json_without_queue_or_provider_work() {
         let fixture = Fixture::new().await;
         for (path, request) in [
             (
@@ -1365,43 +1010,28 @@ mod tests {
                     "selected_file_ids":["selected"], "include_overrides":true
                 }),
             ),
+            (
+                &format!("/api/v1/instances/{}/content/uninstall", fixture.id),
+                json!({"canonical_ids":["modrinth:duplicate", "modrinth:duplicate"]}),
+            ),
         ] {
             let (status, response) = fixture.post(path, request).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
         }
-        let (status, response) = fixture
-            .post(
-                &format!("/api/v1/instances/{}/content/uninstall", fixture.id),
-                json!({"canonical_ids":["modrinth:duplicate", "modrinth:duplicate"]}),
-            )
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-        assert!(fixture.queue.snapshot().active.is_none());
-        assert!(fixture.queue.snapshot().items.is_empty());
-        assert!(fixture.paths.lock().unwrap().is_empty());
-        fixture.close().await;
-    }
-
-    #[tokio::test]
-    async fn invalid_query_is_fixed_bounded_json_without_extractor_details() {
-        for raw in [
-            "/content/search?kind=secret-private-value",
-            "/content/search?kind=mod&limit=no",
-        ] {
-            let parsed = Query::<Search>::try_from_uri(&raw.parse().unwrap());
-            let response = match query(parsed) {
-                Err(error) => error.into_response(),
-                Ok(_) => panic!("invalid query unexpectedly admitted"),
-            };
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert_eq!(response.headers()["content-type"], "application/json");
-            let bytes = axum::body::to_bytes(response.into_body(), 256)
-                .await
-                .unwrap();
+        for query in ["kind=secret-private-value", "kind=mod&limit=no"] {
             assert_eq!(
-                serde_json::from_slice::<Value>(&bytes).unwrap(),
-                json!({"error":"Invalid content query."})
+                fixture
+                    .get(&format!("/api/v1/content/search?{query}"))
+                    .await,
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"Invalid content query."})
+                )
             );
         }
+        assert!(fixture.queue().snapshot().active.is_none());
+        assert!(fixture.queue().snapshot().items.is_empty());
+        assert!(fixture.paths.lock().unwrap().is_empty());
+        fixture.close().await;
     }
 }

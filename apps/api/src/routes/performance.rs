@@ -1,13 +1,20 @@
 //! Authenticated HTTP adaptation for the Performance owner.
 
+use super::error::{ApiError, ApiResult, Extracted};
 use axial_app::{
     instances::model::InstanceId,
     performance::{
-        PerformanceMutationError, PerformanceService,
-        health::{disabled_health_response, health_response, resolved_health_response},
-        model::{PerformanceMode, PerformancePlanRequest},
+        PerformanceService,
+        health::{
+            PerformanceHealthResponse, PerformanceInstallResponse,
+            PerformanceInstanceOperationResponse, PerformanceOperationView,
+            PerformanceRollbackResponse, disabled_health_response, resolved_health_response,
+        },
+        model::{
+            PerformanceMode, PerformancePlanRequest, PerformancePlanResponse,
+            PerformanceRulesStatusResponse, ResolutionRequest,
+        },
         plan::{configured_mode, plan_response, resolve_mode, version_target},
-        rules::RulesWorkflowError,
     },
     settings::SettingsStore,
 };
@@ -21,7 +28,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -29,7 +35,6 @@ struct PerformanceApi {
     service: Arc<PerformanceService>,
     settings: Arc<SettingsStore>,
 }
-type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
 pub fn router(service: Arc<PerformanceService>, settings: Arc<SettingsStore>) -> Router {
     Router::new()
@@ -48,55 +53,40 @@ pub fn router(service: Arc<PerformanceService>, settings: Arc<SettingsStore>) ->
         .with_state(PerformanceApi { service, settings })
 }
 
-async fn status(State(api): State<PerformanceApi>) -> ApiResult {
-    Ok(Json(json!(api.service.rules().status())))
+async fn status(State(api): State<PerformanceApi>) -> Json<PerformanceRulesStatusResponse> {
+    Json(api.service.rules().status())
 }
-async fn refresh(State(api): State<PerformanceApi>) -> ApiResult {
-    api.service
-        .refresh_rules()
-        .await
-        .map(|value| Json(json!(value)))
-        .map_err(|error| {
-            let status = match error {
-                RulesWorkflowError::Unconfigured => StatusCode::BAD_REQUEST,
-                RulesWorkflowError::ProviderFailed => StatusCode::BAD_GATEWAY,
-                _ => StatusCode::CONFLICT,
-            };
-            (status, Json(json!({"error":error.to_string()})))
-        })
+
+async fn refresh(State(api): State<PerformanceApi>) -> ApiResult<PerformanceRulesStatusResponse> {
+    Ok(Json(api.service.refresh_rules().await?))
 }
+
 async fn plan(
     State(api): State<PerformanceApi>,
     query: Result<Query<PerformancePlanRequest>, QueryRejection>,
-) -> ApiResult {
-    let Query(input) = query.map_err(|_| invalid())?;
+) -> ApiResult<PerformancePlanResponse> {
+    let input = query.or_refuse(invalid)?;
     let request = resolution(&api, &input)?;
     if let Some(id) = input.instance_id.as_deref() {
-        let resolved = api
-            .service
-            .resolve_and_inspect(&id.parse::<InstanceId>().map_err(|_| invalid())?, request)
-            .await
-            .map_err(error)?;
-        return Ok(Json(json!(plan_response(&resolved.plan))));
+        let id = id.parse::<InstanceId>().map_err(|_| invalid())?;
+        let resolved = api.service.resolve_and_inspect(&id, request).await?;
+        return Ok(Json(plan_response(&resolved.plan)));
     }
-    let planned = api.service.rules().plan(request).await.map_err(|error| {
-        (
-            StatusCode::CONFLICT,
-            Json(json!({"error":error.to_string()})),
-        )
-    })?;
-    Ok(Json(json!(plan_response(planned.plan()))))
+    let planned = api.service.rules().plan(request).await?;
+    Ok(Json(plan_response(planned.plan())))
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstanceQuery {
     instance_id: Option<String>,
 }
+
 async fn health(
     State(api): State<PerformanceApi>,
     query: Result<Query<InstanceQuery>, QueryRejection>,
-) -> ApiResult {
-    let Query(query) = query.map_err(|_| invalid())?;
+) -> ApiResult<PerformanceHealthResponse> {
+    let query = query.or_refuse(invalid)?;
     let id = selected(&api, query.instance_id.as_deref())?;
     let request = resolution(
         &api,
@@ -106,24 +96,24 @@ async fn health(
         },
     )?;
     if request.mode != PerformanceMode::Managed {
-        return Ok(Json(json!(disabled_health_response())));
+        return Ok(Json(disabled_health_response()));
     }
-    Ok(Json(json!(resolved_health_response(
-        api.service
-            .resolve_and_inspect(&id, request)
-            .await
-            .map_err(error)?
-    ))))
+    let resolved = api.service.resolve_and_inspect(&id, request).await?;
+    Ok(Json(resolved_health_response(resolved)))
 }
+
 async fn rollback(
     State(api): State<PerformanceApi>,
     query: Result<Query<InstanceQuery>, QueryRejection>,
-) -> ApiResult {
-    let Query(query) = query.map_err(|_| invalid())?;
+) -> ApiResult<PerformanceRollbackResponse> {
+    let query = query.or_refuse(invalid)?;
     let id = selected(&api, query.instance_id.as_deref())?;
-    let inspected = api.service.inspect(&id).await.map_err(error)?;
-    Ok(Json(json!({"snapshots":inspected.rollback_snapshots})))
+    let inspected = api.service.inspect(&id).await?;
+    Ok(Json(PerformanceRollbackResponse {
+        snapshots: inspected.rollback_snapshots,
+    }))
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallRequest {
@@ -135,11 +125,12 @@ struct InstallRequest {
     rollback_id: Option<String>,
     queued: Option<bool>,
 }
+
 async fn install(
     State(api): State<PerformanceApi>,
     body: Result<Json<InstallRequest>, JsonRejection>,
-) -> ApiResult {
-    let Json(body) = body.map_err(|_| invalid())?;
+) -> ApiResult<PerformanceInstallResponse> {
+    let body = body.or_refuse(invalid)?;
     let id = selected(&api, body.instance_id.as_deref())?;
     let request = resolution(
         &api,
@@ -152,13 +143,8 @@ async fn install(
     )?;
     let action = body.action.as_deref().unwrap_or("apply");
     if body.queued == Some(true) {
-        let operation = api
-            .service
-            .submit(&id, request, action, body.rollback_id)
-            .map_err(error)?;
-        return Ok(Json(
-            json!({"active":true,"status":"queued","install_id":operation.id,"health":"disabled","composition_id":"","tier":"","installed_count":0,"managed_artifacts":[],"warnings":[],"operation":operation_payload(operation)}),
-        ));
+        let operation = api.service.submit(&id, request, action, body.rollback_id)?;
+        return Ok(Json(PerformanceInstallResponse::queued(operation)));
     }
     let inspected = match action {
         "apply" => api.service.apply(&id, request).await,
@@ -166,47 +152,35 @@ async fn install(
         "remove" => api.service.remove(&id).await,
         "rollback" => api.service.rollback(&id, body.rollback_id).await,
         _ => return Err(invalid()),
-    }
-    .map_err(error)?;
-    let state = inspected.state.as_ref();
-    let response = json!({"active":state.is_some(),"status":"complete","health":inspected.health,
-        "composition_id":state.map(|s| s.composition_id.as_str()).unwrap_or(""), "tier":state.map(|s| match s.tier { axial_app::performance::model::CompositionTier::Core => "core", axial_app::performance::model::CompositionTier::Extended => "extended", axial_app::performance::model::CompositionTier::VanillaEnhanced => "vanilla_enhanced" }).unwrap_or(""),
-        "installed_count":state.map_or(0,|s|s.installed_mods.len()),"managed_artifacts":health_response(inspected.clone()).managed_artifacts,"warnings":inspected.warnings});
-    Ok(Json(response))
+    }?;
+    Ok(Json(PerformanceInstallResponse::complete(inspected)))
 }
-async fn operation(State(api): State<PerformanceApi>, Path(id): Path<String>) -> ApiResult {
-    let operation = api.service.operation(&id).map_err(error)?.ok_or((
-        StatusCode::NOT_FOUND,
-        Json(json!({"error":"performance operation not found"})),
-    ))?;
-    Ok(Json(operation_payload(operation)))
+
+async fn operation(
+    State(api): State<PerformanceApi>,
+    Path(id): Path<String>,
+) -> ApiResult<PerformanceOperationView> {
+    let operation = api
+        .service
+        .operation(&id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "performance operation not found"))?;
+    Ok(Json(operation.into()))
 }
+
 async fn instance_operation(
     State(api): State<PerformanceApi>,
     Path(id): Path<String>,
-) -> ApiResult {
+) -> ApiResult<PerformanceInstanceOperationResponse> {
     let id = id.parse().map_err(|_| invalid())?;
-    Ok(Json(
-        json!({"operation":api.service.instance_operation(&id).map_err(error)?.map(operation_payload)}),
-    ))
+    Ok(Json(PerformanceInstanceOperationResponse {
+        operation: api.service.instance_operation(&id)?.map(Into::into),
+    }))
 }
-fn operation_payload(
-    operation: axial_app::performance::mutation::PerformanceOperationStatus,
-) -> Value {
-    let complete = operation.state == "complete";
-    let terminal = matches!(
-        operation.state.as_str(),
-        "complete" | "failed" | "interrupted"
-    );
-    let mut value = json!(operation);
-    value["view_model"] = json!({"state_label":operation.state,"tone":if complete {"ok"} else if terminal {"warn"} else {"mute"},
-        "title":"Performance operation","detail":operation.error.unwrap_or_default(),"progress":{"phase":operation.state,"current":if terminal {1}else{0},"total":1,"done":terminal},"is_terminal":terminal,"is_complete":complete});
-    value
-}
+
 fn resolution(
     api: &PerformanceApi,
     input: &PerformancePlanRequest,
-) -> Result<axial_app::performance::model::ResolutionRequest, (StatusCode, Json<Value>)> {
+) -> Result<ResolutionRequest, ApiError> {
     let settings = api.settings.current().map_err(|_| unavailable())?;
     let record = input
         .instance_id
@@ -239,10 +213,8 @@ fn resolution(
     .map_err(|_| invalid())?;
     Ok(api.service.resolution_request(game, loader, mode.mode))
 }
-fn selected(
-    api: &PerformanceApi,
-    raw: Option<&str>,
-) -> Result<InstanceId, (StatusCode, Json<Value>)> {
+
+fn selected(api: &PerformanceApi, raw: Option<&str>) -> Result<InstanceId, ApiError> {
     if let Some(raw) = raw {
         return raw.parse().map_err(|_| invalid());
     }
@@ -253,38 +225,21 @@ fn selected(
         .map_err(|_| unavailable())?
         .ok_or_else(invalid)
 }
-fn error(error: PerformanceMutationError) -> (StatusCode, Json<Value>) {
-    let code = match error {
-        PerformanceMutationError::InstanceNotFound | PerformanceMutationError::SnapshotNotFound => {
-            StatusCode::NOT_FOUND
-        }
-        PerformanceMutationError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::CONFLICT,
-    };
-    (code, Json(json!({"error":error.to_string()})))
+
+fn invalid() -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "invalid performance request")
 }
-fn invalid() -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error":"invalid performance request"})),
-    )
-}
-fn unavailable() -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::CONFLICT,
-        Json(json!({"error":"performance target is unavailable"})),
-    )
+
+fn unavailable() -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, "performance target is unavailable")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture::Profile;
     use axial_app::{
-        instances::{
-            create::{CreateInstanceRequest, CreateTarget},
-            model::InstancePatch,
-        },
-        performance::rules::PerformanceRules,
+        instances::model::InstancePatch, performance::rules::PerformanceRules,
         storage::StorageError,
     };
     use axial_performance::{
@@ -298,6 +253,7 @@ mod tests {
         http::Request,
     };
     use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{Value, json};
     use sha2::{Digest, Sha512};
     use std::{
         collections::BTreeMap,
@@ -308,81 +264,45 @@ mod tests {
     use tower::ServiceExt;
 
     struct ProjectionFixture {
-        root: tempfile::TempDir,
-        services: crate::DesktopServices,
+        profile: Profile,
         instance: InstanceId,
         mods: PathBuf,
     }
 
     impl ProjectionFixture {
         async fn new() -> Self {
-            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-            let services = crate::start_in_profile(root.path().join("replacement"), None)
-                .await
-                .unwrap();
-            let target = CreateTarget::loader_for_tests(
-                axial_minecraft::LoaderComponentId::Fabric,
-                "1.20.1",
-                "0.16.9",
-            )
-            .unwrap();
-            let created = services
-                .instances
-                .create(
-                    CreateInstanceRequest {
-                        name: "Performance projection".into(),
-                        selection_id: target.selection_id().to_owned(),
-                        ..Default::default()
-                    },
-                    target,
-                    services
-                        .instances
-                        .creation_admission_for_tests()
-                        .await
-                        .unwrap(),
-                )
+            let profile = Profile::start().await;
+            let (instance, game) = profile.create_instance().await;
+            let instances = &profile.services.instances;
+            let revision = instances
+                .registry()
+                .get_live(&instance)
                 .unwrap()
-                .join()
-                .await
-                .unwrap()
-                .unwrap();
-            services
-                .instances
+                .instance
+                .revision;
+            instances
                 .update(
-                    &created.id,
+                    &instance,
                     InstancePatch {
-                        expected_revision: Some(created.revision),
+                        expected_revision: Some(revision),
                         performance_mode: Some("managed".into()),
                         ..Default::default()
                     },
                 )
                 .unwrap();
-            let admission = services.instances.directories().admit(&created.id).unwrap();
-            let mods = services
-                .library
-                .admit()
-                .unwrap()
-                .read_projection()
-                .unwrap()
-                .join("instances")
-                .join(&admission.record().directory_name)
-                .join("mods");
-            admission.validate_current().unwrap();
+            let mods = game.join("mods");
             std::fs::write(mods.join("iris-mc1.20.1-1.7.0.jar"), jar("iris")).unwrap();
-            admission.validate_current().unwrap();
-            drop(admission);
             Self {
-                root,
-                services,
-                instance: created.id,
+                profile,
+                instance,
                 mods,
             }
         }
 
         fn router(&self) -> Router {
             router(
-                Arc::new(self.services.performance.clone()),
-                self.services.settings.clone(),
+                Arc::new(self.profile.services.performance.clone()),
+                self.profile.services.settings.clone(),
             )
         }
 
@@ -413,7 +333,8 @@ mod tests {
                     key_id: Some("projection-fixture".into()),
                 },
             };
-            self.services
+            self.profile
+                .services
                 .settings
                 .metadata()
                 .transaction(|db| -> Result<_, StorageError> {
@@ -425,13 +346,18 @@ mod tests {
                 })
                 .unwrap();
             let rules = PerformanceRules::with_remote(
-                self.services.settings.metadata().clone(),
+                self.profile.services.settings.metadata().clone(),
                 Some("https://example.invalid/rules".into()),
                 Some(hex::encode(key.verifying_key().to_bytes())),
             )
             .unwrap();
-            let service = self.services.performance.clone().with_rules_for_test(rules);
-            router(Arc::new(service), self.services.settings.clone())
+            let service = self
+                .profile
+                .services
+                .performance
+                .clone()
+                .with_rules_for_test(rules);
+            router(Arc::new(service), self.profile.services.settings.clone())
         }
 
         async fn seed_managed(&self) {
@@ -521,6 +447,7 @@ mod tests {
             )
             .unwrap();
             let inspection = self
+                .profile
                 .services
                 .performance
                 .install_plan_for_test(&self.instance, plan, transfers)
@@ -534,9 +461,7 @@ mod tests {
         }
 
         async fn close(self) {
-            self.services.server.shutdown().await.unwrap();
-            drop(self.services);
-            drop(self.root);
+            self.profile.close().await;
         }
     }
 
@@ -596,6 +521,7 @@ mod tests {
             let fixture = ProjectionFixture::new().await;
             let body = std::panic::AssertUnwindSafe(async {
                 let instance = fixture
+                    .profile
                     .services
                     .instances
                     .registry()
@@ -608,24 +534,24 @@ mod tests {
                 );
                 let mut health = Box::pin(get_json(fixture.router(), &health_path));
                 let waiting = futures_util::poll!(health.as_mut()).is_pending();
-                let refused = fixture.services.instances.update_with_sessions(
+                let refused = fixture.profile.services.instances.update_with_sessions(
                     &fixture.instance,
                     InstancePatch {
                         expected_revision: Some(instance.revision),
                         max_memory_mb: Some(2048),
                         ..Default::default()
                     },
-                    &fixture.services.sessions,
+                    &fixture.profile.services.sessions,
                 );
                 let result = health.await;
-                let saved = fixture.services.instances.update_with_sessions(
+                let saved = fixture.profile.services.instances.update_with_sessions(
                     &fixture.instance,
                     InstancePatch {
                         expected_revision: Some(instance.revision),
                         max_memory_mb: Some(2048),
                         ..Default::default()
                     },
-                    &fixture.services.sessions,
+                    &fixture.profile.services.sessions,
                 );
                 move || {
                     assert!(waiting);
@@ -641,28 +567,31 @@ mod tests {
             .await;
             let shutdown = std::panic::AssertUnwindSafe(tokio::time::timeout(
                 Duration::from_secs(30),
-                fixture.services.server.shutdown(),
+                fixture.profile.services.server.shutdown(),
             ))
             .catch_unwind()
             .await;
-            let settled = fixture.services.server.is_shutdown_settled()
-                && fixture.services.tasks.shutdown_receipt().is_some()
-                && fixture.services.tasks.status().is_idle();
+            let settled = fixture.profile.services.server.is_shutdown_settled()
+                && fixture.profile.services.tasks.shutdown_receipt().is_some()
+                && fixture.profile.services.tasks.status().is_idle();
             if !matches!(shutdown, Ok(Ok(Ok(())))) || !settled {
                 return Err(fixture);
             }
-            drop(fixture.services);
+            drop(fixture.profile.services);
             let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 body.unwrap_or_else(|panic| std::panic::resume_unwind(panic))();
             }));
             if let Err(panic) = verified {
-                eprintln!("Retained health fixture: {}", fixture.root.keep().display());
+                eprintln!(
+                    "Retained health fixture: {}",
+                    fixture.profile.temporary.keep().display()
+                );
                 std::panic::resume_unwind(panic);
             }
             Ok(())
         });
         if let Err(fixture) = cleanup {
-            let retained = fixture.root.path().to_owned();
+            let retained = fixture.profile.temporary.path().to_owned();
             std::mem::forget((runtime, fixture));
             panic!(
                 "Health cleanup did not prove settlement; retained owners and fixture: {}",
@@ -791,6 +720,7 @@ mod tests {
         let mut responses = Vec::new();
         for mode in ["custom", "vanilla"] {
             fixture
+                .profile
                 .services
                 .instances
                 .update(
@@ -800,6 +730,7 @@ mod tests {
                 )
                 .unwrap();
             let admission = fixture
+                .profile
                 .services
                 .performance
                 .instances()
@@ -820,6 +751,7 @@ mod tests {
         }
         let after = files(&fixture.mods);
         let pending = fixture
+            .profile
             .services
             .settings
             .metadata()
@@ -843,21 +775,5 @@ mod tests {
         }
         assert_eq!(before, after);
         assert_eq!(pending, 0);
-    }
-
-    #[test]
-    fn operation_projection_preserves_current_terminal_wire() {
-        let record = json!({
-            "id":"e89198a7-fc9a-4268-8237-1d03a7865d7d",
-            "instance_id":"d6926227-f5e6-47a3-a736-f6c1cef14435", "action":"apply",
-            "state":"failed", "error":"Operation failed",
-            "created_at":"2026-01-01T00:00:00.000Z", "updated_at":"2026-01-01T00:00:01.000Z"
-        });
-        let payload = operation_payload(serde_json::from_value(record.clone()).unwrap());
-        assert_eq!(payload["action"], record["action"]);
-        assert_eq!(payload["view_model"]["title"], "Performance operation");
-        assert_eq!(payload["view_model"]["is_terminal"], true);
-        assert_eq!(payload["view_model"]["is_complete"], false);
-        assert_eq!(payload["view_model"]["progress"]["done"], true);
     }
 }

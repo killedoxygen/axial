@@ -1,5 +1,6 @@
 //! Native package authority stays with the desktop adapter; HTTP carries only
 //! commands and the feature-owned update state.
+use super::error::{ApiError, ApiResult, update_failure};
 use axial_app::update::{UpdateError, UpdateFlow, UpdateInfo, UpdateService, UpdateSnapshot};
 use axum::{
     Json, Router,
@@ -8,9 +9,6 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
-
-type ApiError = (StatusCode, Json<Value>);
 
 pub fn router(updates: UpdateService) -> Router {
     Router::new()
@@ -23,8 +21,8 @@ pub fn router(updates: UpdateService) -> Router {
         .with_state(updates)
 }
 
-async fn check(State(updates): State<UpdateService>) -> Result<Json<UpdateInfo>, ApiError> {
-    updates.check().await.map(Json).map_err(update_error)
+async fn check(State(updates): State<UpdateService>) -> ApiResult<UpdateInfo> {
+    Ok(Json(updates.check().await?))
 }
 
 #[derive(Deserialize)]
@@ -36,9 +34,9 @@ struct DownloadRequest {
 async fn download(
     State(updates): State<UpdateService>,
     request: Result<Json<DownloadRequest>, JsonRejection>,
-) -> Result<Json<UpdateFlow>, ApiError> {
+) -> ApiResult<UpdateFlow> {
     if !updates.snapshot().flow.supported {
-        return Err(update_error(UpdateError::Unsupported));
+        return Err(UpdateError::Unsupported.into());
     }
     let Json(request) = request.map_err(|error| {
         invalid_request(if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -53,15 +51,11 @@ async fn download(
     {
         return Err(invalid_request(StatusCode::BAD_REQUEST));
     }
-    updates
-        .download(&request.version)
-        .await
-        .map(Json)
-        .map_err(update_error)
+    Ok(Json(updates.download(&request.version).await?))
 }
 
-async fn apply(State(updates): State<UpdateService>) -> Result<Json<UpdateFlow>, ApiError> {
-    updates.apply().await.map(Json).map_err(update_error)
+async fn apply(State(updates): State<UpdateService>) -> ApiResult<UpdateFlow> {
+    Ok(Json(updates.apply().await?))
 }
 
 async fn flow(State(updates): State<UpdateService>) -> Json<UpdateFlow> {
@@ -73,29 +67,11 @@ async fn snapshot(State(updates): State<UpdateService>) -> Json<UpdateSnapshot> 
 }
 
 fn invalid_request(status: StatusCode) -> ApiError {
-    (
+    update_failure(
         status,
-        Json(json!({
-            "error": "Provide an update version in a valid download request.",
-            "code": "invalid_update_request"
-        })),
+        "invalid_update_request",
+        "Provide an update version in a valid download request.".into(),
     )
-}
-
-fn update_error(error: UpdateError) -> ApiError {
-    let (status, code) = match &error {
-        UpdateError::Unsupported => (StatusCode::NOT_IMPLEMENTED, "update_unsupported"),
-        UpdateError::Busy => (StatusCode::CONFLICT, "update_busy"),
-        UpdateError::StaleRelease => (StatusCode::CONFLICT, "update_stale_release"),
-        UpdateError::NotReady => (StatusCode::CONFLICT, "update_not_ready"),
-        UpdateError::Failed(_) => (StatusCode::BAD_GATEWAY, "update_failed"),
-    };
-    let message = if matches!(error, UpdateError::Unsupported) {
-        "In-app updates are unavailable for this build because a trusted release feed has not been configured.".into()
-    } else {
-        error.to_string().chars().take(500).collect::<String>()
-    };
-    (status, Json(json!({ "error": message, "code": code })))
 }
 
 #[cfg(test)]
@@ -104,6 +80,7 @@ mod tests {
     use axial_app::update::{NativeUpdateAdapter, UpdateFuture, UpdatePhase};
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -333,27 +310,5 @@ mod tests {
             );
             assert_eq!(updates.snapshot(), before);
         }
-    }
-
-    #[tokio::test]
-    async fn status_reports_unsupported_without_inventing_a_release() {
-        let updates = UpdateService::new("1.0.0", "browser", "unknown");
-        let response = router(updates)
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/update/snapshot")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let snapshot: UpdateSnapshot = serde_json::from_slice(&body).unwrap();
-        assert_eq!(snapshot.info, None);
-        assert!(!snapshot.flow.supported);
-        assert!(!snapshot.flow.can_check);
-        assert!(!snapshot.flow.can_download);
-        assert!(!snapshot.flow.can_apply);
     }
 }

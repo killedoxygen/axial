@@ -1,3 +1,4 @@
+use super::error::{ApiError, ApiResult, Extracted};
 use axial_app::{
     install::{
         model::{
@@ -13,15 +14,11 @@ use axum::{
         DefaultBodyLimit, Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{delete, get, post},
 };
 use futures_util::{Stream, stream};
-use serde_json::{Value, json};
 use std::{convert::Infallible, sync::Arc};
-
-type ApiError = (StatusCode, Json<Value>);
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,61 +55,53 @@ async fn snapshot(State(queue): State<Arc<InstallQueue>>) -> Json<InstallQueueSt
 async fn enqueue(
     State(queue): State<Arc<InstallQueue>>,
     request: Result<Json<InstallQueueRequest>, JsonRejection>,
-) -> Result<Json<InstallQueueStateResponse>, ApiError> {
-    let Json(request) = request.map_err(|_| failure(InstallError::InvalidRequest))?;
-    queue.enqueue(request).await.map(Json).map_err(failure)
+) -> ApiResult<InstallQueueStateResponse> {
+    let request = request.or_refuse(|| InstallError::InvalidRequest)?;
+    Ok(Json(queue.enqueue(request).await?))
 }
 async fn retry(
     State((queue, setup)): State<(Arc<InstallQueue>, Arc<SetupService>)>,
     query: Result<Query<RetryQuery>, QueryRejection>,
     request: Result<Json<InstallQueueRequest>, JsonRejection>,
-) -> Result<Json<InstallQueueStateResponse>, ApiError> {
-    let Query(query) = query.map_err(|_| failure(InstallError::InvalidRequest))?;
-    let Json(request) = request.map_err(|_| failure(InstallError::InvalidRequest))?;
+) -> ApiResult<InstallQueueStateResponse> {
+    let query = query.or_refuse(|| InstallError::InvalidRequest)?;
+    let request = request.or_refuse(|| InstallError::InvalidRequest)?;
     if let Some(id) = query.expected_install_id {
         if !uuid::Uuid::parse_str(&id).is_ok_and(|parsed| parsed.to_string() == id) {
-            return Err(failure(InstallError::InvalidRequest));
+            return Err(InstallError::InvalidRequest.into());
         }
-        return queue
-            .retry_retained(&id, &request)
-            .await
-            .map(Json)
-            .map_err(failure);
+        return Ok(Json(queue.retry_retained(&id, &request).await?));
     }
-    if let Some(response) = setup
-        .retry_queued_setup(&request)
-        .await
-        .map_err(super::instances::error)?
-    {
+    if let Some(response) = setup.retry_queued_setup(&request).await? {
         return Ok(Json(response));
     }
-    queue.retry(request).await.map(Json).map_err(failure)
+    Ok(Json(queue.retry(request).await?))
 }
 async fn remove(
     State(queue): State<Arc<InstallQueue>>,
     Path(id): Path<String>,
-) -> Result<Json<InstallQueueStateResponse>, ApiError> {
-    queue.remove(&id).await.map(Json).map_err(failure)
+) -> ApiResult<InstallQueueStateResponse> {
+    Ok(Json(queue.remove(&id).await?))
 }
 async fn dismiss_failure(
     State(queue): State<Arc<InstallQueue>>,
     Path(operation_id): Path<String>,
-) -> Result<Json<InstallQueueStateResponse>, ApiError> {
+) -> ApiResult<InstallQueueStateResponse> {
     let operation_id = axial_app::public::OperationId::parse(&operation_id)
-        .map_err(|_| failure(InstallError::InvalidRequest))?;
+        .map_err(|_| InstallError::InvalidRequest)?;
     Ok(Json(queue.dismiss_failure(&operation_id)))
 }
 async fn status(
     State(queue): State<Arc<InstallQueue>>,
     Path(id): Path<String>,
-) -> Result<Json<InstallStatusResponse>, ApiError> {
-    queue.status(&id).map(Json).map_err(failure)
+) -> ApiResult<InstallStatusResponse> {
+    Ok(Json(queue.status(&id)?))
 }
 async fn cancel(
     State(queue): State<Arc<InstallQueue>>,
     Path(id): Path<String>,
-) -> Result<Json<InstallStatusResponse>, ApiError> {
-    queue.cancel(&id).map(Json).map_err(failure)
+) -> ApiResult<InstallStatusResponse> {
+    Ok(Json(queue.cancel(&id)?))
 }
 
 async fn queue_events(
@@ -154,7 +143,7 @@ async fn install_events(
     // Subscribe before reading status so the current snapshot and later events
     // cannot have a gap. Slow clients rebase to the queue's latest projection.
     let (_, receiver) = queue.subscribe();
-    let initial = queue.status(&id).map_err(failure)?;
+    let initial = queue.status(&id)?;
     Ok(Sse::new(stream::unfold(
         (Some(initial), receiver, queue, id, false),
         |(initial, mut receiver, queue, id, finished)| async move {
@@ -181,30 +170,6 @@ async fn install_events(
     ))
     .keep_alive(KeepAlive::default()))
 }
-pub(crate) fn failure(error: InstallError) -> ApiError {
-    let status = match error {
-        InstallError::InvalidRequest => StatusCode::BAD_REQUEST,
-        InstallError::NotFound => StatusCode::NOT_FOUND,
-        InstallError::Busy
-        | InstallError::SettlementRequired
-        | InstallError::NotReady
-        | InstallError::ClientJarMissing
-        | InstallError::ClientJarCorrupt
-        | InstallError::VersionJsonMissing
-        | InstallError::LibrariesMissing
-        | InstallError::LibrariesCorrupt
-        | InstallError::AssetIndexMissing
-        | InstallError::AssetIndexCorrupt => StatusCode::CONFLICT,
-        InstallError::AtCapacity => StatusCode::TOO_MANY_REQUESTS,
-        InstallError::ContentUnavailable
-        | InstallError::LoaderUnavailable
-        | InstallError::Cancelled
-        | InstallError::Closed => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, Json(json!({"error":error.to_string()})))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +178,8 @@ mod tests {
         settings::InstanceSettings,
         storage::rusqlite::params,
     };
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
     use std::time::Duration;
     use tokio::{net::TcpListener, sync::Semaphore};
 
@@ -221,27 +188,15 @@ mod tests {
         path: &str,
         request: Value,
     ) -> (StatusCode, Value) {
-        let bootstrap = services.server.bootstrap();
-        let response = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap()
-            .post(format!("{}{path}", bootstrap.base_url))
-            .header(crate::transport::CAPABILITY_HEADER, bootstrap.capability)
-            .json(&request)
-            .send()
+        crate::fixture::Api::new(services)
+            .response(reqwest::Method::POST, path, Some(request))
             .await
-            .unwrap();
-        (response.status(), response.json().await.unwrap())
     }
 
     #[tokio::test]
     async fn retained_retry_selector_refuses_stale_or_malformed_identity_without_enqueuing() {
-        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let services = crate::start_in_profile(root.path().join("profile"), None)
-            .await
-            .unwrap();
+        let profile = crate::fixture::Profile::start().await;
+        let services = &profile.services;
         let id = "00000000-0000-4000-8000-000000000001";
         for (query, expected) in [
             (
@@ -260,7 +215,7 @@ mod tests {
             (format!("expected_install_id={id}"), StatusCode::NOT_FOUND),
         ] {
             let (status, _) = post(
-                &services,
+                services,
                 &format!("/api/v1/install/queue/retry?{query}"),
                 json!({"kind":"vanilla","version_id":"must-not-enqueue"}),
             )
@@ -270,7 +225,7 @@ mod tests {
             assert!(snapshot.active.is_none());
             assert!(snapshot.items.is_empty());
         }
-        services.server.shutdown().await.unwrap();
+        profile.close().await;
     }
 
     #[tokio::test]
