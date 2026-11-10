@@ -26,8 +26,8 @@ pub enum InstallError {
 pub enum RulesRefreshError {
     #[error("performance remote rules url is not configured")]
     Unconfigured,
-    #[error("remote rules request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    #[error("remote rules {0}")]
+    Request(axial_minecraft::http::FetchError),
     #[error("remote rules returned HTTP {0}")]
     HttpStatus(u16),
     #[error("remote rules response is too large")]
@@ -40,6 +40,19 @@ pub enum RulesRefreshError {
     Signature(#[from] RulesSignatureError),
     #[error("failed to persist remote performance manifest: {0}")]
     Cache(#[from] std::io::Error),
+}
+
+impl From<axial_minecraft::http::FetchError> for RulesRefreshError {
+    fn from(error: axial_minecraft::http::FetchError) -> Self {
+        use axial_minecraft::http::FetchError;
+        match error {
+            FetchError::TooLarge { .. } | FetchError::Allocation => Self::ResponseTooLarge,
+            error => match error.status() {
+                Some(status) => Self::HttpStatus(status),
+                None => Self::Request(error),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

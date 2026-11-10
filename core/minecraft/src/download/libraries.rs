@@ -1,4 +1,4 @@
-use super::client::{library_download_concurrency, standard_minecraft_download_client};
+use super::client::library_download_concurrency;
 use super::facts::selected_download_source_label;
 use super::integrity::is_sha1_hex;
 use super::library_source::{
@@ -421,7 +421,7 @@ async fn download_profile_retained_library_jobs<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let client = standard_minecraft_download_client();
+    let client = crate::http::artifact_client().clone();
     let source_pool = LibrarySourcePool::new_with_workers(workers)?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
@@ -478,7 +478,7 @@ async fn download_installer_classified_library_jobs<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let client = standard_minecraft_download_client();
+    let client = crate::http::artifact_client().clone();
     let source_pool = LibrarySourcePool::new_with_workers(workers.clone())?;
     let cache_admission =
         ExactLibraryCacheAdmission::bind_with_workers(library_root, workers).await?;
@@ -515,25 +515,7 @@ where
 }
 
 pub(crate) fn decode_sha1(value: &str) -> Option<[u8; 20]> {
-    if !is_sha1_hex(value) {
-        return None;
-    }
-    let mut digest = [0_u8; 20];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        digest[index] = hex_nibble(pair[0])?
-            .checked_mul(16)?
-            .checked_add(hex_nibble(pair[1])?)?;
-    }
-    Some(digest)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    hex::FromHex::from_hex(value).ok()
 }
 
 fn resolve_library_plan(lib: &Library) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {

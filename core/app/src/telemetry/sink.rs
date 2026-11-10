@@ -94,10 +94,9 @@ impl CollectorConfig {
             return Err(CollectorConfigurationError);
         }
         endpoint.set_path(&format!("{}/batch/", endpoint.path().trim_end_matches('/')));
-        let client = reqwest::Client::builder()
+        let client = axial_minecraft::http::builder()
             .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!("axial/", env!("CARGO_PKG_VERSION"), " telemetry"))
             .build()
             .map_err(|_| CollectorConfigurationError)?;
         Ok(Self {

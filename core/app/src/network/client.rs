@@ -1,9 +1,6 @@
 use std::io::{Read, Write};
 
-use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION,
-    TRANSFER_ENCODING,
-};
+use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, CONTENT_TYPE, LOCATION};
 use reqwest::{Response, StatusCode};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
@@ -77,13 +74,10 @@ impl ProviderClient {
     }
 
     fn builder(config: &ClientConfig) -> reqwest::ClientBuilder {
-        reqwest::Client::builder()
+        axial_minecraft::http::builder()
             .user_agent(config.user_agent.as_str())
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
-            .pool_max_idle_per_host(32)
-            .pool_idle_timeout(std::time::Duration::from_secs(120))
-            .tcp_keepalive(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             // Count HTTP representation bytes before any decoder changes them.
@@ -248,7 +242,7 @@ impl ProviderClient {
             });
         }
         let encoding = response_encoding(&response)?;
-        let body = read_response(response, request.limits.max_encoded_bytes, cancellation).await?;
+        let body = read_response(response, request.limits.max_encoded_bytes).await?;
         let encoded_bytes = body.len() as u64;
         let bytes = decode_body(
             body,
@@ -291,51 +285,15 @@ fn check_cancelled(cancellation: &CancellationToken) -> Result<(), DownloadError
     }
 }
 
-async fn read_response(
-    mut response: Response,
-    limit: u64,
-    cancellation: &CancellationToken,
-) -> Result<Vec<u8>, DownloadError> {
-    let mut lengths = response.headers().get_all(CONTENT_LENGTH).iter();
-    let declared = lengths
-        .next()
-        .map(|value| {
-            let value = value.to_str().map_err(|_| DownloadError::IncompleteBody)?;
-            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(DownloadError::IncompleteBody);
-            }
-            value
-                .parse::<u64>()
-                .map_err(|_| DownloadError::IncompleteBody)
-        })
-        .transpose()?;
-    if lengths.next().is_some()
-        || (declared.is_some() && response.headers().contains_key(TRANSFER_ENCODING))
-    {
-        return Err(DownloadError::IncompleteBody);
-    }
-    if declared.is_some_and(|length| length > limit) {
-        return Err(DownloadError::EncodedLimitExceeded { limit });
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(request_error)? {
-        check_cancelled(cancellation)?;
-        let next = (bytes.len() as u64)
-            .checked_add(chunk.len() as u64)
-            .ok_or(DownloadError::EncodedLimitExceeded { limit })?;
-        if next > limit {
-            return Err(DownloadError::EncodedLimitExceeded { limit });
-        }
-        bytes
-            .try_reserve(chunk.len())
-            .map_err(|_| DownloadError::AllocationFailed)?;
-        bytes.extend_from_slice(&chunk);
-        tokio::task::yield_now().await;
-    }
-    if declared.is_some_and(|length| length != bytes.len() as u64) {
-        return Err(DownloadError::IncompleteBody);
-    }
-    Ok(bytes)
+async fn read_response(response: Response, limit: u64) -> Result<Vec<u8>, DownloadError> {
+    use axial_minecraft::http::{FetchError, admit};
+    let read = async { admit(response, limit)?.bytes().await };
+    read.await.map_err(|error| match error {
+        FetchError::Request(error) => request_error(error),
+        FetchError::TooLarge { .. } => DownloadError::EncodedLimitExceeded { limit },
+        FetchError::Allocation => DownloadError::AllocationFailed,
+        _ => DownloadError::IncompleteBody,
+    })
 }
 
 #[derive(Clone, Copy)]

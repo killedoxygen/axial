@@ -164,7 +164,7 @@ pub(crate) async fn fetch_profile_install_proof(
     fetch_profile_install_proof_from_url(record, &url).await
 }
 
-async fn fetch_profile_install_proof_from_url(
+pub(super) async fn fetch_profile_install_proof_from_url(
     record: &LoaderBuildRecord,
     url: &str,
 ) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
@@ -180,17 +180,6 @@ pub(crate) async fn fetch_profile_install_proof_from_loopback_for_test(
     let entry =
         crate::loaders::http::fetch_json_from_loopback_for_test::<FabricInstallEntry>(url).await?;
     profile_install_proof_from_entry(record, url.as_str(), entry)
-}
-
-#[cfg(test)]
-pub(super) async fn fetch_profile_install_proof_from_url_for_test(
-    record: &LoaderBuildRecord,
-    url: &str,
-) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
-    use crate::loaders::http::fetch_json_for_test;
-
-    let entry = fetch_json_for_test::<FabricInstallEntry>(url).await?;
-    profile_install_proof_from_entry(record, url, entry)
 }
 
 fn profile_install_proof_from_entry(

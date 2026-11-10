@@ -1,5 +1,5 @@
 use super::assets::unique_asset_object_jobs;
-use super::client::{adaptive_download_concurrency, build_http_client};
+use super::client::adaptive_download_concurrency;
 use super::facts::execution_download_fact;
 use super::install::{
     observe_managed_install_lease_wait_for_test,
@@ -4193,17 +4193,18 @@ async fn write_raw_response(socket: &mut tokio::net::TcpStream, status: &str, bo
 
 #[tokio::test]
 async fn authenticated_source_retry_binds_observed_bytes() {
+    use crate::http::test_server::{response, serve};
     let body = br#"{"id":"1.21.1"}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, requests) = spawn_scripted_download_server(vec![
-        ScriptedDownloadResponse::full("503 Service Unavailable", b"temporary".to_vec()),
-        ScriptedDownloadResponse::full("200 OK", body.clone()),
+    let server = serve(vec![
+        response("503 Service Unavailable", &[], b"temporary"),
+        response("200 OK", &[], &body),
     ])
     .await;
 
     let source = acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
+        crate::http::loopback_client(),
+        &server.url("/version.json"),
         &expected,
         1024,
         "minecraft_version_json_1.21.1",
@@ -4216,165 +4217,5 @@ async fn authenticated_source_retry_binds_observed_bytes() {
     assert_eq!(source.observed_size(), body.len() as u64);
     let expected_sha1: [u8; 20] = Sha1::digest(&body).into();
     assert_eq!(source.observed_sha1(), expected_sha1);
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn authenticated_source_interrupted_stream_retries() {
-    let body = br#"{"objects":{}}"#.to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, requests) = spawn_scripted_download_server(vec![
-        ScriptedDownloadResponse::partial("200 OK", body.len(), b"{\"objects".to_vec()),
-        ScriptedDownloadResponse::full("200 OK", body.clone()),
-    ])
-    .await;
-
-    let source = acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
-        &expected,
-        1024,
-        "minecraft_asset_index_legacy",
-        &[Duration::ZERO],
-    )
-    .await
-    .expect("interrupted source stream should recover");
-
-    assert_eq!(source.bytes(), body);
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn authenticated_source_rejects_integrity_and_memory_bound_failures_without_retry() {
-    let oversize = b"oversize source".to_vec();
-    for (case, body, expected, limit, label) in [
-        (
-            "checksum mismatch",
-            b"wrong source".to_vec(),
-            ExpectedIntegrity::from_mojang(
-                b"wrong source".len() as i64,
-                &sha1_hex(b"right source"),
-            ),
-            1024,
-            "minecraft_version_json_1.21.1",
-        ),
-        (
-            "size mismatch",
-            b"asset index".to_vec(),
-            ExpectedIntegrity {
-                size: Some(b"asset index".len() as u64 + 1),
-                sha1: Some(sha1_hex(b"asset index")),
-            },
-            1024,
-            "minecraft_asset_index_legacy",
-        ),
-        (
-            "memory bound",
-            oversize.clone(),
-            ExpectedIntegrity::from_mojang(oversize.len() as i64, &sha1_hex(&oversize)),
-            4,
-            "minecraft_version_json_1.21.1",
-        ),
-    ] {
-        let (url, requests) =
-            spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)])
-                .await;
-
-        acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-            &build_http_client(Duration::from_secs(5)),
-            &url,
-            &expected,
-            limit,
-            label,
-            &[Duration::ZERO],
-        )
-        .await
-        .err()
-        .expect(case);
-
-        assert_eq!(requests.load(Ordering::SeqCst), 1, "{case}");
-    }
-}
-
-#[tokio::test]
-async fn authenticated_source_reports_terminal_provider_failure() {
-    let expected = ExpectedIntegrity::from_mojang(7, &sha1_hex(b"missing"));
-    let (url, requests) = spawn_scripted_download_server(vec![ScriptedDownloadResponse::full(
-        "404 Not Found",
-        b"missing".to_vec(),
-    )])
-    .await;
-
-    acquire_authenticated_selected_artifact_source_with_retry_delays_for_test(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
-        &expected,
-        1024,
-        "minecraft_asset_index_legacy",
-        &[Duration::ZERO],
-    )
-    .await
-    .err()
-    .expect("terminal provider failure must fail");
-
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-}
-
-struct ScriptedDownloadResponse {
-    status: &'static str,
-    body: Vec<u8>,
-    content_length: usize,
-}
-
-impl ScriptedDownloadResponse {
-    fn full(status: &'static str, body: Vec<u8>) -> Self {
-        let content_length = body.len();
-        Self {
-            status,
-            body,
-            content_length,
-        }
-    }
-
-    fn partial(status: &'static str, content_length: usize, body: Vec<u8>) -> Self {
-        Self {
-            status,
-            body,
-            content_length,
-        }
-    }
-}
-
-async fn spawn_scripted_download_server(
-    responses: Vec<ScriptedDownloadResponse>,
-) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind scripted download server");
-    let url = format!("http://{}", listener.local_addr().expect("local addr"));
-    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let requests_for_server = Arc::clone(&requests);
-    tokio::spawn(async move {
-        for response in responses {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            requests_for_server.fetch_add(1, Ordering::SeqCst);
-            let _ = read_request_path(&mut socket).await;
-            write_scripted_download_response(&mut socket, response).await;
-        }
-    });
-    (url, requests)
-}
-
-async fn write_scripted_download_response(
-    socket: &mut tokio::net::TcpStream,
-    response: ScriptedDownloadResponse,
-) {
-    let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response.status, response.content_length
-    );
-    let _ = socket.write_all(header.as_bytes()).await;
-    let _ = socket.write_all(&response.body).await;
+    assert_eq!(server.finish().len(), 2);
 }

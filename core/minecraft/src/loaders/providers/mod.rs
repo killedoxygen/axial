@@ -174,11 +174,9 @@ pub(crate) async fn fetch_profile_install_proof_from_url_for_test(
 ) -> Result<ProfileInstallProof, LoaderError> {
     match record.component_id {
         LoaderComponentId::Fabric => {
-            fabric::fetch_profile_install_proof_from_url_for_test(record, url).await
+            fabric::fetch_profile_install_proof_from_url(record, url).await
         }
-        LoaderComponentId::Quilt => {
-            quilt::fetch_profile_install_proof_from_url_for_test(record, url).await
-        }
+        LoaderComponentId::Quilt => quilt::fetch_profile_install_proof_from_url(record, url).await,
         LoaderComponentId::Forge | LoaderComponentId::NeoForge => {
             Err(LoaderError::ProviderDataInvalid {
                 kind: LoaderProviderFailureKind::SchemaInvalid,

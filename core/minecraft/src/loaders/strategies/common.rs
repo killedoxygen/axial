@@ -9,7 +9,7 @@ use crate::download::{
     download_installer_libraries_with_declarations_and_facts,
     download_profile_retained_libraries_with_declarations_and_facts, prepare_local_managed_install,
     publish_prepared_managed_install, reconstruct_installer_library_declarations,
-    reconstruct_profile_library_declarations, standard_minecraft_download_client,
+    reconstruct_profile_library_declarations,
 };
 use crate::known_good::{
     KnownGoodInstallReceipt, KnownGoodLoaderBaseDerivation, KnownGoodReconstructionReceipt,
@@ -33,10 +33,7 @@ use crate::loaders::forge_installer::{
     plan_authenticated_installer,
 };
 use crate::loaders::game_libraries::{self, Requirements};
-#[cfg(not(test))]
 use crate::loaders::http::fetch_bytes;
-#[cfg(test)]
-use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
 use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
 use crate::loaders::types::{
@@ -150,47 +147,19 @@ impl AuthenticatedLegacyOverlayAuthority {
     }
 }
 
-struct AuthenticatedProfileSource {
-    bytes: Vec<u8>,
-    provider_url: String,
-    logical_identity: String,
-}
-
-impl AuthenticatedProfileSource {
-    fn into_bytes_for(
-        self,
-        provider_url: &str,
-        logical_identity: &str,
-    ) -> Result<Vec<u8>, LoaderError> {
-        if self.provider_url != provider_url || self.logical_identity != logical_identity {
-            return Err(LoaderError::Verify(
-                "authenticated loader profile does not match its selected contract".to_string(),
-            ));
-        }
-        Ok(self.bytes)
-    }
-}
-
 async fn acquire_profile_source(
     provider_url: &str,
-    logical_identity: &str,
     #[cfg(feature = "test-support")] transport_url: Option<&reqwest::Url>,
-) -> Result<AuthenticatedProfileSource, LoaderError> {
+) -> Result<Vec<u8>, LoaderError> {
     #[cfg(feature = "test-support")]
-    let bytes = match transport_url {
-        Some(url) => {
-            crate::loaders::http::fetch_bytes_from_loopback_for_test(url, MAX_LOADER_SOURCE_BYTES)
-                .await?
-        }
-        None => fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await?,
-    };
-    #[cfg(not(feature = "test-support"))]
-    let bytes = fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await?;
-    Ok(AuthenticatedProfileSource {
-        bytes,
-        provider_url: provider_url.to_string(),
-        logical_identity: logical_identity.to_string(),
-    })
+    if let Some(url) = transport_url {
+        return crate::loaders::http::fetch_bytes_from_loopback_for_test(
+            url,
+            MAX_LOADER_SOURCE_BYTES,
+        )
+        .await;
+    }
+    fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await
 }
 
 pub(super) async fn reconstruct_from_profile_source(
@@ -223,14 +192,13 @@ async fn reconstruct_profile_with_downloader(
         .reconstruct_version_with_context(&plan.record.minecraft_version, context)
         .await
         .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
-    let profile_source = acquire_profile_source(
+    let profile_bytes = acquire_profile_source(
         url,
-        &plan.record.version_id,
         #[cfg(feature = "test-support")]
         None,
     )
     .await?;
-    reconstruct_profile_after_sources(plan, base, profile_source, proof, context).await
+    reconstruct_profile_after_sources(plan, base, profile_bytes, proof, context).await
 }
 
 #[cfg(test)]
@@ -251,7 +219,7 @@ async fn reconstruct_profile_with_test_sources(
 async fn reconstruct_profile_after_sources(
     plan: &LoaderInstallPlan,
     base: KnownGoodReconstructionReceipt,
-    profile_source: AuthenticatedProfileSource,
+    profile_bytes: Vec<u8>,
     proof: ProfileInstallProof,
     context: &ManagedReconstructionContext,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
@@ -260,12 +228,14 @@ async fn reconstruct_profile_after_sources(
             "loader profile proof has no provider identity".to_string(),
         ));
     }
-    let LoaderInstallSource::ProfileJson { url } = &plan.record.install_source else {
+    if !matches!(
+        plan.record.install_source,
+        LoaderInstallSource::ProfileJson { .. }
+    ) {
         return Err(LoaderError::InvalidProfile(
             "profile reconstruction requires a fixed profile source".to_string(),
         ));
-    };
-    let profile_bytes = profile_source.into_bytes_for(url, &plan.record.version_id)?;
+    }
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
     validate_profile_source_structure(
         &fragment,
@@ -682,12 +652,10 @@ where
     });
     let profile_bytes = acquire_profile_source(
         profile_url,
-        &plan.record.version_id,
         #[cfg(feature = "test-support")]
         transport_url.as_ref(),
     )
-    .await?
-    .into_bytes_for(profile_url, &plan.record.version_id)?;
+    .await?;
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
     validate_profile_source_structure(
         &fragment,
@@ -1260,7 +1228,7 @@ where
         let cache = ExactLibraryCacheAdmission::bind_with_workers(library_root, workers.clone())
             .await
             .map_err(|_| LoaderError::Verify("game library cache unavailable".into()))?;
-        let client = standard_minecraft_download_client();
+        let client = crate::http::artifact_client().clone();
         let mut sources = Vec::new();
         send(progress(
             "game_libraries",
@@ -3755,7 +3723,7 @@ printf '%s' 'processor-terminal' > "$last"
         );
         assert_eq!(version_server.request_count(), counts.0 + 1);
         assert_eq!(client_server.request_count(), counts.1 + 1);
-        assert_eq!(archive_server.request_count(), counts.2 + 2);
+        assert_eq!(archive_server.request_count(), counts.2 + 1);
         assert_eq!(snapshot_tree(&root), before);
 
         for server in [client_server, version_server, archive_server] {
@@ -4734,7 +4702,7 @@ printf '%s' 'processor-terminal' > "$last"
             matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
         );
         assert_eq!(snapshot_tree(&root), before);
-        assert_eq!(server.request_count(), 2);
+        assert_eq!(server.request_count(), 1);
         server.stop();
     }
 

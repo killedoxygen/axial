@@ -931,35 +931,28 @@ async fn parse_response<T: DeserializeOwned>(
 }
 
 async fn bounded_response_body(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     step: MicrosoftAuthStep,
 ) -> Result<Vec<u8>, MicrosoftAuthError> {
-    if response
-        .content_length()
-        .is_some_and(|content_length| content_length > MAX_MICROSOFT_AUTH_RESPONSE_BYTES as u64)
-    {
-        return Err(MicrosoftAuthError::new(MicrosoftAuthErrorKind::Parse, step));
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| MicrosoftAuthError::request(error, step))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_MICROSOFT_AUTH_RESPONSE_BYTES {
-            return Err(MicrosoftAuthError::new(MicrosoftAuthErrorKind::Parse, step));
+    use axial_minecraft::http::{FetchError, admit};
+    let read = async {
+        admit(response, MAX_MICROSOFT_AUTH_RESPONSE_BYTES as u64)?
+            .bytes()
+            .await
+    };
+    read.await.map_err(|error| match error {
+        FetchError::Request(error) => MicrosoftAuthError::request(error, step),
+        FetchError::TooLarge { .. } | FetchError::Allocation => {
+            MicrosoftAuthError::new(MicrosoftAuthErrorKind::Parse, step)
         }
-        body.extend_from_slice(&chunk);
-    }
-
-    Ok(body)
+        _ => MicrosoftAuthError::new(MicrosoftAuthErrorKind::Request, step),
+    })
 }
 
 fn auth_client() -> Result<&'static Client, MicrosoftAuthError> {
     MICROSOFT_AUTH_CLIENT
         .get_or_init(|| {
-            Client::builder()
+            axial_minecraft::http::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(MICROSOFT_AUTH_TIMEOUT)
                 .build()
@@ -985,17 +978,7 @@ fn get_date_header(headers: &HeaderMap) -> DateTime<Utc> {
 fn generate_oauth_challenge() -> String {
     let mut bytes = [0_u8; 64];
     OsRng.fill_bytes(&mut bytes);
-    hex_encode(&bytes)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+    hex::encode(bytes)
 }
 
 fn error_kind_for_status(status: StatusCode) -> MicrosoftAuthErrorKind {

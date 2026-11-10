@@ -160,9 +160,8 @@ pub(crate) use manifest::{
 };
 #[cfg(test)]
 use manifest::{
-    MAX_RUNTIME_MANIFEST_BYTES, RuntimeDownloadManifest, RuntimeManifest,
-    acquire_runtime_source_for_test, fetch_runtime_manifest_bytes_for_test,
-    runtime_source_url_is_secure_for_test, select_runtime_manifest,
+    RuntimeDownloadManifest, RuntimeManifest, acquire_runtime_source_for_test,
+    fetch_runtime_manifest_bytes_for_test, select_runtime_manifest,
     validate_runtime_file_source_urls_for_test,
 };
 #[cfg(test)]

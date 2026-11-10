@@ -215,19 +215,19 @@ impl ProfileLookup {
 }
 
 pub(crate) fn http_client() -> Result<reqwest::Client, ProfileMediaError> {
-    reqwest::Client::builder()
+    axial_minecraft::http::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(25))
-        .user_agent(concat!("axial/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|_| ProfileMediaError::Unavailable)
 }
 
 pub(crate) async fn read_response(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, ProfileMediaError> {
+    use axial_minecraft::http::{FetchError, admit};
     match response.status().as_u16() {
         200..=299 => (),
         401 | 403 => return Err(ProfileMediaError::AccountRequired),
@@ -236,24 +236,11 @@ pub(crate) async fn read_response(
         400..=499 => return Err(ProfileMediaError::Rejected),
         _ => return Err(ProfileMediaError::Unavailable),
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(ProfileMediaError::TooLarge);
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| ProfileMediaError::Unavailable)?
-    {
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err(ProfileMediaError::TooLarge);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    let read = async { admit(response, limit as u64)?.bytes().await };
+    read.await.map_err(|error| match error {
+        FetchError::TooLarge { .. } => ProfileMediaError::TooLarge,
+        _ => ProfileMediaError::Unavailable,
+    })
 }
 
 #[derive(Deserialize)]
@@ -330,9 +317,9 @@ fn parse_textures(
         .cape
         .and_then(|cape| TextureUrl::parse_prefix(&cape.url, prefix).ok())
         .map(|url| url.0);
-    let model = skin
-        .metadata
-        .map_or(SkinVariant::Classic, |m| SkinVariant::from_provider(&m.model));
+    let model = skin.metadata.map_or(SkinVariant::Classic, |m| {
+        SkinVariant::from_provider(&m.model)
+    });
     Ok(UsernameProfile {
         uuid: profile.id,
         username: profile.name,

@@ -109,7 +109,7 @@ impl Default for ClientConfig {
             connect_timeout: Duration::from_secs(20),
             read_timeout: Duration::from_secs(30),
             total_timeout: Duration::from_secs(10 * 60),
-            user_agent: "axial/0.4".to_owned(),
+            user_agent: axial_minecraft::http::USER_AGENT.to_owned(),
         }
     }
 }
@@ -306,7 +306,10 @@ pub enum DownloadError {
 
 impl DownloadError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Timeout | Self::Network | Self::IncompleteBody)
-            || matches!(self, Self::HttpStatus { status } if *status == 408 || *status == 429 || (500..=599).contains(status))
+        match self {
+            Self::Timeout | Self::Network | Self::IncompleteBody => true,
+            Self::HttpStatus { status } => axial_minecraft::http::is_retryable_status(*status),
+            _ => false,
+        }
     }
 }

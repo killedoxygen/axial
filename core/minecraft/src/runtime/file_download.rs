@@ -207,11 +207,8 @@ pub(super) async fn fetch_runtime_source_until_cancelled(
         .admit_transient_destination(&destination_name)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let target = SourceOnlyTransferTarget::new(destination, authority.retained());
-    let retry = RetryPolicy::classified(
-        &[Duration::from_millis(250), Duration::from_millis(500)],
-        runtime_transfer_retryable,
-    )
-    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    let retry = RetryPolicy::transient(&crate::http::RETRY_DELAYS)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let (transfer_sender, transfer_cancellation) = transfer_cancellation_channel();
     let task = start_source_transfer(
         client,
@@ -300,19 +297,11 @@ fn runtime_transfer_destination_name() -> String {
     format!(".axial-runtime-source-{}", uuid::Uuid::new_v4().simple())
 }
 
-fn runtime_transfer_retryable(failure: &TransferFailureKind) -> bool {
-    matches!(
-        failure,
-        TransferFailureKind::Network
-            | TransferFailureKind::ProviderStatus(408 | 425 | 429 | 500..=599)
-    )
-}
-
 fn runtime_transfer_origin(
     url: &reqwest::Url,
 ) -> Result<TransferOrigin, crate::download::TransferOriginError> {
     #[cfg(any(test, feature = "test-support"))]
-    if url.scheme() == "http" {
+    if crate::http::is_loopback_http(url) {
         return TransferOrigin::from_loopback_http_for_test_support(url);
     }
     TransferOrigin::from_url(url)
@@ -362,8 +351,8 @@ fn runtime_transfer_failure(
         return runtime_download_cancelled();
     }
     let kind = match failure {
-        TransferFailureKind::Network
-        | TransferFailureKind::ProviderStatus(408 | 425 | 429 | 500..=599) => {
+        TransferFailureKind::Network => RuntimeSourceFailureKind::Unavailable,
+        TransferFailureKind::ProviderStatus(_) if failure.is_retryable() => {
             RuntimeSourceFailureKind::Unavailable
         }
         TransferFailureKind::RequestPolicy | TransferFailureKind::ContentEncodingRejected => {

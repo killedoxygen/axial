@@ -104,23 +104,11 @@ pub(crate) async fn fetch_profile_install_proof(
     fetch_profile_install_proof_from_url(record, &url).await
 }
 
-async fn fetch_profile_install_proof_from_url(
+pub(super) async fn fetch_profile_install_proof_from_url(
     record: &LoaderBuildRecord,
     url: &str,
 ) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
     let entry = fetch_json::<QuiltInstallEntry>(url).await?;
-    let proof = profile_install_proof_from_entry(record, url, entry)?;
-    resolve_sidecar_integrity(record, proof).await
-}
-
-#[cfg(test)]
-pub(super) async fn fetch_profile_install_proof_from_url_for_test(
-    record: &LoaderBuildRecord,
-    url: &str,
-) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
-    use crate::loaders::http::fetch_json_for_test;
-
-    let entry = fetch_json_for_test::<QuiltInstallEntry>(url).await?;
     let proof = profile_install_proof_from_entry(record, url, entry)?;
     resolve_sidecar_integrity(record, proof).await
 }
@@ -215,7 +203,7 @@ async fn fetch_sidecar(url: reqwest::Url, _proof_url: &str) -> Result<Vec<u8>, L
         fixture.set_path(url.path());
         fixture.set_query(None);
         fixture.set_fragment(None);
-        return crate::loaders::http::fetch_bytes_for_test(fixture.as_str(), 40).await;
+        return fetch_bytes(fixture.as_str(), 40).await;
     }
     fetch_bytes(url.as_str(), 40).await
 }
@@ -475,7 +463,7 @@ mod tests {
         });
         let proof = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::fetch_profile_install_proof_from_url_for_test(record, &url),
+            super::fetch_profile_install_proof_from_url(record, &url),
         )
         .await;
         server.abort();

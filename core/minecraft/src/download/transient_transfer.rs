@@ -8,6 +8,7 @@ use axial_fs::{
 };
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use futures_util::FutureExt as _;
+use hex::FromHex as _;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha512;
@@ -140,12 +141,12 @@ impl ExpectedTransferDigests {
         Ok(Self {
             sha1: sha1
                 .map(|value| {
-                    parse_hex_digest::<20>(value).ok_or(TransferDigestParseError::InvalidSha1)
+                    <[u8; 20]>::from_hex(value).map_err(|_| TransferDigestParseError::InvalidSha1)
                 })
                 .transpose()?,
             sha512: sha512
                 .map(|value| {
-                    parse_hex_digest::<64>(value).ok_or(TransferDigestParseError::InvalidSha512)
+                    <[u8; 64]>::from_hex(value).map_err(|_| TransferDigestParseError::InvalidSha512)
                 })
                 .transpose()?,
         })
@@ -161,28 +162,6 @@ impl ExpectedTransferDigests {
 
     fn is_authenticated(&self) -> bool {
         self.sha1.is_some() || self.sha512.is_some()
-    }
-}
-
-fn parse_hex_digest<const N: usize>(value: &str) -> Option<[u8; N]> {
-    if value.len() != N * 2 || !value.is_ascii() {
-        return None;
-    }
-    let mut digest = [0_u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = parse_hex_nibble(pair[0])?;
-        let low = parse_hex_nibble(pair[1])?;
-        digest[index] = (high << 4) | low;
-    }
-    Some(digest)
-}
-
-fn parse_hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
     }
 }
 
@@ -277,7 +256,6 @@ impl std::error::Error for RetryPolicyError {}
 pub struct RetryPolicy {
     delays: [Duration; MAX_RETRY_DELAYS],
     delay_count: u8,
-    classifier: fn(&TransferFailureKind) -> bool,
 }
 
 impl fmt::Debug for RetryPolicy {
@@ -294,14 +272,11 @@ impl RetryPolicy {
         Self {
             delays: [Duration::ZERO; MAX_RETRY_DELAYS],
             delay_count: 0,
-            classifier: |_| false,
         }
     }
 
-    pub fn classified(
-        delays: &[Duration],
-        classifier: fn(&TransferFailureKind) -> bool,
-    ) -> Result<Self, RetryPolicyError> {
+    /// Retries network failures and transient provider statuses after each delay.
+    pub fn transient(delays: &[Duration]) -> Result<Self, RetryPolicyError> {
         if delays.len() > MAX_RETRY_DELAYS {
             return Err(RetryPolicyError::TooManyAttempts);
         }
@@ -323,16 +298,11 @@ impl RetryPolicy {
         Ok(Self {
             delays: owned,
             delay_count: delays.len() as u8,
-            classifier,
         })
     }
 
     fn delay_after(&self, attempt: usize) -> Option<Duration> {
         (attempt < usize::from(self.delay_count)).then(|| self.delays[attempt])
-    }
-
-    fn permits_retry(&self, failure: &TransferFailureKind) -> bool {
-        failure.is_policy_retryable() && (self.classifier)(failure)
     }
 }
 
@@ -570,11 +540,12 @@ pub enum TransferFailureKind {
 }
 
 impl TransferFailureKind {
-    fn is_policy_retryable(self) -> bool {
-        matches!(
-            self,
-            Self::Network | Self::ProviderStatus(408 | 425 | 429 | 500..=599)
-        )
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::Network => true,
+            Self::ProviderStatus(status) => crate::http::is_retryable_status(status),
+            _ => false,
+        }
     }
 
     fn is_writer_local(self) -> bool {
@@ -804,11 +775,7 @@ impl TransferOrigin {
     pub fn from_loopback_http_for_test_support(
         url: &reqwest::Url,
     ) -> Result<Self, TransferOriginError> {
-        let is_loopback_ip = url
-            .host_str()
-            .and_then(parse_transfer_literal_ip)
-            .is_some_and(|address| address.is_loopback());
-        if url.scheme() != "http" || !is_loopback_ip {
+        if !crate::http::is_loopback_http(url) {
             return Err(TransferOriginError::UnsupportedScheme);
         }
         Self::validated(url, TransferOriginScheme::LoopbackHttp)
@@ -837,13 +804,7 @@ impl TransferOrigin {
         let scheme_matches = match self.scheme {
             TransferOriginScheme::Https => url.scheme() == "https",
             #[cfg(any(test, feature = "test-support"))]
-            TransferOriginScheme::LoopbackHttp => {
-                url.scheme() == "http"
-                    && url
-                        .host_str()
-                        .and_then(parse_transfer_literal_ip)
-                        .is_some_and(|address| address.is_loopback())
-            }
+            TransferOriginScheme::LoopbackHttp => crate::http::is_loopback_http(url),
         };
         url.username().is_empty()
             && url.password().is_none()
@@ -1173,7 +1134,7 @@ impl TransferClient {
         let origins: Arc<[TransferOrigin]> = config.origins.into();
         let redirect_origins = Arc::clone(&origins);
         let pinned_public = !config.pinned_origins.is_empty();
-        let mut builder = reqwest::Client::builder()
+        let mut builder = crate::http::builder()
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.idle_read_timeout)
             .timeout(config.request_timeout)
@@ -2339,7 +2300,7 @@ async fn run_transfer(
                 let Some(delay) = retry.delay_after(attempt) else {
                     return terminal_failure(failures.report(), returned_destination, authority);
                 };
-                if !retry.permits_retry(&failure) {
+                if !failure.is_retryable() {
                     return terminal_failure(failures.report(), returned_destination, authority);
                 }
                 if cancellation.wait(tokio::time::sleep(delay)).await.is_none() {
@@ -3193,29 +3154,26 @@ mod tests {
 
     #[test]
     fn retry_policy_caps_total_attempts_at_eight() {
-        fn retry_network(failure: &TransferFailureKind) -> bool {
-            matches!(failure, TransferFailureKind::Network)
-        }
         let seven = [Duration::from_millis(1); 7];
         let eight = [Duration::from_millis(1); 8];
-        let accepted = RetryPolicy::classified(&seven, retry_network).expect("eight attempts");
+        let accepted = RetryPolicy::transient(&seven).expect("eight attempts");
         assert_eq!(accepted.delay_after(6), Some(Duration::from_millis(1)));
         assert_eq!(accepted.delay_after(7), None);
         assert!(matches!(
-            RetryPolicy::classified(&eight, retry_network),
+            RetryPolicy::transient(&eight),
             Err(RetryPolicyError::TooManyAttempts)
         ));
         assert!(matches!(
-            RetryPolicy::classified(&[Duration::ZERO], retry_network),
+            RetryPolicy::transient(&[Duration::ZERO]),
             Err(RetryPolicyError::ZeroDelay)
         ));
         assert!(matches!(
-            RetryPolicy::classified(&[MAX_RETRY_DELAY + Duration::from_nanos(1)], retry_network,),
+            RetryPolicy::transient(&[MAX_RETRY_DELAY + Duration::from_nanos(1)]),
             Err(RetryPolicyError::DelayExceedsMaximum)
         ));
-        assert!(RetryPolicy::classified(&[MAX_RETRY_DELAY; 4], retry_network).is_ok());
+        assert!(RetryPolicy::transient(&[MAX_RETRY_DELAY; 4]).is_ok());
         assert!(matches!(
-            RetryPolicy::classified(&[MAX_RETRY_DELAY; 5], retry_network),
+            RetryPolicy::transient(&[MAX_RETRY_DELAY; 5]),
             Err(RetryPolicyError::RetryWindowExceedsMaximum)
         ));
     }
@@ -3609,25 +3567,20 @@ mod tests {
     }
 
     #[test]
-    fn engine_retry_ceiling_allows_only_documented_transients() {
+    fn engine_retries_network_and_transient_statuses_only() {
         for failure in [
             TransferFailureKind::Network,
-            TransferFailureKind::ProviderStatus(408),
             TransferFailureKind::ProviderStatus(425),
-            TransferFailureKind::ProviderStatus(429),
-            TransferFailureKind::ProviderStatus(500),
-            TransferFailureKind::ProviderStatus(599),
+            TransferFailureKind::ProviderStatus(503),
         ] {
-            assert!(failure.is_policy_retryable(), "{failure:?}");
+            assert!(failure.is_retryable(), "{failure:?}");
         }
         for failure in [
             TransferFailureKind::RequestPolicy,
-            TransferFailureKind::ProviderStatus(301),
             TransferFailureKind::ProviderStatus(404),
-            TransferFailureKind::ProviderStatus(409),
-            TransferFailureKind::ProviderStatus(600),
+            TransferFailureKind::DigestMismatch(TransferDigestAlgorithm::Sha1),
         ] {
-            assert!(!failure.is_policy_retryable(), "{failure:?}");
+            assert!(!failure.is_retryable(), "{failure:?}");
         }
     }
 

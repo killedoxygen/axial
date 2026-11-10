@@ -7,15 +7,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axial_minecraft::download::{
-    PinnedTransferOrigin, RetryPolicy, TransferClient, TransferClientConfig, TransferFailureKind,
-    TransferOrigin,
+    PinnedTransferOrigin, RetryPolicy, TransferClient, TransferClientConfig, TransferOrigin,
 };
 
-const RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_millis(500),
-    Duration::from_millis(1_500),
-    Duration::from_millis(4_000),
-];
 const DNS_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(90);
@@ -82,7 +76,7 @@ pub(super) async fn lookup_candidates(host: String, port: u16) -> io::Result<Vec
 /// Retains the managed transfer's finite, transient-failure-only retry policy.
 /// Digest, size, admission, cancellation and filesystem failures are not retried.
 pub fn managed_transfer_retry_policy() -> RetryPolicy {
-    RetryPolicy::classified(&RETRY_DELAYS, transfer_retryable)
+    RetryPolicy::transient(&axial_minecraft::http::RETRY_DELAYS)
         .expect("fixed managed transfer retry policy is valid")
 }
 
@@ -112,13 +106,6 @@ fn bounded_unique_addresses(addresses: impl IntoIterator<Item = SocketAddr>) -> 
         }
     }
     unique
-}
-
-fn transfer_retryable(failure: &TransferFailureKind) -> bool {
-    matches!(
-        failure,
-        TransferFailureKind::Network | TransferFailureKind::ProviderStatus(408 | 429 | 500..=599)
-    )
 }
 
 fn admission_error() -> io::Error {
@@ -205,26 +192,5 @@ mod tests {
             .collect::<Vec<_>>();
         let answers = (1..=64).flat_map(|last| [SocketAddr::from(([1, 1, 1, last], 443)); 2]);
         assert_eq!(bounded_unique_addresses(answers), expected);
-    }
-
-    #[test]
-    fn managed_retry_classifier_retains_transient_statuses_only() {
-        for failure in [
-            TransferFailureKind::Network,
-            TransferFailureKind::ProviderStatus(408),
-            TransferFailureKind::ProviderStatus(429),
-            TransferFailureKind::ProviderStatus(503),
-        ] {
-            assert!(transfer_retryable(&failure));
-        }
-        for failure in [
-            TransferFailureKind::ProviderStatus(400),
-            TransferFailureKind::ProviderStatus(401),
-            TransferFailureKind::ProviderStatus(404),
-            TransferFailureKind::ProviderStatus(425),
-        ] {
-            assert!(!transfer_retryable(&failure));
-        }
-        let _policy = managed_transfer_retry_policy();
     }
 }

@@ -23,13 +23,12 @@ use super::{
     publish_staged_managed_runtime_with_rotation_failure_for_test,
     rosetta_requirement_for_managed_runtime, runtime_cancellation_channel,
     runtime_file_download_concurrency_for, runtime_materialization_control, runtime_os_arch_for,
-    runtime_publication_lock_available_for_test, runtime_source_url_is_secure_for_test,
-    runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
-    stage_managed_runtime_until_cancelled, validate_ephemeral_processor_manifest_for_test,
-    validate_runtime_file_source_urls_for_test, verify_runtime_download,
+    runtime_publication_lock_available_for_test, runtime_windows_verbatim_path_string,
+    select_runtime_manifest, stage_managed_runtime, stage_managed_runtime_until_cancelled,
+    validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
+    verify_runtime_download,
 };
 use crate::JavaVersion;
-use serde::Deserialize;
 use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 use std::fs;
@@ -762,36 +761,6 @@ async fn runtime_manifest_link_fails_explicitly_on_non_unix() {
 }
 
 #[tokio::test]
-async fn runtime_manifest_json_fetch_reads_async_http_body() {
-    #[derive(Debug, Deserialize)]
-    struct SampleRuntimeManifest {
-        ok: bool,
-    }
-
-    let url = serve_runtime_json(200, r#"{"ok":true}"#.as_bytes().to_vec(), None).await;
-
-    let bytes = fetch_runtime_manifest_bytes_for_test(&url)
-        .await
-        .expect("runtime manifest bytes");
-    let manifest =
-        serde_json::from_slice::<SampleRuntimeManifest>(&bytes).expect("runtime manifest json");
-
-    assert!(manifest.ok);
-}
-
-#[tokio::test]
-async fn runtime_manifest_json_fetch_rejects_http_errors() {
-    let url = serve_runtime_json(503, b"unavailable".to_vec(), None).await;
-
-    let error = fetch_runtime_manifest_bytes_for_test(&url)
-        .await
-        .expect_err("HTTP error should fail");
-
-    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::Unavailable);
-    assert!(failure.detail().contains("HTTP 503"), "{failure:?}");
-}
-
-#[tokio::test]
 async fn runtime_manifest_json_fetch_classifies_permanent_http_status_as_metadata_invalid() {
     let url = serve_runtime_json(404, b"missing".to_vec(), None).await;
 
@@ -801,46 +770,6 @@ async fn runtime_manifest_json_fetch_classifies_permanent_http_status_as_metadat
 
     let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::MetadataInvalid);
     assert!(failure.detail().contains("HTTP 404"), "{failure:?}");
-}
-
-#[tokio::test]
-async fn runtime_manifest_json_fetch_classifies_transport_failure_as_unavailable() {
-    let error = fetch_runtime_manifest_bytes_for_test("http://127.0.0.1:9/runtime.json")
-        .await
-        .expect_err("connection failure should fail");
-
-    expect_runtime_source_failure(error, RuntimeSourceFailureKind::Unavailable);
-}
-
-#[tokio::test]
-async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
-    let url = serve_runtime_json(
-        200,
-        b"ignored".to_vec(),
-        Some(super::MAX_RUNTIME_MANIFEST_BYTES + 1),
-    )
-    .await;
-
-    let error = fetch_runtime_manifest_bytes_for_test(&url)
-        .await
-        .expect_err("oversized manifest should fail");
-
-    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::PolicyRejected);
-    assert_eq!(failure.detail(), "runtime manifest response too large");
-}
-
-#[test]
-fn production_runtime_source_policy_accepts_only_https_urls() {
-    assert!(runtime_source_url_is_secure_for_test(
-        "https://launchermeta.mojang.com/runtime.json"
-    ));
-    assert!(!runtime_source_url_is_secure_for_test(
-        "http://launchermeta.mojang.com/runtime.json"
-    ));
-    assert!(!runtime_source_url_is_secure_for_test(
-        "file:///tmp/runtime.json"
-    ));
-    assert!(!runtime_source_url_is_secure_for_test("not a URL"));
 }
 
 #[test]

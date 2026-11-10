@@ -12,7 +12,7 @@ use std::future::Future;
 use std::time::Duration;
 
 const REMOTE_RULES_TIMEOUT: Duration = Duration::from_secs(10);
-const REMOTE_RULES_MAX_BYTES: usize = 1024 * 1024;
+const REMOTE_RULES_MAX_BYTES: u64 = 1024 * 1024;
 
 impl PerformanceRulesAuthority {
     pub fn mutation_allowed(&self) -> bool {
@@ -115,40 +115,22 @@ impl PerformanceManager {
         &self,
         remote_rules_url: &str,
     ) -> Result<RemoteRulesCandidate, RulesRefreshError> {
-        let response = self
-            .rules_client
-            .get(remote_rules_url)
-            .timeout(REMOTE_RULES_TIMEOUT)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(RulesRefreshError::HttpStatus(response.status().as_u16()));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > REMOTE_RULES_MAX_BYTES as u64)
-        {
-            return Err(RulesRefreshError::ResponseTooLarge);
-        }
+        let body = axial_minecraft::http::send(
+            self.rules_client
+                .get(remote_rules_url)
+                .timeout(REMOTE_RULES_TIMEOUT),
+            REMOTE_RULES_MAX_BYTES,
+        )
+        .await?;
         let signature = signature_metadata_from_header(
-            response
-                .headers()
+            body.headers()
                 .get(RULES_SIGNATURE_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            response
-                .headers()
+            body.headers()
                 .get(RULES_KEY_ID_HEADER)
                 .and_then(|value| value.to_str().ok()),
         )?;
-
-        let mut body = Vec::new();
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
-            if body.len().saturating_add(chunk.len()) > REMOTE_RULES_MAX_BYTES {
-                return Err(RulesRefreshError::ResponseTooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = body.bytes().await?;
 
         let manifest = serde_json::from_slice::<crate::types::Manifest>(&body)?;
         validate_manifest(&manifest)?;
@@ -184,14 +166,7 @@ pub fn remote_rules_refresh_warning(action: &str, error: &RulesRefreshError) -> 
     }
 }
 
+/// Rules are signature-verified, so an operator-configured plain-HTTP source remains admitted.
 pub(super) fn rules_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(concat!(
-            "axial/",
-            env!("CARGO_PKG_VERSION"),
-            " performance-rules"
-        ))
-        .timeout(REMOTE_RULES_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    axial_minecraft::http::artifact_client().clone()
 }

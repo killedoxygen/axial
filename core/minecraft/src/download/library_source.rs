@@ -1,11 +1,12 @@
 use super::facts::{
-    emit_execution_download_facts, execution_download_fact, no_download_fact_fields,
-    size_mismatch_fact,
+    emit_execution_download_facts, execution_download_fact, fetch_failure_fact,
+    no_download_fact_fields, size_mismatch_fact,
 };
 use super::model::{
     DownloadError, ExactLibraryDownloadProof, ExecutionDownloadFact, ExecutionDownloadFactKind,
     ExpectedIntegrity,
 };
+use crate::http;
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::loaders::types::LoaderError;
 #[cfg(test)]
@@ -30,7 +31,6 @@ use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use crate::portable_path::PortableRelativePath;
 use axial_resource::{PhysicalScratchPermit, PhysicalWorkOwner, process_physical_work};
-use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -43,11 +43,6 @@ pub(super) const LIBRARY_SOURCE_MAX_BYTES: u64 = 512 << 20;
 const LIBRARY_SOURCE_BUDGET_UNIT_BYTES: u64 = 1 << 20;
 const LIBRARY_SOURCE_BUDGET_UNITS: u32 =
     (LIBRARY_SOURCE_MAX_BYTES / LIBRARY_SOURCE_BUDGET_UNIT_BYTES) as u32;
-const LIBRARY_SOURCE_RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_millis(500),
-    Duration::from_millis(1_500),
-    Duration::from_millis(4_000),
-];
 const MAX_JAR_ENTRIES: u16 = 32_768;
 const MAX_JAR_CENTRAL_DIRECTORY_BYTES: u32 = 16 << 20;
 const MAX_JAR_ENTRY_NAME_BYTES: usize = 1 << 10;
@@ -333,7 +328,7 @@ impl AcquiredLibrarySource {
     pub(super) fn observed_expected(&self) -> ExpectedIntegrity {
         ExpectedIntegrity {
             size: Some(self.observed_size),
-            sha1: Some(format!("{}", HexSha1(&self.observed_sha1))),
+            sha1: Some(hex::encode(self.observed_sha1)),
         }
     }
 }
@@ -790,7 +785,7 @@ pub(crate) struct LibrarySourceRequest<'a> {
 async fn acquire_library_source(
     request: LibrarySourceRequest<'_>,
 ) -> Result<AcquiredLibrarySource, DownloadError> {
-    acquire_library_source_with_retry_delays(request, &LIBRARY_SOURCE_RETRY_DELAYS).await
+    acquire_library_source_with_retry_delays(request, &http::RETRY_DELAYS).await
 }
 
 pub(crate) async fn acquire_retained_library_component_source(
@@ -816,18 +811,13 @@ async fn acquire_library_source_with_retry_delays(
     request: LibrarySourceRequest<'_>,
     retry_delays: &[Duration],
 ) -> Result<AcquiredLibrarySource, DownloadError> {
-    let mut next_delay = 0;
-    loop {
-        request.pool.ensure_active()?;
-        match acquire_library_source_attempt(&request).await {
-            Ok(source) => return Ok(source),
-            Err(error) if error.retryable && next_delay < retry_delays.len() => {
-                tokio::time::sleep(retry_delays[next_delay]).await;
-                next_delay += 1;
-            }
-            Err(error) => return Err(error.error),
-        }
-    }
+    http::retry(
+        retry_delays,
+        || acquire_library_source_attempt(&request),
+        |error| error.retryable,
+    )
+    .await
+    .map_err(|error| error.error)
 }
 
 struct LibrarySourceAttemptError {
@@ -919,33 +909,9 @@ async fn acquire_library_source_attempt_inner(
         .reserve(hard_limit)
         .await
         .map_err(nonretryable)?;
-    let response = request.client.get(request.url).send().await.map_err(|_| {
-        emit_source_fact(
-            request,
-            ExecutionDownloadFactKind::NetworkFailure,
-            no_download_fact_fields(),
-        );
-        retryable("request failed")
-    })?;
-    if !response.status().is_success() {
-        let status = response.status();
-        emit_source_fact(
-            request,
-            ExecutionDownloadFactKind::ProviderFailure,
-            vec![("status", status.as_u16().to_string())],
-        );
-        return Err(LibrarySourceAttemptError {
-            error: source_integrity_error("provider rejected the request"),
-            retryable: status.is_server_error() || status.as_u16() == 429,
-        });
-    }
-    let declared_length = response.content_length();
-    if declared_length.is_some_and(|length| length > hard_limit) {
-        emit_source_size_mismatch(request, hard_limit, declared_length.unwrap_or(hard_limit));
-        return Err(nonretryable(source_integrity_error(
-            "declared response exceeds the bounded scratch limit",
-        )));
-    }
+    let mut body = http::send(request.client.get(request.url), hard_limit)
+        .await
+        .map_err(|error| source_fetch_failure(request, error))?;
 
     let file = tempfile::tempfile().map_err(|error| {
         emit_source_fact(
@@ -956,39 +922,17 @@ async fn acquire_library_source_attempt_inner(
         nonretryable(error.into())
     })?;
     let mut output = tokio::fs::File::from_std(file);
-    let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut observed_size = 0_u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| {
-            emit_source_facts(
-                request,
-                [
-                    execution_download_fact(
-                        ExecutionDownloadFactKind::Interrupted,
-                        request.target,
-                        no_download_fact_fields(),
-                    ),
-                    execution_download_fact(
-                        ExecutionDownloadFactKind::NetworkFailure,
-                        request.target,
-                        no_download_fact_fields(),
-                    ),
-                ],
-            );
-            retryable("response stream was interrupted")
-        })?;
-        observed_size = observed_size
-            .checked_add(chunk.len() as u64)
-            .ok_or_else(|| nonretryable(source_integrity_error("source size overflow")))?;
-        if observed_size > hard_limit {
-            emit_source_size_mismatch(request, hard_limit, observed_size);
-            return Err(nonretryable(source_integrity_error(
-                "response exceeds the bounded scratch limit",
-            )));
-        }
-        hasher.update(&chunk);
-        output.write_all(&chunk).await.map_err(|error| {
+    while let Some(chunk) = body
+        .chunk()
+        .await
+        .map_err(|error| source_fetch_failure(request, error))?
+    {
+        let chunk = chunk.as_ref();
+        observed_size += chunk.len() as u64;
+        hasher.update(chunk);
+        output.write_all(chunk).await.map_err(|error| {
             emit_source_fact(
                 request,
                 ExecutionDownloadFactKind::TempWriteFailed,
@@ -996,21 +940,6 @@ async fn acquire_library_source_attempt_inner(
             );
             nonretryable(error.into())
         })?;
-    }
-    if declared_length.is_some_and(|length| length != observed_size) {
-        let declared = declared_length.unwrap_or(observed_size);
-        emit_source_facts(
-            request,
-            [
-                execution_download_fact(
-                    ExecutionDownloadFactKind::Interrupted,
-                    request.target,
-                    no_download_fact_fields(),
-                ),
-                size_mismatch_fact(request.target, declared, observed_size),
-            ],
-        );
-        return Err(retryable("response stream was interrupted"));
     }
     output.flush().await.map_err(|error| {
         emit_source_fact(
@@ -1038,7 +967,7 @@ async fn acquire_library_source_attempt_inner(
         )));
     }
     if let Some(expected_sha1) = request.expected.sha1.as_deref()
-        && !expected_sha1.eq_ignore_ascii_case(&format!("{}", HexSha1(&observed_sha1)))
+        && !expected_sha1.eq_ignore_ascii_case(&hex::encode(observed_sha1))
     {
         emit_source_fact(
             request,
@@ -1352,21 +1281,20 @@ fn preflight_zip_central_directory<R: Read + Seek>(
     Ok(())
 }
 
-struct HexSha1<'a>(&'a [u8; 20]);
-
-impl std::fmt::Display for HexSha1<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-fn retryable(message: &'static str) -> LibrarySourceAttemptError {
+fn source_fetch_failure(
+    request: &LibrarySourceRequest<'_>,
+    error: http::FetchError,
+) -> LibrarySourceAttemptError {
+    emit_source_facts(request, [fetch_failure_fact(request.target, &error)]);
+    let message = match &error {
+        http::FetchError::TooLarge { .. } => "response exceeds the bounded scratch limit",
+        http::FetchError::Incomplete => "response stream was interrupted",
+        _ if error.status().is_some() => "provider rejected the request",
+        _ => "request failed",
+    };
     LibrarySourceAttemptError {
         error: source_integrity_error(message),
-        retryable: true,
+        retryable: error.is_retryable(),
     }
 }
 
@@ -1693,7 +1621,7 @@ mod tests {
     }
 
     fn sha1_hex(bytes: &[u8]) -> String {
-        format!("{}", HexSha1(&sha1_bytes(bytes)))
+        hex::encode(sha1_bytes(bytes))
     }
 
     async fn acquire(
@@ -2368,7 +2296,11 @@ mod tests {
             "expected declared oversize rejection",
         );
 
-        assert!(error.to_string().contains("declared response exceeds"));
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the bounded scratch limit")
+        );
     }
 
     #[tokio::test]
@@ -2429,40 +2361,6 @@ mod tests {
 
         assert_source(&source, &body, &expected, "library:retry");
         assert_eq!(requests.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn request_timeout_status_is_not_retried() {
-        let body = jar_bytes(b"must-not-be-requested");
-        let responses = vec![
-            ScriptedResponse::status("408 Request Timeout"),
-            ScriptedResponse::full(body),
-        ];
-        let (url, requests) = spawn_server(responses).await;
-        let client = reqwest::Client::new();
-        let expected = ExpectedIntegrity::default();
-        let relative_path = fixture_relative_path();
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let error = acquire_library_source_with_retry_delays(
-            LibrarySourceRequest {
-                client: &client,
-                url: &url,
-                expected: &expected,
-                relative_path: &relative_path,
-                max_bytes: LIBRARY_SOURCE_MAX_BYTES,
-                target: "library:408",
-                pool: &pool,
-                fact_tx: None,
-            },
-            &[Duration::ZERO],
-        )
-        .await
-        .err()
-        .expect("408 must not retry");
-
-        assert!(error.to_string().contains("provider rejected"));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

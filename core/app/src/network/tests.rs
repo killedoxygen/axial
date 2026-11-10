@@ -1255,8 +1255,7 @@ fn retry_advice_distinguishes_transient_failures_from_policy_and_integrity() {
         DownloadError::Timeout,
         DownloadError::Network,
         DownloadError::IncompleteBody,
-        DownloadError::HttpStatus { status: 408 },
-        DownloadError::HttpStatus { status: 429 },
+        DownloadError::HttpStatus { status: 425 },
         DownloadError::HttpStatus { status: 503 },
     ] {
         assert!(error.is_retryable());

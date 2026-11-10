@@ -1,51 +1,15 @@
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::http;
 use crate::managed_fs::{ManagedDir, ManagedFileGuard, ManagedLibraryOperation};
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const MANIFEST_CACHE_NAME: &str = "version_manifest_v2.json";
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_MANIFEST_BYTES: u64 = 8 << 20;
-const MANIFEST_CLIENT_MAX_IDLE_PER_HOST: usize = 4;
-const MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
-const MANIFEST_CLIENT_TCP_KEEPALIVE_SECS: u64 = 60;
-const MANIFEST_RETRY_DELAY_MILLIS: [u64; 3] = [500, 1_500, 4_000];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ManifestFetchFailureKind {
-    Network,
-    Interrupted,
-    Http(u16),
-    InsecureRedirect,
-    TooLarge,
-}
-
-struct ManifestFetchFailure {
-    kind: ManifestFetchFailureKind,
-    message: String,
-}
-
-impl ManifestFetchFailure {
-    fn new(kind: ManifestFetchFailureKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    fn retryable(&self) -> bool {
-        matches!(
-            self.kind,
-            ManifestFetchFailureKind::Network
-                | ManifestFetchFailureKind::Interrupted
-                | ManifestFetchFailureKind::Http(408 | 429 | 500..=599)
-        )
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionManifest {
@@ -99,8 +63,7 @@ pub(crate) async fn fetch_fresh_install_version_manifest() -> Result<VersionMani
 pub(crate) async fn fetch_fresh_install_version_manifest_at_test_endpoint(
     endpoints: &crate::download::InstallTestEndpoints,
 ) -> Result<VersionManifest, String> {
-    let body =
-        fetch_manifest_live_body_with_policy(endpoints.version_manifest(), false, true).await?;
+    let body = fetch_manifest_body(endpoints.version_manifest(), &http::RETRY_DELAYS).await?;
     parse_manifest_body(&body)
 }
 
@@ -134,14 +97,12 @@ pub async fn fetch_version_manifest_cached_from_loopback_for_test(
             "manifest test source cannot contain query or fragment".into(),
         ));
     }
-    let client = manifest_client_builder().no_proxy().build().map_err(|_| {
-        FetchError::Unavailable("manifest test client configuration is invalid".into())
-    })?;
-    fetch_version_manifest_cached_with(operation, cancelled, false, async {
-        fetch_manifest_live_body_attempt_with_client(url.as_str(), false, &client)
-            .await
-            .map_err(|failure| failure.message)
-    })
+    fetch_version_manifest_cached_with(
+        operation,
+        cancelled,
+        false,
+        fetch_manifest_body(url.as_str(), &[]),
+    )
     .await
 }
 
@@ -255,116 +216,26 @@ async fn fetch_manifest_live() -> Result<VersionManifest, String> {
 }
 
 async fn fetch_manifest_live_body() -> Result<Vec<u8>, String> {
-    fetch_manifest_live_body_with_policy(MANIFEST_URL, true, true).await
+    fetch_manifest_body(MANIFEST_URL, &http::RETRY_DELAYS).await
 }
 
-#[cfg(test)]
-async fn fetch_manifest_live_body_from_url(url: &str) -> Result<Vec<u8>, String> {
-    fetch_manifest_live_body_with_policy(url, false, false).await
-}
-
-async fn fetch_manifest_live_body_with_policy(
-    url: &str,
-    require_https: bool,
-    retry_transient: bool,
-) -> Result<Vec<u8>, String> {
-    fetch_manifest_live_body_with_retry_delays(
-        url,
-        require_https,
-        retry_transient,
-        &MANIFEST_RETRY_DELAY_MILLIS,
-    )
-    .await
-}
-
-async fn fetch_manifest_live_body_with_retry_delays(
-    url: &str,
-    require_https: bool,
-    retry_transient: bool,
-    retry_delays: &[u64],
-) -> Result<Vec<u8>, String> {
-    let mut retry_delays = retry_delays.iter().copied();
-    loop {
-        match fetch_manifest_live_body_attempt(url, require_https).await {
-            Ok(body) => return Ok(body),
-            Err(failure) => {
-                let Some(delay_millis) = retry_delays
-                    .next()
-                    .filter(|_| retry_transient && failure.retryable())
-                else {
-                    return Err(failure.message);
-                };
-                tokio::time::sleep(Duration::from_millis(delay_millis)).await;
-            }
-        }
-    }
-}
-
-async fn fetch_manifest_live_body_attempt(
-    url: &str,
-    require_https: bool,
-) -> Result<Vec<u8>, ManifestFetchFailure> {
-    fetch_manifest_live_body_attempt_with_client(url, require_https, manifest_client()).await
-}
-
-async fn fetch_manifest_live_body_attempt_with_client(
-    url: &str,
-    require_https: bool,
-    client: &reqwest::Client,
-) -> Result<Vec<u8>, ManifestFetchFailure> {
-    let response = client.get(url).send().await.map_err(|error| {
-        let kind = if error.is_redirect() {
-            ManifestFetchFailureKind::InsecureRedirect
-        } else if error.is_timeout() {
-            ManifestFetchFailureKind::Interrupted
-        } else {
-            ManifestFetchFailureKind::Network
-        };
-        ManifestFetchFailure::new(kind, format!("fetching version manifest: {error}"))
-    })?;
-    if require_https && response.url().scheme() != "https" {
-        return Err(ManifestFetchFailure::new(
-            ManifestFetchFailureKind::InsecureRedirect,
-            "fetching version manifest: insecure redirect",
-        ));
-    }
-    let status = response.status();
-    if !status.is_success() {
-        return Err(ManifestFetchFailure::new(
-            ManifestFetchFailureKind::Http(status.as_u16()),
-            format!("fetching version manifest: HTTP {status}"),
-        ));
-    }
-    if response
-        .content_length()
-        .is_some_and(|content_length| content_length > MAX_MANIFEST_BYTES)
-    {
-        return Err(ManifestFetchFailure::new(
-            ManifestFetchFailureKind::TooLarge,
-            "reading version manifest: response too large",
-        ));
-    }
-
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            let kind = if error.is_timeout() {
-                ManifestFetchFailureKind::Interrupted
-            } else {
-                ManifestFetchFailureKind::Network
-            };
-            ManifestFetchFailure::new(kind, format!("reading version manifest: {error}"))
-        })?;
-        if body.len() as u64 + chunk.len() as u64 > MAX_MANIFEST_BYTES {
-            return Err(ManifestFetchFailure::new(
-                ManifestFetchFailureKind::TooLarge,
-                "reading version manifest: response too large",
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+async fn fetch_manifest_body(url: &str, retry_delays: &[Duration]) -> Result<Vec<u8>, String> {
+    let fetch = || async {
+        http::fetch_once(
+            http::client_for(url)?,
+            url,
+            MAX_MANIFEST_BYTES,
+            http::Expected::default(),
+        )
+        .await
+    };
+    http::retry(retry_delays, fetch, http::FetchError::is_retryable)
+        .await
+        .map(|fetched| fetched.bytes)
+        .map_err(|error| match error.status() {
+            Some(status) => format!("fetching version manifest: HTTP {status}"),
+            None => format!("fetching version manifest: {error}"),
+        })
 }
 
 fn resolve_manifest_from_live_or_cache(
@@ -505,37 +376,13 @@ fn parse_manifest_body(data: &[u8]) -> Result<VersionManifest, String> {
         .map_err(|error| format!("parsing version manifest: {error}"))
 }
 
-fn manifest_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        manifest_client_builder()
-            .build()
-            .expect("version manifest HTTP client configuration should be valid")
-    })
-}
-
-fn manifest_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("axial/0.3")
-        .pool_max_idle_per_host(MANIFEST_CLIENT_MAX_IDLE_PER_HOST)
-        .pool_idle_timeout(Duration::from_secs(MANIFEST_CLIENT_POOL_IDLE_TIMEOUT_SECS))
-        .tcp_keepalive(Duration::from_secs(MANIFEST_CLIENT_TCP_KEEPALIVE_SECS))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::test_server::{response, serve};
     use crate::managed_fs::ManagedLibraryRoot;
     use std::fs;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
 
     #[tokio::test]
     async fn writes_and_reads_persistent_manifest_cache() {
@@ -691,7 +538,7 @@ mod tests {
             &operation,
             std::future::pending(),
             false,
-            fetch_manifest_live_body_from_url("http://127.0.0.1:9/version_manifest_v2.json"),
+            fetch_manifest_body("http://127.0.0.1:9/version_manifest_v2.json", &[]),
         )
         .await
         .unwrap();
@@ -761,13 +608,18 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))
             .unwrap();
-        let server = TestManifestServer::start(200, sample_manifest_body("1.21.9"));
-        let source = server.url();
+        let server = serve(vec![response(
+            "200 OK",
+            &[],
+            sample_manifest_body("1.21.9").as_bytes(),
+        )])
+        .await;
+        let source = server.url("/version_manifest_v2.json");
         let manifest = fetch_version_manifest_cached_with(
             &operation,
             std::future::pending(),
             false,
-            fetch_manifest_live_body_from_url(&source),
+            fetch_manifest_body(&source, &[]),
         )
         .await
         .unwrap();
@@ -780,108 +632,8 @@ mod tests {
                 .release,
             "1.21.9"
         );
-        server.join();
+        assert_eq!(server.finish().len(), 1);
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn live_manifest_fetch_reads_async_http_body() {
-        let server = TestManifestServer::start(200, sample_manifest_body("1.21.7"));
-
-        let body = fetch_manifest_live_body_from_url(&server.url())
-            .await
-            .expect("fetch live manifest body");
-        let manifest = parse_manifest_body(&body).expect("parse fetched manifest body");
-
-        assert_eq!(manifest.latest.release, "1.21.7");
-        assert_eq!(manifest.versions[0].id, "1.21.7");
-        server.join();
-    }
-
-    #[tokio::test]
-    async fn live_manifest_fetch_rejects_http_errors() {
-        let server = TestManifestServer::start(503, "unavailable".to_string());
-
-        let error = fetch_manifest_live_body_from_url(&server.url())
-            .await
-            .expect_err("HTTP error should fail");
-
-        assert!(error.contains("HTTP 503"), "{error}");
-        server.join();
-    }
-
-    #[test]
-    fn manifest_fetch_retry_policy_is_typed_and_bounded() {
-        for kind in [
-            ManifestFetchFailureKind::Network,
-            ManifestFetchFailureKind::Interrupted,
-            ManifestFetchFailureKind::Http(408),
-            ManifestFetchFailureKind::Http(429),
-            ManifestFetchFailureKind::Http(500),
-            ManifestFetchFailureKind::Http(599),
-        ] {
-            assert!(ManifestFetchFailure::new(kind, "transient").retryable());
-        }
-        for kind in [
-            ManifestFetchFailureKind::Http(400),
-            ManifestFetchFailureKind::Http(404),
-            ManifestFetchFailureKind::Http(600),
-            ManifestFetchFailureKind::InsecureRedirect,
-            ManifestFetchFailureKind::TooLarge,
-        ] {
-            assert!(!ManifestFetchFailure::new(kind, "terminal").retryable());
-        }
-        assert_eq!(MANIFEST_RETRY_DELAY_MILLIS, [500, 1_500, 4_000]);
-    }
-
-    #[tokio::test]
-    async fn canonical_manifest_retry_executes_only_typed_transient_attempts() {
-        let expected = sample_manifest_body("1.21.10");
-        let server = ScriptedManifestServer::start(vec![
-            (503, "unavailable".to_string()),
-            (429, "rate limited".to_string()),
-            (200, expected.clone()),
-        ]);
-
-        let body =
-            fetch_manifest_live_body_with_retry_delays(&server.url(), false, true, &[0, 0, 0])
-                .await
-                .expect("transient manifest attempts reach success");
-
-        assert_eq!(body, expected.as_bytes());
-        assert_eq!(server.join(), 3);
-
-        let terminal = ScriptedManifestServer::start(vec![(404, "missing".to_string())]);
-        let error =
-            fetch_manifest_live_body_with_retry_delays(&terminal.url(), false, true, &[0, 0, 0])
-                .await
-                .expect_err("terminal manifest response must not retry");
-        assert!(error.contains("HTTP 404"), "{error}");
-        assert_eq!(terminal.join(), 1);
-
-        let redirect = ScriptedManifestServer::start(vec![(302, String::new())]);
-        let error =
-            fetch_manifest_live_body_with_retry_delays(&redirect.url(), false, true, &[0, 0, 0])
-                .await
-                .expect_err("redirect response must not be followed or retried");
-        assert!(error.contains("HTTP 302"), "{error}");
-        assert_eq!(redirect.join(), 1);
-    }
-
-    #[tokio::test]
-    async fn live_manifest_fetch_rejects_oversized_content_length() {
-        let server = TestManifestServer::start_with_content_length(
-            200,
-            "ignored".to_string(),
-            MAX_MANIFEST_BYTES + 1,
-        );
-
-        let error = fetch_manifest_live_body_from_url(&server.url())
-            .await
-            .expect_err("oversized manifest should fail");
-
-        assert_eq!(error, "reading version manifest: response too large");
-        server.join();
     }
 
     fn sample_manifest_body(release: &str) -> String {
@@ -905,99 +657,6 @@ mod tests {
   ]
 }}"#
         )
-    }
-
-    struct TestManifestServer {
-        address: String,
-        server: thread::JoinHandle<()>,
-    }
-
-    struct ScriptedManifestServer {
-        address: String,
-        requests: Arc<AtomicUsize>,
-        server: thread::JoinHandle<()>,
-    }
-
-    impl ScriptedManifestServer {
-        fn start(responses: Vec<(u16, String)>) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted manifest server");
-            let address = listener
-                .local_addr()
-                .expect("scripted manifest server addr");
-            let requests = Arc::new(AtomicUsize::new(0));
-            let observed_requests = requests.clone();
-            let server = thread::spawn(move || {
-                for (status, body) in responses {
-                    let (mut stream, _) = listener.accept().expect("accept scripted request");
-                    let mut request = [0_u8; 1024];
-                    let _ = stream.read(&mut request);
-                    observed_requests.fetch_add(1, Ordering::SeqCst);
-                    write_response(&mut stream, status, &body, body.len() as u64);
-                }
-            });
-            Self {
-                address: address.to_string(),
-                requests,
-                server,
-            }
-        }
-
-        fn url(&self) -> String {
-            format!("http://{}/version_manifest_v2.json", self.address)
-        }
-
-        fn join(self) -> usize {
-            self.server.join().expect("scripted manifest server join");
-            self.requests.load(Ordering::SeqCst)
-        }
-    }
-
-    impl TestManifestServer {
-        fn start(status: u16, body: String) -> Self {
-            Self::start_with_content_length(status, body.clone(), body.len() as u64)
-        }
-
-        fn start_with_content_length(status: u16, body: String, content_length: u64) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind manifest test server");
-            let address = listener.local_addr().expect("manifest test server addr");
-            let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept manifest request");
-                let mut request = [0_u8; 1024];
-                let _ = stream.read(&mut request);
-                write_response(&mut stream, status, &body, content_length);
-            });
-
-            Self {
-                address: address.to_string(),
-                server,
-            }
-        }
-
-        fn url(&self) -> String {
-            format!("http://{}/version_manifest_v2.json", self.address)
-        }
-
-        fn join(self) {
-            self.server.join().expect("manifest test server join");
-        }
-    }
-
-    fn write_response(stream: &mut TcpStream, status: u16, body: &str, content_length: u64) {
-        let reason = if status == 200 { "OK" } else { "Error" };
-        let location = if (300..400).contains(&status) {
-            "Location: /redirected\r\n"
-        } else {
-            ""
-        };
-        let headers = format!(
-            "HTTP/1.1 {status} {reason}\r\n{location}Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
-        );
-        stream
-            .write_all(headers.as_bytes())
-            .expect("write response headers");
-        stream
-            .write_all(body.as_bytes())
-            .expect("write response body");
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {

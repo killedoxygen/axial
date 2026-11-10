@@ -6,7 +6,7 @@ use super::assets::{
 };
 #[cfg(test)]
 use super::assets::{AssetDownloadPipeline, asset_cache_error};
-use super::client::{library_download_concurrency, standard_minecraft_download_client};
+use super::client::library_download_concurrency;
 use super::facts::selected_download_source_label;
 use super::libraries::{
     ExactLibraryCacheAdmission, RetainedClassifiedLibraryAcquisition,
@@ -429,7 +429,7 @@ impl AuthenticatedVersionBundleMemberSource {
                 ));
             }
         };
-        let observed_sha1 = encode_sha1_digest(observed_sha1);
+        let observed_sha1 = hex::encode(observed_sha1);
         if observed_size == 0
             || observed_size > MAX_TIER2_ARTIFACT_BYTES
             || u64::try_from(bytes.len()).ok() != Some(observed_size)
@@ -505,16 +505,6 @@ impl AuthenticatedVersionBundleMemberSource {
     fn observed_size(&self) -> u64 {
         self.observed_size
     }
-}
-
-fn encode_sha1_digest(digest: [u8; 20]) -> String {
-    use std::fmt::Write as _;
-
-    let mut encoded = String::with_capacity(40);
-    for byte in digest {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }
 
 pub(crate) struct ReconstructedVanillaClientAuthority {
@@ -1060,7 +1050,7 @@ impl Downloader {
                 library_operation,
                 runtime_cache,
             },
-            client: standard_minecraft_download_client(),
+            client: crate::http::artifact_client().clone(),
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             #[cfg(feature = "test-support")]
             test_endpoints: None,
@@ -1080,7 +1070,7 @@ impl Downloader {
     pub(crate) fn source_only() -> Self {
         Self {
             root: DownloaderRoot::SourceOnly,
-            client: standard_minecraft_download_client(),
+            client: crate::http::artifact_client().clone(),
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             #[cfg(feature = "test-support")]
             test_endpoints: None,
@@ -1114,7 +1104,7 @@ impl Downloader {
                 runtime_cache: ManagedRuntimeCache::isolated_for_test()
                     .expect("isolated downloader runtime cache"),
             },
-            client: standard_minecraft_download_client(),
+            client: crate::http::artifact_client().clone(),
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             #[cfg(feature = "test-support")]
             test_endpoints: None,
@@ -2304,7 +2294,7 @@ async fn reconstruct_profile_library_declarations_unsettled(
             "profile library reconstruction classification failed: {error:?}"
         ))
     })?;
-    let client = standard_minecraft_download_client();
+    let client = crate::http::artifact_client().clone();
     let mut proofs = Vec::new();
     let source_pool = context.library_source_pool()?;
     for classified in classified {
@@ -2376,7 +2366,7 @@ async fn reconstruct_installer_library_declarations_unsettled(
             "processor reconstruction sources require an ephemeral workspace".to_string(),
         ));
     }
-    let client = standard_minecraft_download_client();
+    let client = crate::http::artifact_client().clone();
     let mut proofs = Vec::new();
     let source_pool = context.library_source_pool()?;
     for classified in jobs {

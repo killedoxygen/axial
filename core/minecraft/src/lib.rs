@@ -5,6 +5,7 @@ pub(crate) fn test_temp_root() -> std::path::PathBuf {
 }
 
 pub mod download;
+pub mod http;
 pub mod known_good;
 mod known_good_libraries;
 mod known_good_reconstruction;

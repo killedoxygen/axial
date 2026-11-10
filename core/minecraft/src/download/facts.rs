@@ -122,3 +122,31 @@ pub(super) fn integrity_mismatch_fact(
         ),
     }
 }
+
+/// Transport-level fact for a failed bounded fetch; integrity mismatches are reported by the caller.
+pub(super) fn fetch_failure_fact(
+    target: &str,
+    error: &crate::http::FetchError,
+) -> ExecutionDownloadFact {
+    use crate::http::FetchError;
+    match error {
+        FetchError::TooLarge { limit, observed } => size_mismatch_fact(target, *limit, *observed),
+        FetchError::Incomplete => execution_download_fact(
+            ExecutionDownloadFactKind::Interrupted,
+            target,
+            no_download_fact_fields(),
+        ),
+        _ => match error.status() {
+            Some(status) => execution_download_fact(
+                ExecutionDownloadFactKind::ProviderFailure,
+                target,
+                vec![("status", status.to_string())],
+            ),
+            None => execution_download_fact(
+                ExecutionDownloadFactKind::NetworkFailure,
+                target,
+                no_download_fact_fields(),
+            ),
+        },
+    }
+}

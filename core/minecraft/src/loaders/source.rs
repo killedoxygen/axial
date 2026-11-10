@@ -1,19 +1,16 @@
-#[cfg(not(test))]
 use super::http::fetch_bytes;
-#[cfg(test)]
-use super::http::fetch_bytes_for_test as fetch_bytes;
 use super::types::LoaderError;
 use sha1::Digest as _;
 use std::sync::Arc;
 
 const MAX_SOURCE_SHA1_PROOF_BYTES: u64 = 128;
 
+/// Bytes that matched the live SHA-1 sidecar published beside `provider_url`.
 #[derive(Debug)]
 pub(crate) struct VerifiedLoaderSource {
     bytes: Arc<[u8]>,
     provider_url: String,
     logical_identity: String,
-    expected_sha1: String,
 }
 
 impl VerifiedLoaderSource {
@@ -26,22 +23,11 @@ impl VerifiedLoaderSource {
     }
 
     pub(crate) fn matches_contract(&self, provider_url: &str, logical_identity: &str) -> bool {
-        self.provider_url == provider_url
-            && self.logical_identity == logical_identity
-            && self.expected_sha1.len() == 40
-            && self
-                .expected_sha1
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        self.provider_url == provider_url && self.matches_logical_identity(logical_identity)
     }
 
     pub(crate) fn matches_logical_identity(&self, logical_identity: &str) -> bool {
         self.logical_identity == logical_identity
-            && self.expected_sha1.len() == 40
-            && self
-                .expected_sha1
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
     }
 
     pub(crate) fn into_shared_bytes_for(
@@ -49,10 +35,7 @@ impl VerifiedLoaderSource {
         provider_url: &str,
         logical_identity: &str,
     ) -> Result<Arc<[u8]>, LoaderError> {
-        if self.provider_url != provider_url
-            || self.logical_identity != logical_identity
-            || self.expected_sha1.len() != 40
-        {
+        if !self.matches_contract(provider_url, logical_identity) {
             return Err(LoaderError::Verify(
                 "authenticated loader source does not match its selected contract".to_string(),
             ));
@@ -63,7 +46,6 @@ impl VerifiedLoaderSource {
     #[cfg(test)]
     pub(crate) fn from_test_bytes(bytes: Vec<u8>) -> Self {
         Self {
-            expected_sha1: format!("{:x}", sha1::Sha1::digest(&bytes)),
             bytes: Arc::from(bytes),
             provider_url: "https://fixtures.invalid/loader-source.jar".to_string(),
             logical_identity: "test-loader-source".to_string(),
@@ -78,11 +60,10 @@ pub(crate) async fn fetch_sha1_verified_source(
     logical_identity: &str,
 ) -> Result<VerifiedLoaderSource, LoaderError> {
     let proof_url = sha1_sidecar_url(source_url)?;
-    let bytes = fetch_bytes(source_url, max_source_bytes).await?;
     let proof_bytes = fetch_bytes(&proof_url, MAX_SOURCE_SHA1_PROOF_BYTES).await?;
-    let proof = strict_sha1_proof(&proof_bytes, source_label)?;
-    let actual = format!("{:x}", sha1::Sha1::digest(&bytes));
-    if !proof.eq_ignore_ascii_case(&actual) {
+    let sha1 = strict_sha1_proof(&proof_bytes, source_label)?;
+    let bytes = fetch_bytes(source_url, max_source_bytes).await?;
+    if <[u8; 20]>::from(sha1::Sha1::digest(&bytes)) != sha1 {
         return Err(LoaderError::Verify(format!(
             "{source_label} does not match its live sha1 proof"
         )));
@@ -91,7 +72,6 @@ pub(crate) async fn fetch_sha1_verified_source(
         bytes: Arc::from(bytes),
         provider_url: source_url.to_string(),
         logical_identity: logical_identity.to_string(),
-        expected_sha1: proof.to_ascii_lowercase(),
     })
 }
 
@@ -113,17 +93,12 @@ fn sha1_sidecar_url(source_url: &str) -> Result<String, LoaderError> {
     Ok(url.into())
 }
 
-fn strict_sha1_proof<'a>(bytes: &'a [u8], source_label: &str) -> Result<&'a str, LoaderError> {
+fn strict_sha1_proof(bytes: &[u8], source_label: &str) -> Result<[u8; 20], LoaderError> {
     let digest = match bytes {
-        [digest @ .., b'\n'] if digest.len() == 40 => digest,
-        [digest @ .., b'\r', b'\n'] if digest.len() == 40 => digest,
-        digest if digest.len() == 40 => digest,
+        [digest @ .., b'\r', b'\n'] | [digest @ .., b'\n'] | digest if digest.len() == 40 => digest,
         _ => return Err(source_proof_error(source_label)),
     };
-    if !digest.iter().all(u8::is_ascii_hexdigit) {
-        return Err(source_proof_error(source_label));
-    }
-    std::str::from_utf8(digest).map_err(|_| source_proof_error(source_label))
+    hex::FromHex::from_hex(digest).map_err(|_| source_proof_error(source_label))
 }
 
 fn source_proof_error(source_label: &str) -> LoaderError {
@@ -164,7 +139,7 @@ mod tests {
         let digest = b"0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             strict_sha1_proof(digest, "test source").expect("bare digest"),
-            std::str::from_utf8(digest).expect("ASCII digest")
+            <[u8; 20] as hex::FromHex>::from_hex(digest).unwrap()
         );
         let mut lf = digest.to_vec();
         lf.push(b'\n');
