@@ -17,7 +17,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha512;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, Cursor, Write},
+    io::{Cursor, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -41,261 +41,6 @@ const EXTERNAL_CANARY: &[u8] = b"external user file survives launch and profile 
 // installed-version inspection refuses rather than waits while every worker is
 // held. Each fixture holds this so one test's installs cannot refuse another's reads.
 static PROCESS_WORK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[derive(Clone, Copy, serde::Serialize)]
-pub(super) enum KillAckStage {
-    #[serde(rename = "kill_send")]
-    Send,
-    #[serde(rename = "kill_result")]
-    Result,
-    #[serde(rename = "kill_ingress")]
-    Ingress,
-    #[serde(rename = "kill_response")]
-    Response,
-    #[serde(rename = "kill_enter")]
-    Enter,
-    #[serde(rename = "kill_return")]
-    Return,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct KillAckEvent {
-    stage: KillAckStage,
-    elapsed_ms: u64,
-    session_id: String,
-    status: Option<u16>,
-    timeout: bool,
-    connect: bool,
-    tls_matches: bool,
-}
-
-struct KillAckCapture {
-    started: std::time::Instant,
-    events: Mutex<Vec<KillAckEvent>>,
-    incomplete: std::sync::atomic::AtomicBool,
-    pending: Mutex<KillObservation>,
-    changed: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct KillObservation {
-    request: Option<(String, std::net::SocketAddr, std::time::Instant)>,
-    stopped: bool,
-    attempted: bool,
-}
-
-struct PendingKill(Arc<KillAckCapture>);
-
-impl Drop for PendingKill {
-    fn drop(&mut self) {
-        match self.0.pending.lock() {
-            Ok(mut pending) => pending.request = None,
-            Err(_) => self
-                .0
-                .incomplete
-                .store(true, std::sync::atomic::Ordering::Relaxed),
-        }
-        self.0.changed.notify_one();
-    }
-}
-
-thread_local! {
-    static KILL_ACK_CAPTURE: std::cell::RefCell<Option<Arc<KillAckCapture>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-struct KillAckScope;
-
-impl Drop for KillAckScope {
-    fn drop(&mut self) {
-        KILL_ACK_CAPTURE.with(|capture| drop(capture.borrow_mut().take()));
-    }
-}
-
-pub(super) fn record_kill_ack(
-    stage: KillAckStage,
-    session_id: &str,
-    status: Option<u16>,
-    timeout: bool,
-    connect: bool,
-) {
-    if !uuid::Uuid::parse_str(session_id)
-        .is_ok_and(|id| !id.is_nil() && id.to_string() == session_id)
-    {
-        return;
-    }
-    KILL_ACK_CAPTURE.with(|capture| {
-        let capture = capture.borrow();
-        let Some(capture) = capture.as_ref() else {
-            return;
-        };
-        capture.record(stage, session_id, status, timeout, connect, true);
-    });
-}
-
-pub(super) fn observe_kill_router(router: Router) -> Router {
-    let capture = KILL_ACK_CAPTURE.with(|capture| capture.borrow().clone());
-    let Some(capture) = capture else {
-        return router;
-    };
-    router.layer(axum::middleware::from_fn_with_state(
-        capture,
-        observe_kill_request,
-    ))
-}
-
-async fn observe_kill_request(
-    State(capture): State<Arc<KillAckCapture>>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let session = (request.method() == Method::POST)
-        .then(|| {
-            request
-                .uri()
-                .path()
-                .strip_prefix("/api/v1/launch/")?
-                .strip_suffix("/kill")
-        })
-        .flatten()
-        .filter(|id| {
-            uuid::Uuid::parse_str(id).is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id)
-        })
-        .map(str::to_owned);
-    let tls_matches = KILL_ACK_CAPTURE.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &capture))
-    });
-    if let Some(id) = &session {
-        capture.record(KillAckStage::Ingress, id, None, false, false, tls_matches);
-    }
-    let response = next.run(request).await;
-    if let Some(id) = &session {
-        capture.record(
-            KillAckStage::Response,
-            id,
-            Some(response.status().as_u16()),
-            false,
-            false,
-            KILL_ACK_CAPTURE.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &capture))
-            }),
-        );
-    }
-    response
-}
-
-impl KillAckCapture {
-    fn arm(self: &Arc<Self>, session: &str, base: &str) -> Option<PendingKill> {
-        let url = reqwest::Url::parse(base).ok()?;
-        let listener = std::net::SocketAddr::new(url.host_str()?.parse().ok()?, url.port()?);
-        if !listener.ip().is_loopback() || listener.port() == 0 {
-            return None;
-        }
-        let Ok(mut pending) = self.pending.lock() else {
-            self.incomplete
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        };
-        if pending.request.is_some() {
-            self.incomplete
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return None;
-        }
-        if pending.attempted || pending.stopped {
-            return None;
-        }
-        pending.request = Some((session.to_owned(), listener, std::time::Instant::now()));
-        self.changed.notify_one();
-        Some(PendingKill(Arc::clone(self)))
-    }
-
-    fn observe_pending(&self) -> Result<(), ()> {
-        let mut pending = self.pending.lock().map_err(|_| ())?;
-        loop {
-            if pending.stopped || pending.attempted {
-                return Ok(());
-            }
-            let Some((session, listener, started)) = &pending.request else {
-                pending = self.changed.wait(pending).map_err(|_| ())?;
-                continue;
-            };
-            let remaining = Duration::from_secs(5).saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                let (session, listener, elapsed) = (session.clone(), *listener, started.elapsed());
-                pending.attempted = true;
-                drop(pending);
-                let snapshot = json!({
-                    "pid":std::process::id(),"session_id":session,"listener":listener.to_string(),
-                    "elapsed_ms":elapsed.as_millis(),"capture":self.snapshot(),
-                });
-                // Bypass libtest buffering so the external sampler can observe a live wait.
-                writeln!(io::stderr().lock(), "[DEBUG-kill-pending] {snapshot}").map_err(|_| ())?;
-                return Ok(());
-            }
-            pending = self
-                .changed
-                .wait_timeout(pending, remaining)
-                .map_err(|_| ())?
-                .0;
-        }
-    }
-
-    fn record(
-        &self,
-        stage: KillAckStage,
-        session_id: &str,
-        status: Option<u16>,
-        timeout: bool,
-        connect: bool,
-        tls_matches: bool,
-    ) {
-        let Ok(mut events) = self.events.try_lock() else {
-            self.incomplete
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
-        };
-        if events.len() == 32 {
-            self.incomplete
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        events.push(KillAckEvent {
-            stage,
-            elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-            session_id: session_id.to_owned(),
-            status,
-            timeout,
-            connect,
-            tls_matches,
-        });
-    }
-    fn snapshot(&self) -> Value {
-        let events = self.events.try_lock().ok().map(|events| events.clone());
-        let complete =
-            events.is_some() && !self.incomplete.load(std::sync::atomic::Ordering::Relaxed);
-        json!({
-            "complete": complete, "events": events.unwrap_or_default(),
-        })
-    }
-
-    fn dump(&self, preserved: Option<&std::path::Path>) {
-        let encoded = serde_json::to_vec(&self.snapshot())
-            .expect("bounded kill acknowledgement diagnostic serialization");
-        eprintln!(
-            "[DEBUG-kill-ack] {}",
-            std::str::from_utf8(&encoded).unwrap()
-        );
-        if let Some(parent) = preserved {
-            if std::fs::write(parent.join("kill-ack-probe.json"), &encoded).is_err() {
-                eprintln!("[DEBUG-kill-ack] diagnostic file unavailable; parent remains preserved");
-            }
-        }
-    }
-}
 
 fn configure_external(profile: &std::path::Path) -> (axial_app::library::LibraryId, PathBuf) {
     let admitted = super::admit_profile(profile).unwrap();
@@ -1065,14 +810,7 @@ impl Api {
     }
 
     async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
-        let capture_active = KILL_ACK_CAPTURE.with(|capture| capture.borrow().is_some());
-        let kill_session = (capture_active && method == reqwest::Method::POST)
-            .then(|| path.strip_prefix("/api/v1/launch/")?.strip_suffix("/kill"))
-            .flatten()
-            .filter(|id| {
-                uuid::Uuid::parse_str(id)
-                    .is_ok_and(|uuid| !uuid.is_nil() && uuid.to_string() == *id)
-            });
+        let kill = method == reqwest::Method::POST && path.ends_with("/kill");
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))
@@ -1080,31 +818,8 @@ impl Api {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        if let Some(id) = kill_session {
-            record_kill_ack(KillAckStage::Send, id, None, false, false);
-        }
-        let pending = kill_session.and_then(|id| {
-            KILL_ACK_CAPTURE.with(|capture| {
-                capture
-                    .borrow()
-                    .as_ref()
-                    .and_then(|capture| capture.arm(id, &self.base))
-            })
-        });
         let response = request.send().await;
-        drop(pending);
-        if let Some(id) = kill_session {
-            let (status, timeout, connect) = match &response {
-                Ok(response) => (Some(response.status().as_u16()), false, false),
-                Err(error) => (
-                    error.status().map(|status| status.as_u16()),
-                    error.is_timeout(),
-                    error.is_connect(),
-                ),
-            };
-            record_kill_ack(KillAckStage::Result, id, status, timeout, connect);
-        }
-        let response = if kill_session.is_some() {
+        let response = if kill {
             response.unwrap_or_else(|_| {
                 panic!("Kill request failed before response headers; Stop acceptance is unknown")
             })
@@ -5485,7 +5200,7 @@ fn real_offline_vanilla_install_launch_stop_and_restart() {
     let _process_work = PROCESS_WORK.blocking_lock();
     for (case, existing) in [("managed library", false), ("external library", true)] {
         eprintln!("offline vanilla case: {case}");
-        run_with_kill_capture(async {
+        run_retaining_journey(async {
             offline_vanilla_journey(existing).await;
             Ok(())
         });
@@ -5495,7 +5210,7 @@ fn real_offline_vanilla_install_launch_stop_and_restart() {
 #[test]
 fn ordinary_play_reacquires_missing_default_runtime_after_reopen() {
     let _process_work = PROCESS_WORK.blocking_lock();
-    run_with_kill_capture(async {
+    run_retaining_journey(async {
         missing_default_runtime_after_reopen().await;
         Ok(())
     });
@@ -5510,39 +5225,12 @@ struct RetainedKillJourney {
     failure: Option<Box<dyn std::any::Any + Send>>,
 }
 
-fn run_with_kill_capture(
+fn run_retaining_journey(
     journey: impl std::future::Future<Output = Result<(), RetainedKillJourney>>,
 ) {
-    let capture = Arc::new(KillAckCapture {
-        started: std::time::Instant::now(),
-        events: Mutex::new(Vec::with_capacity(32)),
-        incomplete: std::sync::atomic::AtomicBool::new(false),
-        pending: Mutex::new(KillObservation::default()),
-        changed: std::sync::Condvar::new(),
-    });
-    KILL_ACK_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&capture)));
-    let _capture_scope = KillAckScope;
-    let (runtime, _diagnostics) = diagnostic_runtime(Some(Arc::clone(&capture)));
-    let observed = Arc::clone(&capture);
-    let observer = std::thread::Builder::new()
-        .name("kill-observer".to_owned())
-        .spawn(move || observed.observe_pending());
-    if observer.is_err() {
-        capture
-            .incomplete
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+    let (runtime, _diagnostics) = diagnostic_runtime();
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(journey)));
-    if let Ok(mut pending) = capture.pending.lock() {
-        pending.stopped = true;
-    }
-    capture.changed.notify_one();
-    if !matches!(observer.map(|observer| observer.join()), Ok(Ok(Ok(())))) {
-        capture
-            .incomplete
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
     match result {
         Ok(Err(retained)) => {
             let parent = retained.temporary.keep();
@@ -5555,9 +5243,8 @@ fn run_with_kill_capture(
                 retained.startup,
             ));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                capture.dump(Some(&parent));
                 eprintln!(
-                    "[DEBUG-kill-ack] {reason}; retained runtime and fixture: {}",
+                    "{reason}; retained runtime and fixture: {}",
                     parent.display()
                 );
             }));
@@ -5569,13 +5256,8 @@ fn run_with_kill_capture(
                 parent.display()
             );
         }
-        Ok(Ok(())) => capture.dump(None),
-        Err(panic) => {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                capture.dump(None);
-            }));
-            std::panic::resume_unwind(panic);
-        }
+        Ok(Ok(())) => {}
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
@@ -5877,20 +5559,15 @@ async fn missing_default_runtime_after_reopen() {
     let mut preserve = || {
         if let Some(temporary) = temporary.take() {
             let preserved = temporary.keep();
-            KILL_ACK_CAPTURE.with(|capture| {
-                if let Some(capture) = capture.borrow().as_ref() {
-                    capture.dump(Some(&preserved));
-                }
-            });
             eprintln!(
-                "[DEBUG-kill-ack] Retained missing-runtime fixture: {}; process/tree settlement is not inferred",
+                "Retained missing-runtime fixture: {}; process/tree settlement is not inferred",
                 preserved.display()
             );
         }
     };
     if journey.is_err() {
         preserve();
-        eprintln!("[DEBUG-kill-ack] API/provider joins unknown; attempting existing owner cleanup");
+        eprintln!("API/provider joins unknown; attempting existing owner cleanup");
     }
     let shutdown = match &services {
         Some(services) => {
@@ -5919,14 +5596,6 @@ async fn missing_default_runtime_after_reopen() {
     if absent.is_err() {
         preserve();
     }
-    KILL_ACK_CAPTURE.with(|slot| {
-        if let Some(capture) = slot.borrow().as_ref() {
-            eprintln!("[DEBUG-kill-ack] post_cleanup shutdown_joined={} shutdown_settled={} provider_joined={} observed_process_count={} observed_processes_absent={:?}",
-                matches!(&shutdown, Ok(Ok(()))), settled, provider_shutdown.is_ok(), processes.len(),
-                (!processes.is_empty()).then_some(absent.is_ok()));
-            capture.dump(None);
-        }
-    });
     let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         shutdown
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -6170,13 +5839,8 @@ async fn offline_vanilla_journey(existing: bool) {
     .await;
     if let Err(panic) = result {
         let retained = temporary.keep();
-        KILL_ACK_CAPTURE.with(|slot| {
-            if let Some(capture) = slot.borrow().as_ref() {
-                capture.dump(Some(&retained));
-            }
-        });
         eprintln!(
-            "[DEBUG-kill-ack] Retained Vanilla fixture: {}; process/tree settlement is unknown",
+            "Retained Vanilla fixture: {}; process/tree settlement is unknown",
             retained.display()
         );
         std::panic::resume_unwind(panic);
@@ -6332,7 +5996,7 @@ async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
 #[test]
 fn real_playing_instance_edits_preserve_active_command_and_next_launch_settings() {
     let _process_work = PROCESS_WORK.blocking_lock();
-    run_with_kill_capture(playing_instance_edits());
+    run_retaining_journey(playing_instance_edits());
 }
 
 async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
@@ -6503,21 +6167,6 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
     })
     .catch_unwind()
     .await;
-    if journey.is_err() {
-        KILL_ACK_CAPTURE.with(|slot| {
-            if let Some(capture) = slot.borrow().as_ref() {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    capture.dump(Some(temporary.path()));
-                }))
-                .is_err()
-                {
-                    capture
-                        .incomplete
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        });
-    }
     if let Some(failure) = startup.take() {
         if let Err(failure) = failure.try_preserve() {
             return Err(RetainedKillJourney {
@@ -6607,15 +6256,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
     if let Err(panic) = verified {
         let parent = temporary.keep();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            KILL_ACK_CAPTURE.with(|slot| {
-                if let Some(capture) = slot.borrow().as_ref() {
-                    capture.dump(Some(&parent));
-                }
-            });
-            eprintln!(
-                "[DEBUG-kill-ack] Retained playing-edit fixture: {}",
-                parent.display()
-            );
+            eprintln!("Retained playing-edit fixture: {}", parent.display());
         }));
         std::panic::resume_unwind(panic);
     }
@@ -6630,12 +6271,10 @@ fn real_benchmark_mapping_survives_response_loss_and_restart() {
 }
 
 fn benchmark_diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
-    diagnostic_runtime(None)
+    diagnostic_runtime()
 }
 
-fn diagnostic_runtime(
-    kill_ack: Option<Arc<KillAckCapture>>,
-) -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
+fn diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
     use tracing_subscriber::prelude::*;
 
     let diagnostics = tracing::Dispatch::new(
@@ -6658,12 +6297,11 @@ fn diagnostic_runtime(
                     .with_target("axial_app::launch::prepare", tracing::Level::WARN),
             ),
     );
-    runtime_with_diagnostics(diagnostics, kill_ack)
+    runtime_with_diagnostics(diagnostics)
 }
 
 fn runtime_with_diagnostics(
     diagnostics: tracing::Dispatch,
-    kill_ack: Option<Arc<KillAckCapture>>,
 ) -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
     thread_local! {
         static DIAGNOSTICS: std::cell::RefCell<Option<tracing::dispatcher::DefaultGuard>> =
@@ -6678,10 +6316,8 @@ fn runtime_with_diagnostics(
             DIAGNOSTICS.with(|guard| {
                 *guard.borrow_mut() = Some(tracing::dispatcher::set_default(&diagnostics));
             });
-            KILL_ACK_CAPTURE.with(|capture| *capture.borrow_mut() = kill_ack.clone());
         })
         .on_thread_stop(|| {
-            KILL_ACK_CAPTURE.with(|capture| drop(capture.borrow_mut().take()));
             DIAGNOSTICS.with(|guard| drop(guard.borrow_mut().take()));
         })
         .build()
@@ -7420,7 +7056,7 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
                     .with_target("axial_app::install::queue", tracing::Level::WARN),
             ),
     );
-    let (runtime, _diagnostics) = runtime_with_diagnostics(diagnostics, None);
+    let (runtime, _diagnostics) = runtime_with_diagnostics(diagnostics);
     let cleanup = runtime.block_on(async {
         let mut temporary = Some(
             tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap(),

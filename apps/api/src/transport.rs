@@ -335,7 +335,7 @@ fn canonical_origin(origin: &str) -> Result<String, String> {
 }
 
 fn is_stream_path(path: &str) -> bool {
-    if matches!(path, "/api/v1/install/queue/events" | "/api/v1/events") {
+    if path == "/api/v1/install/queue/events" {
         return true;
     }
     if !safe_segments(path) {

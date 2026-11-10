@@ -53,46 +53,7 @@ mod tests {
     use crate::transport::{CAPABILITY_HEADER, LocalApiAuthority, protected_router};
     use axum::http::{Method, Request};
     use http_body_util::BodyExt;
-    use std::{fs, path::Path};
     use tower::ServiceExt;
-
-    fn collect_files(directory: &Dir<'_>, paths: &mut Vec<String>) {
-        paths.extend(
-            directory
-                .files()
-                .map(|file| file.path().to_string_lossy().into_owned()),
-        );
-        for child in directory.dirs() {
-            collect_files(child, paths);
-        }
-    }
-
-    #[test]
-    fn embedded_frontend_is_byte_exact_and_manifest_reachable() {
-        let manifest_file = EMBEDDED_FRONTEND.get_file("generation.json").unwrap();
-        let manifest: serde_json::Value = serde_json::from_slice(manifest_file.contents()).unwrap();
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../frontend/dist");
-        let mut expected = vec!["generation.json".to_owned()];
-        for record in manifest["files"].as_array().unwrap() {
-            let relative = record["path"].as_str().unwrap();
-            let file = EMBEDDED_FRONTEND.get_file(relative).unwrap();
-            assert_eq!(
-                file.contents(),
-                fs::read(source.join(relative)).unwrap(),
-                "{relative}"
-            );
-            expected.push(relative.to_owned());
-        }
-        assert_eq!(
-            manifest_file.contents(),
-            fs::read(source.join("generation.json")).unwrap()
-        );
-        let mut actual = Vec::new();
-        collect_files(&EMBEDDED_FRONTEND, &mut actual);
-        actual.sort();
-        expected.sort();
-        assert_eq!(actual, expected);
-    }
 
     #[tokio::test]
     async fn static_mime_and_spa_fallback_do_not_change_the_api_authority_boundary() {

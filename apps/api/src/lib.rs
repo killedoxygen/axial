@@ -1,10 +1,7 @@
 //! Composition for the isolated replacement application and its local HTTP API.
 
-pub mod events;
 #[cfg(feature = "embedded-frontend")]
 mod frontend;
-#[cfg(test)]
-mod frontend_build_support;
 #[cfg(test)]
 mod library_tests;
 #[cfg(all(test, unix))]
@@ -191,7 +188,6 @@ pub struct DesktopServices {
     pub auth: Arc<AuthService>,
     pub telemetry: Arc<Telemetry>,
     pub updates: UpdateService,
-    pub catalog: Arc<Catalog>,
     pub instances: Arc<InstanceService>,
     pub installs: Arc<InstallQueue>,
     pub sessions: SessionManager,
@@ -200,7 +196,6 @@ pub struct DesktopServices {
     pub launch: Arc<LaunchCoordinator>,
     pub benchmarks: Arc<BenchmarkService>,
     pub content_mutations: Arc<ContentMutations>,
-    pub resources: Arc<ResourceService>,
     pub music: Arc<MusicService>,
 }
 
@@ -950,8 +945,6 @@ async fn start_profile_inner(
         .merge(routes::system::router())
         .merge(routes::music::router(music.clone()));
     let router = transport::protected_router(router, authority.clone());
-    #[cfg(all(test, unix))]
-    let router = offline_journey_tests::observe_kill_router(router);
     #[cfg(feature = "embedded-frontend")]
     let router = if native_login {
         router
@@ -1034,7 +1027,6 @@ async fn start_profile_inner(
         auth,
         telemetry,
         updates,
-        catalog,
         instances,
         installs,
         sessions,
@@ -1043,7 +1035,6 @@ async fn start_profile_inner(
         launch,
         benchmarks,
         content_mutations,
-        resources,
         music,
     })
 }
