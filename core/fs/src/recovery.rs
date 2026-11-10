@@ -1,6 +1,9 @@
+mod frame;
+pub(crate) mod replay;
+
 use crate::ROOT_LEASE_NAME;
-use crate::control_frame::{self, Cursor, Envelope, Probe, generation_side};
 use crate::platform;
+use frame::{Cursor, Envelope, Probe, generation_side};
 use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -9,12 +12,12 @@ use unicode_normalization::UnicodeNormalization as _;
 
 const RECOVERY_SLOT_COUNT: usize = 64;
 const RECOVERY_FRAMES_PER_SLOT: usize = 2;
-const RECOVERY_FRAME_BYTES: usize = control_frame::FRAME_BYTES;
+const RECOVERY_FRAME_BYTES: usize = frame::FRAME_BYTES;
 pub(crate) const RECOVERY_CONTROL_BYTES: u64 =
     RECOVERY_SLOT_COUNT as u64 * RECOVERY_FRAMES_PER_SLOT as u64 * RECOVERY_FRAME_BYTES as u64;
 
-const HEADER_BYTES: usize = control_frame::HEADER_BYTES;
-const FRAME_BODY_BYTES: usize = control_frame::BODY_BYTES;
+const HEADER_BYTES: usize = frame::HEADER_BYTES;
+const FRAME_BODY_BYTES: usize = frame::BODY_BYTES;
 const MAX_COMPONENTS: usize = 32;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_NAME_UTF16_UNITS: usize = 255;
@@ -36,8 +39,8 @@ fn ensure(valid: bool) -> Result<()> {
     valid.then_some(()).ok_or(RecoveryCodecError)
 }
 
-impl From<control_frame::Error> for RecoveryCodecError {
-    fn from(_: control_frame::Error) -> Self {
+impl From<frame::Error> for RecoveryCodecError {
+    fn from(_: frame::Error) -> Self {
         Self
     }
 }
@@ -63,7 +66,7 @@ fn random_nonzero_id() -> [u8; 16] {
     value
 }
 
-type RecoveryFrameAddress = control_frame::Address;
+type RecoveryFrameAddress = frame::Address;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecoveryName(String);
@@ -998,7 +1001,7 @@ fn footprint_keys(record: &RecoveryRecord) -> Vec<Vec<u8>> {
 }
 
 fn recovery_frame_offset(slot: u8, frame: u8) -> Result<u64> {
-    control_frame::offset(slot, frame).map_err(Into::into)
+    frame::offset(slot, frame).map_err(Into::into)
 }
 
 fn encode_recovery_frame(
@@ -1013,12 +1016,7 @@ fn encode_recovery_frame(
     } else {
         0
     };
-    Ok(control_frame::encode(
-        address,
-        frame.generation,
-        kind,
-        &payload,
-    )?)
+    Ok(frame::encode(address, frame.generation, kind, &payload)?)
 }
 
 fn decode_recovery_envelope(envelope: Envelope<'_>) -> Result<RecoveryFrame> {
@@ -1042,7 +1040,7 @@ enum RecoveryProbe {
     Valid(SelectedRecoveryFrame),
 }
 fn probe_recovery_frame(encoded: &[u8], slot: u8, side: u8) -> Result<RecoveryProbe> {
-    Ok(match control_frame::probe(encoded, slot, side)? {
+    Ok(match frame::probe(encoded, slot, side)? {
         Probe::Empty => RecoveryProbe::Empty,
         Probe::Torn => RecoveryProbe::Torn,
         Probe::Valid(envelope) => RecoveryProbe::Valid(SelectedRecoveryFrame {
@@ -1235,7 +1233,7 @@ fn coordinate_key(parent: &[RecoveryName], leaf: &RecoveryName) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control_frame::PLATFORM as PLATFORM_TAG;
+    use frame::PLATFORM as PLATFORM_TAG;
     use std::cell::Cell;
 
     const LANE: [u8; 16] = [0x21; 16];
@@ -1271,15 +1269,14 @@ mod tests {
     }
 
     fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
-        control_frame::checksum(body, side)
+        frame::checksum(body, side)
     }
 
     fn decode_recovery_frame(
         encoded: &[u8],
         address: RecoveryFrameAddress,
     ) -> Result<RecoveryFrame> {
-        let Probe::Valid(envelope) = control_frame::probe(encoded, address.slot, address.side)?
-        else {
+        let Probe::Valid(envelope) = frame::probe(encoded, address.slot, address.side)? else {
             return Err(RecoveryCodecError);
         };
         if envelope.address != address {

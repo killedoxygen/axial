@@ -20,10 +20,8 @@ macro_rules! impl_redacted_debug {
     };
 }
 
-mod control_frame;
 mod platform;
 mod recovery;
-mod recovery_runtime;
 mod reset;
 mod transient;
 
@@ -1894,7 +1892,7 @@ enum DurableReplaceState {
     },
     Replaying {
         parent: Directory,
-        replay: recovery_runtime::RecoveryReplay,
+        replay: recovery::replay::RecoveryReplay,
     },
     Restoring(ReplacementRestore),
 }
@@ -1931,7 +1929,7 @@ pub enum AbsoluteDirectoryOutsideRootAdmission {
 
 struct AcquiredRoot {
     lease: platform::LeaseHandle,
-    replay: Option<recovery_runtime::RecoveryReplay>,
+    replay: Option<recovery::replay::RecoveryReplay>,
 }
 
 #[must_use = "partial root construction must be reconciled, cleaned up, or preserved"]
@@ -7452,7 +7450,7 @@ fn settle_removed_recovery_stage(
                 parent.inner.handle(),
                 OsStr::new(expected.destination_leaf.as_str()),
             )?;
-            let proof = recovery_runtime::prove_file(
+            let proof = recovery::replay::prove_file(
                 parent.inner.handle(),
                 OsStr::new(expected.destination_leaf.as_str()),
                 &handle,
@@ -7597,7 +7595,7 @@ fn seal_recovery_stage(
     let Some(registration) = registration else {
         return Ok(());
     };
-    let proof = recovery_runtime::prove_file(
+    let proof = recovery::replay::prove_file(
         file.parent.inner.handle(),
         file.name.as_os_str(),
         &file.handle,
@@ -7692,7 +7690,7 @@ fn validate_recovery_publication(
             "publication does not match its durable create-only destination",
         ));
     }
-    let proof = recovery_runtime::prove_file(
+    let proof = recovery::replay::prove_file(
         source.inner.handle(),
         file.name.as_os_str(),
         &file.handle,
@@ -7777,7 +7775,7 @@ fn complete_recovery_publication(
         .as_os_str()
         .to_str()
         .ok_or_else(stale_capability)?;
-    let proof = recovery_runtime::prove_file(
+    let proof = recovery::replay::prove_file(
         destination.inner.handle(),
         destination_name.as_os_str(),
         &file.handle,
@@ -12009,7 +12007,7 @@ fn admit_durable_destination(
     }
     let proof = existing
         .map(|request| {
-            let observed = recovery_runtime::prove_file(
+            let observed = recovery::replay::prove_file(
                 parent.inner.handle(),
                 name.as_os_str(),
                 &request.file.handle,
@@ -12047,7 +12045,7 @@ fn discard_durable_stage(cause: io::Error, discard: StageDiscardOutcome) -> Dura
 fn begin_live_replacement(
     parent: &Directory,
     sealed: SealedStagedFile,
-) -> Result<recovery_runtime::RecoveryReplay, (io::Error, SealedStagedFile)> {
+) -> Result<recovery::replay::RecoveryReplay, (io::Error, SealedStagedFile)> {
     let authority = match parent.authority() {
         Ok(authority) => authority,
         Err(error) => return Err((error, sealed)),
@@ -12059,7 +12057,7 @@ fn begin_live_replacement(
         sealed
             .file
             .validate_revision_in(&operation, &sealed.revision)?;
-        let proof = recovery_runtime::prove_file(
+        let proof = recovery::replay::prove_file(
             parent.inner.handle(),
             sealed.file.name.as_os_str(),
             &sealed.file.handle,
@@ -12125,7 +12123,7 @@ fn begin_live_replacement(
     drop(state);
     drop(cleanup);
     drop(token);
-    Ok(recovery_runtime::RecoveryReplay::from_live_carrier(
+    Ok(recovery::replay::RecoveryReplay::from_live_carrier(
         journal,
         LiveReplacementCarrier {
             registration,
@@ -13025,7 +13023,7 @@ fn finish_root_session(
             });
         }
     };
-    let recovery = match recovery_runtime::initialize_and_replay(root, &lease) {
+    let recovery = match recovery::replay::initialize_and_replay(root, &lease) {
         Ok(recovery) => recovery,
         Err((error, replay)) => {
             return RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
@@ -19958,7 +19956,7 @@ mod tests {
         let stage_path = temporary.path().join(stage_name.as_str());
         assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
 
-        recovery_runtime::fail_next_replay_exclusive_admission();
+        recovery::replay::fail_next_replay_exclusive_admission();
         let obligation = match RootSession::acquire(temporary.path()) {
             RootSessionAcquireOutcome::AppliedUnverified(obligation)
                 if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
@@ -20005,7 +20003,7 @@ mod tests {
         assert!(!stage_path.exists());
         #[cfg(unix)]
         assert_eq!(
-            recovery_runtime::take_replay_tombstone_prunes(),
+            recovery::replay::take_replay_tombstone_prunes(),
             1,
             "confirmed tombstone must retire the exclusive carrier after receipt settlement",
         );
@@ -20050,9 +20048,9 @@ mod tests {
             outcome => panic!("initial replay did not retain both carriers: {outcome:?}"),
         };
         drop(phase_failure);
-        assert_eq!(recovery_runtime::take_replay_transfer_commits(), 0);
+        assert_eq!(recovery::replay::take_replay_transfer_commits(), 0);
 
-        recovery_runtime::fail_replay_transfer_after(2);
+        recovery::replay::fail_replay_transfer_after(2);
         let obligation = match obligation.reconcile() {
             RootSessionAcquireOutcome::AppliedUnverified(obligation)
                 if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
@@ -20062,7 +20060,7 @@ mod tests {
             outcome => panic!("second transfer mapping did not fail in preflight: {outcome:?}"),
         };
         assert_eq!(
-            recovery_runtime::take_replay_transfer_commits(),
+            recovery::replay::take_replay_transfer_commits(),
             0,
             "mapping two failed after validation, so mapping one must not move",
         );
@@ -20071,7 +20069,7 @@ mod tests {
             RootSessionAcquireOutcome::Acquired(session) => session,
             outcome => panic!("unchanged retained carriers did not replay: {outcome:?}"),
         };
-        assert_eq!(recovery_runtime::take_replay_transfer_commits(), 2);
+        assert_eq!(recovery::replay::take_replay_transfer_commits(), 2);
         assert_eq!(
             std::fs::read(temporary.path().join("first-replayed.bin"))
                 .expect("first replayed target"),
@@ -20280,7 +20278,7 @@ mod tests {
         let target_identity = test_file_identity(&target_path);
         assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
 
-        recovery_runtime::fail_next_replay_removal_settlement();
+        recovery::replay::fail_next_replay_removal_settlement();
         let obligation = match RootSession::acquire(temporary.path()) {
             RootSessionAcquireOutcome::AppliedUnverified(obligation)
                 if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
@@ -20301,7 +20299,7 @@ mod tests {
             RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
         ));
         assert_eq!(
-            recovery_runtime::take_replay_pending_removal_settlements(),
+            recovery::replay::take_replay_pending_removal_settlements(),
             0,
             "the injected cut must occur before pending settlement starts",
         );
@@ -20314,7 +20312,7 @@ mod tests {
             outcome => panic!("post-removal settlement did not reconcile: {outcome:?}"),
         };
         assert_eq!(
-            recovery_runtime::take_replay_pending_removal_settlements(),
+            recovery::replay::take_replay_pending_removal_settlements(),
             1,
             "retry must settle the typed removed carrier before classification",
         );
@@ -20556,7 +20554,7 @@ mod tests {
                 true,
             );
             assert!(matches!(first.revoke(), RootRevokeOutcome::Revoked));
-            recovery_runtime::fail_next_replay_exclusive_admission();
+            recovery::replay::fail_next_replay_exclusive_admission();
             let obligation = match RootSession::acquire(temporary.path()) {
                 RootSessionAcquireOutcome::AppliedUnverified(obligation)
                     if matches!(obligation.error(), RootSessionError::Recovery(_)) =>
@@ -20632,13 +20630,13 @@ mod tests {
         let destination_for_hook = destination.clone();
         let displaced_for_hook = displaced.clone();
         #[cfg(unix)]
-        recovery_runtime::set_replay_parent_validation_hook(move || {
+        recovery::replay::set_replay_parent_validation_hook(move || {
             std::fs::rename(&destination_for_hook, &displaced_for_hook)
                 .expect("displace replay parent");
             std::fs::create_dir(&destination_for_hook).expect("replace replay parent");
         });
         #[cfg(windows)]
-        recovery_runtime::set_replay_parent_validation_hook(move || {
+        recovery::replay::set_replay_parent_validation_hook(move || {
             std::fs::rename(&destination_for_hook, &displaced_for_hook)
                 .expect_err("retained replay parent must prevent displacement");
             assert!(destination_for_hook.is_dir());
