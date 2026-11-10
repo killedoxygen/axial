@@ -337,7 +337,8 @@ mod tests {
     async fn invalid_final_intermediate_and_alias_topology_fail_closed() {
         let workers = ManagedBlockingWorkers::new();
         let attempt = workers.attempt_guard();
-        let final_directory = tempfile::tempdir_in(crate::test_temp_root()).expect("final topology root");
+        let final_directory =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("final topology root");
         std::fs::create_dir_all(final_directory.path().join("assets/objects/aa/aa01"))
             .expect("create directory at final path");
         let cache = bind_cache(
@@ -351,7 +352,8 @@ mod tests {
             Err(ManagedComponentExactCacheError::Admission)
         );
 
-        let intermediate_file = tempfile::tempdir_in(crate::test_temp_root()).expect("intermediate topology root");
+        let intermediate_file =
+            tempfile::tempdir_in(crate::test_temp_root()).expect("intermediate topology root");
         std::fs::create_dir_all(intermediate_file.path().join("assets"))
             .expect("create Assets root");
         std::fs::write(

@@ -254,13 +254,6 @@ pub struct ManagedContentEncodedManifest {
     path_policy: ManagedContentPathPolicy,
 }
 
-#[must_use = "deferred manifests remain bound to the observing content session"]
-pub struct ManagedContentDeferredManifest {
-    session: Arc<()>,
-    remaining_transaction_bytes: u64,
-    path_policy: ManagedContentPathPolicy,
-}
-
 impl fmt::Debug for ManagedContentEncodedManifest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -274,50 +267,42 @@ pub struct ManagedContentMutationPlan {
     mutations: Vec<ManagedContentPathMutation>,
     payloads: Vec<ManagedContentPayloadPlan>,
     manifest: ManagedContentManifestPlan,
-    remaining_manifest_bytes: u64,
 }
 
 enum ManagedContentManifestPlan {
     Encoded(ManagedContentEncodedManifest),
-    Deferred(ManagedContentDeferredManifest),
 }
 
 impl ManagedContentManifestPlan {
     fn session(&self) -> &Arc<()> {
         match self {
             Self::Encoded(manifest) => &manifest.session,
-            Self::Deferred(manifest) => &manifest.session,
         }
     }
 
     fn remaining_transaction_bytes(&self) -> u64 {
         match self {
             Self::Encoded(manifest) => manifest.remaining_transaction_bytes,
-            Self::Deferred(manifest) => manifest.remaining_transaction_bytes,
         }
     }
 
     fn path_policy(&self) -> ManagedContentPathPolicy {
         match self {
             Self::Encoded(manifest) => manifest.path_policy,
-            Self::Deferred(manifest) => manifest.path_policy,
         }
     }
 
     fn into_parts(self) -> (Box<[u8]>, u64) {
         match self {
             Self::Encoded(manifest) => (manifest.body, manifest.remaining_transaction_bytes),
-            Self::Deferred(manifest) => (Box::default(), manifest.remaining_transaction_bytes),
         }
     }
 }
 
 impl fmt::Debug for ManagedContentMutationPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let manifest_bytes = match &self.manifest {
-            ManagedContentManifestPlan::Encoded(manifest) => Some(manifest.body.len()),
-            ManagedContentManifestPlan::Deferred(_) => None,
-        };
+        let ManagedContentManifestPlan::Encoded(manifest) = &self.manifest;
+        let manifest_bytes = manifest.body.len();
         formatter
             .debug_struct("ManagedContentMutationPlan")
             .field("paths", &self.mutations.len())
@@ -339,20 +324,6 @@ impl ManagedContentMutationPlan {
             mutations,
             payloads,
             ManagedContentManifestPlan::Encoded(manifest),
-        )
-    }
-
-    pub fn new_deferred(
-        observations: &[ManagedContentPathObservation],
-        mutations: Vec<ManagedContentPathMutation>,
-        payloads: Vec<ManagedContentPayloadPlan>,
-        manifest: ManagedContentDeferredManifest,
-    ) -> Result<Self, ManagedContentPlanError> {
-        Self::validated(
-            observations,
-            mutations,
-            payloads,
-            ManagedContentManifestPlan::Deferred(manifest),
         )
     }
 
@@ -476,14 +447,10 @@ impl ManagedContentMutationPlan {
                 return Err(ManagedContentPlanError::ObservationChanged);
             }
         }
-        let remaining_manifest_bytes = manifest
-            .remaining_transaction_bytes()
-            .saturating_sub(payload_bytes);
         Ok(Self {
             mutations,
             payloads,
             manifest,
-            remaining_manifest_bytes,
         })
     }
 }
@@ -658,21 +625,6 @@ pub struct ManagedContentPlanningSession {
     path_policy: ManagedContentPathPolicy,
 }
 
-/// Opaque proof that Content data came from one exact Core planning session.
-/// It is intentionally move-only and exposes no serializable identity.
-#[must_use = "content planning bindings must remain with their decoded projection"]
-pub struct ManagedContentPlanningBinding {
-    session: Arc<()>,
-}
-
-impl fmt::Debug for ManagedContentPlanningBinding {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ManagedContentPlanningBinding")
-            .finish_non_exhaustive()
-    }
-}
-
 impl fmt::Debug for ManagedContentPlanningSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -696,16 +648,6 @@ impl ManagedContentPlanningSession {
             .iter()
             .map(|observation| observation.public.clone())
             .collect()
-    }
-
-    pub fn planning_binding(&self) -> ManagedContentPlanningBinding {
-        ManagedContentPlanningBinding {
-            session: Arc::clone(&self.manifest_session),
-        }
-    }
-
-    pub fn matches_planning_binding(&self, binding: &ManagedContentPlanningBinding) -> bool {
-        Arc::ptr_eq(&self.manifest_session, &binding.session)
     }
 
     pub fn observe_more(
@@ -796,23 +738,11 @@ impl ManagedContentTransactionSession {
         })
     }
 
-    pub fn defer_manifest(&self) -> ManagedContentDeferredManifest {
-        ManagedContentDeferredManifest {
-            session: Arc::clone(&self.manifest_session),
-            remaining_transaction_bytes: self.remaining_transaction_bytes,
-            path_policy: self.path_policy,
-        }
-    }
-
     pub fn observations(&self) -> Vec<ManagedContentPathObservation> {
         self.observations
             .iter()
             .map(|observation| observation.public.clone())
             .collect()
-    }
-
-    pub fn matches_planning_binding(&self, binding: &ManagedContentPlanningBinding) -> bool {
-        Arc::ptr_eq(&self.manifest_session, &binding.session)
     }
 
     pub fn prepare(self, plan: ManagedContentMutationPlan) -> ManagedContentPreparationOutcome {
@@ -1591,28 +1521,6 @@ pub struct ManagedContentCompleteTransfers {
     state: TransactionState,
 }
 
-#[must_use = "manifest binding must retain the complete verified transfer set"]
-pub enum ManagedContentManifestBindOutcome {
-    Bound(ManagedContentCompleteTransfers),
-    Refused {
-        error: ManagedContentPlanError,
-        transfers: ManagedContentCompleteTransfers,
-    },
-}
-
-impl fmt::Debug for ManagedContentManifestBindOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let variant = match self {
-            Self::Bound(_) => "Bound",
-            Self::Refused { .. } => "Refused",
-        };
-        formatter
-            .debug_struct("ManagedContentManifestBindOutcome")
-            .field("variant", &variant)
-            .finish()
-    }
-}
-
 impl fmt::Debug for ManagedContentCompleteTransfers {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1893,26 +1801,6 @@ impl ManagedContentCompleteTransfers {
             .map(|(planned, payload)| (&planned.id, &payload.report))
     }
 
-    pub fn bind_manifest(mut self, body: Vec<u8>) -> ManagedContentManifestBindOutcome {
-        let error = if !self.state.manifest_body.is_empty() || body.is_empty() {
-            Some(ManagedContentPlanError::InvalidManifest)
-        } else if body.len() > MAX_MANIFEST_BYTES {
-            Some(ManagedContentPlanError::ManifestTooLarge)
-        } else if body.len() as u64 > self.state.remaining_manifest_bytes {
-            Some(ManagedContentPlanError::TransactionBudgetExceeded)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            return ManagedContentManifestBindOutcome::Refused {
-                error,
-                transfers: self,
-            };
-        }
-        self.state.manifest_body = body.into_boxed_slice();
-        ManagedContentManifestBindOutcome::Bound(self)
-    }
-
     pub fn stage(self) -> ManagedContentStageOutcome {
         if self.state.manifest_body.is_empty() {
             return ManagedContentStageOutcome::Unwind(drive_rollback(self.state, true));
@@ -1995,7 +1883,6 @@ struct TransactionState {
     backup: ManagedDir,
     manifest: ExactObservation,
     manifest_body: Box<[u8]>,
-    remaining_manifest_bytes: u64,
     mutations: Vec<TransactionMutation>,
     read_preconditions: Vec<PathObservationAuthority>,
     planned_payloads: Vec<PlannedPayload>,
@@ -2215,7 +2102,6 @@ fn prepare_transaction(
             }
         })
         .collect();
-    let remaining_manifest_bytes = plan.remaining_manifest_bytes;
     let (manifest_body, _) = plan.manifest.into_parts();
     let stage_cleanup = CleanupDirectoryState::Known(stage.clone());
     let backup_cleanup = CleanupDirectoryState::Known(backup.clone());
@@ -2240,7 +2126,6 @@ fn prepare_transaction(
             backup,
             manifest: session.manifest,
             manifest_body,
-            remaining_manifest_bytes,
             mutations,
             read_preconditions: session.read_preconditions,
             planned_payloads,
@@ -6561,23 +6446,6 @@ mod tests {
         .expect("content plan")
     }
 
-    fn deferred_absent_plan(
-        session: &ManagedContentTransactionSession,
-        path: PortableRelativePath,
-    ) -> ManagedContentMutationPlan {
-        ManagedContentMutationPlan::new_deferred(
-            &session.observations(),
-            vec![ManagedContentPathMutation::new(
-                path,
-                ManagedContentObservedState::Absent,
-                ManagedContentPathResult::Absent,
-            )],
-            Vec::new(),
-            session.defer_manifest(),
-        )
-        .expect("deferred content plan")
-    }
-
     fn download_plan(session: &ManagedContentTransactionSession) -> ManagedContentMutationPlan {
         let observations = session.observations();
         let mut mutations = Vec::with_capacity(observations.len());
@@ -9562,44 +9430,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_manifest_refusal_retains_complete_transaction_for_exact_binding() {
-        let temporary = test_tempdir().expect("temporary instance");
-        let (_tree, root) = content_root(&temporary);
-        let path = PortableRelativePath::new_exact("mods/deferred.jar").expect("path");
-        let session = transaction_session(root, vec![path.clone()]);
-        let plan = deferred_absent_plan(&session, path);
-        let complete = match prepared(session, plan).into_transfer_batch().next() {
-            ManagedContentTransferStep::Complete(complete) => complete,
-            ManagedContentTransferStep::Issued(_) => panic!("empty plan must be complete"),
-        };
-        assert_eq!(complete.reports().len(), 0);
-        let complete = match complete.bind_manifest(Vec::new()) {
-            ManagedContentManifestBindOutcome::Refused {
-                error: ManagedContentPlanError::InvalidManifest,
-                transfers,
-            } => transfers,
-            _ => panic!("empty deferred manifest must retain the complete owner"),
-        };
-        let complete = match complete.bind_manifest(b"late-manifest".to_vec()) {
-            ManagedContentManifestBindOutcome::Bound(complete) => complete,
-            _ => panic!("bounded deferred manifest must bind"),
-        };
-        let ready = match complete.stage() {
-            ManagedContentStageOutcome::Ready(ready) => ready,
-            ManagedContentStageOutcome::Unwind(_) => panic!("bound transaction must stage"),
-        };
-        assert!(matches!(
-            ready.commit(),
-            ManagedContentTransactionOutcome::Committed(_)
-        ));
-        assert_eq!(
-            std::fs::read(temporary.path().join(MANIFEST_NAME)).expect("committed manifest"),
-            b"late-manifest"
-        );
-    }
-
-    #[test]
-    fn external_reader_and_late_manifest_share_one_transaction_owner() {
+    fn external_reader_payload_publishes_through_one_transaction_owner() {
         let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
         let root = root.for_pack();
@@ -9615,7 +9446,10 @@ mod tests {
             ))),
         )
         .expect("external contract");
-        let plan = ManagedContentMutationPlan::new_deferred(
+        let manifest = session
+            .bind_encoded_manifest(b"external-manifest".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(
             &session.observations(),
             vec![ManagedContentPathMutation::new(
                 path.clone(),
@@ -9626,7 +9460,7 @@ mod tests {
                 id.clone(),
                 contract,
             )],
-            session.defer_manifest(),
+            manifest,
         )
         .expect("external plan");
         let issued = match prepared(session, plan).into_transfer_batch().next() {
@@ -9651,10 +9485,6 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].0, &id);
         assert_eq!(reports[0].1.bytes(), source.len() as u64);
-        let complete = match complete.bind_manifest(b"external-manifest".to_vec()) {
-            ManagedContentManifestBindOutcome::Bound(complete) => complete,
-            _ => panic!("late external manifest must bind"),
-        };
         let ready = match complete.stage() {
             ManagedContentStageOutcome::Ready(ready) => ready,
             ManagedContentStageOutcome::Unwind(_) => panic!("external payload must stage"),
@@ -9707,13 +9537,11 @@ mod tests {
                 id, contract,
             ));
         }
-        let plan = ManagedContentMutationPlan::new_deferred(
-            &observations,
-            mutations,
-            payloads,
-            session.defer_manifest(),
-        )
-        .expect("large pack plan");
+        let manifest = session
+            .bind_encoded_manifest(b"pack-manifest".to_vec())
+            .expect("manifest");
+        let plan = ManagedContentMutationPlan::new(&observations, mutations, payloads, manifest)
+            .expect("large pack plan");
         let mut transfers = prepared(session, plan).into_transfer_batch();
         let complete = loop {
             match transfers.next() {
@@ -9773,14 +9601,11 @@ mod tests {
                 id, contract,
             ));
         }
+        let manifest = session
+            .bind_encoded_manifest(b"pack-manifest".to_vec())
+            .expect("manifest");
         assert!(
-            ManagedContentMutationPlan::new_deferred(
-                &observations,
-                mutations,
-                payloads,
-                session.defer_manifest(),
-            )
-            .is_ok(),
+            ManagedContentMutationPlan::new(&observations, mutations, payloads, manifest).is_ok(),
             "the legacy pack path had no four-GiB aggregate indexed-download ceiling"
         );
     }
@@ -9861,26 +9686,6 @@ mod tests {
     }
 
     #[test]
-    fn unbound_deferred_manifest_unwinds_without_namespace_effects() {
-        let temporary = test_tempdir().expect("temporary instance");
-        let (_tree, root) = content_root(&temporary);
-        let root = root.for_pack();
-        let path = PortableRelativePath::new_exact("config/nested/unbound.toml").expect("path");
-        let session = transaction_session(root, vec![path.clone()]);
-        let plan = deferred_absent_plan(&session, path);
-        let complete = match prepared(session, plan).into_transfer_batch().next() {
-            ManagedContentTransferStep::Complete(complete) => complete,
-            ManagedContentTransferStep::Issued(_) => panic!("empty plan must be complete"),
-        };
-        assert!(matches!(
-            complete.stage(),
-            ManagedContentStageOutcome::Unwind(ManagedContentTransactionOutcome::Cancelled(_))
-        ));
-        assert!(!temporary.path().join(MANIFEST_NAME).exists());
-        assert!(!temporary.path().join("config").exists());
-    }
-
-    #[test]
     fn pack_observation_rejects_portable_parent_aliases_before_effects() {
         let temporary = test_tempdir().expect("temporary instance");
         let (_tree, root) = content_root(&temporary);
@@ -9899,22 +9704,6 @@ mod tests {
         assert!(failure.into_session().observations().is_empty());
         assert!(!temporary.path().join("Config").exists());
         assert!(!temporary.path().join("config").exists());
-    }
-
-    #[test]
-    fn planning_binding_matches_only_its_exact_planning_flow() {
-        let first = test_tempdir().expect("first instance");
-        let second = test_tempdir().expect("second instance");
-        let (_first_tree, first_root) = content_root(&first);
-        let (_second_tree, second_root) = content_root(&second);
-        let first_planning = first_root.observe_manifest().expect("first planning");
-        let second_planning = second_root.observe_manifest().expect("second planning");
-        let binding = first_planning.planning_binding();
-
-        assert!(first_planning.matches_planning_binding(&binding));
-        assert!(!second_planning.matches_planning_binding(&binding));
-        let first_session = first_planning.finish(Vec::new()).expect("first session");
-        assert!(first_session.matches_planning_binding(&binding));
     }
 
     #[test]
