@@ -37,7 +37,7 @@ export async function savePlayerName(raw: string, successMessage = 'Player name 
   }
   const nextName = raw.trim();
   try {
-    const { activeAccount: readActiveAccount, accountsNotice, refreshAccountsData, saveOfflineIdentityName } =
+    const { activeAccount: readActiveAccount, accountsNotice, refreshAccountsData, renameOfflineAccount } =
       await import('./machines/accounts');
     await refreshAccountsData();
     const activeAccount = readActiveAccount();
@@ -46,7 +46,7 @@ export async function savePlayerName(raw: string, successMessage = 'Player name 
       return false;
     }
     if (!activeAccount) throw new Error('Select an offline identity before changing its name.');
-    const saved = await saveOfflineIdentityName(activeAccount, nextName, successMessage);
+    const saved = await renameOfflineAccount(activeAccount, nextName, successMessage);
     if (!saved) throw new Error(accountsNotice.value ?? 'The account name could not be saved.');
     return saved;
   } catch (err) {

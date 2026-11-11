@@ -6,31 +6,25 @@ import type { DefaultSkin } from '../../default-skins';
 import { apiResourceUrl } from '../../api';
 import { capeFileUrl, savedSkinFileUrl } from './api';
 import { SkinSnapshotImg } from './SkinSnapshotImg';
-import type { MinecraftCape, MinecraftProfile, SavedSkinRecord, SkinVariant } from './types';
+import { profileCape } from '../../player-skin';
+import type { LauncherAccount, SavedSkinRecord } from './types';
 
+/** The skin the account's Minecraft profile wears. Renders nothing while it has none. */
 export function ProfileSkinTile({
-  minecraftProfile,
-  profileSkinId,
-  profileSkinUrl,
-  profileSkinFileSrc,
-  profileSkinVariant,
-  profileCape,
-  profileSkinIdentity,
+  account,
   selected,
   menuItems,
   onView,
 }: {
-  minecraftProfile: MinecraftProfile;
-  profileSkinId: string;
-  profileSkinUrl: string;
-  profileSkinFileSrc?: string;
-  profileSkinVariant: SkinVariant;
-  profileCape: MinecraftCape | null;
-  profileSkinIdentity?: string;
+  account: LauncherAccount;
   selected: boolean;
   menuItems: ContextMenuItem[];
   onView: () => void;
-}): JSX.Element {
+}): JSX.Element | null {
+  const skin = account.profile_skin;
+  if (!skin) return null;
+  const cape = profileCape(account);
+  const identity = `profile:${account.account_id}:${skin.id}:${skin.url}`;
   return (
     <div class="cp-skin-tilewrap">
       <button
@@ -44,13 +38,13 @@ export function ProfileSkinTile({
         title="Preview the current Minecraft profile skin"
       >
         <SkinSnapshotImg
-          cacheKey={`profile:${minecraftProfile.id}:${profileSkinId}:${profileSkinUrl}:${profileSkinVariant}:${profileCape?.id ?? ''}`}
-          src={profileSkinFileSrc ?? apiResourceUrl('/skin/profile/file')}
-          variant={profileSkinVariant}
-          capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-          textureIdentity={profileSkinIdentity}
-          capeIdentity={profileCape?.id}
-          alt={`${minecraftProfile.name} current profile skin`}
+          cacheKey={`${identity}:${skin.variant}:${cape?.id ?? ''}`}
+          src={apiResourceUrl('/skin/profile/file')}
+          variant={skin.variant}
+          capeSrc={cape ? capeFileUrl(cape) : undefined}
+          textureIdentity={identity}
+          capeIdentity={cape?.id}
+          alt={`${account.display_name} current profile skin`}
         />
         <span class="cp-skin-tile__label">Current profile</span>
       </button>

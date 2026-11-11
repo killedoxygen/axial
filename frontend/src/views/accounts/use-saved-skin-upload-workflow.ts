@@ -13,7 +13,6 @@ import {
   boundedMessage,
   isPngFile,
   normalizeSkinUpload,
-  resolveUploadSkinVariant,
   skinActionErrorMessage,
   stagedSkinVariant,
   uploadSkinName,
@@ -67,7 +66,7 @@ export function useSavedSkinUploadWorkflow() {
       const capture = captureWardrobeContext();
       setWardrobeNotice(null);
       try {
-        const resolvedVariant = variantOverride ?? (await resolveUploadSkinVariant(file, uploadVariant));
+        const resolvedVariant = variantOverride ?? (uploadVariant === 'auto' ? undefined : uploadVariant);
         if (!isWardrobeContextCurrent(capture)) return;
         await uploadSkinPng(file, {
           name,
@@ -121,11 +120,11 @@ export function useSavedSkinUploadWorkflow() {
           current?.objectUrl === objectUrl
             ? {
                 ...current,
-                detectedVariant: metadata.variantSuggestion,
+                detectedVariant: metadata.variant_suggestion,
                 detectingVariant: false,
                 normalizeStatus: 'ready',
                 normalizeError: undefined,
-                normalizedDataUrl: metadata.normalizedDataUrl,
+                normalizedDataUrl: metadata.normalized_data_url,
               }
             : current,
         );

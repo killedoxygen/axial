@@ -1,13 +1,10 @@
 import type { JSX } from 'preact';
 import { useMemo, useRef } from 'preact/hooks';
-import { apiResourceUrl } from '../../api';
 import { DEFAULT_SKINS } from '../../default-skins';
 import {
   applySkin,
   cancelPendingApply,
   changeSavedSkinCape,
-  defaultSkinKeys,
-  defaultSkinKeysReady,
   deleteSavedSkin,
   downloadSavedSkin,
   flushPendingApply,
@@ -15,6 +12,7 @@ import {
   previewProfileSkin,
   resetProfileCape,
   resetProfileSkin,
+  savedDefaultSkin,
   saveProfileSkinLocally,
   selectDefaultSkin,
   selectSavedSkin,
@@ -26,15 +24,13 @@ import {
   wardrobeOp,
   wardrobeSelection,
 } from '../../machines/skin-wardrobe';
+import { profileCape as accountProfileCape } from '../../player-skin';
 import { local } from '../../state';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import {
-  activeMinecraftCape,
-  activeMinecraftSkin,
   boundedMessage,
   capeFileUrl,
   DEFAULT_SKIN_SOURCE,
-  skinVariantValue,
   sortSavedSkins,
   stagedSkinPreviewSrc,
 } from './api';
@@ -54,11 +50,6 @@ import { useSavedSkinNativeDragDrop } from './use-saved-skin-native-drag-drop';
 import { useSavedSkinUploadWorkflow } from './use-saved-skin-upload-workflow';
 import { NO_CAPE_VALUE, type SavedSkinRecord } from './types';
 
-function looksLikeUnresolvedDefaultSkin(skin: SavedSkinRecord, defaultKeyLookupComplete: boolean): boolean {
-  if (defaultKeyLookupComplete || skin.source !== 'local_upload') return false;
-  return DEFAULT_SKINS.some((defaultSkin) => defaultSkin.name === skin.name && defaultSkin.variant === skin.variant);
-}
-
 export function SavedSkinLibrary({
   skinActionDisabledReason,
   playerName,
@@ -73,7 +64,7 @@ export function SavedSkinLibrary({
   const selection = wardrobeSelection.value;
   const op = wardrobeOp.value;
   const notice = wardrobeNotice.value;
-  const { skinActionsEnabled, profile } = wardrobeContext.value;
+  const { skinActionsEnabled, account } = wardrobeContext.value;
 
   const lookup = useSavedSkinLookupWorkflow();
   const edit = useSavedSkinEditWorkflow();
@@ -84,50 +75,24 @@ export function SavedSkinLibrary({
     data.pendingApply?.phase === 'queued' || data.pendingApply?.phase === 'applying'
       ? data.pendingApply.texture_key
       : null;
-  const profileSkin = activeMinecraftSkin(profile ?? undefined);
-  const profileCape = activeMinecraftCape(profile ?? undefined);
-  const availableCapes = profile?.capes ?? [];
+  const profileSkin = account?.profile_skin;
+  const profileCape = accountProfileCape(account);
+  const availableCapes = account?.minecraft_profile?.capes ?? [];
   const capeById = useMemo(() => new Map(availableCapes.map((cape) => [cape.id, cape])), [availableCapes]);
   const capeSrcForId = (capeId: string | null | undefined): string | undefined => {
     if (!capeId) return undefined;
     const cape = capeById.get(capeId);
     return cape ? capeFileUrl(cape) : undefined;
   };
-  const profileSkinVariant = skinVariantValue(profileSkin?.variant);
-  const profileSkinFileSrc = profileSkin ? apiResourceUrl('/skin/profile/file') : undefined;
-  const profileSkinIdentity =
-    profileSkin && profile ? `profile:${profile.id}:${profileSkin.id}:${profileSkin.url}` : undefined;
-
   const sortedSkins = useMemo(() => sortSavedSkins(skins, 'recent'), [skins]);
   const savedSkinByKey = useMemo(() => new Map(skins.map((skin) => [skin.texture_key, skin])), [skins]);
-  const keysById = defaultSkinKeys.value;
-  const defaultKeysComplete = defaultSkinKeysReady.value;
-  const defaultIdByKey = useMemo(() => {
-    const ids = new Map<string, string>();
-    for (const [id, key] of keysById) ids.set(key, id);
-    return ids;
-  }, [keysById]);
   const librarySkins = useMemo(
-    () =>
-      sortedSkins.filter(
-        (skin) =>
-          skin.source !== DEFAULT_SKIN_SOURCE &&
-          !defaultIdByKey.has(skin.texture_key) &&
-          !looksLikeUnresolvedDefaultSkin(skin, defaultKeysComplete),
-      ),
-    [sortedSkins, defaultIdByKey, defaultKeysComplete],
+    () => sortedSkins.filter((skin) => skin.source !== DEFAULT_SKIN_SOURCE),
+    [sortedSkins],
   );
   const savedRecordForDefault = (id: string): SavedSkinRecord | null => {
-    const key = keysById.get(id);
-    if (key) return savedSkinByKey.get(key) ?? null;
-    const defaultSkin = DEFAULT_SKINS.find((skin) => skin.id === id);
-    if (!defaultSkin) return null;
-    return (
-      skins.find(
-        (skin) =>
-          skin.source === DEFAULT_SKIN_SOURCE && skin.name === defaultSkin.name && skin.variant === defaultSkin.variant,
-      ) ?? null
-    );
+    const skin = DEFAULT_SKINS.find((candidate) => candidate.id === id);
+    return skin ? savedDefaultSkin(skin, skins) : null;
   };
 
   const currentProfileSavedKey = inferredProfileSavedSkin()?.texture_key ?? null;
@@ -143,8 +108,8 @@ export function SavedSkinLibrary({
       : (selectedSavedSkin ?? profileSavedRecord ?? pendingApplySkin ?? equippedSkin ?? sortedSkins[0] ?? null);
 
   const lookupPreview = selection.kind === 'lookup' && lookup.lookupState === 'ready' ? lookup.lookupProfile : null;
-  const profilePreviewActive = Boolean(selection.kind === 'profile' && profileSkin && profile);
-  const showProfileSelectedPreview = Boolean(data.state === 'ready' && skins.length === 0 && profileSkin && profile);
+  const profilePreviewActive = Boolean(selection.kind === 'profile' && profileSkin);
+  const showProfileSelectedPreview = Boolean(data.state === 'ready' && skins.length === 0 && profileSkin);
 
   const stageNametag = local.hideSkinNametag ? null : playerName.trim() || null;
   const wornKey = (skin: SavedSkinRecord): boolean =>
@@ -222,7 +187,7 @@ export function SavedSkinLibrary({
   if (skinActionsEnabled && profileCape && op === null) {
     profileMenuItems.push({ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() });
   }
-  const showProfileSkinTile = Boolean(profile && profileSkin && !showProfileSelectedPreview && !currentProfileSavedKey);
+  const showProfileSkinTile = Boolean(profileSkin && !showProfileSelectedPreview && !currentProfileSavedKey);
 
   const editingSkin = edit.editKey ? (savedSkinByKey.get(edit.editKey) ?? null) : null;
   const selectedSkinTextureKey = selectedSkinRecord?.texture_key ?? null;
@@ -328,13 +293,7 @@ export function SavedSkinLibrary({
               librarySkins={librarySkins}
               uploadDragActive={uploadWorkflow.uploadDragActive}
               canUpload={uploadWorkflow.canUpload}
-              showProfileSkinTile={showProfileSkinTile}
-              minecraftProfile={profile ?? undefined}
-              profileSkin={profileSkin ?? undefined}
-              profileSkinFileSrc={profileSkinFileSrc}
-              profileSkinVariant={profileSkinVariant}
-              profileCape={profileCape ?? undefined}
-              profileSkinIdentity={profileSkinIdentity}
+              profileAccount={showProfileSkinTile ? account : null}
               profilePreviewActive={profilePreviewActive}
               profileMenuItems={profileMenuItems}
               selectedSkinTextureKey={selectedSkinTextureKey}

@@ -17,11 +17,11 @@ import { toast } from '../../toast';
 import { showConfirm } from '../../ui/Dialog';
 import {
   boundedMessage,
-  detectSkinVariantFromSavedSkin,
+  suggestedSavedSkinVariant,
   isPngFile,
   normalizeSkinUpload,
   replaceSavedSkinTexture,
-  savedSkinRecord,
+  savedSkin,
   skinActionErrorMessage,
 } from './api';
 import { useSavedSkinEditReplacementDrop } from './use-saved-skin-edit-replacement-drop';
@@ -127,7 +127,7 @@ export function useSavedSkinEditWorkflow() {
     setEditDetectError(null);
     setWardrobeNotice(null);
     try {
-      const detectedVariant = await detectSkinVariantFromSavedSkin(skin);
+      const detectedVariant = await suggestedSavedSkinVariant(skin);
       if (token !== editDetectTokenRef.current) return;
       setEditVariant(detectedVariant);
     } catch (err) {
@@ -171,16 +171,16 @@ export function useSavedSkinEditWorkflow() {
     void normalizeSkinUpload(file)
       .then((metadata) => {
         if (token !== editReplacementTokenRef.current) return;
-        setEditVariant(metadata.variantSuggestion);
+        setEditVariant(metadata.variant_suggestion);
         setEditReplacement((current) =>
           current?.objectUrl === objectUrl
             ? {
                 ...current,
-                detectedVariant: metadata.variantSuggestion,
+                detectedVariant: metadata.variant_suggestion,
                 detectingVariant: false,
                 normalizeStatus: 'ready',
                 normalizeError: undefined,
-                normalizedDataUrl: metadata.normalizedDataUrl,
+                normalizedDataUrl: metadata.normalized_data_url,
               }
             : current,
         );
@@ -274,8 +274,10 @@ export function useSavedSkinEditWorkflow() {
           if (skin && editCapeId !== (skin.cape_id ?? NO_CAPE_VALUE)) {
             payload.cape_id = editCapeId === NO_CAPE_VALUE ? null : editCapeId;
           }
-          const updated = savedSkinRecord(await api('PUT', `/skins/${encodeURIComponent(textureKey)}`, payload));
-          if (!updated) throw new Error('Skin details update returned an invalid response.');
+          const updated = savedSkin(
+            await api('PUT', `/skins/${encodeURIComponent(textureKey)}`, payload),
+            'Skin details update',
+          );
           savedTextureKey = updated.texture_key;
         }
         if (!isWardrobeContextCurrent(capture)) {

@@ -6,11 +6,13 @@ import { initColorField, positionFieldMarker } from '../../theme';
 export function ColorField({
   hue,
   vibrancy,
+  height = 140,
   onChange,
   onEnd,
 }: {
   hue: number;
   vibrancy: number;
+  height?: number;
   onChange: (hue: number, vibrancy: number) => void;
   onEnd?: () => void;
 }): JSX.Element {
@@ -41,7 +43,7 @@ export function ColorField({
       style={{
         position: 'relative',
         width: '100%',
-        height: 140,
+        height,
         borderRadius: 'var(--r-md)',
         cursor: 'crosshair',
         background:

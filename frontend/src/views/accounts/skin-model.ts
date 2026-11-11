@@ -235,12 +235,12 @@ export function addFloorSpotlight(
   THREE: ThreeModule,
   scene: import('three').Scene,
   disposables: Array<() => void>,
-): void {
+): import('three').Mesh | null {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 256;
   const ctx = canvas.getContext('2d');
-  if (!ctx) return;
+  if (!ctx) return null;
 
   const shadow = ctx.createRadialGradient(128, 128, 6, 128, 128, 112);
   shadow.addColorStop(0, 'rgba(0, 0, 0, 0.34)');
@@ -270,6 +270,7 @@ export function addFloorSpotlight(
     texture.dispose();
     material.dispose();
   });
+  return mesh;
 }
 
 export function buildSkinModel({

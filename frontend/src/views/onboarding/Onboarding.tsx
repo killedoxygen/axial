@@ -1,630 +1,82 @@
 import type { JSX } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
-import { Input, Toggle } from '../../ui/Atoms';
-import { Icon, type IconName } from '../../ui/Icons';
-import { MicrosoftMark } from '../../ui/MicrosoftMark';
-import { AccentField } from '../settings/AccentEditor';
+import { useRef, useState } from 'preact/hooks';
 import { WindowControls } from '../../shell/WindowControls';
-import { Music } from '../../music';
 import { Sound } from '../../sound';
-import { api } from '../../api';
-import { configResponse } from '../../dto-core';
-import { dtoError } from '../../dto-contract';
-import { config, systemInfo } from '../../store';
+import { config } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
-import { toast } from '../../toast';
-import { clampPlayerNameInput } from '../../player-name';
-import { launcherSkinAccountKey, minecraftProfileSkinTextureSrc, refreshAccountSkin, setSelectedSkin } from '../../player-skin';
-import { DEFAULT_SKINS } from '../../default-skins';
-import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
-import { activeMinecraftCape, activeMinecraftSkin, capeFileUrl } from '../accounts/api';
-import { LazySkinThreePreview } from '../accounts/LazySkinThreePreview';
-import { errMessage, getMemoryRecommendation, validateUsername } from '../../utils';
-import { hasNativeDesktopRuntime } from '../../native';
-import type { AuthStatusRecord } from '../accounts/types';
-import { useMicrosoftSignIn } from '../accounts/useMicrosoftSignIn';
-import { saveConfigPatch } from '../../hooks/use-autosave';
-import {
-  accountsNotice,
-  accountsSnapshot,
-  activeAccount,
-  createOfflineAccount,
-  refreshAccountsData,
-  selectAccount,
-} from '../../machines/accounts';
+import { errMessage } from '../../utils';
+import { finishOnboarding, type Preferences } from './finish';
+import { Identity } from './Identity';
+import { useIdentity } from './use-identity';
+import { Stage } from './Stage';
+import { Style } from './Style';
 
-type Stage = 'name' | 'style';
-const ORDER: Stage[] = ['name', 'style'];
-const STAGE_LABELS: Record<Stage, string> = {
-  name: 'You',
-  style: 'Style',
-};
+/** Matches the `cp-ob-leave` animation. */
+const LEAVE_MS = 560;
 
-function statusOnlineReady(status: AuthStatusRecord | null): boolean {
-  return status?.online_action?.state_id === 'online_ready';
-}
+export function Onboarding(): JSX.Element {
+  const identity = useIdentity();
+  const [styling, setStyling] = useState(false);
+  const [preferences, setPreferences] = useState<Preferences>(() => ({
+    music: false,
+    discord: config.value?.discord_rpc_enabled !== false,
+    // Anonymous stats stay off until the player turns them on.
+    telemetry: config.value?.telemetry_enabled === true,
+  }));
+  const [phase, setPhase] = useState<'editing' | 'saving' | 'leaving'>('editing');
+  const [error, setError] = useState<string | null>(null);
+  const finishing = useRef(false);
+  const { choice } = identity;
 
-function statusOnlineMessage(status: AuthStatusRecord | null, fallback: string): string {
-  return (
-    status?.online_action?.success_summary ||
-    status?.online_action?.disabled_reason ||
-    status?.online_action?.detail ||
-    fallback
-  );
-}
-
-function Words({ text }: { text: string }): JSX.Element {
-  // Keep the space as a sibling text node between word spans, not inside them.
-  // Trailing whitespace inside an inline-block gets swallowed by layout, which
-  // collapsed the headline into "WhatshouldMinecraftcallyou?". Sibling text nodes
-  // also preserve natural line-break opportunities between words.
-  const parts = text.split(' ');
-  return (
-    <>
-      {parts.flatMap((w, i) => {
-        const span = (
-          <span key={`w${i}`} class="cp-ob-word" style={{ ['--i' as any]: String(i) }}>
-            {w}
-          </span>
-        );
-        return i === 0 ? [span] : [' ', span];
-      })}
-    </>
-  );
-}
-
-function Stepper({
-  current,
-  maxReached,
-  order,
-  onJump,
-}: {
-  current: number;
-  maxReached: number;
-  order: Stage[];
-  onJump: (i: number) => void;
-}): JSX.Element {
-  const nodes: JSX.Element[] = [];
-  order.forEach((s, i) => {
-    if (i > 0) {
-      nodes.push(
-        <span key={`sep-${i}`} class="cp-ob-stepper-sep" aria-hidden="true">
-          ›
-        </span>,
-      );
-    }
-    const state = i < current ? 'past' : i === current ? 'active' : 'future';
-    const clickable = i !== current && i <= maxReached;
-    const label = STAGE_LABELS[s];
-    const num = String(i + 1).padStart(2, '0');
-    const inner = (
-      <>
-        <span class="cp-ob-stepper-num">{num}</span>
-        <span class="cp-ob-stepper-label">{label}</span>
-      </>
-    );
-    if (clickable) {
-      nodes.push(
-        <button
-          key={s}
-          type="button"
-          class="cp-ob-stepper-item"
-          data-state={state}
-          onClick={() => onJump(i)}
-          aria-label={`Go to ${label}`}
-        >
-          {inner}
-        </button>,
-      );
-    } else {
-      nodes.push(
-        <div
-          key={s}
-          class="cp-ob-stepper-item"
-          data-state={state}
-          aria-current={state === 'active' ? 'step' : undefined}
-        >
-          {inner}
-        </div>,
-      );
-    }
-  });
-  return (
-    <nav class="cp-ob-stepper" aria-label="Onboarding progress">
-      {nodes}
-    </nav>
-  );
-}
-
-const AVATAR_FIT = { top: 0.16, bottom: 0.1, side: 0.12 };
-
-/** The player's character, shown beside every step and updated live. */
-function Avatar({
-  src,
-  capeSrc,
-  variant,
-  name,
-  nametag,
-  caption,
-}: {
-  src: string;
-  capeSrc?: string;
-  variant: 'classic' | 'slim';
-  name: string;
-  nametag: string | null;
-  caption: string;
-}): JSX.Element {
-  return (
-    <div class="cp-ob-avatar">
-      <div class="cp-ob-avatar-figure" key={src}>
-        <LazySkinThreePreview
-          src={src}
-          capeSrc={capeSrc}
-          name={name}
-          nametag={nametag}
-          variant={variant}
-          side="front"
-          showOuterLayers
-          fitPadding={AVATAR_FIT}
-          showHint={false}
-        />
-      </div>
-      <div class="cp-skinhall__caption cp-ob-avatar-caption">
-        <span class="cp-skinhall__caption-status">{caption}</span>
-        <span class="cp-skinhall__hint" aria-hidden="true">
-          <Icon name="arrow-left" size={10} />
-          <Icon name="arrow-right" size={10} />
-          <span>Drag to rotate</span>
-        </span>
-      </div>
-    </div>
-  );
-}
-
-export function Onboarding(): JSX.Element | null {
-  const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
-  const rec = getMemoryRecommendation(totalGB);
-
-  const [stage, setStage] = useState<Stage>('name');
-  const [maxReached, setMaxReached] = useState<number>(0);
-  const [username, setUsername] = useState('');
-  const [musicEnabled, setMusicEnabled] = useState(false);
-  // Anonymous stats stay off until the player turns them on.
-  const [telemetryEnabled, setTelemetryEnabled] = useState(config.value?.telemetry_enabled === true);
-  const [discordRpcEnabled, setDiscordRpcEnabled] = useState<boolean>(config.value?.discord_rpc_enabled !== false);
-  const [saving, setSaving] = useState(false);
-  const saveInFlight = useRef(false);
-  const [dissolving, setDissolving] = useState(false);
-  // The focused input hint shows Enter because arrow keys move the text cursor.
-  const [nameFocused, setNameFocused] = useState(false);
-  // Null until the player picks a face; only then is an existing account's look replaced.
-  const [skinId, setSkinId] = useState<string | null>(null);
-  const { status: authStatus, state: authState } = accountsSnapshot.value;
-  const onlineAfterOnboarding = statusOnlineReady(authStatus);
-  const microsoftSignInAvailable = hasNativeDesktopRuntime() || authStatus?.login_available !== false;
-  const microsoftLogin = useMicrosoftSignIn({
-    canStart: !saving && authState === 'ready' && microsoftSignInAvailable,
-    onAuthenticated: async (result) => {
-      const refreshedStatus = accountsSnapshot.value.status;
-      const profileName =
-        refreshedStatus?.minecraft_profile?.name ?? result.profile_name ?? refreshedStatus?.username ?? '';
-      const nextUsername = clampPlayerNameInput(profileName);
-      if (nextUsername) setUsername(nextUsername);
-
-      const backendOnlineReady = statusOnlineReady(refreshedStatus);
-      if (backendOnlineReady && nextUsername && validateUsername(nextUsername) === null && stage === 'name') {
-        setStage('style');
-        setMaxReached((m) => Math.max(m, 1));
-        Sound.ui('affirm');
-      }
-      return {
-        tone: backendOnlineReady ? 'ok' : 'err',
-        text: statusOnlineMessage(refreshedStatus, 'Microsoft sign-in completed.'),
-      };
-    },
-  });
-
-  const idx = ORDER.indexOf(stage);
-  const nameError = validateUsername(username);
-  const nameValid = nameError === null;
-  const showNameError = username.length > 0 && !nameValid;
-
-  const isLast = idx === ORDER.length - 1;
-  const canAdvance: boolean = stage === 'name' ? nameValid && !microsoftLogin.busy : !saving;
-
-  const advance = (): void => {
-    const nextIdx = idx + 1;
-    if (nextIdx >= ORDER.length) return;
-    setStage(ORDER[nextIdx] as Stage);
-    setMaxReached((m) => Math.max(m, nextIdx));
-    Sound.ui('click');
-  };
-
-  const jumpTo = (i: number): void => {
-    if (saveInFlight.current || dissolving) return;
-    const target = ORDER[i];
-    if (!target || i === idx) return;
-    // Only stages reached through the validated path can be jump targets.
-    if (i > maxReached) return;
-    setStage(target);
-    Sound.ui('soft');
-  };
-
-  useEffect(() => {
-    void refreshAccountsData();
-  }, []);
-
-  const commit = async (): Promise<void> => {
-    if (saveInFlight.current || dissolving) return;
-    if (!nameValid) {
-      setStage('name');
-      return;
-    }
-    saveInFlight.current = true;
-    setSaving(true);
+  const finish = async (): Promise<void> => {
+    if (!choice || finishing.current) return;
+    finishing.current = true;
+    setPhase('saving');
+    setError(null);
     try {
-      const patch: Record<string, unknown> = {
-        // Memory starts at the system recommendation and stays editable in Settings.
-        max_memory_mb: Math.round(rec.rec * 1024),
-        music_enabled: musicEnabled,
-        music_volume: 5,
-        telemetry_enabled: telemetryEnabled,
-        discord_rpc_enabled: discordRpcEnabled,
-        discord_rpc_onboarding_seen: true,
-      };
-      let profileSeedQuery: URLSearchParams | null = null;
-      if (onlineAfterOnboarding) {
-        patch.launch_auth_mode = 'online';
-        const snapshot = accountsSnapshot.value;
-        const account = snapshot.accounts.find((candidate) => candidate.active && candidate.kind === 'microsoft');
-        if (snapshot.state === 'ready' && account && snapshot.selection_revision !== null) {
-          profileSeedQuery = new URLSearchParams({
-            expected_account_id: account.account_id,
-            expected_selection_revision: String(snapshot.selection_revision),
-          });
-        }
-      } else {
-        await refreshAccountsData();
-        const snapshot = accountsSnapshot.value;
-        if (snapshot.state !== 'ready') throw new Error('Could not load accounts. Try again.');
-        const existing = snapshot.accounts.find(
-          (account) => account.kind === 'offline' && account.display_name === username.trim(),
-        );
-        if (existing) {
-          if (!existing.active) await selectAccount(existing);
-          if (activeAccount()?.account_id !== existing.account_id) {
-            throw new Error(accountsNotice.value ?? 'Could not select the offline account. Try again.');
-          }
-        } else if (!(await createOfflineAccount(username.trim()))) {
-          throw new Error(accountsNotice.value ?? 'Could not create the offline account. Try again.');
-        }
-        const offline = activeAccount();
-        if (offline && (skinId !== null || !existing)) {
-          setSelectedSkin(`default:${skinId ?? DEFAULT_SKINS[0].id}`, launcherSkinAccountKey(offline.account_id));
-        }
-        patch.username = username.trim();
-        patch.launch_auth_mode = 'offline';
-      }
-      await saveConfigPatch(patch);
-      if (profileSeedQuery) {
-        try {
-          await api('POST', `/skins/from-profile?${profileSeedQuery.toString()}`, { mark_current: true });
-        } catch (err: unknown) {
-          console.warn('Could not seed profile skin after onboarding Microsoft sign-in.', err);
-        }
-      }
-      refreshAccountSkin();
-      let completionError: unknown;
-      try {
-        const error = dtoError(
-          await api('POST', '/onboarding/complete', { expected_revision: config.value?.revision }),
-        );
-        if (error) throw new Error(error);
-      } catch (err) {
-        completionError = err;
-      }
-      config.value = configResponse(await api('GET', '/config'));
-      if (!config.value.onboarding_done) {
-        throw completionError ?? new Error('Onboarding progress was not saved. Try again.');
-      }
-      Music.applyConfig({ music_enabled: musicEnabled, music_volume: 5 });
-      if (musicEnabled) void Music.play();
-      setDissolving(true);
+      await finishOnboarding(choice, preferences);
+      setPhase('leaving');
       window.setTimeout(() => {
         showOnboardingOverlay.value = false;
-      }, 560);
-    } catch (err) {
-      // Earlier commands may have committed even when a later step failed.
-      try {
-        config.value = configResponse(await api('GET', '/config'));
-      } catch {
-        // Keep the last acknowledged config when recovery is unavailable.
-      }
-      toast(`Couldn't finish onboarding: ${errMessage(err)}`, 'error');
-      saveInFlight.current = false;
-      setSaving(false);
+      }, LEAVE_MS);
+    } catch (err: unknown) {
+      setError(errMessage(err));
+      setPhase('editing');
+      finishing.current = false;
     }
   };
 
-  const onCta = (): void => {
-    if (!canAdvance) return;
-    if (isLast) void commit();
-    else advance();
+  // Enter in a field submits the step; focused buttons keep their own Enter.
+  const submit = (event: Event): void => {
+    event.preventDefault();
+    if (!choice) return;
+    if (styling) void finish();
+    else {
+      setStyling(true);
+      Sound.ui('click');
+    }
   };
 
-  // Enter always advances; arrow keys keep native cursor behavior in text fields.
-  useEffect(() => {
-    const h = (e: KeyboardEvent): void => {
-      if (dissolving || saving) return;
-
-      const target = e.target as HTMLElement | null;
-      const inTextField = target != null && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
-
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        onCta();
-      } else if (e.key === 'ArrowRight' && !inTextField) {
-        e.preventDefault();
-        onCta();
-      } else if (e.key === 'ArrowLeft' && !inTextField) {
-        if (idx > 0) {
-          e.preventDefault();
-          jumpTo(idx - 1);
-        }
-      }
-    };
-    window.addEventListener('keydown', h);
-    return () => {
-      window.removeEventListener('keydown', h);
-    };
-  });
-
-  const chosenSkin = DEFAULT_SKINS.find((skin) => skin.id === skinId) ?? DEFAULT_SKINS[0];
-  const signedInProfile = onlineAfterOnboarding ? (activeAccount()?.minecraft_profile ?? authStatus?.minecraft_profile ?? null) : null;
-  const profileSkin = activeMinecraftSkin(signedInProfile ?? undefined);
-  const profileCape = activeMinecraftCape(signedInProfile ?? undefined);
-  const profileSkinSrc = signedInProfile && profileSkin ? minecraftProfileSkinTextureSrc(signedInProfile) : null;
-  const avatar = profileSkinSrc ? (
-    <Avatar
-      src={profileSkinSrc}
-      capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-      variant={profileSkin?.variant === 'slim' ? 'slim' : 'classic'}
-      name={signedInProfile?.name ?? 'Player'}
-      nametag={signedInProfile?.name ?? null}
-      caption="Your Minecraft skin"
-    />
-  ) : (
-    <Avatar
-      src={chosenSkin.src}
-      variant={chosenSkin.variant}
-      name={chosenSkin.name}
-      nametag={username.trim() || null}
-      caption={`${chosenSkin.name}, a default look`}
-    />
-  );
-
-  let headline = '';
-  let subline: JSX.Element | null = null;
-  let widget: JSX.Element;
-
-  if (stage === 'name') {
-    const authSignedIn = Boolean(authStatus?.msa_authenticated || onlineAfterOnboarding);
-    const authUnavailable = authState === 'unavailable' || !microsoftSignInAvailable;
-    const authDisabled = saving || microsoftLogin.busy || authState === 'loading' || authUnavailable || authSignedIn;
-    const authStateText = authSignedIn
-      ? 'Signed in'
-      : microsoftLogin.busy
-        ? 'Waiting for browser'
-        : authState === 'loading'
-          ? 'Checking'
-          : authUnavailable
-            ? 'Unavailable'
-            : null;
-    const authProfileName = authStatus?.minecraft_profile?.name ?? authStatus?.username ?? '';
-    const authLabel =
-      authSignedIn && authProfileName ? `Welcome back, ${authProfileName}` : 'Sign in with Microsoft';
-    headline = "Who's playing?";
-    subline = (
-      <p class="cp-ob-subline">
-        {authSignedIn ? 'Your Minecraft profile and skin are ready.' : 'Sign in to bring your Minecraft profile and skin.'}
-      </p>
-    );
-    widget = (
-      <div class="cp-ob-widget cp-ob-namefield">
-        <button
-          class="cp-ob-msa"
-          data-state={
-            authSignedIn ? 'signed-in' : authUnavailable ? 'unavailable' : microsoftLogin.busy ? 'pending' : 'ready'
-          }
-          disabled={authDisabled}
-          type="button"
-          title={
-            authUnavailable
-              ? (authStatus?.login_reason ?? 'Microsoft sign-in is unavailable.')
-              : 'Sign in with Microsoft'
-          }
-          onClick={() => void microsoftLogin.startLogin()}
-        >
-          <MicrosoftMark class="cp-ob-msa-mark" />
-          <span class="cp-ob-msa-label">{authLabel}</span>
-          {authStateText && <span class="cp-ob-msa-state">{authStateText}</span>}
-        </button>
-        {microsoftLogin.message && (
-          <div class="cp-ob-auth-message" data-tone={microsoftLogin.message.tone}>
-            {microsoftLogin.message.text}
-          </div>
-        )}
-        {!authSignedIn && (
-          <>
-            <div class="cp-ob-offline">
-            <p class="cp-ob-subline">No account? Pick a name to play offline.</p>
-            <Input
-              value={username}
-              onChange={(v) => setUsername(clampPlayerNameInput(v))}
-              placeholder="Pick a player name"
-              autoFocus
-              onFocus={() => setNameFocused(true)}
-              onBlur={() => setNameFocused(false)}
-            />
-            <div class="cp-ob-feedback" data-state={showNameError ? 'error' : nameValid ? 'hint' : 'idle'}>
-              {showNameError ? (
-                <span class="cp-ob-feedback-error">{nameError}</span>
-              ) : nameValid ? (
-                <span class="cp-ob-feedback-hint">
-                  Press <kbd>Enter</kbd>
-                  {!nameFocused && (
-                    <>
-                      {' '}
-                      or <kbd>→</kbd>
-                    </>
-                  )}{' '}
-                  to continue
-                </span>
-              ) : null}
-            </div>
-            <span class="cp-ob-looks-label">Your look in Axial</span>
-            <div class="cp-ob-looks" role="radiogroup" aria-label="Your look in Axial">
-              {DEFAULT_SKINS.map((skin) => (
-                <button
-                  key={skin.id}
-                  type="button"
-                  role="radio"
-                  class="cp-ob-look"
-                  aria-checked={chosenSkin.id === skin.id}
-                  title={skin.name}
-                  onClick={() => {
-                    setSkinId(skin.id);
-                    Sound.ui('soft');
-                  }}
-                >
-                  <PlayerHeadPreview textureSrc={skin.src} size={40} radius={8} ariaLabel={skin.name} />
-                </button>
-              ))}
-            </div>
-            </div>
-          </>
-        )}
-      </div>
-    );
-  } else {
-    headline = 'Make it yours.';
-    subline = <p class="cp-ob-subline">Pick a color for the launcher, then choose what runs in the background.</p>;
-    const preferences: {
-      key: string;
-      icon: IconName;
-      label: string;
-      detail: string;
-      on: boolean;
-      set: (on: boolean) => void;
-    }[] = [
-      {
-        key: 'music',
-        icon: 'music',
-        label: 'Ambient music',
-        detail: 'Pauses itself when the game starts.',
-        on: musicEnabled,
-        set: setMusicEnabled,
-      },
-      {
-        key: 'discord',
-        icon: 'activity',
-        label: 'Discord activity',
-        detail: 'Shows that you are playing, without instance or server names.',
-        on: discordRpcEnabled,
-        set: setDiscordRpcEnabled,
-      },
-      {
-        key: 'telemetry',
-        icon: 'shield-person',
-        label: 'Anonymous usage stats',
-        detail: 'Feature use and launch success. Never your name, files or servers.',
-        on: telemetryEnabled,
-        set: setTelemetryEnabled,
-      },
-    ];
-    widget = (
-      <div class="cp-ob-widget">
-        <AccentField showPresets={false} />
-        <ul class="cp-ob-prefs">
-          {preferences.map((preference) => (
-            <li key={preference.key} class="cp-ob-pref">
-              <Icon name={preference.icon} size={16} />
-              <div class="cp-ob-pref-text">
-                <span class="cp-ob-pref-label">{preference.label}</span>
-                <span class="cp-ob-pref-detail">{preference.detail}</span>
-              </div>
-              <Toggle
-                on={preference.on}
-                ariaLabel={preference.label}
-                disabled={saving}
-                onChange={() => {
-                  preference.set(!preference.on);
-                  Sound.ui(preference.on ? 'soft' : 'affirm');
-                }}
-              />
-            </li>
-          ))}
-        </ul>
-      </div>
-    );
-  }
-
   return (
-    <div class={`cp-ob-root${dissolving ? ' is-dissolving' : ''}`}>
-      <div class="cp-ob-topstrip cp-drag">
+    <div class="cp-ob" data-phase={phase}>
+      <div class="cp-ob-chrome cp-drag">
         <WindowControls />
       </div>
-
-      <div class="cp-ob-statusbar">
-        <Stepper current={idx} maxReached={maxReached} order={ORDER} onJump={jumpTo} />
-      </div>
-
-      <main class="cp-ob-main">
-        {avatar}
-        <div class="cp-ob-column">
-          <div class="cp-ob-stage" key={stage}>
-            <h1 class="cp-ob-headline">
-              <Words text={headline} />
-            </h1>
-            {subline}
-            {widget}
-          </div>
-        </div>
-      </main>
-
-      <footer class="cp-ob-bottom">
-        <div class="cp-ob-nav" role="group" aria-label="Step navigation">
-          <button
-            type="button"
-            class="cp-ob-navbtn"
-            onClick={() => jumpTo(idx - 1)}
-            disabled={idx === 0 || saving}
-            aria-label="Previous step (Left arrow)"
-            title="Previous  ←"
-          >
-            <Icon name="chevron-left" size={18} stroke={2.2} />
-          </button>
-          <button
-            type="button"
-            class="cp-ob-navbtn"
-            onClick={onCta}
-            disabled={!canAdvance}
-            data-finish={isLast}
-            aria-label={isLast ? 'Finish (Enter)' : 'Next step (Right arrow)'}
-            title={isLast ? (saving ? 'Starting…' : 'Finish  ↵') : 'Next  →'}
-          >
-            {isLast ? (
-              <>
-                <span>{saving ? 'Starting…' : 'Start playing'}</span>
-                <Icon name="arrow-right" size={16} stroke={2.2} />
-              </>
-            ) : (
-              <Icon name="chevron-right" size={18} stroke={2.2} />
-            )}
-          </button>
-        </div>
-        <div class="cp-ob-footnote">You can change any of this later in Settings.</div>
-      </footer>
+      <Stage player={identity.player} />
+      <form class="cp-ob-pane" onSubmit={submit}>
+        {styling && choice ? (
+          <Style
+            player={identity.player}
+            preferences={preferences}
+            onChange={setPreferences}
+            onBack={() => setStyling(false)}
+            saving={phase !== 'editing'}
+            error={error}
+          />
+        ) : (
+          <Identity identity={identity} />
+        )}
+      </form>
     </div>
   );
 }

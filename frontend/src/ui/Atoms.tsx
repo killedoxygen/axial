@@ -20,6 +20,7 @@ export function Button({
   buttonRef,
   sound,
   pressed,
+  type = 'button',
 }: {
   children?: ComponentChildren;
   variant?: BtnVariant;
@@ -34,11 +35,13 @@ export function Button({
   buttonRef?: { current: HTMLButtonElement | null };
   sound?: SoundKind | false;
   pressed?: boolean;
+  type?: 'button' | 'submit';
 }): JSX.Element {
   const cls = `cp-btn cp-btn--${size} cp-btn--${variant}${full ? ' cp-btn--full' : ''}`;
   return (
     <button
       ref={buttonRef}
+      type={type}
       class={cls}
       onClick={disabled ? undefined : onClick}
       disabled={disabled}

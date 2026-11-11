@@ -14,7 +14,6 @@ import { installItemFromQueuedViewModel, installQueueRequestFromItem } from '../
 import { mockApi } from '../src/mock/api';
 import { updateFlowFromResponse, updateInfoResponse } from '../src/updater';
 import { createBackendViewResponse } from '../src/views/create/CreateView';
-import { authStatusResponse, launcherAccountsResponse, savedSkinsResponse } from '../src/views/accounts/api';
 
 test('content plans accept omitted empty dependencies from the live Rust response', () => {
   // Captured from /content/plan for Sodium on Fabric 1.20.1.
@@ -108,98 +107,6 @@ test('content compatibility maps the Rust empty Vanilla key without accepting ma
   }
 });
 
-test('account DTOs share readiness validation while retaining their distinct fields', () => {
-  const action = { state_id: 'sign_in', label: 'Sign in', enabled: true };
-  const readiness = {
-    msa_authenticated: false,
-    msa_refresh_available: false,
-    minecraft_profile_ready: false,
-    minecraft_ownership_verified: false,
-    online_action: action,
-    refresh_action: action,
-    profile_sync_action: action,
-  };
-  const account = (changes: Record<string, unknown>) =>
-    launcherAccountsResponse({
-      revision: 1,
-      selection_revision: 1,
-      launch_auth_mode: 'online',
-      active_account_id: 'account-1',
-      accounts: [
-        {
-          account_id: 'account-1',
-          account_revision: 1,
-          profile_revision: 1,
-          credential_revision: 0,
-          kind: 'microsoft',
-          display_name: 'Player',
-          active: true,
-          view_model: { detail: 'Sign in again' },
-          ...readiness,
-          ...changes,
-        },
-      ],
-    });
-  const status = (changes: Record<string, unknown>) =>
-    authStatusResponse({
-      selection_revision: 1,
-      launch_auth_mode: 'online',
-      mode: 'online',
-      username: 'Player',
-      uuid: 'profile-1',
-      provider: 'microsoft',
-      verified: false,
-      skin_source: 'default',
-      login_available: true,
-      login_reason: '',
-      skin_action: action,
-      ...readiness,
-      ...changes,
-    });
-  for (const expiry of [undefined, null, 0, 3600]) {
-    const changes = { msa_token_expires_in: expiry, minecraft_token_expires_in: expiry };
-    for (const parsed of [account(changes)?.accounts[0], status(changes)]) {
-      assert.ok(parsed);
-      assert.equal(parsed.msa_authenticated, false);
-      assert.equal(parsed.msa_refresh_available, false);
-      assert.equal(parsed.msa_token_expires_in, expiry);
-      assert.equal(parsed.minecraft_token_expires_in, expiry);
-      assert.equal(parsed.minecraft_profile_ready, false);
-      for (const field of ['online_action', 'refresh_action', 'profile_sync_action'] as const) {
-        assert.equal(parsed[field]?.state_id, action.state_id);
-        assert.equal(parsed[field]?.enabled, true);
-      }
-    }
-  }
-  const profile = { id: 'profile-1', name: 'Player', skins: [], capes: [] };
-  const withProfile = { minecraft_profile_ready: true, minecraft_profile: profile };
-  assert.deepEqual(account(withProfile)?.accounts[0]?.minecraft_profile, profile);
-  assert.deepEqual(status(withProfile)?.minecraft_profile, profile);
-  for (const changes of [
-    { msa_authenticated: 'yes' },
-    { msa_refresh_available: null },
-    { msa_token_expires_in: Infinity },
-    { minecraft_token_expires_in: 'soon' },
-    { minecraft_profile_ready: true },
-    { minecraft_profile: profile },
-    { minecraft_ownership_verified: undefined },
-    { online_action: undefined },
-    { refresh_action: { ...action, disabled_reason: null } },
-    { profile_sync_action: { ...action, enabled: 1 } },
-  ]) {
-    assert.equal(account(changes), null);
-    assert.equal(status(changes), null);
-  }
-  assert.equal(account({ account_revision: -1 }), null);
-  assert.equal(account({ login_id: null }), null);
-  assert.equal(account({ view_model: {} }), null);
-  assert.ok(account({ skin_action: null }));
-  assert.equal(status({ skin_action: null }), null);
-  assert.equal(status({ msa_provider: null }), null);
-  assert.equal(status({ login_available: undefined }), null);
-  assert.ok(status({ view_model: {} }));
-});
-
 test('dto-validation retained bootstrap, update, content, and create DTOs reject malformed payloads', async () => {
   const config = dtoRecord(await mockApi('GET', '/config'), 'Config fixture');
   assert.equal(configResponse(config).username, 'MockPlayer');
@@ -239,9 +146,6 @@ test('dto-validation retained bootstrap, update, content, and create DTOs reject
     () => instancesResponse({ ...instanceList, instances: [{ ...firstInstance, version_display: undefined }] }),
     /Instance version display response was invalid/,
   );
-
-  assert.equal(launcherAccountsResponse({ active_account_id: null, accounts: [null] }), null);
-  assert.equal(savedSkinsResponse({ pending_apply_texture_key: null, skins: [null] }), null);
 });
 
 test('dto-validation content queue DTO retains the exact strict retry request', () => {

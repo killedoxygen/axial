@@ -89,10 +89,6 @@ export function prepareAutoSaves(phase: 'flush' | 'discard'): { done: Promise<bo
 export function saveConfigPatch(patch: Record<string, unknown>, isCurrent?: () => boolean): Promise<Config> {
   if (!canAutoSave()) return Promise.reject(new Error(pausedMessage));
   const work: Write = { started: false, done: Promise.resolve(true) };
-  const changesIdentity =
-    Object.prototype.hasOwnProperty.call(patch, 'username') ||
-    Object.prototype.hasOwnProperty.call(patch, 'launch_auth_mode');
-  const accountSelectionRevision = changesIdentity ? config.value?.account_selection_revision : undefined;
   const pending = configWrites.then(async () => {
     let current = config.value;
     if (!current) {
@@ -103,13 +99,10 @@ export function saveConfigPatch(patch: Record<string, unknown>, isCurrent?: () =
     const loadedConfig = current;
     return startWrite(work, async () => {
       const latest = config.value ?? loadedConfig;
-      const accountFence = changesIdentity
-        ? { expected_account_selection_revision: accountSelectionRevision ?? latest.account_selection_revision }
-        : {};
       if (isCurrent && !isCurrent()) throw new Error('Settings change was superseded.');
       try {
         const saved = configResponse(
-          await api('PUT', '/config', { ...patch, ...accountFence, expected_revision: latest.revision }),
+          await api('PUT', '/config', { ...patch, expected_revision: latest.revision }),
         );
         setConfig(saved);
         return saved;

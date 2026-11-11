@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { api } from '../../api';
 import {
   applySavedSkin,
   captureWardrobeContext,
@@ -15,7 +14,7 @@ import {
 import { clampPlayerNameInput } from '../../player-name';
 import { toast } from '../../toast';
 import { validateUsername } from '../../utils';
-import { lookupMinecraftSkin, savedSkinApplyErrorMessage, savedSkinRecord, skinActionErrorMessage } from './api';
+import { lookupMinecraftSkin, savedSkinApplyErrorMessage, saveLookupSkin, skinActionErrorMessage } from './api';
 import type { MinecraftSkinLookup, SkinVariant } from './types';
 
 export function useSavedSkinLookupWorkflow() {
@@ -26,7 +25,12 @@ export function useSavedSkinLookupWorkflow() {
   const [lookupVariant, setLookupVariant] = useState<SkinVariant>('classic');
   const lookupRequest = useRef(0);
 
-  useEffect(() => () => { lookupRequest.current += 1; }, []);
+  useEffect(
+    () => () => {
+      lookupRequest.current += 1;
+    },
+    [],
+  );
 
   const lookupBusy = wardrobeOp.value?.kind === 'lookup';
   const trimmedLookupUsername = lookupUsername.trim();
@@ -92,13 +96,8 @@ export function useSavedSkinLookupWorkflow() {
       const capture = captureWardrobeContext();
       setWardrobeNotice(null);
       try {
-        const request: { username: string; variant?: SkinVariant } = {
-          username: lookupProfile.username,
-          variant: lookupVariant,
-        };
-        const payload = await api('POST', '/skins/from-username', request);
-        const saved = savedSkinRecord(payload);
-        if (!saved) throw new Error('Player skin save returned an invalid response.');
+        const { username } = lookupProfile;
+        const saved = await saveLookupSkin(username, lookupVariant);
         if (!isWardrobeContextCurrent(capture)) {
           void refreshWardrobe();
           return;
@@ -115,10 +114,11 @@ export function useSavedSkinLookupWorkflow() {
           }
         } else {
           void refreshWardrobe();
-          toast(`${request.username}'s skin added to your library`);
+          toast(`${username}'s skin added to your library`);
         }
       } catch (err) {
-        if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Could not save player skin.'));
+        if (isWardrobeContextCurrent(capture))
+          setWardrobeNotice(skinActionErrorMessage(err, 'Could not save player skin.'));
       }
     });
   };

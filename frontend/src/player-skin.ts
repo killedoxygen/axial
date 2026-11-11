@@ -4,7 +4,7 @@ import { DEFAULT_SKINS } from './default-skins';
 import { accountsSnapshot, activeAccount } from './machines/accounts-state';
 import { local, saveLocalState, canEditPreferences } from './state';
 import { config } from './store';
-import type { MinecraftProfile } from './views/accounts/types';
+import type { LauncherAccount, MinecraftCape } from './views/accounts/types';
 
 export const accountSkinSrc = signal<string | null>(null);
 export const accountDisplayName = signal('Player');
@@ -41,15 +41,18 @@ export function selectedSkinTextureSrc(value = selectedSkinForAccount()): string
   return null;
 }
 
-export function minecraftProfileSkinTextureSrc(profile: MinecraftProfile | undefined | null): string | null {
-  const id = profile?.id.trim() ?? '';
-  const skin = activeMinecraftSkin(profile);
-  if (!id || !skin) return null;
-
-  const params = new URLSearchParams({ profile: id });
-  if (skin.id) params.set('skin', skin.id);
-  if (skin.url) params.set('texture', skin.url);
+/** The texture of the skin a Microsoft account's Minecraft profile wears. */
+export function profileSkinTextureSrc(account: LauncherAccount): string | null {
+  const profile = account.minecraft_profile;
+  const skin = account.profile_skin;
+  if (!profile || !skin) return null;
+  const params = new URLSearchParams({ profile: profile.id, skin: skin.id, texture: skin.url });
   return apiResourceUrl(`/skin/profile/file?${params.toString()}`);
+}
+
+/** The cape a Microsoft account's Minecraft profile wears. */
+export function profileCape(account: LauncherAccount | null | undefined): MinecraftCape | null {
+  return account?.minecraft_profile?.capes.find((cape) => cape.id === account.profile_cape_id) ?? null;
 }
 
 export function setSelectedSkin(value: string, accountKey?: string): void {
@@ -73,33 +76,43 @@ export function resetSelectedSkin(accountKey?: string): void {
   setSelectedSkin(DEFAULT_SELECTED_SKIN, accountKey);
 }
 
+/** Carries an account's chosen skin to the id it has after a rename. */
+export function moveAccountSkin(fromAccountId: string, toAccountId: string): void {
+  const from = launcherSkinAccountKey(fromAccountId);
+  const to = launcherSkinAccountKey(toAccountId);
+  if (from === to || !canEditPreferences()) return;
+  const { [from]: chosen, ...rest } = local.selectedSkinsByAccount;
+  if (chosen === undefined) return;
+  local.selectedSkinsByAccount = { ...rest, [to]: chosen };
+  saveLocalState();
+}
+
+/** Drops the skin chosen for an account that no longer exists. */
+export function forgetAccountSkin(accountId: string): void {
+  const key = launcherSkinAccountKey(accountId);
+  if (!(key in local.selectedSkinsByAccount) || !canEditPreferences()) return;
+  const { [key]: _removed, ...rest } = local.selectedSkinsByAccount;
+  local.selectedSkinsByAccount = rest;
+  saveLocalState();
+}
+
 export function refreshAccountSkin(): void {
   const fallbackName = config.value?.username || 'Player';
   const account = activeAccount(accountsSnapshot.value);
-  if (!account) {
+  const profile = account?.kind === 'microsoft' ? account.minecraft_profile : null;
+  if (!account || (account.kind === 'microsoft' && !profile)) {
     applyNoAccountHead(fallbackName);
     return;
   }
+  accountDisplayName.value = profile?.name.trim() || account.display_name.trim() || fallbackName;
+  accountSkinSrc.value = accountSkinTextureSrc(account);
+}
 
-  const displayName = account.display_name.trim() || fallbackName;
-  if (account.kind === 'microsoft') {
-    const profile = account.minecraft_profile;
-    if (profile) {
-      accountDisplayName.value = profile.name.trim() || displayName;
-      accountSkinSrc.value = minecraftProfileSkinTextureSrc(profile);
-      return;
-    }
-  }
-
-  if (account.kind === 'offline') {
-    accountDisplayName.value = displayName;
-    accountSkinSrc.value = selectedSkinTextureSrc(
-      selectedSkinForAccount(launcherSkinAccountKey(account.account_id)),
-    );
-    return;
-  }
-
-  applyNoAccountHead(fallbackName);
+/** The skin texture an account shows: its Minecraft profile skin, or the look chosen for it in Axial. */
+export function accountSkinTextureSrc(account: LauncherAccount): string | null {
+  return account.kind === 'microsoft'
+    ? profileSkinTextureSrc(account)
+    : selectedSkinTextureSrc(selectedSkinForAccount(launcherSkinAccountKey(account.account_id)));
 }
 
 function applyNoAccountHead(displayName = 'Player'): void {
@@ -110,10 +123,4 @@ function applyNoAccountHead(displayName = 'Player'): void {
 function validSelectedSkin(value: string | undefined): string {
   const selected = value?.trim();
   return selected || DEFAULT_SELECTED_SKIN;
-}
-
-function activeMinecraftSkin(profile: MinecraftProfile | undefined | null): { id: string; url: string } | null {
-  const selected = profile?.skins.find((skin) => skin.state.toLowerCase() === 'active') ?? profile?.skins[0];
-  if (!selected) return null;
-  return { id: selected.id, url: selected.url };
 }

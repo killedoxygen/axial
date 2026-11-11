@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { Icon, type IconName } from './Icons';
 import { toasts } from '../store';
+import { showOnboardingOverlay } from '../ui-state';
 import { dismissToast } from '../toast';
 import type { ToastKind } from '../types-ui';
 
@@ -11,6 +12,8 @@ const ICON_FOR: Record<ToastKind, IconName> = {
 };
 
 export function ToastHost(): JSX.Element | null {
+  // Onboarding reports its own errors inline; background notices would only cover it.
+  if (showOnboardingOverlay.value) return null;
   const list = toasts.value;
   return (
     <div class="cp-toasts" role="region" aria-live="polite" aria-label="Notifications">

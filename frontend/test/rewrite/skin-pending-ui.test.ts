@@ -71,28 +71,36 @@ function pending(overrides: Partial<PendingSkinStatus> = {}): PendingSkinStatus 
     generation: 1,
     phase: 'queued',
     texture_key: skin.texture_key,
+    due_in_ms: 10_000,
     error: null,
     ...overrides,
   };
 }
 
 function context(accountId = accountA, selectionRevision: number | null = 7): WardrobeContext {
-  return { accountKey: `account:${accountId}`, selectionRevision, skinActionsEnabled: true, profile: null };
+  return { accountKey: `account:${accountId}`, selectionRevision, skinActionsEnabled: true, account: null };
 }
 
 function profileContext(selectionRevision = 7): WardrobeContext {
   return {
     ...context(accountA, selectionRevision),
-    profile: {
-      id: accountA,
-      name: 'Player',
-      skins: [{ id: 'profile-skin', state: 'ACTIVE', variant: 'CLASSIC', url: 'https://textures.minecraft.net/texture/abc' }],
-      capes: [{ id: 'profile-cape', state: 'ACTIVE', url: 'https://textures.minecraft.net/texture/def' }],
-    },
+    account: {
+      account_id: accountA,
+      display_name: 'Player',
+      profile_skin: { id: 'profile-skin', variant: 'classic', url: 'https://textures.minecraft.net/texture/abc' },
+      profile_cape_id: 'profile-cape',
+      minecraft_profile: {
+        id: accountA,
+        name: 'Player',
+        skins: [],
+        capes: [{ id: 'profile-cape', state: 'ACTIVE', url: 'https://textures.minecraft.net/texture/def' }],
+      },
+    } as unknown as WardrobeContext['account'],
   };
 }
 
 type ViewNode = { type: unknown; props: Record<string, unknown> };
+
 function nodes(tree: unknown): ViewNode[] {
   if (Array.isArray(tree)) return tree.flatMap(nodes);
   if (!tree || typeof tree !== 'object' || !('props' in tree)) return [];
@@ -118,8 +126,7 @@ function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin)
       calls.push([method, path]);
       const url = new URL(path, 'http://skin-fixture.invalid');
       if (method === 'GET' && url.pathname === '/skins')
-        return skinsRead ? skinsRead() : { skins: [skin], pending_apply_texture_key: status?.texture_key ?? null };
-      if (method === 'GET' && url.pathname === '/skins/pending') return statusRead ? statusRead() : status;
+        return skinsRead ? skinsRead() : { skins: [skin], pending: statusRead ? await statusRead() : status };
       if (method === 'POST' && url.pathname === '/skins/from-profile') {
         profileSaves.push({ path, body: JSON.stringify(body) });
         return skin;
@@ -213,6 +220,7 @@ function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin)
       '../../api': transport,
       '../../default-skins': defaults,
       '../../machines/skin-wardrobe': machine,
+      '../../player-skin': { profileCape: () => null },
       '../../state': { local: { hideSkinNametag: false } },
       './api': api,
       './types': { NO_CAPE_VALUE: '__none' },
@@ -490,27 +498,14 @@ test('late cancellation from the previous account cannot cancel the new account 
   assert.deepEqual(h.notices, []);
 });
 
-test('malformed or unavailable pending status remains visibly unavailable', async () => {
+test('an unreadable wardrobe remains visibly unavailable', async () => {
   const h = harness();
-  assert.equal(h.api.pendingSkinStatus(null), null);
-  for (const bad of [
-    undefined,
-    {},
-    pending({ phase: 'success' }),
-    pending({ generation: -1 }),
-    pending({ generation: Number.MAX_SAFE_INTEGER + 1 }),
-    pending({ texture_key: null }),
-    pending({ phase: 'failed', texture_key: null }),
-    { ...pending(), error: undefined },
-  ]) {
-    assert.equal(h.api.pendingSkinStatus(bad), undefined);
-  }
-  h.setStatusRead(async () => ({ phase: 'done' }));
+  h.setSkinsRead(async () => ({ error: 'Saved skins are locked.' }));
   h.machine.setWardrobeContext(context());
   await settle();
   assert.equal(h.machine.wardrobeData.value.state, 'unavailable');
-  assert.deepEqual(inlineErrors(h), ['Skin change status returned an invalid response.']);
-  h.setStatusRead(async () => {
+  assert.deepEqual(inlineErrors(h), ['Saved skins returned an invalid response.']);
+  h.setSkinsRead(async () => {
     throw new Error('Skin status could not be read.');
   });
   await h.machine.refreshWardrobe();
@@ -646,7 +641,7 @@ test('automatic seeding and manual profile save serialize the displayed account 
     assert.equal(url.pathname, '/skins/from-profile', label);
     assert.equal(url.searchParams.get('expected_account_id'), accountA, label);
     assert.equal(url.searchParams.get('expected_selection_revision'), '7', label);
-    assert.deepEqual(JSON.parse(body), { variant: 'classic', mark_current: true }, label);
+    assert.deepEqual(JSON.parse(body), { mark_current: true }, label);
   };
   assertSaved('automatic');
   h.profileSaves.length = 0;
@@ -658,34 +653,15 @@ for (const missingTarget of [false, true]) {
   test(`onboarding profile seed ${missingTarget ? 'skips a missing target and completes' : 'keeps its pre-save selection while config is pending'}`, async () => {
     const savedConfig = deferred<void>();
     const calls: { method: string; path: string; body: string }[] = [];
-    const notices: string[] = [];
     const accountsSnapshot = { value: {
       state: 'ready',
       accounts: missingTarget ? [] : [{ account_id: accountA, kind: 'microsoft', active: true }],
       selection_revision: missingTarget ? null : Number.MAX_SAFE_INTEGER,
-      status: { online_action: { state_id: 'online_ready' } },
     } };
-    const config = { value: { revision: 7, telemetry_enabled: false, discord_rpc_enabled: false, onboarding_done: false } };
-    const showOnboardingOverlay = { value: true };
-    let stateIndex = 0;
-    const initialStates: unknown[] = ['style', 1, 'Player', false];
-    const { Onboarding } = source<typeof import('../../src/views/onboarding/Onboarding')>(
-      'views/onboarding/Onboarding.tsx',
+    const config = { value: { revision: 7, onboarding_done: false } };
+    const { finishOnboarding } = source<typeof import('../../src/views/onboarding/finish')>(
+      'views/onboarding/finish.ts',
       {
-        'preact/hooks': {
-          useState: <V>(value: V) => [stateIndex < initialStates.length ? initialStates[stateIndex++] : value, () => {}],
-          useRef: <V>(value: V) => ({ current: value }),
-          useEffect() {},
-        },
-        'preact/jsx-runtime': {
-          jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
-          jsxs: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
-        },
-        '../../ui/Atoms': { Input: 'Input', Toggle: 'Toggle' },
-        '../../ui/Icons': { Icon: 'Icon' }, '../../ui/MicrosoftMark': { MicrosoftMark: 'MicrosoftMark' },
-        '../settings/AccentEditor': { AccentField: 'AccentField', AccentModeToggle: 'AccentModeToggle' }, '../../shell/WindowControls': { WindowControls: 'WindowControls' },
-        '../../state': { local: { lightness: 50 } },
-        '../../music': { Music: { applyConfig() {} } }, '../../sound': { Sound: { ui() {} } },
         '../../api': { api: async (method: string, path: string, body: unknown) => {
           calls.push({ method, path, body: JSON.stringify(body) });
           if (path.startsWith('/skins/from-profile')) throw new Error('Stale fixture selection');
@@ -693,41 +669,27 @@ for (const missingTarget of [false, true]) {
           if (method === 'GET' && path === '/config') return config.value;
           throw new Error(`Unexpected onboarding request: ${method} ${path}`);
         } },
-        '../../dto-core': { configResponse: (value: unknown) => value },
+        '../../default-skins': { DEFAULT_SKINS: [{ id: 'steve' }] },
         '../../dto-contract': { dtoError: () => null },
-        '../../store': { config, systemInfo: { value: null } },
-        '../../ui-state': { showOnboardingOverlay },
-        '../../toast': { toast: (message: string) => notices.push(message) },
-        '../../player-name': {},
-        '../../player-skin': {
-          refreshAccountSkin() {}, launcherSkinAccountKey: (id: string) => `account:${id}`,
-          minecraftProfileSkinTextureSrc: () => null, setSelectedSkin() {},
-        },
-        '../../default-skins': { DEFAULT_SKINS: [{ id: 'steve', name: 'Steve', variant: 'classic', src: 'steve.png' }] },
-        '../../ui/PlayerHeadPreview': { PlayerHeadPreview: 'PlayerHeadPreview' },
-        '../accounts/api': { activeMinecraftSkin: () => null, activeMinecraftCape: () => null, capeFileUrl: () => '' },
-        '../accounts/LazySkinThreePreview': { LazySkinThreePreview: 'LazySkinThreePreview' },
-        '../../utils': { getMemoryRecommendation: () => ({ rec: 4 }), validateUsername: () => null, errMessage: String },
-        '../../native': { hasNativeDesktopRuntime: () => false },
-        '../accounts/useMicrosoftSignIn': { useMicrosoftSignIn: () => ({ busy: false }) },
+        '../../dto-core': { configResponse: (value: unknown) => value },
         '../../hooks/use-autosave': { saveConfigPatch: () => savedConfig.promise },
-        '../../machines/accounts': {
-          accountsSnapshot,
-          activeAccount: () => accountsSnapshot.value.accounts.find((account) => account.active) ?? null,
-        },
+        '../../machines/accounts': { accountsSnapshot },
+        '../../music': { Music: { applyConfig() {} } },
+        '../../player-skin': { refreshAccountSkin() {} },
+        '../../store': { config, systemInfo: { value: null } },
+        '../../utils': { getMemoryRecommendation: () => ({ rec: 4 }) },
+        '../accounts/api': {},
       },
-      { console: { warn() {} }, window: { setTimeout: (callback: () => void) => callback() } },
+      { console: { warn() {} } },
     );
-    const finish = nodes(Onboarding()).find((node) => node.props['aria-label'] === 'Finish (Enter)');
-    assert.ok(finish);
-    (finish.props.onClick as () => void)();
+    const finished = finishOnboarding({ kind: 'microsoft' }, { music: false, discord: false, telemetry: false });
     assert.equal(calls.length, 0);
     accountsSnapshot.value = {
       ...accountsSnapshot.value,
       accounts: [{ account_id: accountB, kind: 'microsoft', active: true }], selection_revision: 3,
     };
     savedConfig.resolve();
-    await settle();
+    await finished;
     const seeds = calls.filter((call) => call.path.startsWith('/skins/from-profile'));
     assert.equal(seeds.length, missingTarget ? 0 : 1);
     if (!missingTarget) {
@@ -737,8 +699,6 @@ for (const missingTarget of [false, true]) {
       assert.deepEqual(JSON.parse(seeds[0].body), { mark_current: true });
     }
     assert.equal(calls.filter((call) => call.method === 'POST' && call.path === '/onboarding/complete').length, 1);
-    assert.equal(showOnboardingOverlay.value, false);
-    assert.deepEqual(notices, []);
   });
 }
 

@@ -1,690 +1,387 @@
-.cp-ob-root {
+/* Stage on the left, one step on the right. */
+.cp-ob {
   position: fixed;
   inset: 0;
   z-index: 1000;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(340px, 39%) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
   color: var(--text);
   background: var(--bg);
-  animation: cp-ob-root-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation: cp-ob-enter 320ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
 }
 
-/* Keeps the stage centered while short viewports scroll instead of colliding with the nav. */
-.cp-ob-main {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: clamp(16px, 3.5vh, 32px) clamp(20px, 4vw, 40px);
-  min-height: 0;
-  overflow: auto;
-  scrollbar-gutter: stable;
-}
-
-.cp-ob-bottom {
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: clamp(8px, 1.4vh, 14px);
-  padding: 0 clamp(20px, 4vw, 40px) clamp(16px, 2.8vh, 28px);
-}
-
-.cp-ob-nav {
-  display: inline-flex;
-  padding: 4px;
-  gap: 4px;
-  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-}
-
-.cp-ob-navbtn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 36px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text-mute);
-  border-radius: 10px;
-  font: inherit;
-  cursor: not-allowed;
-  transition:
-    background-color 180ms ease,
-    color 180ms ease,
-    transform 140ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.cp-ob-navbtn:not(:disabled) {
-  color: var(--text);
-  cursor: pointer;
-}
-
-.cp-ob-navbtn:not(:disabled):hover {
-  background: var(--surface-3);
-}
-
-.cp-ob-navbtn:not(:disabled):active {
-  transform: scale(0.94);
-}
-
-.cp-ob-navbtn:disabled {
-  opacity: 0.35;
-}
-
-.cp-ob-navbtn:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring-inset);
-}
-
-.cp-ob-navbtn[data-finish='true'] {
-  width: auto;
-  gap: 8px;
-  padding: 0 16px;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.cp-ob-navbtn[data-finish='true']:not(:disabled) {
-  background: var(--accent-fill);
-  color: var(--accent-on);
-}
-
-.cp-ob-navbtn[data-finish='true']:not(:disabled):hover {
-  background: color-mix(in oklab, var(--accent-fill) 88%, var(--text));
-}
-
-@media (max-height: 720px) {
-  .cp-ob-stage {
-    gap: 16px;
-  }
-  .cp-ob-headline {
-    font-size: 30px;
-  }
-  .cp-ob-statusbar {
-    padding: 10px clamp(20px, 4vw, 40px);
-  }
-}
-
-@media (max-height: 600px) {
-  .cp-ob-stage {
-    gap: 12px;
-  }
-  .cp-ob-statusbar {
-    padding: 8px clamp(20px, 4vw, 40px);
-  }
-}
-
-@keyframes cp-ob-root-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-.cp-ob-root.is-dissolving {
-  animation: cp-ob-dissolve 560ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+.cp-ob[data-phase='leaving'] {
+  animation: cp-ob-leave 560ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
   pointer-events: none;
 }
 
-@keyframes cp-ob-dissolve {
+@keyframes cp-ob-enter {
   from {
-    opacity: 1;
-    transform: scale(1);
+    opacity: 0;
   }
+}
+
+@keyframes cp-ob-leave {
   to {
     opacity: 0;
     transform: scale(1.015);
   }
 }
 
-.cp-ob-topstrip {
-  flex-shrink: 0;
-  height: var(--cp-window-onboarding-strip-h, 36px);
-  display: flex;
-  align-items: stretch;
-  justify-content: flex-end;
-  padding-right: 2px;
-}
-
-html[data-desktop-chrome='browser'] .cp-ob-topstrip,
-html[data-desktop-chrome='native-decorated'] .cp-ob-topstrip {
-  display: none;
-}
-
-.cp-ob-column {
-  width: min(580px, 100%);
-  display: flex;
-  flex-direction: column;
-}
-
-/* The fixed-height status bar prevents stage content from shifting between steps. */
-.cp-ob-statusbar {
-  flex-shrink: 0;
-  display: flex;
-  justify-content: center;
-  padding: 14px clamp(20px, 4vw, 40px) 0;
-}
-
-.cp-ob-stepper {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  animation: cp-ob-stepper-in 320ms cubic-bezier(0.2, 0.7, 0.2, 1) 60ms both;
-}
-
-@keyframes cp-ob-stepper-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-.cp-ob-stepper-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-radius: 10px;
-  border: 0;
-  background: transparent;
-  font: inherit;
-  color: var(--text-mute);
-  cursor: default;
-  transition:
-    background-color 200ms ease,
-    color 200ms ease;
-}
-
-button.cp-ob-stepper-item {
-  cursor: pointer;
-}
-
-button.cp-ob-stepper-item:hover {
-  background: var(--surface-2);
-  color: var(--text-dim);
-}
-
-button.cp-ob-stepper-item:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.cp-ob-stepper-item[data-state='past'] {
-  color: var(--text-dim);
-}
-
-.cp-ob-stepper-item[data-state='active'] {
-  color: var(--text);
-  background: var(--accent-softer);
-}
-
-.cp-ob-stepper-num {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0;
-  font-variant-numeric: tabular-nums;
-  opacity: 0.55;
-  transition:
-    color 200ms ease,
-    opacity 200ms ease;
-}
-
-.cp-ob-stepper-item[data-state='past'] .cp-ob-stepper-num {
-  color: var(--accent);
-  opacity: 0.85;
-}
-
-.cp-ob-stepper-item[data-state='active'] .cp-ob-stepper-num {
-  color: var(--accent);
-  opacity: 1;
-}
-
-.cp-ob-stepper-label {
-  font-size: 13px;
-  font-weight: 500;
-  letter-spacing: 0;
-  white-space: nowrap;
-  transition: font-weight 200ms ease;
-}
-
-.cp-ob-stepper-item[data-state='active'] .cp-ob-stepper-label {
-  font-weight: 600;
-}
-
-.cp-ob-stepper-sep {
-  color: var(--text-mute);
-  font-size: 15px;
-  opacity: 0.45;
-  user-select: none;
-  padding: 0 2px;
-}
-
-.cp-ob-stage {
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  animation: cp-ob-stage-in 360ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
-}
-
-@keyframes cp-ob-stage-in {
+@keyframes cp-ob-rise {
   from {
     opacity: 0;
     transform: translateY(10px);
   }
-  to {
-    opacity: 1;
-    transform: none;
-  }
 }
 
-.cp-ob-headline {
-  margin: 0;
-  font-size: 36px;
-  font-weight: 500;
-  letter-spacing: 0;
-  line-height: 1.12;
-  color: var(--text);
-}
-
-.cp-ob-word {
-  display: inline-block;
-  animation: cp-ob-word-rise 420ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
-  animation-delay: calc((var(--i, 0) * 38ms) + 140ms);
-}
-
-@keyframes cp-ob-word-rise {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-.cp-ob-subline {
-  margin: 0;
-  font-size: 14px;
-  color: var(--text-dim);
-  line-height: 1.55;
-  letter-spacing: 0;
-}
-
-.cp-ob-widget {
+.cp-ob-chrome {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 1;
+  height: var(--cp-window-onboarding-strip-h, 36px);
   display: flex;
-  flex-direction: column;
-  gap: 14px;
+  justify-content: flex-end;
+  padding-right: 2px;
 }
 
-.cp-ob-namefield .cp-field {
-  height: 52px;
-  padding: 0 18px;
-  border-radius: var(--r-sm);
-  transition:
-    box-shadow 200ms ease,
-    border-color 200ms ease,
-    background-color 240ms ease;
+html[data-desktop-chrome='browser'] .cp-ob-chrome,
+html[data-desktop-chrome='native-decorated'] .cp-ob-chrome {
+  display: none;
 }
 
-/* This onboarding field uses a neutral focus ring instead of the shared accent ring. */
-.cp-ob-namefield .cp-field:focus-within {
-  border-color: var(--text);
+.cp-ob-stage {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--r-xl);
+  background: color-mix(in oklab, var(--bg) 40%, var(--surface));
+}
+
+.cp-ob-stage .cp-mark {
+  position: absolute;
+  top: 28px;
+  left: 28px;
+}
+
+/* The window buttons sit in this corner on macOS. */
+html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
+  top: 52px;
+}
+
+.cp-ob-stage .cp-skin-three {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  background: transparent;
   box-shadow: none;
 }
 
-.cp-ob-namefield .cp-field input {
+/* The preview draws the unbuilt character in this colour. */
+.cp-ob-stage canvas {
+  color: var(--surface-3);
+}
+
+.cp-ob-stage .cp-skin-three__status {
+  display: none;
+}
+
+.cp-ob-stage .cp-skin-three__overlays {
+  animation: cp-ob-rise 320ms ease 700ms both;
+}
+
+.cp-ob-pane {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 24px;
+}
+
+.cp-ob-dots {
+  display: flex;
+  gap: 6px;
+  margin-top: 18px;
+}
+
+.cp-ob-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  transition:
+    width 240ms ease,
+    background-color 240ms ease;
+}
+
+.cp-ob-dots [data-state='done'] {
+  background: var(--accent);
+}
+
+.cp-ob-dots [data-state='current'] {
+  width: 20px;
+  background: var(--accent);
+}
+
+/* Starts at a fixed height so the headline holds its place from screen to screen. */
+.cp-ob-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  width: min(440px, 100%);
+  min-height: 0;
+  padding-top: clamp(24px, 16vh, 136px);
+  overflow-y: auto;
+  animation: cp-ob-rise 360ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.cp-ob-heading {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.cp-ob-heading h1 {
+  margin: 0;
+  font-size: 40px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.cp-ob-head {
+  display: none;
+  flex-shrink: 0;
+}
+
+.cp-ob-lead {
+  margin: 12px 0 28px;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.cp-ob-note,
+.cp-ob-error {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-mute);
+}
+
+.cp-ob-error {
+  color: var(--err);
+}
+
+.cp-ob-body > .cp-ob-note,
+.cp-ob-body > .cp-ob-error {
+  margin-top: 12px;
+  text-align: center;
+}
+
+.cp-ob-body > .cp-btn--ghost {
+  align-self: center;
+  margin-top: 20px;
+}
+
+.cp-ob-msa {
+  height: 52px;
+  font-size: 15px;
+}
+
+.cp-ob-msa-mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-xs);
+  background: #fff;
+}
+
+.cp-ob-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0;
+  padding: 14px 16px;
+  list-style: none;
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.cp-ob-card-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.cp-ob-card-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.cp-ob-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cp-ob-spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid var(--surface-3);
+  border-top-color: var(--accent);
+  animation: cp-spin 800ms linear infinite;
+}
+
+.cp-ob-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cp-ob-label {
+  padding: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.cp-ob-field .cp-field {
+  height: 48px;
+  padding: 0 16px;
+}
+
+.cp-ob-field .cp-field input {
   font-size: 16px;
   font-weight: 500;
 }
 
-/* The reserved row keeps the input from jumping between hint and error states. */
-.cp-ob-feedback {
-  display: flex;
-  align-items: center;
-  min-height: 20px;
-  margin-bottom: -6px;
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1;
-  transition: color 160ms ease;
-}
-
-.cp-ob-feedback-error {
-  color: var(--err);
-  animation: cp-ob-feedback-in 180ms ease both;
-}
-
-.cp-ob-feedback-hint {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-mute);
-  animation: cp-ob-feedback-in 220ms ease both;
-}
-
-@keyframes cp-ob-feedback-in {
-  from {
-    opacity: 0;
-    transform: translateY(-2px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-.cp-ob-feedback kbd {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 22px;
-  height: 20px;
-  padding: 0 6px;
-  border-radius: 5px;
-  background: var(--surface-3);
-  color: var(--text-dim);
-  font-family: inherit;
-  font-weight: 600;
-  font-size: 11px;
-  line-height: 1;
-  border: 1px solid transparent;
-}
-
-.cp-ob-msa {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  height: 48px;
-  padding: 0 16px;
-  border: 1px solid transparent;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background-color 180ms ease,
-    border-color 180ms ease,
-    color 180ms ease;
-}
-
-.cp-ob-msa:not(:disabled):hover {
-  background: var(--surface-3);
-  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
-  color: var(--text);
-}
-
-.cp-ob-msa:disabled {
-  opacity: 0.62;
-  cursor: not-allowed;
-}
-
-.cp-ob-msa[data-state='signed-in'] {
-  border-color: color-mix(in srgb, var(--ok) 28%, transparent);
-  color: var(--text);
-}
-
-.cp-ob-msa-mark {
-  flex-shrink: 0;
-  display: block;
-  border-radius: 2px;
-}
-
-.cp-ob-msa-label {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cp-ob-msa-state {
-  flex-shrink: 0;
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  color: var(--text-mute);
-}
-
-.cp-ob-auth-message {
-  display: flex;
-  gap: 10px;
-  color: var(--text-mute);
-  font-size: 11px;
-  line-height: 1.35;
-}
-
-.cp-ob-auth-message[data-tone='ok'] {
-  color: var(--ok);
-}
-.cp-ob-auth-message[data-tone='err'] {
-  color: var(--err);
-}
-
-.cp-ob-prefs {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin: 4px 0 0;
-  padding: 8px 4px;
-  list-style: none;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-}
-
-.cp-ob-pref {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  color: var(--text-dim);
-}
-
-.cp-ob-pref-text {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.cp-ob-pref-label {
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.cp-ob-pref-detail {
-  color: var(--text-mute);
-  font-size: 12px;
-}
-
-.cp-ob-footnote {
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0;
-  color: var(--text-mute);
-  pointer-events: none;
-  text-align: center;
-  max-width: 420px;
-  animation: cp-ob-footnote-in 360ms cubic-bezier(0.2, 0.7, 0.2, 1) 280ms both;
-}
-
-@keyframes cp-ob-footnote-in {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 0.85;
-    transform: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .cp-ob-root,
-  .cp-ob-root *,
-  .cp-ob-root *::before,
-  .cp-ob-root *::after {
-    animation: none !important;
-    transition:
-      opacity 120ms linear,
-      background-color 160ms linear,
-      color 160ms linear !important;
-  }
-  .cp-ob-word {
-    opacity: 1 !important;
-    transform: none !important;
-  }
-}
-
-/* Character column: the player's skin stays beside every step. */
-.cp-ob-main {
-  gap: clamp(24px, 5vw, 72px);
-}
-
-.cp-ob-avatar {
-  position: relative;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  width: clamp(260px, 30vw, 360px);
-  height: min(520px, 70vh);
-  animation: cp-ob-stage-in 480ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
-}
-
-.cp-ob-avatar-figure {
-  position: relative;
-  flex: 1;
-  width: 100%;
-  min-height: 0;
-  animation: cp-ob-avatar-swap 420ms cubic-bezier(0.34, 1.4, 0.64, 1) both;
-}
-
-@keyframes cp-ob-avatar-swap {
-  from {
-    opacity: 0;
-    transform: translateY(8px) scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-@media (max-width: 900px) {
-  .cp-ob-avatar {
-    display: none;
-  }
-}
-
-.cp-ob-msa[data-state='ready'] {
-  background: color-mix(in oklab, var(--accent) 12%, var(--surface-2));
-  border-color: color-mix(in oklab, var(--accent) 34%, transparent);
-  color: var(--text);
-}
-
-.cp-ob-msa[data-state='ready']:hover {
-  background: color-mix(in oklab, var(--accent) 18%, var(--surface-2));
-}
-
-.cp-ob-namefield {
-  gap: 28px;
-}
-
-.cp-ob-offline {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.cp-ob-offline .cp-ob-feedback {
-  margin: 0;
-}
-
-.cp-ob-looks-label {
-  margin-top: 8px;
-  color: var(--text-dim);
-  font-size: 14px;
-}
-
-.cp-ob-avatar-caption {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
+/* Reserved so the looks below do not jump when an error appears. */
+.cp-ob-field .cp-ob-error {
+  min-height: 18px;
 }
 
 .cp-ob-looks {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 5px;
+  margin: 4px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.cp-ob-looks legend {
+  margin-bottom: 10px;
 }
 
 .cp-ob-look {
-  display: inline-flex;
-  padding: 3px;
-  border: 0;
+  position: relative;
+  display: flex;
+  padding: 4px;
   border-radius: 10px;
-  background: var(--surface-2);
+  background: var(--surface);
   cursor: pointer;
-  box-shadow: inset 0 0 0 2px transparent;
   transition:
     box-shadow 160ms ease,
     transform 160ms ease;
+}
+
+.cp-ob-look input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .cp-ob-look:hover {
   transform: translateY(-1px);
 }
 
-.cp-ob-look[aria-checked='true'] {
+.cp-ob-look:has(:checked) {
   box-shadow: inset 0 0 0 2px var(--accent);
 }
 
-.cp-ob-look:focus-visible {
-  outline: none;
+.cp-ob-look:has(:focus-visible) {
   box-shadow: var(--focus-ring);
 }
 
-.cp-ob-avatar-figure .cp-skin-three {
-  width: 100%;
-  height: 100%;
-  background: transparent;
-  border-radius: 0;
-  box-shadow: none;
-  overflow: visible;
+.cp-ob-prefs {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+  margin-top: 16px;
+  padding: 6px 16px;
 }
 
-/* Both steps start at the character's top edge, so the headline does not jump. */
-@media (min-width: 901px) {
-  .cp-ob-column {
-    align-self: stretch;
-    justify-content: center;
+.cp-ob-prefs li {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 0;
+}
+
+.cp-ob-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: min(440px, 100%);
+  min-height: 44px;
+  margin: 16px 0 28px;
+}
+
+.cp-ob-footer > .cp-btn--ghost {
+  margin-left: -22px;
+}
+
+.cp-ob-footer > .cp-ob-error {
+  flex: 1;
+  text-align: right;
+}
+
+.cp-ob-footer > .cp-btn--primary {
+  margin-left: auto;
+}
+
+/* Small windows drop the stage; the player's head joins the headline instead. */
+@media (max-width: 900px), (max-height: 620px) {
+  .cp-ob {
+    grid-template-columns: minmax(0, 1fr);
   }
+
   .cp-ob-stage {
-    min-height: min(520px, 70vh);
-    justify-content: flex-start;
-    padding-top: 40px;
+    display: none;
+  }
+
+  .cp-ob-head {
+    display: block;
+  }
+
+  .cp-ob-body {
+    padding-top: clamp(16px, 8vh, 64px);
+  }
+
+  .cp-ob-heading h1 {
+    font-size: 34px;
+  }
+
+  .cp-ob-lead {
+    margin-bottom: 20px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cp-ob,
+  .cp-ob * {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
   }
 }

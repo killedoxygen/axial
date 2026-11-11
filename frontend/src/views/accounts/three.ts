@@ -13,8 +13,10 @@ export {
   MeshLambertMaterial,
   NearestFilter,
   PerspectiveCamera,
+  Plane,
   PlaneGeometry,
   SRGBColorSpace,
   Scene,
+  Vector3,
   WebGLRenderer,
 } from 'three';

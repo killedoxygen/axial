@@ -1,7 +1,6 @@
 import { signal } from '@preact/signals';
 import { api, apiFetch, apiUrl } from '../api';
 import { DEFAULT_SKINS, type DefaultSkin } from '../default-skins';
-import type { PendingSkinStatus } from '../generated/PendingSkinStatus';
 import {
   FALLBACK_SKIN_ACCOUNT_KEY,
   hasSelectedSkinForAccount,
@@ -14,28 +13,23 @@ import {
 import { toast } from '../toast';
 import { showConfirm } from '../ui/Dialog';
 import {
-  activeMinecraftSkin,
   apiResponseError,
   boundedMessage,
   commandSummary,
   DEFAULT_SKIN_SOURCE,
   defaultSkinFile,
-  defaultSkinTextureKey,
-  defaultSkinTextureKeys,
   downloadBlob,
   exportNativeSavedSkinPng,
   fetchSavedSkinPng,
   isRecord,
-  pendingSkinStatus,
+  pendingSkin,
+  savedSkin,
   savedSkinApplyErrorMessage,
   savedSkinDownloadFilename,
-  savedSkinRecord,
-  savedSkinsResponse,
   skinActionErrorMessage,
-  skinFlushResult,
-  skinVariantValue,
+  wardrobe,
 } from '../views/accounts/api';
-import type { MinecraftProfile, SavedSkinRecord, SkinVariant } from '../views/accounts/types';
+import type { LauncherAccount, PendingSkinStatus, SavedSkinRecord, SkinVariant } from '../views/accounts/types';
 import { refreshAccountsData } from './accounts';
 
 export type WardrobeSelection =
@@ -49,7 +43,8 @@ export interface WardrobeContext {
   accountKey: string;
   selectionRevision: number | null;
   skinActionsEnabled: boolean;
-  profile: MinecraftProfile | null;
+  /** The selected Microsoft account, whose Minecraft profile the wardrobe changes. */
+  account: LauncherAccount | null;
 }
 
 export interface WardrobeCapture {
@@ -83,21 +78,20 @@ export interface WardrobeOp {
   key?: string;
 }
 
-const DEFERRED_APPLY_RECHECK_MS = 11_500;
+/** Time the backend takes to apply a skin once its queue delay has passed. */
+const APPLY_SETTLE_MS = 1_500;
 const DEFERRED_APPLY_READ_RETRIES = 3;
 
 export const wardrobeContext = signal<WardrobeContext>({
   accountKey: 'account:fallback',
   selectionRevision: null,
   skinActionsEnabled: false,
-  profile: null,
+  account: null,
 });
 export const wardrobeData = signal<WardrobeData>({ state: 'loading', skins: [], pendingApply: null, error: null });
 export const wardrobeSelection = signal<WardrobeSelection>({ kind: 'none' });
 export const wardrobeOp = signal<WardrobeOp | null>(null);
 export const wardrobeNotice = signal<string | null>(null);
-export const defaultSkinKeys = signal<ReadonlyMap<string, string>>(new Map());
-export const defaultSkinKeysReady = signal(false);
 
 let wardrobeRequestId = 0;
 let wardrobeContextRevision = 0;
@@ -105,7 +99,6 @@ let deferredApplyTimer: number | null = null;
 let profileSeedRequestId = 0;
 let profileSeedKey: string | null = null;
 const profileSavedKey = signal<string | null>(null);
-let defaultKeysRequested = false;
 
 export function setWardrobeNotice(text: string | null): void {
   wardrobeNotice.value = text;
@@ -145,19 +138,30 @@ function skinCommandQuery(capture: WardrobeCapture, generation?: number): URLSea
 function pendingSkinCommandQuery(capture: WardrobeCapture): URLSearchParams {
   const pending = wardrobeData.value.pendingApply;
   if (
-    !pending ||
-    launcherSkinAccountKey(pending.account_id) !== capture.context.accountKey ||
-    (pending.phase !== 'queued' && pending.phase !== 'applying')
+    !isPendingActive(pending) ||
+    launcherSkinAccountKey(pending.account_id) !== capture.context.accountKey
   ) {
     throw new Error('Refresh the queued skin change before trying again.');
   }
   return skinCommandQuery(capture, pending.generation);
 }
 
-function profileSkinKey(profile: MinecraftProfile | null): string | null {
-  const skin = activeMinecraftSkin(profile ?? undefined);
-  if (!profile || !skin) return null;
-  return JSON.stringify([profile.id, skin.id, skin.url, skinVariantValue(skin.variant)]);
+function profileSkinKey(account: LauncherAccount | null): string | null {
+  const skin = account?.profile_skin;
+  return skin ? JSON.stringify([account.account_id, skin.id, skin.url, skin.variant]) : null;
+}
+
+function isPendingActive(pending: PendingSkinStatus | null): pending is PendingSkinStatus {
+  return pending?.phase === 'queued' || pending?.phase === 'applying';
+}
+
+/** The saved copy of a built-in skin, which keeps the name and source it was saved with. */
+export function savedDefaultSkin(skin: DefaultSkin, skins = wardrobeData.value.skins): SavedSkinRecord | null {
+  return (
+    skins.find(
+      (saved) => saved.source === DEFAULT_SKIN_SOURCE && saved.name === skin.name && saved.variant === skin.variant,
+    ) ?? null
+  );
 }
 
 export function setWardrobeContext(next: WardrobeContext): void {
@@ -166,7 +170,7 @@ export function setWardrobeContext(next: WardrobeContext): void {
   const changed =
     accountChanged ||
     current.skinActionsEnabled !== next.skinActionsEnabled ||
-    profileSkinKey(current.profile) !== profileSkinKey(next.profile);
+    profileSkinKey(current.account) !== profileSkinKey(next.account);
   wardrobeContext.value = next;
   if (changed) wardrobeContextRevision += 1;
   if (accountChanged) {
@@ -189,20 +193,14 @@ async function readWardrobe(readFailures: number): Promise<void> {
   const requestId = ++wardrobeRequestId;
   const capture = captureWardrobeContext();
   try {
-    const [skinsResponse, pendingResponse] = await Promise.all([
-      api('GET', '/skins'),
-      capture.context.accountKey === FALLBACK_SKIN_ACCOUNT_KEY ? Promise.resolve(null) : api('GET', '/skins/pending'),
-    ]);
+    const { skins, pending } = wardrobe(await api('GET', '/skins'));
     if (requestId !== wardrobeRequestId || !isWardrobeContextCurrent(capture)) return;
-    const parsed = savedSkinsResponse(skinsResponse);
-    const pending = pendingSkinStatus(pendingResponse);
-    if (!parsed) throw new Error('invalid saved skins response');
-    if (pending === undefined) throw new Error('Skin change status returned an invalid response.');
+    // The backend answers for the account selected there; a different one means ours is stale.
     if (pending && launcherSkinAccountKey(pending.account_id) !== capture.context.accountKey) {
       void refreshAccountsData();
       return;
     }
-    wardrobeData.value = { state: 'ready', skins: parsed.skins, pendingApply: pending, error: null };
+    wardrobeData.value = { state: 'ready', skins, pendingApply: pending, error: null };
     schedulePendingApplyRecheck(pending);
   } catch (err: unknown) {
     if (requestId !== wardrobeRequestId || !isWardrobeContextCurrent(capture)) return;
@@ -221,32 +219,12 @@ async function readWardrobe(readFailures: number): Promise<void> {
   seedProfileSkin();
 }
 
-export function loadDefaultSkinKeys(): void {
-  if (defaultKeysRequested) return;
-  defaultKeysRequested = true;
-  void defaultSkinTextureKeys()
-    .then((keys) => {
-      defaultSkinKeys.value = keys;
-      defaultSkinKeysReady.value = true;
-    })
-    .catch(() => {
-      defaultKeysRequested = false;
-    });
-}
-
-function rememberDefaultSkinKey(id: string, textureKey: string): void {
-  if (defaultSkinKeys.value.get(id) === textureKey) return;
-  const next = new Map(defaultSkinKeys.value);
-  next.set(id, textureKey);
-  defaultSkinKeys.value = next;
-}
-
 function schedulePendingApplyRecheck(pending: PendingSkinStatus | null, readFailures = 0): void {
   if (deferredApplyTimer !== null) {
     window.clearTimeout(deferredApplyTimer);
     deferredApplyTimer = null;
   }
-  if (!pending || (pending.phase !== 'queued' && pending.phase !== 'applying')) return;
+  if (!isPendingActive(pending)) return;
   const capture = captureWardrobeContext();
   deferredApplyTimer = window.setTimeout(() => {
     deferredApplyTimer = null;
@@ -254,19 +232,14 @@ function schedulePendingApplyRecheck(pending: PendingSkinStatus | null, readFail
     void readWardrobe(readFailures).then(() => {
       if (isWardrobeContextCurrent(capture)) void refreshAccountsData();
     });
-  }, DEFERRED_APPLY_RECHECK_MS);
+  }, (pending.due_in_ms ?? 0) + APPLY_SETTLE_MS);
 }
 
-function currentProfileSeedCandidate(): { key: string; accountKey: string; variant: SkinVariant } | null {
-  const { accountKey, skinActionsEnabled, profile } = wardrobeContext.value;
-  const profileSkin = activeMinecraftSkin(profile ?? undefined);
-  if (wardrobeData.value.state !== 'ready' || !skinActionsEnabled || !profile || !profileSkin) return null;
-  const variant = skinVariantValue(profileSkin.variant);
-  return {
-    key: JSON.stringify([accountKey, profile.id, profileSkin.id, profileSkin.url, variant]),
-    accountKey,
-    variant,
-  };
+function currentProfileSeedCandidate(): { key: string; accountKey: string } | null {
+  const { accountKey, skinActionsEnabled, account } = wardrobeContext.value;
+  const key = profileSkinKey(account);
+  if (wardrobeData.value.state !== 'ready' || !skinActionsEnabled || !key) return null;
+  return { key, accountKey };
 }
 
 function invalidateProfileSeed(): void {
@@ -276,10 +249,10 @@ function invalidateProfileSeed(): void {
 }
 
 export function reconcileWardrobeSelection(): void {
-  const { accountKey, skinActionsEnabled, profile } = wardrobeContext.value;
+  const { accountKey, skinActionsEnabled, account } = wardrobeContext.value;
   const data = wardrobeData.value;
   const current = wardrobeSelection.value;
-  const profileSkin = activeMinecraftSkin(profile ?? undefined);
+  const profileSkin = account?.profile_skin;
 
   if (current.kind === 'lookup') return;
   if (current.kind === 'profile' && profileSkin) return;
@@ -394,12 +367,11 @@ export async function applySavedSkin(
   query.set('defer', 'true');
   const response = await api('POST', `/skins/${encodeURIComponent(textureKey)}/apply?${query.toString()}`);
   requireCurrentWardrobeContext(capture);
-  const accepted = pendingSkinStatus(isRecord(response) ? response.pending : undefined);
+  const accepted = pendingSkin(isRecord(response) ? response.pending : undefined);
   if (
-    !accepted ||
+    !isPendingActive(accepted) ||
     launcherSkinAccountKey(accepted.account_id) !== capture.context.accountKey ||
-    accepted.texture_key !== textureKey ||
-    (accepted.phase !== 'queued' && accepted.phase !== 'applying')
+    accepted.texture_key !== textureKey
   ) {
     throw new Error('Skin apply returned an invalid queued change. Refresh the skin library to check its status.');
   }
@@ -419,13 +391,12 @@ export async function flushPendingApply(): Promise<void> {
   const capture = captureWardrobeContext();
   await wardrobeAction({ kind: 'flush' }, 'Could not apply queued skin.', async () => {
     const query = pendingSkinCommandQuery(capture);
-    const result = skinFlushResult(await api('POST', `/skins/flush?${query.toString()}`));
-    if (!result) throw new Error('Skin flush returned an invalid response.');
+    const response = await api('POST', `/skins/flush?${query.toString()}`);
     if (!isWardrobeContextCurrent(capture)) return null;
     await refreshWardrobe();
     void refreshAccountsData();
     refreshAccountSkin();
-    return result.viewModel?.summary ?? 'Skin command accepted.';
+    return commandSummary(response, 'Skin command accepted.');
   });
 }
 
@@ -481,7 +452,8 @@ export async function uploadSkinPng(
   file: File,
   options: {
     name: string;
-    variant: SkinVariant;
+    /** Left out, the backend picks the model the texture suggests. */
+    variant?: SkinVariant;
     capeId?: string | null;
     source?: string;
     applyAfterSave: boolean;
@@ -490,7 +462,8 @@ export async function uploadSkinPng(
   },
 ): Promise<SavedSkinRecord | null> {
   const capture = options.capture ?? captureWardrobeContext();
-  const params = new URLSearchParams({ name: options.name, variant: options.variant });
+  const params = new URLSearchParams({ name: options.name });
+  if (options.variant) params.set('variant', options.variant);
   if (options.capeId) params.set('cape_id', options.capeId);
   if (options.source) params.set('source', options.source);
   const response = await apiFetch(apiUrl(`/skins?${params.toString()}`), {
@@ -500,8 +473,7 @@ export async function uploadSkinPng(
   });
   const payload: unknown = await response.json().catch(() => undefined);
   if (!response.ok) throw apiResponseError(response, payload, `Upload failed with HTTP ${response.status}`);
-  const saved = savedSkinRecord(payload);
-  if (!saved) throw new Error('Skin upload returned an invalid response.');
+  const saved = savedSkin(payload, 'Skin upload');
   if (!isWardrobeContextCurrent(capture)) {
     void refreshWardrobe();
     return saved;
@@ -523,15 +495,13 @@ export async function uploadSkinPng(
 
 export async function saveProfileSkinLocally(): Promise<void> {
   const capture = captureWardrobeContext();
-  const { skinActionsEnabled, profile } = wardrobeContext.value;
-  if (!skinActionsEnabled) return;
-  const profileSkin = activeMinecraftSkin(profile ?? undefined);
+  if (!wardrobeContext.value.skinActionsEnabled) return;
   await wardrobeAction({ kind: 'save-profile' }, 'Could not save Minecraft profile skin.', async () => {
-    const request: { variant?: SkinVariant; mark_current: true } = { mark_current: true };
-    if (profileSkin) request.variant = skinVariantValue(profileSkin.variant);
     const query = skinCommandQuery(capture);
-    const saved = savedSkinRecord(await api('POST', `/skins/from-profile?${query.toString()}`, request));
-    if (!saved) throw new Error('Profile skin save returned an invalid response.');
+    const saved = savedSkin(
+      await api('POST', `/skins/from-profile?${query.toString()}`, { mark_current: true }),
+      'Profile skin save',
+    );
     if (!isWardrobeContextCurrent(capture)) return null;
     profileSavedKey.value = saved.texture_key;
     selectSavedSkin(saved.texture_key);
@@ -542,8 +512,8 @@ export async function saveProfileSkinLocally(): Promise<void> {
 
 export async function resetProfileSkin(): Promise<void> {
   const capture = captureWardrobeContext();
-  const { skinActionsEnabled, profile } = wardrobeContext.value;
-  if (!skinActionsEnabled || !activeMinecraftSkin(profile ?? undefined)) return;
+  const { skinActionsEnabled, account } = wardrobeContext.value;
+  if (!skinActionsEnabled || !account?.profile_skin) return;
   const ok = await showConfirm(
     'Reset the active Minecraft profile skin to the default skin? Axial will save the current profile skin locally first.',
     { title: 'Reset profile skin', destructive: true, confirmText: 'Reset' },
@@ -581,14 +551,14 @@ export async function changeSavedSkinCape(skin: SavedSkinRecord, capeId: string 
   const capture = captureWardrobeContext();
   if ((skin.cape_id ?? null) === capeId) return;
   await wardrobeAction({ kind: 'cape', key: skin.texture_key }, 'Could not update the cape.', async () => {
-    const updated = savedSkinRecord(
+    const updated = savedSkin(
       await api('PUT', `/skins/${encodeURIComponent(skin.texture_key)}`, {
         name: skin.name,
         variant: skin.variant,
         cape_id: capeId,
       }),
+      'Cape update',
     );
-    if (!updated) throw new Error('Cape update returned an invalid response.');
     if (!isWardrobeContextCurrent(capture)) {
       void refreshWardrobe();
       return null;
@@ -607,14 +577,9 @@ export async function applyDefaultSkin(skin: DefaultSkin): Promise<void> {
   const capture = captureWardrobeContext();
   selectDefaultSkin(skin.id);
   await wardrobeAction({ kind: 'apply', key: skin.id }, 'Could not apply skin.', async () => {
-    const knownKey = await defaultSkinTextureKey(skin).catch(() => defaultSkinKeys.value.get(skin.id));
-    requireCurrentWardrobeContext(capture);
-    if (knownKey) rememberDefaultSkinKey(skin.id, knownKey);
-    const existing = knownKey
-      ? (wardrobeData.value.skins.find((saved) => saved.texture_key === knownKey) ?? null)
-      : null;
+    const existing = savedDefaultSkin(skin);
     if (existing) return await applySavedSkin(existing.texture_key, { select: false, capture });
-    const saved = await uploadSkinPng(await defaultSkinFile(skin), {
+    await uploadSkinPng(await defaultSkinFile(skin), {
       name: skin.name,
       variant: skin.variant,
       source: DEFAULT_SKIN_SOURCE,
@@ -622,7 +587,6 @@ export async function applyDefaultSkin(skin: DefaultSkin): Promise<void> {
       select: false,
       capture,
     });
-    if (saved) rememberDefaultSkinKey(skin.id, saved.texture_key);
     return null;
   });
   if (isWardrobeContextCurrent(capture)) selectDefaultSkin(skin.id);
@@ -642,7 +606,7 @@ export function seedProfileSkin(): void {
   const capture = captureWardrobeContext();
   void (async () => {
     const query = skinCommandQuery(capture);
-    return api('POST', `/skins/from-profile?${query.toString()}`, { variant: seed.variant, mark_current: true });
+    return api('POST', `/skins/from-profile?${query.toString()}`, { mark_current: true });
   })()
     .then((payload) => {
       if (
@@ -652,8 +616,7 @@ export function seedProfileSkin(): void {
       ) {
         return;
       }
-      const saved = savedSkinRecord(payload);
-      if (!saved) return;
+      const saved = savedSkin(payload);
       profileSavedKey.value = saved.texture_key;
       if (!hasSelectedSkinForAccount(seed.accountKey)) {
         wardrobeSelection.value = { kind: 'saved', key: saved.texture_key };

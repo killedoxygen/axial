@@ -18,6 +18,8 @@ const OVERLAY_MODEL_GAP_PX = 14;
 const BADGE_HEIGHT_PX = 22;
 const NAMETAG_HEIGHT_PX = 26;
 const OVERLAY_ROW_GAP_PX = 6;
+const ASSEMBLE_MS = 900;
+const ASSEMBLE_MARGIN = 2;
 
 export interface SkinThreeFitPadding {
   top?: number;
@@ -40,11 +42,28 @@ export interface SkinThreePreviewProps {
   showOuterLayers: boolean;
   fitPadding?: SkinThreeFitPadding;
   showHint?: boolean;
+  /**
+   * Staged mode: the model stands as a flat outline, in the canvas's CSS `color`, until this is
+   * true, then assembles from the feet up. A new skin always assembles from the outline.
+   */
+  built?: boolean;
 }
 
 interface SceneHandle {
   renderer: import('three').WebGLRenderer;
+  setBuilt: (built: boolean) => void;
   dispose: () => void;
+}
+
+/** Resolves any CSS colour, including oklch, through a 2D canvas. */
+function cssColor(THREE: ThreeModule, element: Element): import('three').Color {
+  const color = new THREE.Color(0x404040);
+  const ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+  if (!ctx) return color;
+  ctx.fillStyle = getComputedStyle(element).color;
+  ctx.fillRect(0, 0, 1, 1);
+  const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+  return color.setRGB(r / 255, g / 255, b / 255, THREE.SRGBColorSpace);
 }
 
 interface SkinThreeFitMetrics {
@@ -139,7 +158,7 @@ async function setupScene(
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(FIT_FOV_DEGREES, 1, 0.1, 500);
   addSceneLighting(THREE, scene, disposables);
-  addFloorSpotlight(THREE, scene, disposables);
+  const floor = addFloorSpotlight(THREE, scene, disposables);
 
   const group = new THREE.Group();
   group.rotation.y = props.side === 'back' ? Math.PI - 0.22 : 0.22;
@@ -188,7 +207,46 @@ async function setupScene(
     setFitState('fitted');
   }
 
+  // Staged mode splits the model at a rising plane: outline above, skin below.
+  const staged = props.built !== undefined;
+  const outline = new THREE.MeshLambertMaterial({ color: cssColor(THREE, canvas) });
+  disposables.push(() => outline.dispose());
+  const above = [new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)];
+  const below = [new THREE.Plane(new THREE.Vector3(0, -1, 0), 0)];
+  const instant = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let built = false;
+  let assembled = 0;
+  let lastTime = 0;
+  renderer.autoClear = !staged;
+
+  function draw(): void {
+    if (staged) {
+      const eased = 1 - (1 - assembled) ** 3;
+      const span = bounds.halfHeight * 2 + ASSEMBLE_MARGIN * 2;
+      // Whole model units, so the skin lands one pixel row at a time.
+      const height = Math.round(eased * span) - ASSEMBLE_MARGIN;
+      above[0].constant = -height;
+      below[0].constant = height;
+      renderer.clear();
+      if (assembled < 1) {
+        if (floor) floor.visible = false;
+        scene.overrideMaterial = outline;
+        renderer.clippingPlanes = above;
+        renderer.render(scene, camera);
+        scene.overrideMaterial = null;
+        if (floor) floor.visible = true;
+      }
+      renderer.clippingPlanes = below;
+    }
+    renderer.render(scene, camera);
+  }
+
   function render(time = 0): void {
+    if (staged) {
+      const step = instant ? 1 : lastTime ? (time - lastTime) / ASSEMBLE_MS : 0;
+      assembled = THREE.MathUtils.clamp(assembled + (built ? step : -2 * step), 0, 1);
+      lastTime = time;
+    }
     const pulseElapsed = time - clickPulseStart;
     const pulseProgress =
       pulseElapsed >= 0 && pulseElapsed < CLICK_PULSE_DURATION_MS ? pulseElapsed / CLICK_PULSE_DURATION_MS : 1;
@@ -208,7 +266,7 @@ async function setupScene(
     group.rotation.z = pulseWobble * 0.035;
     group.position.x = pulseWobble * 0.22;
     group.scale.set(1 - pulse * 0.012, 1 + pulse * 0.026, 1);
-    renderer.render(scene, camera);
+    draw();
     frame = paused ? 0 : window.requestAnimationFrame(render);
   }
 
@@ -258,7 +316,7 @@ async function setupScene(
     }
     modelRotation = dragStartRotation + (event.clientX - dragStartX) / 90;
     group.rotation.y = modelRotation;
-    renderer.render(scene, camera);
+    draw();
   };
 
   const startClickPulse = (): void => {
@@ -298,6 +356,9 @@ async function setupScene(
 
   return {
     renderer,
+    setBuilt: (next) => {
+      built = next;
+    },
     dispose: () => {
       window.cancelAnimationFrame(frame);
       resizeObserver.disconnect();
@@ -326,12 +387,19 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
   const [capeState, setCapeState] = useState<SkinThreeCapeState>(props.capeSrc ? 'loading' : 'none');
   const [fitState, setFitState] = useState<SkinThreeFitState>('pending');
   const [fitMetrics, setFitMetrics] = useState<SkinThreeFitMetrics>({ overlayTopPx: 10, hintBottomPx: 8 });
+  const handleRef = useRef<SceneHandle | null>(null);
+  const built = props.built === true;
+  const builtRef = useRef(built);
+  builtRef.current = built;
+
+  useEffect(() => {
+    handleRef.current?.setBuilt(built);
+  }, [built]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
     let active = true;
-    let handle: SceneHandle | null = null;
     setReady(false);
     setError(null);
     setInteracting(false);
@@ -362,7 +430,8 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
           nextHandle.dispose();
           return;
         }
-        handle = nextHandle;
+        nextHandle.setBuilt(builtRef.current);
+        handleRef.current = nextHandle;
       })
       .catch((err: unknown) => {
         if (!active) return;
@@ -371,7 +440,8 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
 
     return () => {
       active = false;
-      handle?.dispose();
+      handleRef.current?.dispose();
+      handleRef.current = null;
     };
   }, [props.src, props.capeSrc, props.variant, props.side, props.showOuterLayers]);
 

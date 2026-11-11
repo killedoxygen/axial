@@ -1,6 +1,6 @@
 # Conventions
 
-- Preserve the current UI and all non-Guardian behaviour. UI changes fix a specific, named problem; no redesigns.
+- Preserve all non-Guardian behaviour. Redesign UI only at the owner's request; otherwise UI changes fix a specific, named problem.
 - Product logic lives in feature modules under `core/app`; HTTP adapters in `apps/api`; native-only integration in `apps/desktop`.
 - Prefer plain functions and concrete types. Add an abstraction only for a current repeated need or a real external boundary.
 - Name things by purpose and let the enclosing module supply context.

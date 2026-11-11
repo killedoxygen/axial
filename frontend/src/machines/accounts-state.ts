@@ -1,10 +1,11 @@
 import { signal } from '@preact/signals';
-import type { AuthStatusRecord, AuthStatusState, LauncherAccount } from '../views/accounts/types';
+import type { LauncherAccount } from '../views/accounts/types';
 
 export interface AccountsSnapshot {
-  state: AuthStatusState;
+  state: 'loading' | 'ready' | 'unavailable';
   accounts: LauncherAccount[];
-  status: AuthStatusRecord | null;
+  /** Whether this build can open the Microsoft sign-in window. */
+  signInAvailable: boolean;
   revision: number | null;
   selection_revision: number | null;
 }
@@ -13,7 +14,7 @@ export interface AccountsSnapshot {
 export const accountsSnapshot = signal<AccountsSnapshot>({
   state: 'loading',
   accounts: [],
-  status: null,
+  signInAvailable: false,
   revision: null,
   selection_revision: null,
 });

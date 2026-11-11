@@ -1,3 +1,4 @@
+import { profileCape as accountProfileCape } from '../../player-skin';
 import type { JSX } from 'preact';
 import { apiResourceUrl } from '../../api';
 import type { DefaultSkin } from '../../default-skins';
@@ -19,14 +20,7 @@ import {
 import { Button } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { Icon } from '../../ui/Icons';
-import {
-  activeMinecraftCape,
-  activeMinecraftSkin,
-  capeFileUrl,
-  lookupCapeFileUrl,
-  lookupSkinFileUrl,
-  savedSkinFileUrl,
-} from './api';
+import { capeFileUrl, lookupCapeFileUrl, lookupSkinFileUrl, savedSkinFileUrl } from './api';
 import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
 import type { MinecraftSkinLookup, SavedSkinRecord, SkinVariant } from './types';
 
@@ -81,7 +75,7 @@ export function SkinStage({
 }): JSX.Element {
   const op = wardrobeOp.value;
   const busy = op !== null;
-  const { skinActionsEnabled, profile } = wardrobeContext.value;
+  const { skinActionsEnabled, account } = wardrobeContext.value;
 
   const renderScene = (): JSX.Element | null => {
     switch (model.kind) {
@@ -114,17 +108,17 @@ export function SkinStage({
           />
         );
       case 'profile': {
-        const profileSkin = activeMinecraftSkin(profile ?? undefined);
-        const profileCape = activeMinecraftCape(profile ?? undefined);
-        if (!profile || !profileSkin) return null;
+        const profileSkin = account?.profile_skin;
+        const profileCape = accountProfileCape(account);
+        if (!account || !profileSkin) return null;
         return (
           <SkinThreePreview
             src={apiResourceUrl('/skin/profile/file')}
             capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-            name={profile.name}
+            name={account.display_name}
             nametag={nametag}
             onNametagEdit={onRenameNametag}
-            variant={profileSkin.variant === 'slim' ? 'slim' : 'classic'}
+            variant={profileSkin.variant}
             side="front"
             showOuterLayers
             fitPadding={STAGE_FIT}
@@ -159,7 +153,7 @@ export function SkinStage({
       case 'default':
         return { name: model.skin.name, status: 'Minecraft default skin' };
       case 'profile':
-        return { name: profile?.name ?? 'Minecraft profile', status: 'Current Minecraft profile skin' };
+        return { name: account?.display_name ?? 'Minecraft profile', status: 'Current Minecraft profile skin' };
       case 'saved':
         if (model.queued) return { name: model.skin.name, status: 'Queued for the next launch' };
         if (model.worn) return { name: model.skin.name, status: 'Worn on your Minecraft profile' };
@@ -263,7 +257,7 @@ export function SkinStage({
         if (skinActionsEnabled) {
           menu.push({ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() });
         }
-        if (skinActionsEnabled && activeMinecraftCape(profile ?? undefined)) {
+        if (skinActionsEnabled && accountProfileCape(account)) {
           menu.push({ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() });
         }
         return (

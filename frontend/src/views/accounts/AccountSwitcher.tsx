@@ -4,40 +4,30 @@ import {
   accountsOp,
   accountsSnapshot,
   actionEnabled,
+  actionUnavailableMessage,
   activeAccount,
-  activeMicrosoftProfileSyncAction,
-  activeMicrosoftRefreshAction,
-  createOfflineIdentity,
+  createOfflineAccount,
   microsoftSignInAvailable,
   refreshMicrosoftAuth,
   removeAccount,
-  renameOfflineIdentity,
+  renameOfflineAccount,
   selectAccount,
   signInWithMicrosoftAccount,
   syncMinecraftProfile,
 } from '../../machines/accounts';
-import {
-  accountSkinSrc,
-  launcherSkinAccountKey,
-  minecraftProfileSkinTextureSrc,
-  selectedSkinForAccount,
-  selectedSkinTextureSrc,
-} from '../../player-skin';
+import { accountSkinSrc, accountSkinTextureSrc } from '../../player-skin';
 import { IconButton } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { Icon } from '../../ui/Icons';
 import { MicrosoftMark } from '../../ui/MicrosoftMark';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
 import { accountSwitcherAnchor, expandAccountSwitcher, openAccountSwitcher } from '../../ui-state';
-import { actionUnavailableMessage } from '../../machines/accounts';
 import type { LauncherAccount } from './types';
 
+export const SIGN_IN_UNAVAILABLE = 'Microsoft sign-in is available in the desktop app.';
+
 function accountTextureSrc(account: LauncherAccount, live: boolean): string | undefined {
-  if (live && accountSkinSrc.value) return accountSkinSrc.value;
-  if (account.kind === 'microsoft') {
-    return minecraftProfileSkinTextureSrc(account.minecraft_profile) ?? undefined;
-  }
-  return selectedSkinTextureSrc(selectedSkinForAccount(launcherSkinAccountKey(account.account_id))) ?? undefined;
+  return (live && accountSkinSrc.value) || accountSkinTextureSrc(account) || undefined;
 }
 
 function accountDisplayLabel(account: LauncherAccount): string {
@@ -49,22 +39,22 @@ function accountDisplayLabel(account: LauncherAccount): string {
 
 function accountDetailLabel(account: LauncherAccount): string {
   if (account.kind === 'microsoft') {
-    return account.view_model?.detail ?? account.online_action?.detail ?? 'Microsoft account';
+    return account.view_model.detail || account.online_action.detail || 'Microsoft account';
   }
-  return account.view_model?.detail ?? 'Offline identity';
+  return account.view_model.detail || 'Offline identity';
 }
 
 function offlineAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
   return [
-    { icon: 'edit', label: 'Rename', onSelect: () => void renameOfflineIdentity(account) },
+    { icon: 'edit', label: 'Rename', onSelect: () => void renameOfflineAccount(account) },
     { icon: 'x', label: 'Remove identity', onSelect: () => void removeAccount(account), danger: true },
   ];
 }
 
 function activeAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
   if (account.kind === 'offline') return offlineAccountMenuItems(account);
-  const syncAction = activeMicrosoftProfileSyncAction();
-  const refreshAction = activeMicrosoftRefreshAction();
+  const syncAction = account.profile_sync_action;
+  const refreshAction = account.refresh_action;
   const items: ContextMenuItem[] = [];
   if (actionEnabled(syncAction)) {
     items.push({
@@ -227,14 +217,14 @@ export function AccountSwitcherPanel(): JSX.Element {
             {signingIn
               ? 'Waiting for Microsoft sign-in'
               : !signInAvailable
-                ? (snapshot.status?.login_reason ?? 'Microsoft sign-in is unavailable.')
+                ? SIGN_IN_UNAVAILABLE
                 : microsoftCount === 0
                   ? 'Apply skins and launch online'
                   : 'Sign in another Minecraft account'}
           </span>
         </span>
       </button>
-      <button type="button" class="cp-acct__add" disabled={busy} onClick={() => void createOfflineIdentity()}>
+      <button type="button" class="cp-acct__add" disabled={busy} onClick={() => void createOfflineAccount()}>
         <span class="cp-acct__add-glyph">
           <Icon name="plus" size={16} color="var(--text-mute)" />
         </span>

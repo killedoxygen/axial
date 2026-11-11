@@ -2,19 +2,13 @@ import type { JSX } from 'preact';
 import { Icon } from '../../ui/Icons';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import { ProfileSkinTile, SavedSkinTile } from './SkinTiles';
-import type { MinecraftCape, MinecraftProfile, MinecraftSkin, SavedSkinRecord, SkinVariant } from './types';
+import type { LauncherAccount, SavedSkinRecord } from './types';
 
 export function SavedSkinLibraryGrid({
   librarySkins,
   uploadDragActive,
   canUpload,
-  showProfileSkinTile,
-  minecraftProfile,
-  profileSkin,
-  profileSkinFileSrc,
-  profileSkinVariant,
-  profileCape,
-  profileSkinIdentity,
+  profileAccount,
   profilePreviewActive,
   profileMenuItems,
   selectedSkinTextureKey,
@@ -32,13 +26,8 @@ export function SavedSkinLibraryGrid({
   librarySkins: SavedSkinRecord[];
   uploadDragActive: boolean;
   canUpload: boolean;
-  showProfileSkinTile: boolean;
-  minecraftProfile?: MinecraftProfile;
-  profileSkin?: MinecraftSkin;
-  profileSkinFileSrc?: string;
-  profileSkinVariant: SkinVariant;
-  profileCape?: MinecraftCape;
-  profileSkinIdentity?: string;
+  /** Set when the profile's current skin gets its own tile. */
+  profileAccount: LauncherAccount | null;
   profilePreviewActive: boolean;
   profileMenuItems: ContextMenuItem[];
   selectedSkinTextureKey?: string | null;
@@ -68,15 +57,9 @@ export function SavedSkinLibraryGrid({
         <span class="cp-skin-add-tile__hint">{uploadDragActive ? 'Drop to add' : 'Drag and drop'}</span>
       </button>
 
-      {showProfileSkinTile && minecraftProfile && profileSkin && (
+      {profileAccount && (
         <ProfileSkinTile
-          minecraftProfile={minecraftProfile}
-          profileSkinId={profileSkin.id}
-          profileSkinUrl={profileSkin.url}
-          profileSkinFileSrc={profileSkinFileSrc}
-          profileSkinVariant={profileSkinVariant}
-          profileCape={profileCape ?? null}
-          profileSkinIdentity={profileSkinIdentity}
+          account={profileAccount}
           selected={profilePreviewActive}
           menuItems={profileMenuItems}
           onView={onViewProfileSkin}
