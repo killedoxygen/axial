@@ -49,6 +49,9 @@ jobs:
         env:
           CANDIDATE_TAG: ${{ inputs.tag }}
         run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\nDomains=~.\n' | sudo tee /etc/systemd/resolved.conf.d/public-dns.conf > /dev/null
+          sudo systemctl restart systemd-resolved
           sudo apt-get update > /dev/null && sudo apt-get install -y minisign > /dev/null
           node -e 'const s=require(process.argv[1]); if (s.tag !== process.env.CANDIDATE_TAG || s.source_sha !== process.argv[2]) process.exit(1)' "$RUNNER_TEMP/downloads/rewrite-source/source.json" "$(git rev-parse HEAD)"
           node scripts/release/publish.mjs --source "$RUNNER_TEMP/downloads/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --public-key apps/desktop/updater.pub --changelog CHANGELOG.md --guide apps/desktop/platform/install-guide.html --output "$RUNNER_TEMP/publish"
