@@ -417,58 +417,23 @@ mod tests {
         Result<ProfileInstallProof, crate::loaders::types::LoaderError>,
         Vec<String>,
     ) {
-        use std::sync::{Arc, Mutex};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/metadata", listener.local_addr().unwrap());
+        use crate::http::test_server::{response, serve_routes};
         let mut routes = sidecars
             .into_iter()
             .map(|(path, body)| (path.to_owned(), body))
             .collect::<std::collections::BTreeMap<_, _>>();
         routes.insert("/metadata".into(), serde_json::to_vec(&source).unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let observed = requests.clone();
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0; 512];
-                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    let count = stream.read(&mut buffer).await.unwrap();
-                    assert!(count > 0 && request.len() + count <= 8192);
-                    request.extend_from_slice(&buffer[..count]);
-                }
-                let path = std::str::from_utf8(&request)
-                    .unwrap()
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap();
-                observed.lock().unwrap().push(path.to_owned());
-                let (status, body) = routes.get(path).map_or(("404 Not Found", &[][..]), |body| {
-                    ("200 OK", body.as_slice())
-                });
-                stream
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                stream.write_all(body).await.unwrap();
-            }
+        let server = serve_routes(move |path| match routes.get(path) {
+            Some(body) => response("200 OK", &[], body),
+            None => response("404 Not Found", &[], b""),
         });
         let proof = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            super::fetch_profile_install_proof_from_url(record, &url),
+            super::fetch_profile_install_proof_from_url(record, &server.url("/metadata")),
         )
         .await;
-        server.abort();
-        let _ = server.await;
-        let requests = requests.lock().unwrap().clone();
+        let requests = server.paths();
+        server.finish();
         (proof.expect("bounded fixture proof retrieval"), requests)
     }
 

@@ -279,56 +279,37 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn rejects_blank_or_whitespace_padded_version_ids() {
+    fn version_id_admission_rejects_unsafe_and_nonportable_ids() {
+        let oversized = "a".repeat(MAX_VERSION_ID_BYTES + 1);
         for (version_id, expected) in [
-            (" \t ", "loader build version id is empty"),
-            (" \n ", "loader build version id is empty"),
+            (" \t ", Some("loader build version id is empty")),
+            (" \n ", Some("loader build version id is empty")),
             (
                 " loader-id ",
-                "loader build version id contains surrounding whitespace",
+                Some("loader build version id contains surrounding whitespace"),
             ),
+            ("..", None),
+            (".", None),
+            ("../escape", None),
+            ("loader/escape", None),
+            ("loader\\escape", None),
+            (oversized.as_str(), None),
+            ("cafe\u{301}", None),
+            ("CON", None),
+            ("COM1.release", None),
+            ("bad*id", None),
         ] {
-            let error =
-                validate_version_id(version_id, "loader build version id").expect_err("error");
-            assert!(
-                matches!(
-                    &error,
-                    LoaderError::InstallExecutionFailed(message) if message == expected
-                ),
-                "{version_id:?}: {error:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_path_traversal_version_ids() {
-        for version_id in ["..", ".", "../escape", "loader/escape", "loader\\escape"] {
-            let error =
-                validate_version_id(version_id, "loader build version id").expect_err("error");
-            assert!(
-                error.to_string().contains("loader build version id"),
-                "{version_id} => {}",
-                error
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_ids_whose_json_filename_exceeds_known_good_segment_limit() {
-        let version_id = "a".repeat(MAX_VERSION_ID_BYTES + 1);
-        let error =
-            validate_version_id(&version_id, "loader build version id").expect_err("oversized id");
-
-        assert!(error.to_string().contains("too long"));
-    }
-
-    #[test]
-    fn rejects_noncanonical_and_windows_reserved_version_ids() {
-        for version_id in ["cafe\u{301}", "CON", "COM1.release", "bad*id"] {
-            assert!(
-                validate_version_id(version_id, "loader build version id").is_err(),
-                "accepted {version_id:?}"
-            );
+            let error = validate_version_id(version_id, "loader build version id")
+                .expect_err("unsafe version id");
+            if let Some(expected) = expected {
+                assert!(
+                    matches!(
+                        &error,
+                        LoaderError::InstallExecutionFailed(message) if message == expected
+                    ),
+                    "{version_id:?}: {error:?}"
+                );
+            }
         }
     }
 

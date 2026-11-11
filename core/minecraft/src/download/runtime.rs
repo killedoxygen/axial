@@ -344,8 +344,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
@@ -368,31 +366,11 @@ mod tests {
         }
     }
 
-    async fn serve_runtime_file(body: Vec<u8>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
+    async fn serve_runtime_file(body: &[u8]) -> String {
+        use crate::http::test_server::{response, serve};
+        serve(vec![response("200 OK", &[], body)])
             .await
-            .expect("runtime test listener");
-        let address = listener
-            .local_addr()
-            .expect("runtime test listener address");
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("runtime test connection");
-            let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request).await;
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            socket
-                .write_all(headers.as_bytes())
-                .await
-                .expect("runtime test response headers");
-            socket
-                .write_all(&body)
-                .await
-                .expect("runtime test response body");
-        });
-        format!("http://{address}/runtime.bin")
+            .url("/runtime.bin")
     }
 
     fn runtime_manifest_file(url: String, body: &[u8], executable: bool) -> ComponentManifestFile {
@@ -416,8 +394,8 @@ mod tests {
     ) -> (RuntimeEnsurePipeline, ExpectedRuntimeTree) {
         let java_bytes = b"published java runtime".to_vec();
         let config_bytes = b"-server KNOWN".to_vec();
-        let java_url = serve_runtime_file(java_bytes.clone()).await;
-        let config_url = serve_runtime_file(config_bytes.clone()).await;
+        let java_url = serve_runtime_file(&java_bytes).await;
+        let config_url = serve_runtime_file(&config_bytes).await;
         let manifest = ComponentManifest {
             files: HashMap::from([
                 (
@@ -703,61 +681,37 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_runtime_platform_maps_to_typed_download_error() {
-        let error =
+    fn runtime_lookup_errors_map_to_typed_download_errors() {
+        assert!(matches!(
             runtime_lookup_error_to_download_error(JavaRuntimeLookupError::UnsupportedPlatform {
                 component: "jre-legacy".to_string(),
                 platform: "mac-os-arm64".to_string(),
-            });
-
-        assert!(matches!(
-            error,
-            DownloadError::RuntimeUnavailableForPlatform {
-                component,
-                platform
-            } if component == "jre-legacy" && platform == "mac-os-arm64"
+            }),
+            DownloadError::RuntimeUnavailableForPlatform { component, platform }
+                if component == "jre-legacy" && platform == "mac-os-arm64"
         ));
-    }
-
-    #[test]
-    fn rosetta_required_runtime_maps_to_typed_download_error() {
-        let error =
+        assert!(matches!(
             runtime_lookup_error_to_download_error(JavaRuntimeLookupError::RosettaRequired {
                 component: "jre-legacy".to_string(),
-            });
-
+            }),
+            DownloadError::RuntimeRosettaRequired { component } if component == "jre-legacy"
+        ));
         assert!(matches!(
-            error,
-            DownloadError::RuntimeRosettaRequired { component }
-                if component == "jre-legacy"
+            runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Install(
+                "network failed".to_string(),
+            )),
+            DownloadError::PrepareRuntime(message)
+                if message == "failed to install java runtime: network failed"
         ));
-    }
-
-    #[test]
-    fn other_runtime_errors_stay_prepare_runtime_errors() {
-        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Install(
-            "network failed".to_string(),
-        ));
-
-        assert!(matches!(
-            error,
-            DownloadError::PrepareRuntime(message) if message == "failed to install java runtime: network failed"
-        ));
-    }
-
-    #[test]
-    fn runtime_source_errors_map_to_typed_download_errors() {
         let failure = crate::runtime::RuntimeSourceFailure::new(
             crate::runtime::RuntimeId::from("java-runtime-gamma"),
             crate::runtime::RuntimeSourceFailureKind::Unavailable,
             "provider unavailable",
         );
-        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::RuntimeSource(
-            failure.clone(),
-        ));
-
         assert!(matches!(
-            error,
+            runtime_lookup_error_to_download_error(JavaRuntimeLookupError::RuntimeSource(
+                failure.clone(),
+            )),
             DownloadError::RuntimeSource(actual) if actual == failure
         ));
     }

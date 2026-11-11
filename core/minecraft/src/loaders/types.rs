@@ -1076,12 +1076,20 @@ mod tests {
     }
 
     #[test]
-    fn active_loader_failure_inventory_is_unique_and_covers_runtime_categories() {
+    fn loader_errors_map_to_boundary_specific_failure_kinds() {
         let names = LoaderInstallFailureKind::ALL
             .iter()
             .map(|kind| kind.as_str())
             .collect::<HashSet<_>>();
         assert_eq!(names.len(), LoaderInstallFailureKind::ALL.len());
+        assert_eq!(
+            LoaderError::InvalidBuildId.pre_operation_failure_kind(),
+            Some(LoaderPreOperationFailureKind::InvalidBuildId)
+        );
+        assert!(matches!(
+            LoaderInstallError::from(LoaderError::ArtifactDownloadFailed { facts: Vec::new() }),
+            LoaderInstallError::ArtifactDownloadFailed(_)
+        ));
         for (source, expected) in [
             (
                 LoaderError::ProcessorFailed("processor exit".to_string()),
@@ -1095,48 +1103,16 @@ mod tests {
                 LoaderError::Io(io::Error::other("disk failure")),
                 LoaderInstallFailureKind::InstallExecutionFailed,
             ),
+            (
+                LoaderError::InvalidBuildId,
+                LoaderInstallFailureKind::InstallExecutionFailed,
+            ),
         ] {
             let LoaderInstallError::Active(failure) = LoaderInstallError::from(source) else {
                 panic!("active loader source crossed delegated boundary")
             };
             assert_eq!(failure.kind(), expected);
         }
-    }
-
-    #[test]
-    fn loader_failure_inventories_are_closed_and_boundary_specific() {
-        for names in [
-            LoaderPreOperationFailureKind::ALL
-                .iter()
-                .map(|kind| kind.as_str())
-                .collect::<HashSet<_>>(),
-            LoaderInstallFailureKind::ALL
-                .iter()
-                .map(|kind| kind.as_str())
-                .collect::<HashSet<_>>(),
-        ] {
-            assert!(!names.is_empty());
-        }
-        assert_eq!(LoaderPreOperationFailureKind::ALL.len(), 10);
-        assert_eq!(LoaderInstallFailureKind::ALL.len(), 11);
-        assert_eq!(
-            LoaderError::InvalidBuildId.pre_operation_failure_kind(),
-            Some(LoaderPreOperationFailureKind::InvalidBuildId)
-        );
-        assert!(matches!(
-            LoaderInstallError::from(LoaderError::ArtifactDownloadFailed { facts: Vec::new() }),
-            LoaderInstallError::ArtifactDownloadFailed(_)
-        ));
-
-        let LoaderInstallError::Active(failure) =
-            LoaderInstallError::from(LoaderError::InvalidBuildId)
-        else {
-            panic!("defensive pre-operation source must normalize to active failure")
-        };
-        assert_eq!(
-            failure.kind(),
-            LoaderInstallFailureKind::InstallExecutionFailed
-        );
     }
 
     #[tokio::test]

@@ -63,90 +63,44 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn sorts_supported_versions_descending_across_patch_and_year_formats() {
-        let versions = normalize_supported_versions(
-            vec![
-                game_version("1.18", true),
-                game_version("26.1", true),
-                game_version("1.18.2", true),
-                game_version("1.18.1", true),
-                game_version("26.1.2", true),
-            ],
-            None,
-        );
-
-        let ordered = versions
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ordered, vec!["26.1.2", "26.1", "1.18.2", "1.18.1", "1.18"]);
-    }
-
-    #[test]
-    fn prefers_catalog_order_when_manifest_knows_the_versions() {
-        let mut catalog_order = HashMap::new();
-        catalog_order.insert("1.20.4".to_string(), 0);
-        catalog_order.insert("1.20.3".to_string(), 1);
-        catalog_order.insert("1.20.2".to_string(), 2);
-
-        let versions = normalize_supported_versions(
-            vec![
-                game_version("1.20.2", true),
-                game_version("1.20.4", true),
-                game_version("1.20.3", true),
-            ],
-            Some(&catalog_order),
-        );
-
-        let ordered = versions
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ordered, vec!["1.20.4", "1.20.3", "1.20.2"]);
-    }
-
-    #[test]
-    fn keeps_catalog_known_versions_ahead_of_unknown_fallback_versions() {
-        let mut catalog_order = HashMap::new();
-        catalog_order.insert("1.20.4".to_string(), 0);
-        catalog_order.insert("1.20.3".to_string(), 1);
-
-        let versions = normalize_supported_versions(
-            vec![
-                game_version("26.1", true),
-                game_version("1.20.3", true),
-                game_version("1.20.4", true),
-            ],
-            Some(&catalog_order),
-        );
-
-        let ordered = versions
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ordered, vec!["1.20.4", "1.20.3", "26.1"]);
-    }
-
-    #[test]
-    fn keeps_plain_release_ahead_of_prerelease_suffixes() {
-        let versions = normalize_supported_versions(
-            vec![
-                game_version("1.20.5-pre1", false),
-                game_version("1.20.5", true),
-                game_version("1.20.5-rc1", false),
-            ],
-            None,
-        );
-
-        let ordered = versions
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(ordered, vec!["1.20.5", "1.20.5-rc1", "1.20.5-pre1"]);
+    fn orders_supported_versions_by_catalog_then_version_shape() {
+        let catalog = HashMap::from([
+            ("1.20.4".to_string(), 0),
+            ("1.20.3".to_string(), 1),
+            ("1.20.2".to_string(), 2),
+        ]);
+        for (input, catalog_order, expected) in [
+            (
+                vec!["1.18", "26.1", "1.18.2", "1.18.1", "26.1.2"],
+                None,
+                vec!["26.1.2", "26.1", "1.18.2", "1.18.1", "1.18"],
+            ),
+            (
+                vec!["1.20.2", "1.20.4", "1.20.3"],
+                Some(&catalog),
+                vec!["1.20.4", "1.20.3", "1.20.2"],
+            ),
+            (
+                vec!["26.1", "1.20.3", "1.20.4"],
+                Some(&catalog),
+                vec!["1.20.4", "1.20.3", "26.1"],
+            ),
+            (
+                vec!["1.20.5-pre1", "1.20.5", "1.20.5-rc1"],
+                None,
+                vec!["1.20.5", "1.20.5-rc1", "1.20.5-pre1"],
+            ),
+        ] {
+            let versions = input
+                .iter()
+                .map(|id| game_version(id, !id.contains('-')))
+                .collect();
+            let ordered = normalize_supported_versions(versions, catalog_order)
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ordered, expected);
+        }
     }
 
     #[test]

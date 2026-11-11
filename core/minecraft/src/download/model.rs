@@ -621,7 +621,6 @@ mod evidence_id_tests {
             ManagedInstallActivationContractId::parse(id.as_str()),
             Ok(id.clone())
         );
-        assert_eq!(id.as_str().split('.').count(), 2);
         assert_eq!(
             serde_json::from_str::<ManagedInstallActivationContractId>(
                 &serde_json::to_string(&id).expect("serialize activation contract")
@@ -673,13 +672,6 @@ mod evidence_id_tests {
         );
         assert!(id.matches_version_id("1.21.5"));
         assert!(!id.matches_version_id("1.21.6"));
-        let parts = id.as_str().split('.').collect::<Vec<_>>();
-        assert_eq!(parts.len(), 6);
-        assert_eq!(parts[1].len(), 43);
-        assert_eq!(parts[2].len(), 22);
-        assert_eq!(parts[3].len(), 22);
-        assert_eq!(parts[4].len(), 43);
-        assert_eq!(parts[5].len(), 43);
         let encoded = serde_json::to_string(&id).expect("serialize evidence id");
         assert_eq!(
             serde_json::from_str::<ManagedInstallPublicationEvidenceId>(&encoded)

@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_resolution_cancels_pending_provider_acquisition() {
+    async fn install_resolution_cancels_only_a_pending_provider_acquisition() {
         let component = LoaderComponentId::Fabric;
         let build_id = build_id_for(component, "1.21.5", "0.16.14");
         let error = tokio::time::timeout(
@@ -762,14 +762,8 @@ mod tests {
         .await
         .expect("pending acquisition must be cancellable")
         .expect_err("cancelled acquisition");
-
         assert!(matches!(error, LoaderError::Cancelled));
-    }
 
-    #[tokio::test]
-    async fn install_resolution_completed_provider_result_wins_over_cancellation() {
-        let component = LoaderComponentId::Fabric;
-        let build_id = build_id_for(component, "1.21.5", "0.16.14");
         let expected = build_record(component, &build_id);
         let resolved = resolve_build_record_for_install_with(
             component,
@@ -783,15 +777,9 @@ mod tests {
             },
         )
         .await
-        .expect("completed provider result");
-
+        .expect("completed provider result wins over cancellation");
         assert_eq!(resolved, expected);
-    }
 
-    #[tokio::test]
-    async fn install_resolution_completed_provider_error_wins_over_cancellation() {
-        let component = LoaderComponentId::Fabric;
-        let build_id = build_id_for(component, "1.21.5", "0.16.14");
         let error = resolve_build_record_for_install_with(
             component,
             &build_id,
@@ -804,8 +792,7 @@ mod tests {
             },
         )
         .await
-        .expect_err("completed provider refusal");
-
+        .expect_err("completed provider refusal wins over cancellation");
         assert!(matches!(
             error,
             LoaderError::ProviderUnavailable {

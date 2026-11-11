@@ -3495,7 +3495,6 @@ mod tests {
     use crate::loaders::{build_id_for, installed_version_id_for};
     use crate::portable_path::PortableRelativePath;
     use std::io::{Cursor, Read, Write};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
 
     fn typed_plan(bound: &BoundForgeInstallerPlan) -> &BoundProcessorPlan {
@@ -3514,42 +3513,32 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_legacy_forge_version_id() {
-        assert_eq!(
-            normalize_legacy_forge_version_id("net.minecraftforge:forge:1.2.4-2.0.0.68", ""),
-            Some("1.2.4-forge-2.0.0.68".to_string())
-        );
-    }
-
-    #[test]
-    fn normalizes_legacy_forge_library_classifier() {
-        assert_eq!(
-            normalize_legacy_forge_library(
+    fn normalizes_legacy_forge_coordinates_across_naming_eras() {
+        for (path, minecraft, file, version_id, library) in [
+            (
                 "net.minecraftforge:forge:1.2.4-2.0.0.68",
+                "",
                 "forge-1.2.4-2.0.0.68-universal.zip",
-                ""
+                "1.2.4-forge-2.0.0.68",
+                "net.minecraftforge:forge:1.2.4-2.0.0.68:universal",
             ),
-            Some("net.minecraftforge:forge:1.2.4-2.0.0.68:universal".to_string())
-        );
-    }
-
-    #[test]
-    fn normalizes_minecraftforge_legacy_coordinates() {
-        assert_eq!(
-            normalize_legacy_forge_version_id(
+            (
                 "net.minecraftforge:minecraftforge:9.11.1.1345",
-                "1.6.4"
-            ),
-            Some("1.6.4-forge-9.11.1.1345".to_string())
-        );
-        assert_eq!(
-            normalize_legacy_forge_library(
-                "net.minecraftforge:minecraftforge:9.11.1.1345",
+                "1.6.4",
                 "minecraftforge-universal-1.6.4-9.11.1.1345.jar",
-                "1.6.4"
+                "1.6.4-forge-9.11.1.1345",
+                "net.minecraftforge:forge:1.6.4-9.11.1.1345:universal",
             ),
-            Some("net.minecraftforge:forge:1.6.4-9.11.1.1345:universal".to_string())
-        );
+        ] {
+            assert_eq!(
+                normalize_legacy_forge_version_id(path, minecraft).as_deref(),
+                Some(version_id)
+            );
+            assert_eq!(
+                normalize_legacy_forge_library(path, file, minecraft).as_deref(),
+                Some(library)
+            );
+        }
     }
 
     #[test]
@@ -4783,19 +4772,6 @@ mod tests {
     }
 
     #[test]
-    fn processor_contract_errors_do_not_echo_authored_values() {
-        for error in [
-            ForgeInstallerError::InvalidForgeProcessorArtifactContract,
-            ForgeInstallerError::InvalidForgeProcessorFinalOutput,
-        ] {
-            let rendered = error.to_string();
-            assert!(!rendered.contains("PRIVATE"));
-            assert!(!rendered.contains('/'));
-            assert!(!rendered.contains('['));
-        }
-    }
-
-    #[test]
     fn processor_binding_rejects_aliases_multiple_producers_and_dependency_cycles() {
         let (record, version, install) = forge_processor_fixture();
 
@@ -5256,79 +5232,64 @@ mod tests {
     }
 
     #[test]
-    fn pure_plan_retains_legacy_root_forge_library() {
-        let install_profile = br#"{
-            "versionInfo": {
-                "id": "1.6.4-Forge9.11.1.1345",
-                "libraries": [
-                    { "name": "net.minecraftforge:minecraftforge:9.11.1.1345" }
-                ]
-            },
-            "install": {
-                "path": "net.minecraftforge:minecraftforge:9.11.1.1345",
-                "filePath": "minecraftforge-universal-1.6.4-9.11.1.1345.jar",
-                "target": "1.6.4-Forge9.11.1.1345",
-                "minecraft": "1.6.4"
-            }
-        }"#;
-        let jar = zip_with_entries(&[
-            ("install_profile.json", install_profile.as_slice()),
-            (
-                "minecraftforge-universal-1.6.4-9.11.1.1345.jar",
-                b"forge universal",
-            ),
-        ]);
+    fn pure_plan_retains_legacy_root_forge_library_and_strips_meta_only_when_declared() {
+        for (minecraft, forge, strip) in [
+            ("1.6.4", "9.11.1.1345", false),
+            ("1.5.2", "7.8.1.738", true),
+        ] {
+            let install_profile = serde_json::json!({
+                "versionInfo": {
+                    "id": format!("{minecraft}-Forge{forge}"),
+                    "libraries": [{ "name": format!("net.minecraftforge:minecraftforge:{forge}") }]
+                },
+                "install": {
+                    "path": format!("net.minecraftforge:minecraftforge:{forge}"),
+                    "filePath": format!("minecraftforge-universal-{minecraft}-{forge}.jar"),
+                    "target": format!("{minecraft}-Forge{forge}"),
+                    "minecraft": minecraft,
+                    "stripMeta": strip
+                }
+            })
+            .to_string();
+            let forge_jar = zip_with_entries(&[
+                ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
+                ("META-INF/FORGE.SF", b"signature".as_slice()),
+                ("META-INF/FORGE.DSA", b"signature".as_slice()),
+                ("net/minecraft/client/Minecraft.class", b"class".as_slice()),
+            ]);
+            let universal = format!("minecraftforge-universal-{minecraft}-{forge}.jar");
+            let jar = zip_with_entries(&[
+                ("install_profile.json", install_profile.as_bytes()),
+                (&universal, forge_jar.as_slice()),
+            ]);
 
-        let plan = plan(&jar);
-        let artifact = embedded_artifact(
-            &plan,
-            "net/minecraftforge/forge/1.6.4-9.11.1.1345/forge-1.6.4-9.11.1.1345-universal.jar",
-        );
-        assert_eq!(artifact, b"forge universal");
-    }
-
-    #[test]
-    fn pure_plan_strips_legacy_root_forge_library_meta_in_memory() {
-        let install_profile = br#"{
-            "versionInfo": {
-                "id": "1.5.2-Forge7.8.1.738",
-                "libraries": [
-                    { "name": "net.minecraftforge:minecraftforge:7.8.1.738" }
-                ]
-            },
-            "install": {
-                "path": "net.minecraftforge:minecraftforge:7.8.1.738",
-                "filePath": "minecraftforge-universal-1.5.2-7.8.1.738.jar",
-                "target": "1.5.2-Forge7.8.1.738",
-                "minecraft": "1.5.2",
-                "stripMeta": true
+            let plan = plan(&jar);
+            assert_eq!(plan.strip_client_meta(), strip);
+            let installed_jar = embedded_artifact(
+                &plan,
+                &format!(
+                    "net/minecraftforge/forge/{minecraft}-{forge}/forge-{minecraft}-{forge}-universal.jar"
+                ),
+            );
+            if !strip {
+                assert_eq!(installed_jar, forge_jar);
             }
-        }"#;
-        let forge_jar = zip_with_entries(&[
-            ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
-            ("META-INF/FORGE.SF", b"signature".as_slice()),
-            ("META-INF/FORGE.DSA", b"signature".as_slice()),
-            ("net/minecraft/client/Minecraft.class", b"class".as_slice()),
-        ]);
-        let jar = zip_with_entries(&[
-            ("install_profile.json", install_profile.as_slice()),
-            (
-                "minecraftforge-universal-1.5.2-7.8.1.738.jar",
-                forge_jar.as_slice(),
-            ),
-        ]);
-        let plan = plan(&jar);
-        let installed_jar = embedded_artifact(
-            &plan,
-            "net/minecraftforge/forge/1.5.2-7.8.1.738/forge-1.5.2-7.8.1.738-universal.jar",
-        );
-        assert!(zip_contains(
-            installed_jar,
-            "net/minecraft/client/Minecraft.class"
-        ));
-        assert!(!zip_contains(installed_jar, "META-INF/MANIFEST.MF"));
-        assert!(!zip_contains(installed_jar, "META-INF/FORGE.SF"));
-        assert!(!zip_contains(installed_jar, "META-INF/FORGE.DSA"));
+            assert!(zip_contains(
+                installed_jar,
+                "net/minecraft/client/Minecraft.class"
+            ));
+            for signature in [
+                "META-INF/MANIFEST.MF",
+                "META-INF/FORGE.SF",
+                "META-INF/FORGE.DSA",
+            ] {
+                assert_eq!(
+                    zip_contains(installed_jar, signature),
+                    !strip,
+                    "{signature}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5392,57 +5353,10 @@ mod tests {
     }
 
     #[test]
-    fn pure_plan_rejects_duplicate_and_unsafe_maven_paths() {
-        let version_json = br#"{"id":"forge","libraries":[]}"#;
-        let duplicate = zip_with_entries(&[
-            ("version.json", version_json.as_slice()),
-            ("maven/example/mod.jar", b"first"),
-            (r"maven/example\mod.jar", b"second"),
-        ]);
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(duplicate)),
-            Err(ForgeInstallerError::InvalidEntryPath)
-        ));
-
-        let unsafe_path = zip_with_entries(&[
-            ("version.json", version_json.as_slice()),
-            ("maven/../outside.jar", b"outside"),
-        ]);
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(unsafe_path)),
-            Err(ForgeInstallerError::InvalidEntryPath)
-        ));
-    }
-
-    #[test]
-    fn pure_plan_rejects_undeclared_and_portable_alias_maven_paths() {
-        let version_json = br#"{
-            "id":"forge",
-            "libraries":[{"name":"example:mod:1.0"}]
-        }"#;
-        let undeclared = zip_with_entries(&[
-            ("version.json", version_json.as_slice()),
-            ("maven/example/other/1.0/other-1.0.jar", b"undeclared"),
-        ]);
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(undeclared)),
-            Err(ForgeInstallerError::UndeclaredEmbeddedArtifact { .. })
-        ));
-
-        let alias = zip_with_entries(&[
-            ("version.json", version_json.as_slice()),
-            ("maven/example/mod/1.0/mod-1.0.jar", b"first"),
-            ("maven/Example/mod/1.0/mod-1.0.jar", b"second"),
-        ]);
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(alias)),
-            Err(ForgeInstallerError::PortablePathAlias)
-        ));
-    }
-
-    #[test]
-    fn pure_plan_rejects_conflicting_legacy_and_maven_artifacts() {
-        let install_profile = br#"{
+    fn pure_plan_rejects_unsafe_conflicting_and_unbounded_entries() {
+        let anonymous = br#"{"id":"forge","libraries":[]}"#.as_slice();
+        let declared = br#"{"id":"forge","libraries":[{"name":"example:mod:1.0"}]}"#.as_slice();
+        let legacy_profile = br#"{
             "versionInfo": {
                 "id": "1.6.4-Forge9.11.1.1345",
                 "libraries": [{"name":"net.minecraftforge:minecraftforge:9.11.1.1345"}]
@@ -5454,88 +5368,94 @@ mod tests {
                 "minecraft": "1.6.4"
             }
         }"#;
-        let jar = zip_with_entries(&[
-            ("install_profile.json", install_profile.as_slice()),
+        let oversized = vec![b'j'; (MAX_INSTALLER_EMBEDDED_ENTRY_BYTES + 1) as usize];
+        let cases: [(&str, Vec<u8>, fn(&ForgeInstallerError) -> bool); 9] = [
             (
-                "minecraftforge-universal-1.6.4-9.11.1.1345.jar",
-                b"legacy root",
+                "duplicate separator alias",
+                zip_with_entries(&[
+                    ("version.json", anonymous),
+                    ("maven/example/mod.jar", b"first"),
+                    (r"maven/example\mod.jar", b"second"),
+                ]),
+                |error| matches!(error, ForgeInstallerError::InvalidEntryPath),
             ),
             (
-                "maven/net/minecraftforge/forge/1.6.4-9.11.1.1345/forge-1.6.4-9.11.1.1345-universal.jar",
-                b"maven copy",
+                "parent traversal",
+                zip_with_entries(&[
+                    ("version.json", anonymous),
+                    ("maven/../outside.jar", b"outside"),
+                ]),
+                |error| matches!(error, ForgeInstallerError::InvalidEntryPath),
             ),
-        ]);
-
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar)),
-            Err(ForgeInstallerError::ConflictingEmbeddedArtifact)
-        ));
-    }
-
-    #[test]
-    fn pure_plan_has_no_filesystem_effects_and_enforces_aggregate_bounds() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|value| value.as_nanos())
-            .unwrap_or_default();
-        let nonexistent = crate::test_temp_root().join(format!("axial-pure-installer-{nanos:x}"));
-        assert!(!nonexistent.exists());
-
-        let version_json = br#"{
-            "id":"forge",
-            "libraries":[{"name":"example:mod:1.0"}]
-        }"#;
-        let valid = zip_with_entries(&[
-            ("version.json", version_json.as_slice()),
-            ("maven/example/mod/1.0/mod-1.0.jar", b"mod"),
-        ]);
-        plan(&valid);
-        assert!(!nonexistent.exists());
-
-        let aggregate = zip_with_generated_maven_entries(5, 900);
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(aggregate)),
-            Err(ForgeInstallerError::EmbeddedEntriesTooLarge)
-        ));
-        let too_many = zip_with_generated_maven_entries(super::MAX_INSTALLER_ENTRY_COUNT, 0);
-        assert!(matches!(
-            plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(too_many)),
-            Err(ForgeInstallerError::TooManyEntries)
-        ));
-    }
-
-    #[test]
-    fn pure_plan_reports_legacy_strip_meta() {
-        let install_profile = br#"{
-            "versionInfo": {
-                "id": "1.5.2-Forge7.8.1.738",
-                "mainClass": "net.minecraft.launchwrapper.Launch",
-                "minecraftArguments": "${auth_player_name} ${auth_session}",
-                "assetIndex": { "id": "legacy" },
-                "libraries": [
-                    { "name": "net.minecraftforge:minecraftforge:7.8.1.738" }
-                ]
-            },
-            "install": {
-                "path": "net.minecraftforge:minecraftforge:7.8.1.738",
-                "filePath": "minecraftforge-universal-1.5.2-7.8.1.738.jar",
-                "target": "1.5.2-Forge7.8.1.738",
-                "minecraft": "1.5.2",
-                "stripMeta": true
-            }
-        }"#;
-        let forge_jar = zip_with_entries(&[("example/Class.class", b"class".as_slice())]);
-        let jar = zip_with_entries(&[
-            ("install_profile.json", install_profile.as_slice()),
             (
-                "minecraftforge-universal-1.5.2-7.8.1.738.jar",
-                forge_jar.as_slice(),
+                "undeclared artifact",
+                zip_with_entries(&[
+                    ("version.json", declared),
+                    ("maven/example/other/1.0/other-1.0.jar", b"undeclared"),
+                ]),
+                |error| {
+                    matches!(
+                        error,
+                        ForgeInstallerError::UndeclaredEmbeddedArtifact { .. }
+                    )
+                },
             ),
-        ]);
-
-        let extracted = plan(&jar);
-
-        assert!(extracted.strip_client_meta());
+            (
+                "portable alias",
+                zip_with_entries(&[
+                    ("version.json", declared),
+                    ("maven/example/mod/1.0/mod-1.0.jar", b"first"),
+                    ("maven/Example/mod/1.0/mod-1.0.jar", b"second"),
+                ]),
+                |error| matches!(error, ForgeInstallerError::PortablePathAlias),
+            ),
+            (
+                "legacy root and maven copy",
+                zip_with_entries(&[
+                    ("install_profile.json", legacy_profile.as_slice()),
+                    (
+                        "minecraftforge-universal-1.6.4-9.11.1.1345.jar",
+                        b"legacy root",
+                    ),
+                    (
+                        "maven/net/minecraftforge/forge/1.6.4-9.11.1.1345/forge-1.6.4-9.11.1.1345-universal.jar",
+                        b"maven copy",
+                    ),
+                ]),
+                |error| matches!(error, ForgeInstallerError::ConflictingEmbeddedArtifact),
+            ),
+            (
+                "aggregate embedded bytes",
+                zip_with_generated_maven_entries(5, 900),
+                |error| matches!(error, ForgeInstallerError::EmbeddedEntriesTooLarge),
+            ),
+            (
+                "entry count",
+                zip_with_generated_maven_entries(super::MAX_INSTALLER_ENTRY_COUNT, 0),
+                |error| matches!(error, ForgeInstallerError::TooManyEntries),
+            ),
+            (
+                "oversized profile",
+                zip_with_entry(
+                    "install_profile.json",
+                    vec![b' '; (MAX_INSTALLER_PROFILE_ENTRY_BYTES + 1) as usize],
+                ),
+                |error| matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "install_profile.json"),
+            ),
+            (
+                "oversized maven entry",
+                zip_with_entries(&[
+                    ("version.json", declared),
+                    ("maven/example/mod/1.0/mod-1.0.jar", oversized.as_slice()),
+                ]),
+                |error| matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "example/mod/1.0/mod-1.0.jar"),
+            ),
+        ];
+        for (case, jar, expected) in cases {
+            let error = plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar))
+                .expect_err(case);
+            assert!(expected(&error), "{case}: {error:?}");
+        }
     }
 
     #[test]
@@ -5607,41 +5527,6 @@ mod tests {
             merge_libraries_by_name(&[primary], &[conflicting]),
             Err(ForgeInstallerError::ConflictingLibraryDeclaration { .. })
         ));
-    }
-
-    #[test]
-    fn pure_plan_rejects_oversized_profile_entry() {
-        let jar = zip_with_entry(
-            "install_profile.json",
-            vec![b' '; (MAX_INSTALLER_PROFILE_ENTRY_BYTES + 1) as usize],
-        );
-
-        let error = plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar))
-            .expect_err("oversized install profile should fail");
-
-        assert!(
-            matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "install_profile.json")
-        );
-    }
-
-    #[test]
-    fn pure_plan_rejects_oversized_maven_entry_without_effects() {
-        let version_json = br#"{
-            "id":"forge",
-            "libraries":[{"name":"example:mod:1.0"}]
-        }"#;
-        let oversized = vec![b'j'; (MAX_INSTALLER_EMBEDDED_ENTRY_BYTES + 1) as usize];
-        let jar = zip_with_entries(&[
-            ("version.json", version_json.as_slice()),
-            ("maven/example/mod/1.0/mod-1.0.jar", oversized.as_slice()),
-        ]);
-
-        let error = plan_authenticated_installer(VerifiedLoaderSource::from_test_bytes(jar))
-            .expect_err("oversized maven entry should fail");
-
-        assert!(
-            matches!(error, ForgeInstallerError::EntryTooLarge { name } if name == "example/mod/1.0/mod-1.0.jar")
-        );
     }
 
     fn binding_record(

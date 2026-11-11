@@ -7022,33 +7022,6 @@ mod library_lifecycle_tests {
     }
 
     #[test]
-    fn file_batch_validates_original_revision_without_rebuilding_file_authority() {
-        use std::sync::atomic::Ordering;
-
-        let (_temporary, root, operation) = file_batch_fixture();
-        let path = batch_path("first");
-        let file = operation.observe_file(&path).unwrap().unwrap();
-        let expected = file.revision_observation();
-        let mut batch = operation.file_batch();
-        batch.validate_revision(&path, &expected).unwrap();
-        let comparisons = &root.authority.root.inner.root.file_identity_comparisons;
-        let validations = &root.authority.root.inner.root.directory_revalidations;
-        comparisons.store(0, Ordering::Relaxed);
-        validations.store(0, Ordering::Relaxed);
-        for _ in 0..32 {
-            batch.validate_revision(&path, &expected).unwrap();
-        }
-        let observed = comparisons.load(Ordering::Relaxed);
-        let revalidations = validations.load(Ordering::Relaxed);
-        assert_eq!(file.read_bounded(32).unwrap(), b"first payload");
-        assert_eq!(observed, 0, "Revision validation rebuilt file authority");
-        assert!(
-            revalidations <= 32 * 5,
-            "Repeated parent checks: {revalidations}"
-        );
-    }
-
-    #[test]
     fn file_batch_revision_refuses_changed_evidence_and_recovers_after_refusal() {
         for change in [
             "replacement",
@@ -7156,39 +7129,7 @@ mod library_lifecycle_tests {
     }
 
     #[test]
-    fn file_batch_does_not_repeat_validated_leaf_checks() {
-        use std::sync::atomic::Ordering;
-
-        let (temporary, root, operation) = file_batch_fixture();
-        for index in 0..32 {
-            std::fs::write(
-                temporary
-                    .path()
-                    .join(format!("assets/objects/aa/asset-{index}")),
-                b"asset",
-            )
-            .unwrap();
-        }
-        let mut batch = operation.file_batch();
-        batch.observe_file(&batch_path("first")).unwrap().unwrap();
-        let validations = &root.authority.root.inner.root.directory_revalidations;
-        validations.store(0, Ordering::Relaxed);
-        let mut last = None;
-        for index in 0..32 {
-            let file = batch
-                .observe_file(&batch_path(&format!("asset-{index}")))
-                .unwrap()
-                .unwrap();
-            assert_eq!(file.size(), 5);
-            last = Some(file);
-        }
-        let observed = validations.load(Ordering::Relaxed);
-        assert_eq!(last.unwrap().read_bounded(5).unwrap(), b"asset");
-        assert!(observed <= 32 * 8, "Repeated leaf validation: {observed}");
-    }
-
-    #[test]
-    fn file_batch_avoids_comparing_unrelated_retained_files() {
+    fn file_batch_work_stays_bounded_per_observation() {
         use std::sync::atomic::Ordering;
 
         let (temporary, root, operation) = file_batch_fixture();
@@ -7210,10 +7151,12 @@ mod library_lifecycle_tests {
             )
             .unwrap();
         }
-
         let comparisons = &root.authority.root.inner.root.file_identity_comparisons;
-        comparisons.store(0, Ordering::Relaxed);
+        let validations = &root.authority.root.inner.root.directory_revalidations;
         let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        comparisons.store(0, Ordering::Relaxed);
+        validations.store(0, Ordering::Relaxed);
         for index in 0..32 {
             let file = batch
                 .observe_file(&batch_path(&format!("observed-{index}")))
@@ -7221,14 +7164,45 @@ mod library_lifecycle_tests {
                 .unwrap();
             assert_eq!(file.size(), 5);
         }
-        let unrelated_comparisons = comparisons.swap(0, Ordering::Relaxed);
+        assert_eq!(
+            comparisons.swap(0, Ordering::Relaxed),
+            0,
+            "observations compared unrelated retained files"
+        );
+        let revalidations = validations.swap(0, Ordering::Relaxed);
+        assert!(
+            revalidations <= 32 * 8,
+            "Repeated leaf validation: {revalidations}"
+        );
+
+        let path = batch_path("first");
+        let expected = operation
+            .observe_file(&path)
+            .unwrap()
+            .unwrap()
+            .revision_observation();
+        batch.validate_revision(&path, &expected).unwrap();
+        comparisons.store(0, Ordering::Relaxed);
+        validations.store(0, Ordering::Relaxed);
+        for _ in 0..32 {
+            batch.validate_revision(&path, &expected).unwrap();
+        }
+        assert_eq!(
+            comparisons.swap(0, Ordering::Relaxed),
+            0,
+            "revision validation rebuilt file authority"
+        );
+        let revalidations = validations.load(Ordering::Relaxed);
+        assert!(
+            revalidations <= 32 * 5,
+            "Repeated parent checks: {revalidations}"
+        );
 
         let (path, expected) = &retained[0];
         let reopened = batch.observe_file(path).unwrap().unwrap();
         assert_eq!(reopened.guard.identity, expected.guard.identity);
         assert_eq!(reopened.read_bounded(6).unwrap(), b"native");
         assert_eq!(comparisons.load(Ordering::Relaxed), 1);
-        assert_eq!(unrelated_comparisons, 0);
     }
 
     #[test]

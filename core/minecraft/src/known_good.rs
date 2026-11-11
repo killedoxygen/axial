@@ -5629,43 +5629,24 @@ mod tests {
     }
 
     #[test]
-    fn runtime_path_tree_rejects_file_ancestor() {
-        let mut fixture = fixture(false);
+    fn runtime_path_tree_rejects_file_link_and_reserved_conflicts() {
         let java_path = crate::runtime::runtime_java_relative_path();
         let java_root = java_path.split('/').next().expect("java path root");
-        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+        for conflict in [
             runtime_file_entry(java_root),
-            runtime_file_entry(java_path),
-        ]));
-
-        let error = fixture.derive().expect_err("file ancestor");
-        assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
-    }
-
-    #[test]
-    fn runtime_path_tree_rejects_link_ancestor() {
-        let mut fixture = fixture(false);
-        let java_path = crate::runtime::runtime_java_relative_path();
-        let java_root = java_path.split('/').next().expect("java path root");
-        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
             runtime_link_entry(java_root, "java"),
-            runtime_file_entry(java_path),
-        ]));
-
-        let error = fixture.derive().expect_err("link ancestor");
-        assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
-    }
-
-    #[test]
-    fn runtime_path_tree_rejects_incompatible_exact_path() {
-        let mut fixture = fixture(false);
-        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
-            runtime_file_entry(crate::runtime::runtime_java_relative_path()),
             runtime_file_entry(".axial-ready"),
-        ]));
-
-        let error = fixture.derive().expect_err("reserved path");
-        assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
+        ] {
+            let mut fixture = fixture(false);
+            fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+                conflict,
+                runtime_file_entry(java_path),
+            ]));
+            assert_eq!(
+                fixture.derive().expect_err("conflicting runtime path"),
+                KnownGoodInventoryError::ConflictingRuntimePath
+            );
+        }
     }
 
     #[test]

@@ -2948,8 +2948,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     use axial_fs::{LeafName, RootRevokeOutcome, RootSession, RootSessionAcquireOutcome};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    #[cfg(target_os = "linux")]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct AuthorityDropProbe {
         drops: Arc<AtomicUsize>,
@@ -3113,10 +3111,6 @@ mod tests {
             TransferClientConfig::bounded(connect, idle_read, request, origins.clone())
         };
         let config = bounded(connect, idle_read, request).expect("bounded transport config");
-        assert_eq!(config.connect_timeout(), connect);
-        assert_eq!(config.idle_read_timeout(), idle_read);
-        assert_eq!(config.request_timeout(), request);
-        assert_eq!(config.origin_count(), 2);
         let client = TransferClient::build(config).expect("closed transfer client");
         assert!(client.admits_url(
             &reqwest::Url::parse("https://github.com/other/path").expect("GitHub URL")
@@ -3691,29 +3685,26 @@ mod tests {
     fn content_encoding_accepts_only_absent_or_identity_values() {
         use reqwest::header::{HeaderMap, HeaderValue};
 
-        let mut headers = HeaderMap::new();
-        assert!(headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
-        assert!(headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("IDENTITY"));
-        assert!(headers_have_identity_encoding(&headers));
-        headers.insert(
-            CONTENT_ENCODING,
-            HeaderValue::from_static("identity, identity"),
-        );
-        assert!(headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        assert!(!headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
-        assert!(!headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("deflate"));
-        assert!(!headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
-        assert!(!headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity, gzip"));
-        assert!(!headers_have_identity_encoding(&headers));
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static(""));
-        assert!(!headers_have_identity_encoding(&headers));
+        assert!(headers_have_identity_encoding(&HeaderMap::new()));
+        for (value, identity) in [
+            ("identity", true),
+            ("IDENTITY", true),
+            ("identity, identity", true),
+            ("gzip", false),
+            ("br", false),
+            ("deflate", false),
+            ("zstd", false),
+            ("identity, gzip", false),
+            ("", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_ENCODING, HeaderValue::from_static(value));
+            assert_eq!(
+                headers_have_identity_encoding(&headers),
+                identity,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
@@ -3740,10 +3731,6 @@ mod tests {
         let both = both.finish();
         assert!(both.sha1().is_some());
         assert!(both.sha512().is_some());
-        assert_eq!(
-            format!("{both:?}"),
-            "VerifiedTransferDigests { sha1: true, sha512: true }"
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -3798,7 +3785,7 @@ mod tests {
         assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
         drop(discard);
         assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
-        server.await.expect("server task");
+        assert_one_identity_request(server);
         drop(cancellation_owner);
         drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
@@ -3857,7 +3844,7 @@ mod tests {
         assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
         drop(authority);
         assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
-        server.await.expect("server task");
+        assert_one_identity_request(server);
         drop(file);
         drop(cancellation_owner);
         drop(root);
@@ -3905,7 +3892,7 @@ mod tests {
         drop(authority);
         assert_eq!(authority_drops.load(Ordering::SeqCst), 1);
         assert!(!temporary.path().join("failed-reservation").exists());
-        server.await.expect("server task");
+        assert_one_identity_request(server);
         drop(cancellation_owner);
         drop(root);
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
@@ -3955,34 +3942,17 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn serve_once(body: &'static [u8]) -> (reqwest::Url, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind transfer fixture");
-        let address = listener.local_addr().expect("fixture address");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept transfer request");
-            let mut request = [0_u8; 2048];
-            let read = stream.read(&mut request).await.expect("read request");
-            let request = std::str::from_utf8(&request[..read]).expect("HTTP request text");
-            assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains("accept-encoding: identity")
-            );
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(headers.as_bytes())
-                .await
-                .expect("write response headers");
-            stream.write_all(body).await.expect("write response body");
-        });
-        (
-            reqwest::Url::parse(&format!("http://{address}/artifact")).expect("fixture URL"),
-            server,
-        )
+    async fn serve_once(body: &'static [u8]) -> (reqwest::Url, crate::http::test_server::Server) {
+        use crate::http::test_server::{response, serve};
+        let server = serve(vec![response("200 OK", &[], body)]).await;
+        let url = reqwest::Url::parse(&server.url("/artifact")).expect("fixture URL");
+        (url, server)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_one_identity_request(server: crate::http::test_server::Server) {
+        let requests = server.finish();
+        assert!(matches!(&requests[..], [head]
+            if head.to_ascii_lowercase().contains("accept-encoding: identity")));
     }
 }

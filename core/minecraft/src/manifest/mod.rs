@@ -385,54 +385,24 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[tokio::test]
-    async fn writes_and_reads_persistent_manifest_cache() {
+    async fn persistent_manifest_cache_round_trips_bytes_and_values() {
         let root = temp_dir("manifest-cache-round-trip");
         let (_library, operation) = test_library(&root);
-        let body = sample_manifest_body("1.21.5");
 
-        write_persistent_manifest_cache(&operation, body.as_bytes())
+        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.5").as_bytes())
             .await
             .expect("write cache");
         let manifest = read_persistent_manifest_cache(&operation).expect("read cache");
-
         assert_eq!(manifest.latest.release, "1.21.5");
         assert_eq!(manifest.versions[0].id, "1.21.5");
+        let fresh = fresh_persistent_manifest_cache(&operation).expect("fresh local manifest");
+        assert_eq!(fresh.latest.release, "1.21.5");
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn fallback_returns_cached_manifest_when_live_provider_fails() {
-        let root = temp_dir("manifest-cache-fallback");
-        let (_library, operation) = test_library(&root);
-        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.4").as_bytes())
-            .await
-            .expect("write cache");
-
-        let (manifest, live_body) = resolve_manifest_from_live_or_cache(
-            &operation,
-            Err("fetching version manifest: offline".to_string()),
-            None,
-        )
-        .expect("cached manifest should satisfy provider failure");
-
-        assert_eq!(manifest.latest.release, "1.21.4");
-        assert!(live_body.is_none());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn fresh_manifest_value_can_seed_a_requested_library_cache() {
-        let root = temp_dir("manifest-cache-fresh-library");
-        let (_library, operation) = test_library(&root);
-        let manifest =
+        let value =
             parse_manifest_body(sample_manifest_body("1.21.6").as_bytes()).expect("parse manifest");
-
-        write_persistent_manifest_cache_value(&operation, &manifest)
+        write_persistent_manifest_cache_value(&operation, &value)
             .await
             .expect("write cache value");
-
         let cached = read_persistent_manifest_cache(&operation).expect("read cache");
         assert_eq!(cached.latest.release, "1.21.6");
 
@@ -440,19 +410,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_persistent_manifest_is_preferred_for_requested_library() {
-        let root = temp_dir("manifest-cache-fresh-local-first");
-        let (_library, operation) = test_library(&root);
-        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.7").as_bytes())
-            .await
-            .expect("write cache");
+    async fn cached_manifest_satisfies_live_provider_and_parse_failures() {
+        for live in [
+            Err("fetching version manifest: offline".to_string()),
+            Ok(b"not json".to_vec()),
+        ] {
+            let root = temp_dir("manifest-cache-fallback");
+            let (_library, operation) = test_library(&root);
+            write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.4").as_bytes())
+                .await
+                .expect("write cache");
 
-        let manifest = fresh_persistent_manifest_cache(&operation).expect("fresh local manifest");
+            let (manifest, live_body) = resolve_manifest_from_live_or_cache(&operation, live, None)
+                .expect("cached manifest should satisfy live failure");
 
-        assert_eq!(manifest.latest.release, "1.21.7");
-        assert_eq!(manifest.versions[0].id, "1.21.7");
-
-        let _ = fs::remove_dir_all(root);
+            assert_eq!(manifest.latest.release, "1.21.4");
+            assert!(live_body.is_none());
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -501,24 +476,6 @@ mod tests {
         .expect_err("corrupt cache should not replace provider error");
 
         assert_eq!(error, "fetching version manifest: offline");
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn live_parse_error_can_fall_back_to_cached_manifest() {
-        let root = temp_dir("manifest-cache-live-parse");
-        let (_library, operation) = test_library(&root);
-        write_persistent_manifest_cache(&operation, sample_manifest_body("1.21.3").as_bytes())
-            .await
-            .expect("write cache");
-
-        let (manifest, live_body) =
-            resolve_manifest_from_live_or_cache(&operation, Ok(b"not json".to_vec()), None)
-                .expect("cached manifest should satisfy live parse failure");
-
-        assert_eq!(manifest.latest.release, "1.21.3");
-        assert!(live_body.is_none());
 
         let _ = fs::remove_dir_all(root);
     }

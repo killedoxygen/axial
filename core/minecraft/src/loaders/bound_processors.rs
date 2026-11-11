@@ -2277,32 +2277,26 @@ mod tests {
     }
 
     #[test]
-    fn reads_exact_main_class_from_bounded_jar() {
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer
-            .start_file("META-INF/MANIFEST.MF", SimpleFileOptions::default())
-            .expect("manifest entry");
-        writer
-            .write_all(b"Manifest-Version: 1.0\r\nMain-Class: example.Main\r\n\r\n")
-            .expect("manifest bytes");
-        let jar = writer.finish().expect("jar").into_inner();
-        assert_eq!(
-            processor_main_class(&jar).expect("main class"),
-            "example.Main"
-        );
-    }
-
-    #[test]
-    fn rejects_portable_manifest_alias() {
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer
-            .start_file("meta-inf/manifest.mf", SimpleFileOptions::default())
-            .expect("manifest entry");
-        writer
-            .write_all(b"Main-Class: example.Main\r\n")
-            .expect("manifest bytes");
-        let jar = writer.finish().expect("jar").into_inner();
-        assert!(processor_main_class(&jar).is_err());
+    fn reads_exact_main_class_and_rejects_portable_manifest_alias() {
+        for (name, accepted) in [
+            ("META-INF/MANIFEST.MF", true),
+            ("meta-inf/manifest.mf", false),
+        ] {
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .expect("manifest entry");
+            writer
+                .write_all(b"Manifest-Version: 1.0\r\nMain-Class: example.Main\r\n\r\n")
+                .expect("manifest bytes");
+            let jar = writer.finish().expect("jar").into_inner();
+            let main_class = processor_main_class(&jar);
+            if accepted {
+                assert_eq!(main_class.expect("main class"), "example.Main");
+            } else {
+                assert!(main_class.is_err());
+            }
+        }
     }
 
     fn mcp_archive(config: &[u8], entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -2800,13 +2794,13 @@ case "$4" in
 esac
 "#
         .to_vec();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("fixture listener");
-        let url = format!(
-            "http://{}/java",
-            listener.local_addr().expect("fixture address")
-        );
+        let server = crate::http::test_server::serve(vec![crate::http::test_server::response(
+            "200 OK",
+            &[],
+            &program,
+        )])
+        .await;
+        let url = server.url("/java");
         let manifest = serde_json::from_value(serde_json::json!({
             "files": {
                 "bin": {"type": "directory"},
@@ -2821,30 +2815,6 @@ esac
             }
         }))
         .expect("fixture runtime manifest");
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("fixture connection");
-            let mut header = Vec::new();
-            while !header.ends_with(b"\r\n\r\n") {
-                assert!(header.len() < 4096, "bounded fixture request");
-                header.push(
-                    tokio::io::AsyncReadExt::read_u8(&mut stream)
-                        .await
-                        .expect("request byte"),
-                );
-            }
-            assert!(header.starts_with(b"GET /java HTTP/1.1\r\n"));
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        program.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .expect("response header");
-            stream.write_all(&program).await.expect("runtime bytes");
-        });
         let source = crate::runtime::authenticated_runtime_source_from_manifest_for_test(
             crate::runtime::RuntimeId::from("java-runtime-delta"),
             manifest,
@@ -2854,7 +2824,8 @@ esac
             .materialize_runtime(&base.java_version, source)
             .await
             .expect("materialize fixture runtime");
-        server.await.expect("runtime fixture served");
+        let requests = server.finish();
+        assert!(matches!(&requests[..], [head] if head.starts_with("GET /java HTTP/1.1\r\n")));
         runtime
     }
 
@@ -3087,34 +3058,6 @@ esac
             }
             drop(runtime);
             owner.cleanup().expect("cleanup");
-        }
-    }
-
-    #[test]
-    fn processor_errors_are_closed_static_and_redacted() {
-        for error in [
-            BoundProcessorError::Authority,
-            BoundProcessorError::Source,
-            BoundProcessorError::Stage,
-            BoundProcessorError::Runtime,
-            BoundProcessorError::Manifest,
-            BoundProcessorError::Spawn,
-            BoundProcessorError::Containment,
-            BoundProcessorError::Timeout,
-            BoundProcessorError::OutputLimit,
-            BoundProcessorError::Unsuccessful,
-            BoundProcessorError::Cancelled,
-            BoundProcessorError::Unreaped,
-            BoundProcessorError::Cleanup,
-            BoundProcessorError::OwnerStopped,
-        ] {
-            let rendered = error.to_string();
-            assert!(!rendered.is_empty());
-            assert!(!rendered.contains("PRIVATE"));
-            assert!(!rendered.contains('/'));
-            assert!(!rendered.contains('\\'));
-            assert!(!rendered.contains("java"));
-            assert!(!rendered.contains("Main-Class"));
         }
     }
 

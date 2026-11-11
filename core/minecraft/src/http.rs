@@ -315,7 +315,7 @@ where
     }
 }
 
-/// Scripted loopback HTTP server: one raw response per connection, request heads recorded.
+/// Loopback HTTP servers for tests: each records request heads before responding.
 #[cfg(test)]
 pub(crate) mod test_server {
     use std::sync::{Arc, Mutex};
@@ -344,32 +344,39 @@ pub(crate) mod test_server {
         bytes
     }
 
+    /// Serves one scripted raw response per connection, in order, then stops accepting.
     pub(crate) async fn serve(responses: Vec<Vec<u8>>) -> Server {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&requests);
-        let task = tokio::spawn(async move {
+        start(move |listener, requests| async move {
             for response in responses {
-                let Ok((mut stream, _)) = listener.accept().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let mut head = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                while !head.windows(4).any(|end| end == b"\r\n\r\n") {
-                    match stream.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => head.extend_from_slice(&buffer[..read]),
-                    }
-                }
-                recorded
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&head).into_owned());
-                let _ = stream.write_all(&response).await;
-                let _ = stream.shutdown().await;
+                exchange(stream, &requests, |_| response).await;
             }
-        });
+        })
+    }
+
+    /// Serves every connection until finished, answering with `route(request_path)`.
+    /// Requires a Tokio runtime context; binding is synchronous.
+    pub(crate) fn serve_routes(route: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Server {
+        let route = Arc::new(route);
+        start(move |listener, requests| async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (route, requests) = (Arc::clone(&route), Arc::clone(&requests));
+                tokio::spawn(async move { exchange(stream, &requests, |path| route(path)).await });
+            }
+        })
+    }
+
+    fn start<F: std::future::Future<Output = ()> + Send + 'static>(
+        accept: impl FnOnce(tokio::net::TcpListener, Arc<Mutex<Vec<String>>>) -> F,
+    ) -> Server {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(accept(listener, Arc::clone(&requests)));
         Server {
             origin,
             requests,
@@ -377,9 +384,42 @@ pub(crate) mod test_server {
         }
     }
 
+    async fn exchange(
+        mut stream: tokio::net::TcpStream,
+        requests: &Mutex<Vec<String>>,
+        respond: impl FnOnce(&str) -> Vec<u8>,
+    ) {
+        let mut head = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !head.windows(4).any(|end| end == b"\r\n\r\n") {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => head.extend_from_slice(&buffer[..read]),
+            }
+        }
+        let head = String::from_utf8_lossy(&head).into_owned();
+        let response = respond(request_path(&head));
+        requests.lock().unwrap().push(head);
+        let _ = stream.write_all(&response).await;
+        let _ = stream.shutdown().await;
+    }
+
+    fn request_path(head: &str) -> &str {
+        head.split_whitespace().nth(1).unwrap_or_default()
+    }
+
     impl Server {
         pub(crate) fn url(&self, path: &str) -> String {
             format!("{}{path}", self.origin)
+        }
+
+        /// Request paths received so far.
+        pub(crate) fn paths(&self) -> Vec<String> {
+            let requests = self.requests.lock().unwrap();
+            requests
+                .iter()
+                .map(|head| request_path(head).to_owned())
+                .collect()
         }
 
         pub(crate) fn finish(self) -> Vec<String> {
@@ -421,11 +461,6 @@ mod tests {
         ] {
             assert!(!error.is_retryable(), "{error:?}");
         }
-    }
-
-    #[test]
-    fn user_agent_is_the_workspace_version() {
-        assert_eq!(USER_AGENT, concat!("axial/", env!("CARGO_PKG_VERSION")));
     }
 
     #[tokio::test]

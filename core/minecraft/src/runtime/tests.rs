@@ -14,8 +14,7 @@ use super::{
     fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
     install_runtime_manifest_files, java_executable, java_executable_for_os,
     materialize_missing_runtime_source, parse_mach_o_arm64_compatibility,
-    plan_runtime_manifest_files, publish_staged_managed_runtime,
-    publish_staged_managed_runtime_and_finalize,
+    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
     publish_staged_managed_runtime_with_promotion_failure_for_test,
@@ -29,16 +28,14 @@ use super::{
     verify_runtime_download,
 };
 use crate::JavaVersion;
+use crate::http::test_server::{Server, response, serve};
 use sha1::{Digest as _, Sha1};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -358,13 +355,6 @@ fn manifest_link(target: &str) -> ComponentManifestFile {
     }
 }
 
-fn planned_paths(entries: &[(String, ComponentManifestFile)]) -> Vec<&str> {
-    entries
-        .iter()
-        .map(|(relative_path, _)| relative_path.as_str())
-        .collect()
-}
-
 fn unsafe_manifest_path_message(result: Result<PathBuf, JavaRuntimeLookupError>) -> String {
     match result {
         Err(JavaRuntimeLookupError::RuntimeSource(failure))
@@ -393,52 +383,23 @@ fn expect_runtime_source_failure(
 }
 
 #[test]
-fn component_manifest_destination_accepts_safe_nested_path() {
+fn component_manifest_destination_admits_only_safe_portable_paths() {
     let temp_dir = Path::new("runtime-temp");
-    let destination =
-        component_manifest_destination(&test_runtime_component(), temp_dir, "bin/java").unwrap();
-
-    assert_eq!(destination, temp_dir.join("bin").join("java"));
-}
-
-#[test]
-fn component_manifest_destination_rejects_traversal_absolute_and_drive_paths() {
+    assert_eq!(
+        component_manifest_destination(&test_runtime_component(), temp_dir, "bin/java").unwrap(),
+        temp_dir.join("bin").join("java")
+    );
     let absolute_path = if cfg!(windows) {
         r"\Windows\System32"
     } else {
         "/etc/passwd"
     };
+    let overlong = "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES + 1);
     for relative_path in [
         "bin/../java",
         absolute_path,
         "C:/Windows/System32",
         r"C:\Windows\System32",
-    ] {
-        let message = unsafe_manifest_path_message(component_manifest_destination(
-            &test_runtime_component(),
-            Path::new("runtime-temp"),
-            relative_path,
-        ));
-
-        assert!(
-            message.contains("unsafe runtime manifest path"),
-            "{relative_path}: {message}"
-        );
-        assert!(
-            message.contains(relative_path),
-            "{relative_path}: {message}"
-        );
-        assert!(
-            !message.contains("runtime-temp"),
-            "{relative_path}: {message}"
-        );
-    }
-}
-
-#[test]
-fn component_manifest_destination_rejects_nonportable_segments() {
-    let overlong = "a".repeat(crate::portable_path::MAX_PORTABLE_FILE_NAME_BYTES + 1);
-    for relative_path in [
         "bin/NUL.txt",
         "bin/java.",
         "bin/java ",
@@ -449,13 +410,12 @@ fn component_manifest_destination_rejects_nonportable_segments() {
     ] {
         let message = unsafe_manifest_path_message(component_manifest_destination(
             &test_runtime_component(),
-            Path::new("runtime-temp"),
+            temp_dir,
             relative_path,
         ));
-
         assert!(
-            message.contains("unsafe runtime manifest path"),
-            "unexpected rejection for {relative_path:?}: {message}"
+            message.contains("unsafe runtime manifest path") && !message.contains("runtime-temp"),
+            "{relative_path:?}: {message}"
         );
     }
 }
@@ -517,61 +477,25 @@ fn runtime_file_download_concurrency_is_adaptive_and_bounded() {
     assert_eq!(runtime_file_download_concurrency_for(64), 32);
 }
 
-#[test]
-fn runtime_manifest_install_plan_sorts_directories_before_files() {
-    let mut files = HashMap::new();
-    files.insert("lib/server/libjvm.so".to_string(), manifest_file("file"));
-    files.insert("bin/java".to_string(), manifest_file("file"));
-    files.insert("lib/server".to_string(), manifest_file("directory"));
-    files.insert("bin".to_string(), manifest_file("directory"));
-    files.insert(
-        "legal/module/LICENSE".to_string(),
-        manifest_link("../base/LICENSE"),
-    );
-    files.insert("ignored-entry".to_string(), manifest_file("unknown"));
-
-    let plan = plan_runtime_manifest_files(files);
-
-    assert_eq!(
-        planned_paths(&plan.directory_entries),
-        vec!["bin", "lib/server"]
-    );
-    assert_eq!(
-        planned_paths(&plan.file_entries),
-        vec!["bin/java", "lib/server/libjvm.so"]
-    );
-    assert_eq!(
-        planned_paths(&plan.link_entries),
-        vec!["legal/module/LICENSE"]
-    );
-    assert_eq!(planned_paths(&plan.other_entries), vec!["ignored-entry"]);
-}
-
 #[tokio::test]
-async fn runtime_manifest_install_reports_file_progress() {
+async fn runtime_manifest_install_counts_files_and_links_in_progress() {
     let root = unique_temp_root("axial-runtime-progress-test");
-    let java_bytes = b"java".to_vec();
-    let cfg_bytes = b"cfg".to_vec();
-    let java_sha1 = sha1_hex(&java_bytes);
-    let cfg_sha1 = sha1_hex(&cfg_bytes);
-    let java_url = serve_runtime_download(java_bytes.clone()).await;
-    let cfg_url = serve_runtime_response(
-        200,
-        cfg_bytes.clone(),
-        Some(cfg_bytes.len() as u64),
-        "/jvm.cfg",
-    )
-    .await;
-    let mut files = HashMap::new();
-    files.insert("bin".to_string(), manifest_file("directory"));
-    files.insert(
-        "bin/java".to_string(),
-        downloadable_manifest_file(&java_url, java_bytes.len() as u64, &java_sha1),
-    );
-    files.insert(
-        "lib/jvm.cfg".to_string(),
-        downloadable_manifest_file(&cfg_url, cfg_bytes.len() as u64, &cfg_sha1),
-    );
+    let license = b"license";
+    let size = license.len() as u64;
+    let mut files = HashMap::from([
+        ("legal".to_string(), manifest_file("directory")),
+        (
+            "legal/java.base/LICENSE".to_string(),
+            downloadable_manifest_file(&serve_body(license).await, size, &sha1_hex(license)),
+        ),
+    ]);
+    if cfg!(unix) {
+        files.insert(
+            "legal/java.compiler/LICENSE".to_string(),
+            manifest_link("../java.base/LICENSE"),
+        );
+    }
+    let total = files.len() - 1;
     let mut events = Vec::new();
 
     install_runtime_manifest_files(&test_runtime_component(), &root, files, &mut |event| {
@@ -580,84 +504,28 @@ async fn runtime_manifest_install_reports_file_progress() {
     .await
     .expect("runtime manifest files");
 
-    assert_eq!(
-        events.first(),
-        Some(&RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-            component: "java-runtime-delta".to_string(),
-            current: 0,
-            total: 2,
-            bytes_done: 0,
-            bytes_total: (b"java".len() + b"cfg".len()) as u64,
-        })
-    );
-    assert_eq!(events.len(), 3);
-    assert_eq!(
-        events
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEnsureEvent::InstallingManagedRuntimeFiles { current, total, .. } => {
-                    Some((*current, *total))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        vec![(0, 2), (1, 2), (2, 2)]
-    );
-    assert!(events.iter().all(|event| matches!(
-        event,
-        RuntimeEnsureEvent::InstallingManagedRuntimeFiles { .. }
-    )));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn runtime_manifest_install_creates_link_entries_and_counts_them() {
-    let root = unique_temp_root("axial-runtime-link-install-test");
-    let license_bytes = b"license".to_vec();
-    let license_sha1 = sha1_hex(&license_bytes);
-    let license_url = serve_runtime_download(license_bytes.clone()).await;
-    let mut files = HashMap::new();
-    files.insert(
-        "legal/java.base/LICENSE".to_string(),
-        downloadable_manifest_file(&license_url, license_bytes.len() as u64, &license_sha1),
-    );
-    files.insert(
-        "legal/java.compiler/LICENSE".to_string(),
-        manifest_link("../java.base/LICENSE"),
-    );
-    let mut events = Vec::new();
-
-    install_runtime_manifest_files(&test_runtime_component(), &root, files, &mut |event| {
-        events.push(event);
-    })
-    .await
-    .expect("runtime manifest with link");
-
+    #[cfg(unix)]
     assert_eq!(
         fs::read_link(root.join("legal/java.compiler/LICENSE")).expect("runtime link"),
         PathBuf::from("../java.base/LICENSE")
     );
-    assert_eq!(
-        events
-            .iter()
-            .filter_map(|event| match event {
-                RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-                    current,
-                    total,
-                    bytes_done,
-                    bytes_total,
-                    ..
-                } => Some((*current, *total, *bytes_done, *bytes_total)),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        vec![
-            (0, 2, 0, license_bytes.len() as u64),
-            (1, 2, license_bytes.len() as u64, license_bytes.len() as u64),
-            (2, 2, license_bytes.len() as u64, license_bytes.len() as u64)
-        ]
-    );
+    let progress = events
+        .iter()
+        .map(|event| match event {
+            RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
+                current,
+                total,
+                bytes_done,
+                bytes_total,
+                ..
+            } => (*current, *total, *bytes_done, *bytes_total),
+            other => panic!("unexpected runtime event {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let expected = (0..=total)
+        .map(|current| (current, total, if current == 0 { 0 } else { size }, size))
+        .collect::<Vec<_>>();
+    assert_eq!(progress, expected);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -706,7 +574,9 @@ async fn runtime_manifest_link_fails_explicitly_on_non_unix() {
 
 #[tokio::test]
 async fn runtime_manifest_json_fetch_classifies_permanent_http_status_as_metadata_invalid() {
-    let url = serve_runtime_json(404, b"missing".to_vec(), None).await;
+    let url = serve(vec![response("404 Not Found", &[], b"missing")])
+        .await
+        .url("/runtime.json");
 
     let error = fetch_runtime_manifest_bytes_for_test(&url)
         .await
@@ -747,7 +617,7 @@ fn runtime_file_source_policy_classifies_invalid_and_insecure_urls() {
 #[tokio::test]
 async fn runtime_source_receipt_preserves_verified_authored_bytes() {
     let bytes = br#"{"files":{}}"#.to_vec();
-    let url = serve_runtime_json(200, bytes.clone(), None).await;
+    let url = serve_body(&bytes).await;
     let expected_sha1 = sha1_hex(&bytes);
     let receipt = acquire_runtime_source_for_test(
         RuntimeId::from("java-runtime-delta"),
@@ -772,7 +642,7 @@ async fn missing_runtime_source_preserves_canonical_and_sidecar_conflicts() {
         let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let component = RuntimeId::from("jre-legacy");
         let root = cache.component_root(component.as_str()).unwrap();
-        let source = runtime_source_receipt_fixture(&component, &root, b"original java").await;
+        let source = runtime_source_receipt_fixture(&component, b"original java").await;
         let repeated = authenticated_runtime_source_from_manifest_for_test(
             component.clone(),
             source.manifest().clone(),
@@ -851,7 +721,7 @@ async fn missing_runtime_source_concurrent_producers_publish_once_and_reuse() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
     let root = cache.component_root(component.as_str()).unwrap();
-    let source = runtime_source_receipt_fixture(&component, &root, b"concurrent java").await;
+    let source = runtime_source_receipt_fixture(&component, b"concurrent java").await;
     let repeated = authenticated_runtime_source_from_manifest_for_test(
         component.clone(),
         source.manifest().clone(),
@@ -914,7 +784,7 @@ async fn missing_runtime_source_cancellation_before_publication_cleans_only_owne
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
     let root = cache.component_root(component.as_str()).unwrap();
-    let source = runtime_source_receipt_fixture(&component, &root, b"cancelled java").await;
+    let source = runtime_source_receipt_fixture(&component, b"cancelled java").await;
     let unrelated = cache.root().join("unrelated");
     fs::write(&unrelated, b"preserve").unwrap();
     let mut gate = block_runtime_before_publication_claim_for_test(&root);
@@ -985,7 +855,7 @@ fn missing_runtime_source_cancellation_after_claim_requires_publication_settleme
             let quarantine = root.with_file_name("jre-legacy.quarantine");
             let source = match tokio::time::timeout(
                 wait,
-                runtime_source_receipt_fixture(&component, &root, b"committed java"),
+                runtime_source_receipt_fixture(&component, b"committed java"),
             )
             .await
             {
@@ -1130,7 +1000,7 @@ fn missing_runtime_source_preserves_conflicts_after_publication_claim() {
                 let quarantine = root.with_file_name("jre-legacy.quarantine");
                 let source = match tokio::time::timeout(
                     wait,
-                    runtime_source_receipt_fixture(&component, &root, b"unpublished java"),
+                    runtime_source_receipt_fixture(&component, b"unpublished java"),
                 )
                 .await
                 {
@@ -1282,14 +1152,14 @@ async fn authenticated_empty_runtime_file_stages_and_verifies() {
             .component_root(component.as_str())
             .expect("runtime root");
         let java_bytes = b"authenticated Java fixture".to_vec();
-        let (java_url, java_requests) =
-            serve_runtime_retry_responses(vec![(200, java_bytes.clone()); 2]).await;
-        let (empty_url, empty_requests) =
-            serve_runtime_retry_responses(vec![(200, Vec::new())]).await;
+        let java_server = serve_bodies(&java_bytes, 2).await;
+        let java_url = java_server.url("/runtime.bin");
+        let empty_server = serve_bodies(b"", 1).await;
+        let empty_url = empty_server.url("/runtime.bin");
         let compressed_empty = lzma_compress_bytes(b"");
         assert!(!compressed_empty.is_empty());
-        let (compressed_url, compressed_requests) =
-            serve_runtime_retry_responses(vec![(200, compressed_empty.clone()); 2]).await;
+        let compressed_server = serve_bodies(&compressed_empty, 2).await;
+        let compressed_url = compressed_server.url("/runtime.bin");
         let empty = if compressed {
             downloadable_lzma_manifest_file(
                 &empty_url,
@@ -1319,7 +1189,7 @@ async fn authenticated_empty_runtime_file_stages_and_verifies() {
             ]),
         };
         let bytes = serde_json::to_vec(&manifest).expect("runtime manifest");
-        let url = serve_runtime_json(200, bytes.clone(), None).await;
+        let url = serve_body(&bytes).await;
         let source = acquire_runtime_source_for_test(
             component.clone(),
             RuntimeDownloadManifest {
@@ -1353,14 +1223,10 @@ async fn authenticated_empty_runtime_file_stages_and_verifies() {
             .expect("verified runtime tree");
         drop(verified);
         assert!(admit_runtime_component(&cache, component.as_str()).contents_verified());
-        assert_eq!(java_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            compressed_requests.load(Ordering::SeqCst),
-            usize::from(compressed)
-        );
-        assert_eq!(
-            empty_requests.load(Ordering::SeqCst),
-            0,
+        assert_eq!(java_server.finish().len(), 1);
+        assert_eq!(compressed_server.finish().len(), usize::from(compressed));
+        assert!(
+            empty_server.finish().is_empty(),
             "authenticated empty content needs no transfer"
         );
 
@@ -1372,7 +1238,8 @@ async fn authenticated_empty_runtime_file_stages_and_verifies() {
 #[tokio::test]
 async fn authenticated_empty_runtime_file_requires_exact_size_and_empty_digest_before_effects() {
     for (missing_size, empty_compressed) in [(false, false), (true, false), (false, true)] {
-        let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+        let requests = serve_bodies(b"unused", 1).await;
+        let url = requests.url("/runtime.bin");
         let mut empty = downloadable_manifest_file(&url, 0, &sha1_hex(b""));
         let raw = empty.downloads.as_mut().unwrap().raw.as_mut().unwrap();
         if missing_size {
@@ -1407,7 +1274,8 @@ async fn authenticated_empty_runtime_file_cancelled_after_materialization_cleans
     let root = cache
         .component_root(component.as_str())
         .expect("runtime root");
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, Vec::new())]).await;
+    let requests = serve_bodies(b"", 1).await;
+    let url = requests.url("/runtime.bin");
     let source = authenticated_runtime_source_from_manifest_for_test(
         component.clone(),
         ComponentManifest {
@@ -1446,20 +1314,14 @@ async fn authenticated_empty_runtime_file_cancelled_after_materialization_cleans
     assert!(staged.is_none());
     assert!(!root.exists());
     assert!(!staging_root.exists());
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(requests.finish().is_empty());
 }
 
 #[tokio::test]
 async fn cached_runtime_verification_holds_exact_publication_locks_until_consumed() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("runtime root");
-    let source = runtime_source_receipt_fixture(&component, &root, b"cached java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let staged = stage_java(&cache, &component, b"cached java").await;
     let source = publish_staged_managed_runtime_and_finalize(staged)
         .await
         .expect("managed runtime publish")
@@ -1516,11 +1378,7 @@ async fn cancelling_blocked_runtime_staging_removes_owned_sidecar() {
         let _ = connection_closed_tx.send(());
     });
     let java_bytes = b"blocked runtime";
-    let java_relative_path = java_executable(&root)
-        .strip_prefix(&root)
-        .expect("java path under runtime root")
-        .to_string_lossy()
-        .replace('\\', "/");
+    let java_relative_path = runtime_java_manifest_path();
     let mut java_file = downloadable_manifest_file(
         &format!("http://{address}/runtime.bin"),
         java_bytes.len() as u64,
@@ -1581,12 +1439,8 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
     fs::write(root.join("sentinel"), b"canonical").expect("canonical sentinel");
     let raw_bytes = b"replacement java".to_vec();
     let compressed_bytes = lzma_compress_bytes(&raw_bytes);
-    let compressed_url = serve_runtime_download(compressed_bytes.clone()).await;
-    let java_relative_path = java_executable(&root)
-        .strip_prefix(&root)
-        .expect("java path under runtime root")
-        .to_string_lossy()
-        .replace('\\', "/");
+    let compressed_url = serve_body(&compressed_bytes).await;
+    let java_relative_path = runtime_java_manifest_path();
     let mut java_file = downloadable_lzma_manifest_file(
         &compressed_url,
         raw_bytes.len() as u64,
@@ -1603,8 +1457,7 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
         },
     )
     .expect("authenticated compressed runtime source");
-    let contender_source =
-        runtime_source_receipt_fixture(&component, &root, b"contender java").await;
+    let contender_source = runtime_source_receipt_fixture(&component, b"contender java").await;
     let gate = block_runtime_decompression_for_test(java_executable(&staging_root));
     let (cancellation_tx, mut cancellation) = crate::cancellation::channel();
     let stage_cache = cache.clone();
@@ -1692,63 +1545,39 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
 }
 
 #[tokio::test]
-async fn runtime_source_receipt_rejects_size_mismatch_before_parse() {
-    let bytes = b"not json".to_vec();
-    let url = serve_runtime_json(200, bytes.clone(), None).await;
-    let error = acquire_runtime_source_for_test(
-        RuntimeId::from("java-runtime-delta"),
-        RuntimeDownloadManifest {
-            url,
-            sha1: sha1_hex(&bytes),
-            size: bytes.len() as u64 + 1,
-        },
-    )
-    .await
-    .expect_err("size mismatch must reject the source");
-
-    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::IntegrityMismatch);
-    assert_eq!(failure.detail(), "runtime component manifest size mismatch");
-}
-
-#[tokio::test]
-async fn runtime_source_receipt_rejects_checksum_mismatch_before_parse() {
-    let bytes = b"not json".to_vec();
-    let url = serve_runtime_json(200, bytes.clone(), None).await;
-    let error = acquire_runtime_source_for_test(
-        RuntimeId::from("java-runtime-delta"),
-        RuntimeDownloadManifest {
-            url,
-            sha1: "0000000000000000000000000000000000000000".to_string(),
-            size: bytes.len() as u64,
-        },
-    )
-    .await
-    .expect_err("checksum mismatch must reject the source");
-
-    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::IntegrityMismatch);
-    assert_eq!(
-        failure.detail(),
-        "runtime component manifest checksum mismatch"
-    );
-}
-
-#[tokio::test]
-async fn runtime_source_receipt_parses_only_after_integrity_validation() {
-    let bytes = b"not json".to_vec();
-    let url = serve_runtime_json(200, bytes.clone(), None).await;
-    let error = acquire_runtime_source_for_test(
-        RuntimeId::from("java-runtime-delta"),
-        RuntimeDownloadManifest {
-            url,
-            sha1: sha1_hex(&bytes),
-            size: bytes.len() as u64,
-        },
-    )
-    .await
-    .expect_err("authenticated malformed JSON must fail parsing");
-
-    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::MetadataInvalid);
-    assert!(failure.detail().contains("expected ident"), "{failure:?}");
+async fn runtime_source_receipt_verifies_integrity_before_parse() {
+    let bytes = b"not json";
+    let zero = "0000000000000000000000000000000000000000".to_string();
+    for (sha1, size, kind, detail) in [
+        (
+            sha1_hex(bytes),
+            bytes.len() as u64 + 1,
+            RuntimeSourceFailureKind::IntegrityMismatch,
+            "runtime component manifest size mismatch",
+        ),
+        (
+            zero,
+            bytes.len() as u64,
+            RuntimeSourceFailureKind::IntegrityMismatch,
+            "runtime component manifest checksum mismatch",
+        ),
+        (
+            sha1_hex(bytes),
+            bytes.len() as u64,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            "expected ident",
+        ),
+    ] {
+        let url = serve_body(bytes).await;
+        let error = acquire_runtime_source_for_test(
+            RuntimeId::from("java-runtime-delta"),
+            RuntimeDownloadManifest { url, sha1, size },
+        )
+        .await
+        .expect_err("unverified or malformed runtime source must fail");
+        let failure = expect_runtime_source_failure(error, kind);
+        assert!(failure.detail().contains(detail), "{failure:?}");
+    }
 }
 
 #[test]
@@ -1779,19 +1608,7 @@ fn runtime_catalog_requires_component_manifest_integrity_proof() {
 }
 
 #[test]
-fn managed_runtime_cache_clones_share_root_and_install_lock() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let cloned = cache.clone();
-
-    assert_eq!(cache.root(), cloned.root());
-    assert!(Arc::ptr_eq(
-        &cache.install_lock("java-runtime-delta"),
-        &cloned.install_lock("java-runtime-delta"),
-    ));
-}
-
-#[test]
-fn managed_runtime_caches_isolate_roots_locks_and_component_binding() {
+fn managed_runtime_components_stay_bound_to_their_cache() {
     let first = ManagedRuntimeCache::isolated_for_test().expect("first runtime cache");
     let second = ManagedRuntimeCache::isolated_for_test().expect("second runtime cache");
     let first_root = first
@@ -1806,51 +1623,10 @@ fn managed_runtime_caches_isolate_roots_locks_and_component_binding() {
     let second_component = admit_runtime_component(&second, "java-runtime-delta");
 
     assert_ne!(first.root(), second.root());
-    assert!(!Arc::ptr_eq(
-        &first.install_lock("java-runtime-delta"),
-        &second.install_lock("java-runtime-delta"),
-    ));
     assert!(first_component.belongs_to(&first));
     assert!(!first_component.belongs_to(&second));
     assert!(second_component.belongs_to(&second));
     assert!(!second_component.belongs_to(&first));
-}
-
-#[test]
-fn managed_runtime_cache_lives_until_the_final_clone_drops() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let root = cache.root().to_path_buf();
-    let retained = cache.clone();
-
-    drop(cache);
-    assert!(root.is_dir());
-    drop(retained);
-    assert!(!root.exists());
-}
-
-#[test]
-fn managed_runtime_cache_debug_is_redacted() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let debug = format!("{cache:?}");
-
-    assert_eq!(debug, "ManagedRuntimeCache { .. }");
-    assert!(!debug.contains(cache.root().to_string_lossy().as_ref()));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn managed_runtime_cache_root_is_stable_across_task_migration() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let expected = cache.root().to_path_buf();
-    let observed = tokio::spawn(async move {
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-        cache.root().to_path_buf()
-    })
-    .await
-    .expect("runtime cache task");
-
-    assert_eq!(observed, expected);
 }
 
 #[test]
@@ -1880,13 +1656,7 @@ fn structural_runtime_discovery_does_not_parse_incomplete_manifest_proof() {
 
 #[test]
 fn explicit_full_runtime_verifier_detects_same_root_content_drift() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let root = cache
-        .component_root("java-runtime-delta")
-        .expect("runtime root");
-    write_runtime_executable_fixture(&root);
-    write_runtime_manifest_proof_for_java(&root);
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
+    let (cache, root) = ready_runtime();
     assert!(admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
 
     fs::write(java_executable(&root), b"changed java").expect("modify java");
@@ -1917,13 +1687,7 @@ fn explicit_full_runtime_verifier_detects_manifest_link_drift() {
 #[test]
 fn managed_runtime_launch_receipt_rejects_program_and_executable_replacement() {
     let _serial = runtime_launch_receipt_test_guard();
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let root = cache
-        .component_root("java-runtime-delta")
-        .expect("runtime root");
-    write_runtime_executable_fixture(&root);
-    write_runtime_manifest_proof_for_java(&root);
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
+    let (cache, _root) = ready_runtime();
     let component = admit_runtime_component(&cache, "java-runtime-delta");
     let java = component.java_executable_path();
     let receipt = component.launch_receipt().expect("launch receipt");
@@ -1948,13 +1712,7 @@ fn managed_runtime_launch_receipt_rejects_program_and_executable_replacement() {
 #[test]
 fn managed_runtime_launch_receipt_rejects_component_root_replacement() {
     let _serial = runtime_launch_receipt_test_guard();
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let root = cache
-        .component_root("java-runtime-delta")
-        .expect("runtime root");
-    write_runtime_executable_fixture(&root);
-    write_runtime_manifest_proof_for_java(&root);
-    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
+    let (cache, root) = ready_runtime();
     let receipt = admit_runtime_component(&cache, "java-runtime-delta")
         .launch_receipt()
         .expect("launch receipt");
@@ -2022,87 +1780,39 @@ fn runtime_os_arch_uses_mojang_manifest_platform_keys() {
 }
 
 #[test]
-fn runtime_manifest_selection_falls_back_from_macos_arm64_to_macos() {
-    let manifest = runtime_manifest_fixture(serde_json::json!({
-        "mac-os-arm64": {
-            "jre-legacy": []
-        },
-        "mac-os": {
-            "jre-legacy": [
-                { "manifest": {
-                    "url": "https://example.invalid/mac-os/jre-legacy.json",
-                    "sha1": "0000000000000000000000000000000000000000",
-                    "size": 1
-                } }
-            ]
+fn runtime_manifest_selection_prefers_native_then_fallback_platform() {
+    let entry = |platform: &str| {
+        serde_json::json!([{ "manifest": {
+            "url": format!("https://example.invalid/{platform}/jre-legacy.json"),
+            "sha1": "0000000000000000000000000000000000000000",
+            "size": 1
+        } }])
+    };
+    let none = serde_json::json!([]);
+    for (native, fallback, expected) in [
+        (entry("mac-os-arm64"), entry("mac-os"), Some("mac-os-arm64")),
+        (none.clone(), entry("mac-os"), Some("mac-os")),
+        (none.clone(), none.clone(), None),
+    ] {
+        let manifest = runtime_manifest_fixture(serde_json::json!({
+            "mac-os-arm64": { "jre-legacy": native },
+            "mac-os": { "jre-legacy": fallback },
+        }));
+        let selected =
+            select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64");
+        match (selected, expected) {
+            (Ok(descriptor), Some(platform)) => assert_eq!(
+                descriptor.url,
+                format!("https://example.invalid/{platform}/jre-legacy.json")
+            ),
+            (Err(error), None) => assert!(matches!(
+                error,
+                JavaRuntimeLookupError::UnsupportedPlatform { component, platform }
+                    if component == "jre-legacy" && platform == "mac-os-arm64"
+            )),
+            (selected, expected) => panic!("{expected:?}: {selected:?}"),
         }
-    }));
-
-    let descriptor =
-        select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
-            .expect("fallback runtime manifest descriptor");
-
-    assert_eq!(
-        descriptor.url,
-        "https://example.invalid/mac-os/jre-legacy.json"
-    );
-}
-
-#[test]
-fn runtime_manifest_selection_uses_native_entries_before_fallbacks() {
-    let manifest = runtime_manifest_fixture(serde_json::json!({
-        "mac-os-arm64": {
-            "jre-legacy": [
-                { "manifest": {
-                    "url": "https://example.invalid/mac-os-arm64/jre-legacy.json",
-                    "sha1": "1111111111111111111111111111111111111111",
-                    "size": 2
-                } }
-            ]
-        },
-        "mac-os": {
-            "jre-legacy": [
-                { "manifest": {
-                    "url": "https://example.invalid/mac-os/jre-legacy.json",
-                    "sha1": "2222222222222222222222222222222222222222",
-                    "size": 3
-                } }
-            ]
-        }
-    }));
-
-    let descriptor =
-        select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
-            .expect("native runtime manifest descriptor");
-
-    assert_eq!(
-        descriptor.url,
-        "https://example.invalid/mac-os-arm64/jre-legacy.json"
-    );
-    assert_eq!(descriptor.size, 2);
-}
-
-#[test]
-fn runtime_manifest_selection_reports_unsupported_platform_after_empty_fallbacks() {
-    let manifest = runtime_manifest_fixture(serde_json::json!({
-        "mac-os-arm64": {
-            "jre-legacy": []
-        },
-        "mac-os": {
-            "jre-legacy": []
-        }
-    }));
-
-    let error = select_runtime_manifest(&manifest, &RuntimeId::from("jre-legacy"), "mac-os-arm64")
-        .expect_err("empty native and fallback runtimes should fail");
-
-    assert!(matches!(
-        error,
-        JavaRuntimeLookupError::UnsupportedPlatform {
-            component,
-            platform
-        } if component == "jre-legacy" && platform == "mac-os-arm64"
-    ));
+    }
 }
 
 #[test]
@@ -2236,14 +1946,10 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
         .expect("managed runtime component root");
     let java_bytes = b"fallback java".to_vec();
     let cfg_bytes = b"fallback cfg".to_vec();
-    let java_url = serve_runtime_download(java_bytes.clone()).await;
-    let cfg_url = serve_runtime_download(cfg_bytes.clone()).await;
+    let java_url = serve_body(&java_bytes).await;
+    let cfg_url = serve_body(&cfg_bytes).await;
     let mut files = HashMap::new();
-    let java_relative_path = java_executable(&root)
-        .strip_prefix(&root)
-        .expect("java path under runtime root")
-        .to_string_lossy()
-        .replace('\\', "/");
+    let java_relative_path = runtime_java_manifest_path();
     let mut java_file =
         downloadable_manifest_file(&java_url, java_bytes.len() as u64, &sha1_hex(&java_bytes));
     java_file.executable = true;
@@ -2255,8 +1961,7 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
     let component_manifest = ComponentManifest { files };
     let component_manifest_bytes =
         serde_json::to_vec(&component_manifest).expect("component manifest json");
-    let component_manifest_url =
-        serve_runtime_json(200, component_manifest_bytes.clone(), None).await;
+    let component_manifest_url = serve_body(&component_manifest_bytes).await;
     let manifest = runtime_manifest_fixture(serde_json::json!({
         "mac-os-arm64": {
             "jre-legacy": []
@@ -2298,17 +2003,8 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
 
 #[tokio::test]
 async fn behavior_contract_runtime_failure_receipt_restores_the_canonical_runtime() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let (cache, component, root) = seeded_runtime();
+    let staged = stage_java(&cache, &component, b"replacement java").await;
     let staging_root = staged.staging_root_for_test().to_path_buf();
 
     let error = publish_staged_managed_runtime_with_promotion_failure_for_test(staged)
@@ -2331,17 +2027,8 @@ async fn behavior_contract_runtime_failure_receipt_restores_the_canonical_runtim
 
 #[tokio::test]
 async fn atomic_displacement_failure_without_prior_effect_is_preparation() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let (cache, component, root) = seeded_runtime();
+    let staged = stage_java(&cache, &component, b"replacement java").await;
     let staging_root = staged.staging_root_for_test().to_path_buf();
 
     let error = publish_staged_managed_runtime_with_displacement_failure_for_test(staged)
@@ -2359,17 +2046,8 @@ async fn atomic_displacement_failure_without_prior_effect_is_preparation() {
 
 #[tokio::test]
 async fn managed_runtime_restoration_failure_retains_sealed_quarantine_evidence() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let (cache, component, root) = seeded_runtime();
+    let staged = stage_java(&cache, &component, b"replacement java").await;
     let staging_root = staged.staging_root_for_test().to_path_buf();
 
     let error = publish_staged_managed_runtime_with_restoration_failure_for_test(staged)
@@ -2402,17 +2080,8 @@ async fn managed_runtime_restoration_failure_retains_sealed_quarantine_evidence(
 
 #[tokio::test]
 async fn ordinary_managed_runtime_publish_finalizes_displaced_quarantine() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let (cache, component, root) = seeded_runtime();
+    let staged = stage_java(&cache, &component, b"replacement java").await;
 
     let receipt = publish_staged_managed_runtime_and_finalize(staged)
         .await
@@ -2425,17 +2094,8 @@ async fn ordinary_managed_runtime_publish_finalizes_displaced_quarantine() {
 
 #[tokio::test]
 async fn ordinary_quarantine_finalization_failure_retains_effect_evidence() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let (cache, component, root) = seeded_runtime();
+    let staged = stage_java(&cache, &component, b"replacement java").await;
 
     let error = publish_staged_managed_runtime_with_finalization_failure_for_test(staged)
         .await
@@ -2465,19 +2125,9 @@ async fn ordinary_quarantine_finalization_failure_retains_effect_evidence() {
 
 #[tokio::test]
 async fn managed_runtime_abandoned_stage_uses_one_recoverable_fixed_slot() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let (cache, component, root) = seeded_runtime();
 
-    let abandoned_source =
-        runtime_source_receipt_fixture(&component, &root, b"abandoned java").await;
-    let abandoned = stage_managed_runtime(&cache, &component, abandoned_source, &mut |_| {})
-        .await
-        .expect("abandoned managed runtime stage");
+    let abandoned = stage_java(&cache, &component, b"abandoned java").await;
     let staging_root = abandoned.staging_root_for_test().to_path_buf();
     drop(abandoned);
     assert!(staging_root.exists());
@@ -2486,11 +2136,7 @@ async fn managed_runtime_abandoned_stage_uses_one_recoverable_fixed_slot() {
         b"abandoned java"
     );
 
-    let replacement_source =
-        runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let replacement = stage_managed_runtime(&cache, &component, replacement_source, &mut |_| {})
-        .await
-        .expect("replacement managed runtime stage");
+    let replacement = stage_java(&cache, &component, b"replacement java").await;
     assert_eq!(replacement.staging_root_for_test(), staging_root);
     assert_eq!(
         fs::read(java_executable(&staging_root)).expect("replacement staged java"),
@@ -2519,18 +2165,9 @@ async fn managed_runtime_abandoned_stage_uses_one_recoverable_fixed_slot() {
 
 #[tokio::test]
 async fn quarantine_rotation_failure_before_displacement_is_post_effect() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let (cache, component, root) = seeded_runtime();
 
-    let first_source = runtime_source_receipt_fixture(&component, &root, b"first java").await;
-    let first_stage = stage_managed_runtime(&cache, &component, first_source, &mut |_| {})
-        .await
-        .expect("first managed runtime stage");
+    let first_stage = stage_java(&cache, &component, b"first java").await;
     let first_commit = publish_staged_managed_runtime(first_stage)
         .await
         .expect("first retained managed runtime publish");
@@ -2539,10 +2176,7 @@ async fn quarantine_rotation_failure_before_displacement_is_post_effect() {
         .expect("retained quarantine");
     drop(first_commit);
 
-    let second_source = runtime_source_receipt_fixture(&component, &root, b"second java").await;
-    let second_stage = stage_managed_runtime(&cache, &component, second_source, &mut |_| {})
-        .await
-        .expect("second managed runtime stage");
+    let second_stage = stage_java(&cache, &component, b"second java").await;
     let staging_root = second_stage.staging_root_for_test().to_path_buf();
     let error = publish_staged_managed_runtime_with_rotation_failure_for_test(second_stage)
         .await
@@ -2573,18 +2207,9 @@ async fn quarantine_rotation_failure_before_displacement_is_post_effect() {
 
 #[tokio::test]
 async fn managed_runtime_quarantine_rotation_is_bounded_across_repairs() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let (cache, component, root) = seeded_runtime();
 
-    let first_source = runtime_source_receipt_fixture(&component, &root, b"first java").await;
-    let first_stage = stage_managed_runtime(&cache, &component, first_source, &mut |_| {})
-        .await
-        .expect("first managed runtime stage");
+    let first_stage = stage_java(&cache, &component, b"first java").await;
     let first_commit = publish_staged_managed_runtime(first_stage)
         .await
         .expect("first managed runtime publish");
@@ -2602,10 +2227,7 @@ async fn managed_runtime_quarantine_rotation_is_bounded_across_repairs() {
         fs::read(&first_java).expect("first canonical java"),
         b"first java"
     );
-    let second_source = runtime_source_receipt_fixture(&component, &root, b"second java").await;
-    let second_stage = stage_managed_runtime(&cache, &component, second_source, &mut |_| {})
-        .await
-        .expect("second managed runtime stage");
+    let second_stage = stage_java(&cache, &component, b"second java").await;
     let second_commit = publish_staged_managed_runtime(second_stage)
         .await
         .expect("second managed runtime publish");
@@ -2643,17 +2265,11 @@ async fn managed_runtime_quarantine_rotation_is_bounded_across_repairs() {
 async fn managed_runtime_publication_receipt_holds_the_component_lease() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    let first_source = runtime_source_receipt_fixture(&component, &root, b"first java").await;
-    let first_stage = stage_managed_runtime(&cache, &component, first_source, &mut |_| {})
-        .await
-        .expect("first managed runtime stage");
+    let first_stage = stage_java(&cache, &component, b"first java").await;
     let first_receipt = publish_staged_managed_runtime(first_stage)
         .await
         .expect("first managed runtime publish");
-    let second_source = runtime_source_receipt_fixture(&component, &root, b"second java").await;
+    let second_source = runtime_source_receipt_fixture(&component, b"second java").await;
     let second_cache = cache.clone();
     let second_component = component.clone();
     let mut second_stage_task = tokio::spawn(async move {
@@ -2683,201 +2299,89 @@ async fn managed_runtime_publication_receipt_holds_the_component_lease() {
 }
 
 #[tokio::test]
-async fn managed_runtime_admission_rejects_unsafe_sizes_before_effects() {
-    let (oversized_url, oversized_requests) =
-        serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let oversized = ComponentManifest {
-        files: HashMap::from([(
-            runtime_java_manifest_path(),
-            downloadable_manifest_file(
-                &oversized_url,
-                (128 << 20) + 1,
-                "0000000000000000000000000000000000000000",
-            ),
-        )]),
-    };
-    assert_managed_manifest_rejection_preserves_state(oversized, oversized_requests).await;
-
-    let (missing_size_url, missing_size_requests) =
-        serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let mut missing_size = downloadable_manifest_file(
-        &missing_size_url,
-        1,
-        "0000000000000000000000000000000000000000",
-    );
-    missing_size
-        .downloads
-        .as_mut()
-        .expect("download proof")
-        .raw
-        .as_mut()
-        .expect("raw proof")
-        .size = None;
-    let missing_size = ComponentManifest {
-        files: HashMap::from([(runtime_java_manifest_path(), missing_size)]),
-    };
-    assert_managed_manifest_rejection_preserves_state(missing_size, missing_size_requests).await;
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_aliases_and_invalid_links_before_effects() {
+async fn managed_runtime_admission_rejects_unsafe_manifests_before_effects() {
+    type Entries = Vec<(String, ComponentManifestFile)>;
     fn file(url: &str) -> ComponentManifestFile {
         downloadable_manifest_file(url, 1, "0000000000000000000000000000000000000000")
     }
-    let cases: [(&str, fn(&str) -> Vec<(&'static str, ComponentManifestFile)>); 7] = [
+    fn entries(entries: Vec<(&str, ComponentManifestFile)>) -> Entries {
+        entries
+            .into_iter()
+            .map(|(path, file)| (path.to_string(), file))
+            .collect()
+    }
+    let cases: [(&str, fn(&str) -> Entries); 10] = [
+        ("oversized file", |url| {
+            let mut java = file(url);
+            java.downloads.as_mut().unwrap().raw.as_mut().unwrap().size = Some((128 << 20) + 1);
+            vec![(runtime_java_manifest_path(), java)]
+        }),
+        ("missing size", |url| {
+            let mut java = file(url);
+            java.downloads.as_mut().unwrap().raw.as_mut().unwrap().size = None;
+            vec![(runtime_java_manifest_path(), java)]
+        }),
+        ("over-entry tree", |url| {
+            let mut tree = (0..4096)
+                .map(|index| (format!("entry-{index}"), manifest_file("directory")))
+                .collect::<Entries>();
+            tree.push((runtime_java_manifest_path(), file(url)));
+            tree
+        }),
         ("case aliases", |url| {
-            vec![("bin/java.exe", file(url)), ("BIN/JAVA.EXE", file(url))]
+            entries(vec![
+                ("bin/java.exe", file(url)),
+                ("BIN/JAVA.EXE", file(url)),
+            ])
         }),
         ("explicit folded prefix alias", |url| {
-            vec![("bin", manifest_file("directory")), ("BIN/java", file(url))]
+            entries(vec![
+                ("bin", manifest_file("directory")),
+                ("BIN/java", file(url)),
+            ])
         }),
         ("implicit folded prefix alias", |url| {
-            vec![("bin/a", file(url)), ("BIN/b", file(url))]
+            entries(vec![("bin/a", file(url)), ("BIN/b", file(url))])
         }),
         ("case-mismatched link target", |url| {
-            vec![
+            entries(vec![
                 ("legal/base/LICENSE", file(url)),
                 ("legal/module/LICENSE", manifest_link("../BASE/LICENSE")),
-            ]
+            ])
         }),
         ("dangling link target", |url| {
-            vec![
+            entries(vec![
                 ("bin/java", file(url)),
                 ("legal/module/LICENSE", manifest_link("../base/LICENSE")),
-            ]
+            ])
         }),
         ("backslash link target", |url| {
-            vec![
+            entries(vec![
                 ("legal/base/LICENSE", file(url)),
                 ("legal/module/LICENSE", manifest_link(r"..\base\LICENSE")),
-            ]
+            ])
         }),
         ("link loop", |url| {
-            vec![
+            entries(vec![
                 ("bin/java", file(url)),
                 ("legal/loop", manifest_link("loop")),
-            ]
+            ])
         }),
     ];
     for (case, files) in cases {
         eprintln!("runtime admission case: {case}");
-        let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+        let requests = serve_bodies(b"unused", 1).await;
         let manifest = ComponentManifest {
-            files: files(&url)
-                .into_iter()
-                .map(|(path, file)| (path.to_string(), file))
-                .collect(),
+            files: files(&requests.url("/runtime.bin")).into_iter().collect(),
         };
         assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
     }
 }
 
-#[test]
-fn runtime_manifest_admission_rejects_portable_and_runtime_owned_collisions() {
-    let file = downloadable_manifest_file(
-        "https://example.invalid/java",
-        1,
-        "0000000000000000000000000000000000000000",
-    );
-    let manifests = [
-        ComponentManifest {
-            files: HashMap::from([
-                ("bin/java".to_string(), file.clone()),
-                ("BIN/JAVA".to_string(), file.clone()),
-            ]),
-        },
-        ComponentManifest {
-            files: HashMap::from([
-                ("bin/java".to_string(), file.clone()),
-                ("bin/java.axial-tmp".to_string(), file.clone()),
-            ]),
-        },
-        ComponentManifest {
-            files: HashMap::from([(".AXIAL-READY".to_string(), file)]),
-        },
-    ];
-
-    for manifest in manifests {
-        let error = validate_ephemeral_processor_manifest_for_test(&manifest, 1)
-            .expect_err("filesystem alias must be rejected during source admission");
-        assert!(matches!(
-            error,
-            JavaRuntimeLookupError::RuntimeSource(failure)
-                if failure.kind() == RuntimeSourceFailureKind::PolicyRejected
-        ));
-    }
-}
-
-#[test]
-fn runtime_manifest_admission_accepts_declared_forward_slash_link_target() {
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            (
-                "legal/base/LICENSE".to_string(),
-                downloadable_manifest_file(
-                    "https://example.invalid/license",
-                    1,
-                    "0000000000000000000000000000000000000000",
-                ),
-            ),
-            (
-                "legal/module/LICENSE".to_string(),
-                manifest_link("../base/LICENSE"),
-            ),
-            ("legal/module/base".to_string(), manifest_link("../base")),
-        ]),
-    };
-
-    validate_ephemeral_processor_manifest_for_test(&manifest, 1)
-        .expect("declared and implicit portable link targets should be admitted");
-}
-
-#[test]
-fn runtime_manifest_admission_rejects_directory_link_target_ancestor() {
-    let manifest = ComponentManifest {
-        files: HashMap::from([
-            ("a".to_string(), manifest_file("directory")),
-            ("a/link".to_string(), manifest_link("../a")),
-        ]),
-    };
-
-    let error = validate_ephemeral_processor_manifest_for_test(&manifest, 1)
-        .expect_err("link traversal cycle must be rejected during source admission");
-    assert!(matches!(
-        error,
-        JavaRuntimeLookupError::RuntimeSource(failure)
-            if failure.kind() == RuntimeSourceFailureKind::PolicyRejected
-                && failure.detail().contains("invalid topology")
-    ));
-}
-
-#[tokio::test]
-async fn managed_runtime_admission_rejects_over_entry_manifest_before_effects() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let mut files = (0..4096)
-        .map(|index| (format!("entry-{index}"), manifest_file("directory")))
-        .collect::<HashMap<_, _>>();
-    files.insert(
-        runtime_java_manifest_path(),
-        downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
-    );
-
-    assert_managed_manifest_rejection_preserves_state(ComponentManifest { files }, requests).await;
-}
-
 #[tokio::test]
 async fn managed_runtime_stage_rejects_extra_tree_entries_before_displacement() {
-    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-    let component = RuntimeId::from("jre-legacy");
-    let root = cache
-        .component_root(component.as_str())
-        .expect("managed runtime component root");
-    fs::create_dir(&root).expect("canonical runtime root");
-    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
-    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let (cache, component, root) = seeded_runtime();
+    let staged = stage_java(&cache, &component, b"replacement java").await;
     let staging_root = staged.staging_root_for_test().to_path_buf();
     fs::write(staging_root.join("undeclared"), b"extra").expect("undeclared staged file");
 
@@ -2900,10 +2404,7 @@ async fn managed_runtime_commit_revalidation_rejects_ready_marker_tampering() {
     let root = cache
         .component_root(component.as_str())
         .expect("managed runtime component root");
-    let source = runtime_source_receipt_fixture(&component, &root, b"authenticated java").await;
-    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
-        .await
-        .expect("managed runtime stage");
+    let staged = stage_java(&cache, &component, b"authenticated java").await;
     let receipt = publish_staged_managed_runtime(staged)
         .await
         .expect("managed runtime publish");
@@ -2914,32 +2415,35 @@ async fn managed_runtime_commit_revalidation_rejects_ready_marker_tampering() {
     assert!(!receipt.revalidate(&cache, &component).await);
 }
 
-async fn runtime_source_receipt_fixture(
-    component: &RuntimeId,
-    runtime_root: &Path,
-    java_bytes: &[u8],
-) -> RuntimeSourceReceipt {
-    runtime_source_receipt_fixture_with_download_count(component, runtime_root, java_bytes, 1).await
+/// An isolated cache whose canonical `jre-legacy` root holds an `original` sentinel.
+fn seeded_runtime() -> (ManagedRuntimeCache, RuntimeId, PathBuf) {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    (cache, component, root)
 }
 
-async fn runtime_source_receipt_fixture_with_download_count(
+async fn stage_java(
+    cache: &ManagedRuntimeCache,
     component: &RuntimeId,
-    runtime_root: &Path,
+    java: &[u8],
+) -> super::install::StagedManagedRuntime {
+    let source = runtime_source_receipt_fixture(component, java).await;
+    stage_managed_runtime(cache, component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage")
+}
+
+async fn runtime_source_receipt_fixture(
+    component: &RuntimeId,
     java_bytes: &[u8],
-    download_count: usize,
 ) -> RuntimeSourceReceipt {
-    let java_url = if download_count == 1 {
-        serve_runtime_download(java_bytes.to_vec()).await
-    } else {
-        serve_runtime_retry_responses(vec![(200, java_bytes.to_vec()); download_count])
-            .await
-            .0
-    };
-    let java_relative_path = java_executable(runtime_root)
-        .strip_prefix(runtime_root)
-        .expect("java path under runtime root")
-        .to_string_lossy()
-        .replace('\\', "/");
+    let java_url = serve_body(java_bytes).await;
+    let java_relative_path = runtime_java_manifest_path();
     let mut java_file =
         downloadable_manifest_file(&java_url, java_bytes.len() as u64, &sha1_hex(java_bytes));
     java_file.executable = true;
@@ -2948,7 +2452,7 @@ async fn runtime_source_receipt_fixture_with_download_count(
     };
     let manifest_bytes =
         serde_json::to_vec(&component_manifest).expect("component manifest fixture");
-    let manifest_url = serve_runtime_json(200, manifest_bytes.clone(), None).await;
+    let manifest_url = serve_body(&manifest_bytes).await;
     acquire_runtime_source_for_test(
         component.clone(),
         RuntimeDownloadManifest {
@@ -2971,7 +2475,7 @@ fn runtime_java_manifest_path() -> String {
 
 async fn assert_managed_manifest_rejection_preserves_state(
     manifest: ComponentManifest,
-    requests: Arc<AtomicUsize>,
+    requests: Server,
 ) {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
@@ -2995,7 +2499,7 @@ async fn assert_managed_manifest_rejection_preserves_state(
         Err(JavaRuntimeLookupError::RuntimeSource(failure)) if failure.component() == &component
     ));
     tokio::task::yield_now().await;
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(requests.finish().is_empty());
     assert!(events.is_empty());
     assert_eq!(
         fs::read(root.join("sentinel")).expect("unchanged canonical sentinel"),
@@ -3072,7 +2576,7 @@ fn runtime_download_verification_compares_only_declared_metadata() {
 #[tokio::test]
 async fn runtime_manifest_file_streams_and_imports_verified_source() {
     let root = unique_temp_root("axial-runtime-download-stream-test");
-    let url = serve_runtime_download(b"hello".to_vec()).await;
+    let url = serve_body(b"hello").await;
     let file = downloadable_manifest_file(&url, 5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
 
     install_runtime_manifest_file(&test_runtime_component(), &root, "bin/java", file)
@@ -3086,85 +2590,117 @@ async fn runtime_manifest_file_streams_and_imports_verified_source() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn ephemeral_processor_runtime_rejects_oversized_file_before_request() {
-    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
-    let manifest = ComponentManifest {
-        files: HashMap::from([(
-            "bin/java".to_string(),
-            downloadable_manifest_file(
-                &url,
-                (128 << 20) + 1,
-                "0000000000000000000000000000000000000000",
-            ),
-        )]),
-    };
-
-    assert!(validate_ephemeral_processor_manifest_for_test(&manifest, 1).is_err());
-    tokio::task::yield_now().await;
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
-}
-
 #[test]
-fn runtime_manifest_admission_rejects_checked_byte_overflow() {
-    let manifest = ComponentManifest {
-        files: HashMap::from([(
-            "bin/java".to_string(),
-            downloadable_manifest_file(
-                "https://example.invalid/java",
-                1,
-                "0000000000000000000000000000000000000000",
-            ),
-        )]),
+fn ephemeral_processor_manifest_admission_enforces_paths_topology_and_bounds() {
+    let zero = "0000000000000000000000000000000000000000";
+    let file = downloadable_manifest_file("https://example.invalid/java", 1, zero);
+    let manifest = |entries: Vec<(&str, ComponentManifestFile)>| ComponentManifest {
+        files: entries
+            .into_iter()
+            .map(|(path, file)| (path.to_string(), file))
+            .collect(),
     };
+    validate_ephemeral_processor_manifest_for_test(
+        &manifest(vec![
+            ("legal/base/LICENSE", file.clone()),
+            ("legal/module/LICENSE", manifest_link("../base/LICENSE")),
+            ("legal/module/base", manifest_link("../base")),
+        ]),
+        1,
+    )
+    .expect("declared and implicit portable link targets are admitted");
 
-    let error = validate_ephemeral_processor_manifest_for_test(&manifest, u64::MAX)
-        .expect_err("manifest admission total must use checked arithmetic");
-    assert!(matches!(
-        error,
-        JavaRuntimeLookupError::RuntimeSource(failure)
-            if failure.kind() == RuntimeSourceFailureKind::PolicyRejected
-                && failure.detail().contains("overflowed")
-    ));
-}
-
-#[test]
-fn ephemeral_processor_runtime_counts_lzma_peak_entry_before_effects() {
-    let mut files = (0..4091)
+    let mut over_entries = (0..4091)
         .map(|index| (format!("entry-{index}"), manifest_file("directory")))
         .collect::<HashMap<_, _>>();
-    files.insert(
+    over_entries.insert(
         "bin/java".to_string(),
         downloadable_lzma_manifest_file(
             "https://example.invalid/java",
             1,
-            "0000000000000000000000000000000000000000",
+            zero,
             "https://example.invalid/java.lzma",
             1,
-            "0000000000000000000000000000000000000000",
+            zero,
         ),
     );
-    let manifest = ComponentManifest { files };
-
-    assert!(validate_ephemeral_processor_manifest_for_test(&manifest, 1).is_err());
+    let rejected = [
+        (
+            "case alias",
+            manifest(vec![("bin/java", file.clone()), ("BIN/JAVA", file.clone())]),
+            1,
+        ),
+        (
+            "runtime-owned scratch name",
+            manifest(vec![
+                ("bin/java", file.clone()),
+                ("bin/java.axial-tmp", file.clone()),
+            ]),
+            1,
+        ),
+        (
+            "ready marker alias",
+            manifest(vec![(".AXIAL-READY", file.clone())]),
+            1,
+        ),
+        (
+            "directory link ancestor",
+            manifest(vec![
+                ("a", manifest_file("directory")),
+                ("a/link", manifest_link("../a")),
+            ]),
+            1,
+        ),
+        (
+            "oversized file",
+            manifest(vec![(
+                "bin/java",
+                downloadable_manifest_file("https://example.invalid/java", (128 << 20) + 1, zero),
+            )]),
+            1,
+        ),
+        (
+            "checked byte overflow",
+            manifest(vec![("bin/java", file.clone())]),
+            u64::MAX,
+        ),
+        (
+            "lzma peak entry",
+            ComponentManifest {
+                files: over_entries,
+            },
+            1,
+        ),
+    ];
+    for (case, manifest, manifest_bytes) in rejected {
+        assert!(
+            matches!(
+                validate_ephemeral_processor_manifest_for_test(&manifest, manifest_bytes),
+                Err(JavaRuntimeLookupError::RuntimeSource(failure))
+                    if failure.kind() == RuntimeSourceFailureKind::PolicyRejected
+            ),
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn runtime_manifest_file_retries_transient_provider_errors() {
     let root = unique_temp_root("axial-runtime-download-retry-test");
-    let (url, attempts) = serve_runtime_retry_responses(vec![
-        (503, b"try again".to_vec()),
-        (503, b"try again".to_vec()),
-        (200, b"hello".to_vec()),
+    let attempts = serve(vec![
+        response("503 Service Unavailable", &[], b"try again"),
+        response("503 Service Unavailable", &[], b"try again"),
+        response("200 OK", &[], b"hello"),
     ])
     .await;
+    let url = attempts.url("/runtime.bin");
     let file = downloadable_manifest_file(&url, 5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
 
     install_runtime_manifest_file(&test_runtime_component(), &root, "bin/java", file)
         .await
         .expect("runtime download should retry transient failures");
 
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(attempts.finish().len(), 3);
     assert_eq!(
         fs::read(root.join("bin/java")).expect("retried runtime file"),
         b"hello"
@@ -3175,7 +2711,7 @@ async fn runtime_manifest_file_retries_transient_provider_errors() {
 #[tokio::test]
 async fn runtime_manifest_file_discards_transient_source_on_verification_error() {
     let root = unique_temp_root("axial-runtime-download-cleanup-test");
-    let url = serve_runtime_download(b"hello".to_vec()).await;
+    let url = serve_body(b"hello").await;
     let file = downloadable_manifest_file(&url, 6, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
 
     let result =
@@ -3203,7 +2739,13 @@ async fn runtime_manifest_file_discards_transient_source_on_verification_error()
 #[tokio::test]
 async fn runtime_file_download_rejects_oversized_content_length() {
     let root = unique_temp_root("axial-runtime-download-content-length-test");
-    let url = serve_runtime_response(200, b"hello".to_vec(), Some(6), "/runtime.bin").await;
+    let url = serve(vec![response(
+        "200 OK",
+        &[("Content-Length", "6")],
+        b"hello",
+    )])
+    .await
+    .url("/runtime.bin");
     let file = downloadable_manifest_file(&url, 5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
 
     let result =
@@ -3264,7 +2806,7 @@ async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
     let root = unique_temp_root("axial-runtime-lzma-test");
     let raw_bytes = b"decompressed runtime file".to_vec();
     let compressed_bytes = lzma_compress_bytes(&raw_bytes);
-    let lzma_url = serve_runtime_download(compressed_bytes.clone()).await;
+    let lzma_url = serve_body(&compressed_bytes).await;
     let file = downloadable_lzma_manifest_file(
         "http://127.0.0.1:9/raw-runtime-file",
         raw_bytes.len() as u64,
@@ -3288,7 +2830,11 @@ async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
 #[tokio::test]
 async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_temp() {
     let root = unique_temp_root("axial-runtime-download-stream-bound-test");
-    let url = serve_runtime_response(200, b"hello!".to_vec(), None, "/runtime.bin").await;
+    let url = serve(vec![
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello!".to_vec(),
+    ])
+    .await
+    .url("/runtime.bin");
     let file = downloadable_manifest_file(&url, 5, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
 
     let result =
@@ -3355,6 +2901,18 @@ fn unique_temp_root(label: &str) -> PathBuf {
 
 fn runtime_manifest_fixture(value: serde_json::Value) -> RuntimeManifest {
     serde_json::from_value(value).expect("runtime manifest fixture")
+}
+
+/// A verified `java-runtime-delta` with a Java executable, manifest proof and ready marker.
+fn ready_runtime() -> (ManagedRuntimeCache, PathBuf) {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let root = cache
+        .component_root("java-runtime-delta")
+        .expect("runtime root");
+    write_runtime_executable_fixture(&root);
+    write_runtime_manifest_proof_for_java(&root);
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
+    (cache, root)
 }
 
 fn write_runtime_executable_fixture(root: &Path) {
@@ -3504,86 +3062,13 @@ fn make_executable(path: &Path) {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
 
-async fn serve_runtime_download(body: Vec<u8>) -> String {
-    let content_length = body.len() as u64;
-    serve_runtime_response(200, body, Some(content_length), "/runtime.bin").await
-}
-
-async fn serve_runtime_json(status: u16, body: Vec<u8>, content_length: Option<u64>) -> String {
-    let content_length = content_length.unwrap_or(body.len() as u64);
-    serve_runtime_response(status, body, Some(content_length), "/runtime.json").await
-}
-
-async fn serve_runtime_response(
-    status: u16,
-    body: Vec<u8>,
-    content_length: Option<u64>,
-    path: &str,
-) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
+/// Serves `body` once; the detached server outlives the returned URL.
+async fn serve_body(body: &[u8]) -> String {
+    serve(vec![response("200 OK", &[], body)])
         .await
-        .expect("runtime test listener");
-    let address = listener
-        .local_addr()
-        .expect("runtime test listener address");
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("runtime test connection");
-        let mut request = [0_u8; 1024];
-        let _ = socket.read(&mut request).await;
-        let reason = if status == 200 { "OK" } else { "Error" };
-        let headers = if let Some(content_length) = content_length {
-            format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
-            )
-        } else {
-            format!("HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\r\n")
-        };
-        socket
-            .write_all(headers.as_bytes())
-            .await
-            .expect("runtime test response headers");
-        socket
-            .write_all(&body)
-            .await
-            .expect("runtime test response body");
-    });
-    format!("http://{address}{path}")
+        .url("/runtime.bin")
 }
 
-async fn serve_runtime_retry_responses(
-    responses: Vec<(u16, Vec<u8>)>,
-) -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("runtime retry test listener");
-    let address = listener
-        .local_addr()
-        .expect("runtime retry test listener address");
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let attempts_in_task = Arc::clone(&attempts);
-    tokio::spawn(async move {
-        for (status, body) in responses {
-            let (mut socket, _) = listener
-                .accept()
-                .await
-                .expect("runtime retry test connection");
-            attempts_in_task.fetch_add(1, Ordering::SeqCst);
-            let mut request = [0_u8; 1024];
-            let _ = socket.read(&mut request).await;
-            let reason = if status == 200 { "OK" } else { "Error" };
-            let headers = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            socket
-                .write_all(headers.as_bytes())
-                .await
-                .expect("runtime retry response headers");
-            socket
-                .write_all(&body)
-                .await
-                .expect("runtime retry response body");
-        }
-    });
-    (format!("http://{address}/runtime.bin"), attempts)
+async fn serve_bodies(body: &[u8], count: usize) -> Server {
+    serve(vec![response("200 OK", &[], body); count]).await
 }

@@ -1805,13 +1805,9 @@ mod tests {
     use sha1::{Digest as _, Sha1};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::io::{ErrorKind, Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3733,13 +3729,12 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[test]
-    fn profile_source_validation_does_not_enrich_profile() {
+    fn profile_source_validation_rejects_drift_without_enriching_profile() {
         let record = profile_record();
         let proof = fabric_profile_proof(&record);
-        let fragment = fabric_profile_fragment(&record);
         let base = serde_json::from_value(serde_json::json!({"id": record.minecraft_version}))
             .expect("base version");
-
+        let fragment = fabric_profile_fragment(&record);
         validate_profile_source_structure(&fragment, &record, &proof, &base)
             .expect("exact live profile proof");
         let loader = fragment
@@ -3749,48 +3744,24 @@ printf '%s' 'processor-terminal' > "$last"
             .expect("loader library");
         assert!(loader.sha1.is_empty());
         assert_eq!(loader.size, 0);
-    }
 
-    #[test]
-    fn profile_source_rejects_identity_drift_and_base_owned_overrides() {
-        let record = profile_record();
-        let proof = fabric_profile_proof(&record);
-        let base = serde_json::from_value(serde_json::json!({"id": record.minecraft_version}))
-            .expect("base version");
-
-        let mut variants = Vec::new();
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.id.push_str("-wrong");
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.inherits_from = "1.21.4".to_string();
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.main_class = "wrong.Main".to_string();
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.kind = "snapshot".to_string();
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.asset_index = Some(AssetIndex::default());
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.assets = "legacy".to_string();
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.downloads = Some(Downloads::default());
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.java_version = Some(JavaVersion::default());
-        variants.push(fragment);
-        let mut fragment = fabric_profile_fragment(&record);
-        fragment.logging = Some(LoggingConf::default());
-        variants.push(fragment);
-
-        for fragment in variants {
+        let drifts: [fn(&mut LoaderProfileFragment); 9] = [
+            |fragment| fragment.id.push_str("-wrong"),
+            |fragment| fragment.inherits_from = "1.21.4".to_string(),
+            |fragment| fragment.main_class = "wrong.Main".to_string(),
+            |fragment| fragment.kind = "snapshot".to_string(),
+            |fragment| fragment.asset_index = Some(AssetIndex::default()),
+            |fragment| fragment.assets = "legacy".to_string(),
+            |fragment| fragment.downloads = Some(Downloads::default()),
+            |fragment| fragment.java_version = Some(JavaVersion::default()),
+            |fragment| fragment.logging = Some(LoggingConf::default()),
+        ];
+        for (index, drift) in drifts.into_iter().enumerate() {
+            let mut fragment = fabric_profile_fragment(&record);
+            drift(&mut fragment);
             assert!(
                 validate_profile_source_structure(&fragment, &record, &proof, &base).is_err(),
-                "identity drift or base-owned override must fail"
+                "identity drift or base-owned override {index} must fail"
             );
         }
     }
@@ -3856,83 +3827,66 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
-    async fn installer_base_continuation_acquires_source_only_after_base_checkpoint() {
-        let root = temp_dir("installer-base-continuation");
-        let mut record = installer_record();
-        let installer_server =
-            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
-        record.install_source = LoaderInstallSource::InstallerJar {
-            url: installer_server.url.clone(),
-        };
-        assert_eq!(installer_server.request_count(), 0);
-        write_base_version(&root, &record.minecraft_version);
-        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
-        let expected_version_id = record.version_id.clone();
-        let (activation, continuation) = LoaderInstallBaseCommit::new(
-            base_receipt,
-            LoaderInstallContinuation::new(LoaderInstallPlan { record }),
-        )
-        .into_activation_parts()
-        .expect("valid installer base derivation");
-        let library_root = test_library_operation(&root);
+    async fn installer_and_legacy_continuations_acquire_source_only_after_base_checkpoint() {
+        for legacy in [false, true] {
+            let root = temp_dir("installer-base-continuation");
+            let mut record = if legacy {
+                legacy_archive_record()
+            } else {
+                installer_record()
+            };
+            let server = if legacy {
+                TestByteServer::start_with_sha1(zip_entries(&[(
+                    "net/minecraftforge/Forge.class",
+                    b"forge",
+                )]))
+            } else {
+                TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None))
+            };
+            record.install_source = if legacy {
+                LoaderInstallSource::LegacyArchive {
+                    url: server.url.clone(),
+                }
+            } else {
+                LoaderInstallSource::InstallerJar {
+                    url: server.url.clone(),
+                }
+            };
+            write_base_version(&root, &record.minecraft_version);
+            if legacy {
+                fs::write(
+                    versions_dir(&root)
+                        .join(&record.minecraft_version)
+                        .join(format!("{}.jar", record.minecraft_version)),
+                    zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]),
+                )
+                .expect("write valid legacy base archive");
+            }
+            let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+            let expected_version_id = record.version_id.clone();
+            let (activation, continuation) = LoaderInstallBaseCommit::new(
+                base_receipt,
+                LoaderInstallContinuation::new(LoaderInstallPlan { record }),
+            )
+            .into_activation_parts()
+            .expect("valid base derivation");
+            assert_eq!(server.request_count(), 0);
+            let library_root = test_library_operation(&root);
 
-        let receipt = continue_install_build_after_base(&library_root, continuation, |_| {})
-            .await
-            .expect("continue exact installer plan after recovered base");
-        drop(activation);
+            let receipt = continue_install_build_after_base(&library_root, continuation, |_| {})
+                .await
+                .expect("continue exact plan after recovered base");
+            drop(activation);
 
-        assert_eq!(receipt.version_id(), expected_version_id);
-        assert_eq!(
-            installer_server.request_count(),
-            2,
-            "post-base continuation must acquire the installer only after the checkpoint"
-        );
-        installer_server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn legacy_base_continuation_acquires_source_only_after_base_checkpoint() {
-        let root = temp_dir("legacy-base-continuation");
-        let base_client = zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]);
-        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
-        let archive_server = TestByteServer::start_with_sha1(archive);
-        let mut record = legacy_archive_record();
-        record.install_source = LoaderInstallSource::LegacyArchive {
-            url: archive_server.url.clone(),
-        };
-        assert_eq!(archive_server.request_count(), 0);
-        write_base_version(&root, &record.minecraft_version);
-        fs::write(
-            versions_dir(&root)
-                .join(&record.minecraft_version)
-                .join(format!("{}.jar", record.minecraft_version)),
-            base_client,
-        )
-        .expect("write valid legacy base archive");
-        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
-        let expected_version_id = record.version_id.clone();
-        let (activation, continuation) = LoaderInstallBaseCommit::new(
-            base_receipt,
-            LoaderInstallContinuation::new(LoaderInstallPlan { record }),
-        )
-        .into_activation_parts()
-        .expect("valid legacy base derivation");
-        let library_root = test_library_operation(&root);
-
-        let receipt = continue_install_build_after_base(&library_root, continuation, |_| {})
-            .await
-            .expect("continue exact legacy plan after recovered base");
-        drop(activation);
-
-        assert_eq!(receipt.version_id(), expected_version_id);
-        assert_eq!(
-            archive_server.request_count(),
-            2,
-            "post-base continuation must acquire the archive only after the checkpoint"
-        );
-        archive_server.stop();
-        let _ = fs::remove_dir_all(root);
+            assert_eq!(receipt.version_id(), expected_version_id);
+            assert_eq!(
+                server.request_count(),
+                2,
+                "post-base continuation must acquire its source only after the checkpoint"
+            );
+            server.stop();
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -4631,7 +4585,7 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
-    async fn every_installer_strategy_rejects_sha1_mismatch_before_base_effects() {
+    async fn installer_sources_are_rejected_before_base_effects() {
         for (component, strategy) in [
             (
                 LoaderComponentId::Forge,
@@ -4643,150 +4597,61 @@ printf '%s' 'processor-terminal' > "$last"
                 LoaderInstallStrategy::NeoForgeModern,
             ),
         ] {
-            let root = temp_dir("installer-source-sha1-mismatch");
-            let server = TestByteServer::start_with_sha1_proof(
-                installer_jar("upstream-installer-id"),
-                vec![b'0'; 40],
-            );
             let mut record = installer_record();
             record.component_id = component;
             record.component_name = component.display_name().to_string();
             record.strategy = strategy;
-            record.install_source = LoaderInstallSource::InstallerJar {
-                url: server.url.clone(),
-            };
             canonicalize_record_identity(&mut record);
-            let plan = LoaderInstallPlan { record };
-            write_base_version(&root, &plan.record.minecraft_version);
-            let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
-            let library_root = test_library_operation(&root);
-            let before = snapshot_tree(&root);
-
-            let error = continue_installer_install_after_base(
-                &library_root,
-                plan,
-                test_loader_base_derivation(base_receipt),
-                &mut |_| {},
-            )
-            .await
-            .expect_err("mismatched proof must fail");
-
-            assert!(
-                matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
+            let server = TestByteServer::start_with_sha1_proof(
+                installer_jar("upstream-installer-id"),
+                vec![b'0'; 40],
             );
-            assert_eq!(snapshot_tree(&root), before);
-            assert_eq!(server.request_count(), 2);
-            server.stop();
+            let (error, requests) = reject_installer_before_base_effects(record, server).await;
+            assert!(
+                matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof")),
+                "{strategy:?}"
+            );
+            assert_eq!(requests, 2);
         }
-    }
 
-    #[tokio::test]
-    async fn installer_source_rejects_malformed_sha1_proof_before_base_effects() {
-        let root = temp_dir("installer-source-sha1-malformed");
         let server = TestByteServer::start_with_sha1_proof(
             installer_jar("upstream-installer-id"),
             b"not-a-digest installer.jar".to_vec(),
         );
-        let mut record = installer_record();
-        record.install_source = LoaderInstallSource::InstallerJar {
-            url: server.url.clone(),
-        };
-        let plan = LoaderInstallPlan { record };
-        write_base_version(&root, &plan.record.minecraft_version);
-        let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
-        let library_root = test_library_operation(&root);
-        let before = snapshot_tree(&root);
-
-        let error = continue_installer_install_after_base(
-            &library_root,
-            plan,
-            test_loader_base_derivation(base_receipt),
-            &mut |_| {},
-        )
-        .await
-        .expect_err("malformed proof must fail");
-
+        let (error, requests) =
+            reject_installer_before_base_effects(installer_record(), server).await;
         assert!(
             matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
         );
-        assert_eq!(snapshot_tree(&root), before);
-        assert_eq!(server.request_count(), 1);
-        server.stop();
-    }
+        assert_eq!(requests, 1);
 
-    #[test]
-    fn installer_record_authority_rejects_every_envelope_drift() {
         let record = installer_record();
-        validate_installer_record_authority(&record).expect("canonical installer authority");
-
-        let mut variants = Vec::new();
-        let mut drift = record.clone();
-        drift.build_id.push('x');
-        variants.push(drift);
-        let mut drift = record.clone();
-        drift.component_name = "NeoForge".to_string();
-        variants.push(drift);
-        let mut drift = record.clone();
-        drift.strategy = LoaderInstallStrategy::NeoForgeModern;
-        variants.push(drift);
-        let mut drift = record.clone();
-        drift.artifact_kind = LoaderArtifactKind::ProfileJson;
-        variants.push(drift);
-        let mut drift = record.clone();
-        drift.install_source = LoaderInstallSource::ProfileJson {
-            url: "https://example.test/profile.json".to_string(),
-        };
-        variants.push(drift);
-        let mut drift = record;
-        drift.install_source = LoaderInstallSource::InstallerJar { url: String::new() };
-        variants.push(drift);
-
-        for record in variants {
-            assert!(validate_installer_record_authority(&record).is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn semantic_installer_drift_is_rejected_before_base_effects() {
-        let root = temp_dir("installer-semantic-drift");
-        let mut record = installer_record();
-        let server = TestByteServer::start_with_sha1(modern_forge_installer_jar_with_parent(
-            &record, "1.21.4", None,
-        ));
-        record.install_source = LoaderInstallSource::InstallerJar {
-            url: server.url.clone(),
-        };
-        let plan = LoaderInstallPlan { record };
-        write_base_version(&root, &plan.record.minecraft_version);
-        let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
-        let library_root = test_library_operation(&root);
-        let before = snapshot_tree(&root);
-
-        let error = continue_installer_install_after_base(
-            &library_root,
-            plan,
-            test_loader_base_derivation(base_receipt),
-            &mut |_| {},
-        )
-        .await
-        .expect_err("semantic drift must fail after the base checkpoint");
-
+        let semantic_drift = TestByteServer::start_with_sha1(
+            modern_forge_installer_jar_with_parent(&record, "1.21.4", None),
+        );
+        let (error, requests) = reject_installer_before_base_effects(record, semantic_drift).await;
         assert!(matches!(error, LoaderError::InvalidProfile(_)));
-        assert_eq!(snapshot_tree(&root), before);
-        assert_eq!(server.request_count(), 2);
-        server.stop();
-    }
+        assert_eq!(requests, 2);
 
-    #[tokio::test]
-    async fn unsupported_neoforge_processors_are_rejected_without_install_effects() {
-        let root = temp_dir("unsupported-neoforge-no-effects");
         let mut record = installer_record();
         record.component_id = LoaderComponentId::NeoForge;
         record.component_name = "NeoForge".to_string();
         record.loader_version = "21.5.74".to_string();
         canonicalize_record_identity(&mut record);
         record.strategy = LoaderInstallStrategy::NeoForgeModern;
-        let server = TestByteServer::start_with_sha1(unsupported_neoforge_installer_jar(&record));
+        let unsupported =
+            TestByteServer::start_with_sha1(unsupported_neoforge_installer_jar(&record));
+        let (error, requests) = reject_installer_before_base_effects(record, unsupported).await;
+        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        assert_eq!(requests, 2);
+    }
+
+    /// Runs the installer continuation and proves the refusal left the root untouched.
+    async fn reject_installer_before_base_effects(
+        mut record: LoaderBuildRecord,
+        server: TestByteServer,
+    ) -> (LoaderError, usize) {
+        let root = temp_dir("installer-rejected-before-base-effects");
         record.install_source = LoaderInstallSource::InstallerJar {
             url: server.url.clone(),
         };
@@ -4795,7 +4660,6 @@ printf '%s' 'processor-terminal' > "$last"
         let base_receipt = test_authenticated_receipt(&root, &plan.record.minecraft_version);
         let library_root = test_library_operation(&root);
         let before = snapshot_tree(&root);
-
         let error = continue_installer_install_after_base(
             &library_root,
             plan,
@@ -4803,12 +4667,39 @@ printf '%s' 'processor-terminal' > "$last"
             &mut |_| {},
         )
         .await
-        .expect_err("unsupported NeoForge processors");
-
-        assert!(matches!(error, LoaderError::InvalidProfile(_)));
+        .expect_err("installer source must be rejected");
         assert_eq!(snapshot_tree(&root), before);
-        assert_eq!(server.request_count(), 2);
+        let requests = server.request_count();
         server.stop();
+        drop(library_root);
+        let _ = fs::remove_dir_all(root);
+        (error, requests)
+    }
+
+    #[test]
+    fn installer_record_authority_rejects_every_envelope_drift() {
+        let record = installer_record();
+        validate_installer_record_authority(&record).expect("canonical installer authority");
+        let drifts: [fn(&mut LoaderBuildRecord); 6] = [
+            |drift| drift.build_id.push('x'),
+            |drift| drift.component_name = "NeoForge".to_string(),
+            |drift| drift.strategy = LoaderInstallStrategy::NeoForgeModern,
+            |drift| drift.artifact_kind = LoaderArtifactKind::ProfileJson,
+            |drift| {
+                drift.install_source = LoaderInstallSource::ProfileJson {
+                    url: "https://example.test/profile.json".to_string(),
+                }
+            },
+            |drift| drift.install_source = LoaderInstallSource::InstallerJar { url: String::new() },
+        ];
+        for (index, drift) in drifts.into_iter().enumerate() {
+            let mut record = record.clone();
+            drift(&mut record);
+            assert!(
+                validate_installer_record_authority(&record).is_err(),
+                "{index}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4867,77 +4758,48 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
-    async fn continue_receipt_failure_precedes_writes_and_cleans_workspace() {
-        let root = temp_dir("installer-continue-receipt-before-write");
-        write_base_version(&root, "1.21.5");
-        write_base_version(&root, "1.21.4");
+    async fn base_receipt_mismatch_fails_before_installer_writes() {
         let record = installer_record();
-        let installer_server =
-            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-        };
-        let installer_source =
-            verified_test_source(&installer_server.url, "loader installer").await;
-        let library_root = test_library_operation(&root);
-        let execution = retain_test_installer_network(
-            &library_root,
-            bind_test_installer(installer_source, &record),
-            &mut |_| {},
-        )
-        .await;
+        for (installer, processors) in [
+            (modern_forge_installer_jar(&record, None), false),
+            (runnable_forge_installer_jar(&record), true),
+        ] {
+            let root = temp_dir("installer-base-receipt-before-write");
+            write_base_version(&root, "1.21.5");
+            write_base_version(&root, "1.21.4");
+            let installer_server = TestByteServer::start_with_sha1(installer);
+            let plan = LoaderInstallPlan {
+                record: record.clone(),
+            };
+            let installer_source =
+                verified_test_source(&installer_server.url, "loader installer").await;
+            let library_root = test_library_operation(&root);
+            let execution = retain_test_installer_network(
+                &library_root,
+                bind_test_installer(installer_source, &record),
+                &mut |_| {},
+            )
+            .await;
 
-        let error = finish_supported_installer_install(
-            &library_root,
-            &plan,
-            execution,
-            test_loader_base_derivation(test_authenticated_receipt(&root, "1.21.4")),
-            &mut |_| {},
-        )
-        .await
-        .expect_err("mismatched base receipt");
+            let error = finish_supported_installer_install(
+                &library_root,
+                &plan,
+                execution,
+                test_loader_base_derivation(test_authenticated_receipt(&root, "1.21.4")),
+                &mut |_| {},
+            )
+            .await
+            .expect_err("mismatched base receipt");
 
-        assert!(matches!(error, LoaderError::InvalidProfile(_)));
-        assert!(!versions_dir(&root).join(&record.version_id).exists());
-        installer_server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn run_failure_precedes_writes_and_cleans_workspace() {
-        let root = temp_dir("installer-run-receipt-before-write");
-        write_base_version(&root, "1.21.5");
-        write_base_version(&root, "1.21.4");
-        let record = installer_record();
-        let installer_server =
-            TestByteServer::start_with_sha1(runnable_forge_installer_jar(&record));
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-        };
-        let installer_source =
-            verified_test_source(&installer_server.url, "loader installer").await;
-        let library_root = test_library_operation(&root);
-        let execution = retain_test_installer_network(
-            &library_root,
-            bind_test_installer(installer_source, &record),
-            &mut |_| {},
-        )
-        .await;
-
-        let error = finish_supported_installer_install(
-            &library_root,
-            &plan,
-            execution,
-            test_loader_base_derivation(test_authenticated_receipt(&root, "1.21.4")),
-            &mut |_| {},
-        )
-        .await
-        .expect_err("mismatched processor base receipt");
-
-        assert!(matches!(error, LoaderError::ProcessorFailed(_)));
-        assert!(!versions_dir(&root).join(&record.version_id).exists());
-        installer_server.stop();
-        let _ = fs::remove_dir_all(root);
+            if processors {
+                assert!(matches!(error, LoaderError::ProcessorFailed(_)));
+            } else {
+                assert!(matches!(error, LoaderError::InvalidProfile(_)));
+            }
+            assert!(!versions_dir(&root).join(&record.version_id).exists());
+            installer_server.stop();
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[tokio::test]
@@ -5485,73 +5347,45 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
-    async fn legacy_archive_rejects_mismatched_live_sha1_proof() {
-        let root = temp_dir("legacy-archive-sha1-mismatch");
-        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
-        let server = TestByteServer::start_with_sha1_proof(archive, vec![b'0'; 40]);
-        let mut record = legacy_archive_record();
-        record.install_source = LoaderInstallSource::LegacyArchive {
-            url: server.url.clone(),
-        };
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-        };
-        write_base_version(&root, &record.minecraft_version);
-        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
-        let library_root = test_library_operation(&root);
-        let before = snapshot_tree(&root);
-        let error = continue_legacy_install_after_base(
-            &library_root,
-            plan,
-            test_loader_base_derivation(base_receipt),
-            &mut |_| {},
-        )
-        .await
-        .expect_err("mismatched proof must fail");
+    async fn legacy_archive_rejects_bad_live_sha1_proof_before_base_effects() {
+        for (proof, malformed) in [
+            (vec![b'0'; 40], false),
+            (b"not-a-strict-sha1 artifact.jar".to_vec(), true),
+        ] {
+            let root = temp_dir("legacy-archive-sha1-proof");
+            let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
+            let server = TestByteServer::start_with_sha1_proof(archive, proof);
+            let mut record = legacy_archive_record();
+            record.install_source = LoaderInstallSource::LegacyArchive {
+                url: server.url.clone(),
+            };
+            write_base_version(&root, &record.minecraft_version);
+            let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+            let library_root = test_library_operation(&root);
+            let before = snapshot_tree(&root);
 
-        assert!(
-            matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
-        );
-        assert_eq!(snapshot_tree(&root), before);
-        server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
+            let error = continue_legacy_install_after_base(
+                &library_root,
+                LoaderInstallPlan { record },
+                test_loader_base_derivation(base_receipt),
+                &mut |_| {},
+            )
+            .await
+            .expect_err("bad proof must fail");
 
-    #[tokio::test]
-    async fn legacy_archive_rejects_malformed_live_sha1_proof() {
-        let root = temp_dir("legacy-archive-sha1-malformed");
-        let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
-        let server = TestByteServer::start_with_sha1_proof(
-            archive,
-            b"not-a-strict-sha1 artifact.jar".to_vec(),
-        );
-        let mut record = legacy_archive_record();
-        record.install_source = LoaderInstallSource::LegacyArchive {
-            url: server.url.clone(),
-        };
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-        };
-        write_base_version(&root, &record.minecraft_version);
-        let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
-        let library_root = test_library_operation(&root);
-        let before = snapshot_tree(&root);
-
-        let error = continue_legacy_install_after_base(
-            &library_root,
-            plan,
-            test_loader_base_derivation(base_receipt),
-            &mut |_| {},
-        )
-        .await
-        .expect_err("malformed proof must fail");
-
-        assert!(
-            matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
-        );
-        assert_eq!(snapshot_tree(&root), before);
-        server.stop();
-        let _ = fs::remove_dir_all(root);
+            if malformed {
+                assert!(
+                    matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
+                );
+            } else {
+                assert!(
+                    matches!(error, LoaderError::Verify(message) if message.contains("live sha1 proof"))
+                );
+            }
+            assert_eq!(snapshot_tree(&root), before);
+            server.stop();
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[cfg(unix)]
@@ -7680,53 +7514,10 @@ esac
         .expect("canonical installed version id");
     }
 
-    #[test]
-    fn byte_server_waits_for_fragmented_headers_and_records_path_before_response() {
-        let body = b"fragmented request fixture".to_vec();
-        let expected_proof = sha1_hex(&body);
-        let server = TestByteServer::start_with_sha1(body);
-        let url = reqwest::Url::parse(&server.url).expect("test server URL");
-        let address = url.socket_addrs(|| None).expect("test server address")[0];
-        let mut stream = TcpStream::connect(address).expect("connect fragmented request");
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .expect("set incomplete request response timeout");
-        stream
-            .write_all(b"GET /legacy-client.zip.sha1 HTTP/1.1\r\nHost: local")
-            .expect("write first request fragment");
-        let error = stream
-            .read(&mut [0_u8; 1])
-            .expect_err("incomplete header must not receive a response");
-        assert!(matches!(
-            error.kind(),
-            ErrorKind::WouldBlock | ErrorKind::TimedOut
-        ));
-        assert_eq!(server.request_count_for("/legacy-client.zip.sha1"), 0);
-        stream
-            .write_all(b"host\r\nConnection: close\r\n\r\n")
-            .expect("complete request header");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set complete response timeout");
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("read fragmented request response");
-        assert_eq!(
-            response.split_once("\r\n\r\n").expect("response header").1,
-            expected_proof
-        );
-        assert_eq!(server.request_count(), 1);
-        assert_eq!(server.request_count_for("/legacy-client.zip.sha1"), 1);
-        server.stop();
-    }
-
+    /// Serves `body` at every path; `.sha1` sidecar paths get the proof when one is set.
     struct TestByteServer {
         url: String,
-        request_count: Arc<AtomicUsize>,
-        request_paths: Arc<Mutex<Vec<String>>>,
-        stop_server: mpsc::Sender<()>,
-        server: thread::JoinHandle<()>,
+        server: crate::http::test_server::Server,
     }
 
     impl TestByteServer {
@@ -7756,126 +7547,31 @@ esac
             sha1_proof: Option<Vec<u8>>,
             status: &'static str,
         ) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-            listener
-                .set_nonblocking(true)
-                .expect("set test server nonblocking");
-            let url = format!(
-                "http://{}/legacy-client.zip",
-                listener.local_addr().expect("server addr")
-            );
-            let request_count = Arc::new(AtomicUsize::new(0));
-            let server_request_count = Arc::clone(&request_count);
-            let request_paths = Arc::new(Mutex::new(Vec::new()));
-            let server_request_paths = Arc::clone(&request_paths);
-            let (stop_server, server_stopped) = mpsc::channel();
-            let server = thread::spawn(move || {
-                loop {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream
-                                .set_nonblocking(false)
-                                .expect("set accepted test stream blocking");
-                            stream
-                                .set_write_timeout(Some(Duration::from_secs(5)))
-                                .expect("set test response timeout");
-                            let path = read_test_request_path(&mut stream);
-                            server_request_count.fetch_add(1, Ordering::SeqCst);
-                            server_request_paths
-                                .lock()
-                                .expect("record request path")
-                                .push(path.clone());
-                            respond(stream, &path, status, &body, sha1_proof.as_deref());
-                        }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                            if server_stopped.try_recv().is_ok() {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => panic!("accept connection: {error}"),
-                    }
-                }
+            let server = crate::http::test_server::serve_routes(move |path| {
+                let body = match &sha1_proof {
+                    Some(proof) if path.ends_with(".sha1") => proof,
+                    _ => &body,
+                };
+                crate::http::test_server::response(status, &[], body)
             });
-
-            Self {
-                url,
-                request_count,
-                request_paths,
-                stop_server,
-                server,
-            }
+            let url = server.url("/legacy-client.zip");
+            Self { url, server }
         }
 
         fn request_count(&self) -> usize {
-            self.request_count.load(Ordering::SeqCst)
+            self.server.paths().len()
         }
 
         fn request_count_for(&self, path: &str) -> usize {
-            self.request_paths
-                .lock()
-                .expect("read request paths")
+            self.server
+                .paths()
                 .iter()
-                .filter(|requested| requested.as_str() == path)
+                .filter(|requested| *requested == path)
                 .count()
         }
 
         fn stop(self) {
-            self.stop_server.send(()).expect("stop test server");
-            self.server.join().expect("server thread");
+            self.server.finish();
         }
-    }
-
-    fn read_test_request_path(stream: &mut TcpStream) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut buffer = [0_u8; 4096];
-        let mut used = 0;
-        while !buffer[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-            assert!(used < buffer.len(), "test request header exceeds its bound");
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(!remaining.is_zero(), "test request header timed out");
-            stream
-                .set_read_timeout(Some(remaining))
-                .expect("set test request timeout");
-            let read = stream
-                .read(&mut buffer[used..])
-                .expect("read test request header");
-            assert!(read > 0, "test request ended before its complete header");
-            used += read;
-        }
-        let request = std::str::from_utf8(&buffer[..used]).expect("UTF-8 test request header");
-        let mut line = request
-            .lines()
-            .next()
-            .expect("test request line")
-            .split_whitespace();
-        assert_eq!(line.next(), Some("GET"), "test request method");
-        let path = line.next().expect("test request path");
-        assert!(path.starts_with('/'), "test request path must be absolute");
-        assert_eq!(line.next(), Some("HTTP/1.1"), "test request version");
-        assert!(line.next().is_none(), "unexpected test request line field");
-        path.to_string()
-    }
-
-    fn respond(
-        mut stream: TcpStream,
-        request_path: &str,
-        status: &str,
-        body: &[u8],
-        sha1_proof: Option<&[u8]>,
-    ) {
-        let body = if request_path.ends_with(".sha1") {
-            sha1_proof.unwrap_or(body)
-        } else {
-            body
-        };
-        let header = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream
-            .write_all(header.as_bytes())
-            .expect("write response header");
-        stream.write_all(body).expect("write response body");
     }
 }

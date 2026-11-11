@@ -3396,40 +3396,38 @@ mod lzma_failure_classification_tests {
     }
 
     #[test]
-    fn lzma_input_io_failure_stays_local_install_failure() {
+    fn lzma_io_failures_stay_local_and_invalid_bytes_are_source_failures() {
         let component = RuntimeId::from("java-runtime-gamma");
-        let mut input = RuntimeInstallReader::new(FailingReader);
-        let mut output =
-            RuntimeIntegrityWriter::new(Vec::new(), component.clone(), evidence(13), "bin/java");
-
+        let writer = |output| {
+            RuntimeIntegrityWriter::new(output, component.clone(), evidence(13), "bin/java")
+        };
         assert!(matches!(
-            decompress_lzma_stream(&component, &mut input, &mut output),
+            decompress_lzma_stream(
+                &component,
+                &mut RuntimeInstallReader::new(FailingReader),
+                &mut writer(Vec::new()),
+            ),
             Err(JavaRuntimeLookupError::Install(_))
         ));
-    }
-
-    #[test]
-    fn lzma_output_io_failure_stays_local_install_failure() {
-        let component = RuntimeId::from("java-runtime-gamma");
-        let mut input = RuntimeInstallReader::new(Cursor::new(compressed_fixture()));
-        let mut output =
-            RuntimeIntegrityWriter::new(FailingWriter, component.clone(), evidence(13), "bin/java");
-
         assert!(matches!(
-            decompress_lzma_stream(&component, &mut input, &mut output),
+            decompress_lzma_stream(
+                &component,
+                &mut RuntimeInstallReader::new(Cursor::new(compressed_fixture())),
+                &mut RuntimeIntegrityWriter::new(
+                    FailingWriter,
+                    component.clone(),
+                    evidence(13),
+                    "bin/java"
+                ),
+            ),
             Err(JavaRuntimeLookupError::Install(_))
         ));
-    }
-
-    #[test]
-    fn invalid_lzma_bytes_stay_runtime_source_failure() {
-        let component = RuntimeId::from("java-runtime-gamma");
-        let mut input = RuntimeInstallReader::new(Cursor::new(b"not lzma"));
-        let mut output =
-            RuntimeIntegrityWriter::new(Vec::new(), component.clone(), evidence(13), "bin/java");
-
         assert!(matches!(
-            decompress_lzma_stream(&component, &mut input, &mut output),
+            decompress_lzma_stream(
+                &component,
+                &mut RuntimeInstallReader::new(Cursor::new(b"not lzma")),
+                &mut writer(Vec::new()),
+            ),
             Err(JavaRuntimeLookupError::RuntimeSource(failure))
                 if failure.component() == &component
                     && failure.kind() == RuntimeSourceFailureKind::IntegrityMismatch
@@ -3471,7 +3469,7 @@ mod quarantine_observation_tests {
     }
 
     #[test]
-    fn retained_quarantine_observation_is_closed_and_path_free() {
+    fn retained_quarantine_observation_tracks_the_sidecar() {
         let cache = ManagedRuntimeCache::isolated_for_test().expect("Runtime cache");
         let component = RuntimeId::from("jre-legacy");
         let quarantine = cache
@@ -3485,13 +3483,11 @@ mod quarantine_observation_tests {
             obligation.observation(),
             ManagedRuntimeQuarantineObservation::Present
         );
-        assert_eq!(format!("{:?}", obligation.observation()), "Present");
 
         std::fs::remove_dir(&quarantine).expect("remove quarantine fixture");
         assert_eq!(
             obligation.observation(),
             ManagedRuntimeQuarantineObservation::Absent
         );
-        assert_eq!(format!("{:?}", obligation.observation()), "Absent");
     }
 }

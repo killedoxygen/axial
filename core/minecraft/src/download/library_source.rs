@@ -1631,6 +1631,17 @@ mod tests {
         target: &str,
         pool: &LibrarySourcePool,
     ) -> Result<AcquiredLibrarySource, DownloadError> {
+        acquire_retrying(url, expected, max_bytes, target, pool, &[]).await
+    }
+
+    async fn acquire_retrying(
+        url: &str,
+        expected: &ExpectedIntegrity,
+        max_bytes: u64,
+        target: &str,
+        pool: &LibrarySourcePool,
+        delays: &[Duration],
+    ) -> Result<AcquiredLibrarySource, DownloadError> {
         let client = reqwest::Client::new();
         let relative_path = fixture_relative_path();
         acquire_library_source_with_retry_delays(
@@ -1644,7 +1655,7 @@ mod tests {
                 pool,
                 fact_tx: None,
             },
-            &[],
+            delays,
         )
         .await
     }
@@ -1687,12 +1698,7 @@ mod tests {
         result.err().unwrap_or_else(|| panic!("{context}"))
     }
 
-    fn assert_source(
-        source: &AcquiredLibrarySource,
-        body: &[u8],
-        expected: &ExpectedIntegrity,
-        _target: &str,
-    ) {
+    fn assert_source(source: &AcquiredLibrarySource, body: &[u8], expected: &ExpectedIntegrity) {
         assert_eq!(source.observed_size(), body.len() as u64);
         assert_eq!(source.observed_sha1(), sha1_bytes(body));
         assert_eq!(source.expected(), expected);
@@ -1714,63 +1720,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquires_sha_only_exact_source_without_destination_authority() {
-        let body = jar_bytes(b"sha-only");
-        let expected = ExpectedIntegrity {
-            size: None,
-            sha1: Some(sha1_hex(&body)),
-        };
-        let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-        let absent_destination = crate::test_temp_root().join(format!(
-            "axial-library-source-no-destination-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&absent_destination);
+    async fn acquires_source_under_each_declared_integrity_contract() {
+        for (label, size, sha1) in [
+            ("sha-only", false, true),
+            ("size-only", true, false),
+            ("observed-only", false, false),
+        ] {
+            let body = jar_bytes(label.as_bytes());
+            let expected = ExpectedIntegrity {
+                size: size.then_some(body.len() as u64),
+                sha1: sha1.then(|| sha1_hex(&body)),
+            };
+            let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
+            let (pool, _workers, _attempt) = source_pool_for_test();
 
-        let source = acquire(&url, &expected, body.len() as u64, "library:sha", &pool)
-            .await
-            .expect("authenticated SHA-only source");
+            let source = acquire(&url, &expected, body.len() as u64, label, &pool)
+                .await
+                .expect("authenticated source");
 
-        assert_source(&source, &body, &expected, "library:sha");
-        assert!(!absent_destination.exists());
-    }
-
-    #[tokio::test]
-    async fn acquires_size_only_exact_source() {
-        let body = jar_bytes(b"size-only");
-        let expected = ExpectedIntegrity {
-            size: Some(body.len() as u64),
-            sha1: None,
-        };
-        let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let source = acquire(&url, &expected, body.len() as u64, "library:size", &pool)
-            .await
-            .expect("authenticated size-only source");
-
-        assert_source(&source, &body, &expected, "library:size");
-    }
-
-    #[tokio::test]
-    async fn acquires_source_without_declared_integrity() {
-        let body = jar_bytes(b"observed-only");
-        let expected = ExpectedIntegrity::default();
-        let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let source = acquire(
-            &url,
-            &expected,
-            body.len() as u64,
-            "library:observed",
-            &pool,
-        )
-        .await
-        .expect("authenticated observed source");
-
-        assert_source(&source, &body, &expected, "library:observed");
+            assert_source(&source, &body, &expected);
+        }
     }
 
     #[tokio::test]
@@ -1801,32 +1770,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expected_size_is_a_hard_limit_for_lengthless_streams() {
-        let body = jar_bytes(b"larger-than-tiny-expectation");
-        let expected = ExpectedIntegrity {
-            size: Some(1),
-            sha1: None,
-        };
-        let (url, _) = spawn_server(vec![ScriptedResponse::without_length(body)]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let error = rejected(
-            acquire(
-                &url,
-                &expected,
-                LIBRARY_SOURCE_MAX_BYTES,
-                "library:tiny-contract",
-                &pool,
-            )
-            .await,
-            "expected stream hard-limit rejection",
-        );
-
-        assert!(error.to_string().contains("response exceeds"));
-        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
-    }
-
-    #[tokio::test]
     async fn unknown_source_releases_scratch_after_aggregate_retention() {
         const REQUEST_CAP: u64 = 17 << 20;
         let body = jar_bytes(b"small-source-large-contract");
@@ -1843,12 +1786,7 @@ mod tests {
         .await
         .expect("acquire unknown source");
 
-        assert_source(
-            &source,
-            &body,
-            &ExpectedIntegrity::default(),
-            "library:request-cap",
-        );
+        assert_source(&source, &body, &ExpectedIntegrity::default());
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
         assert_eq!(
             pool.retained_available_bytes(),
@@ -2229,171 +2167,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_sha_mismatch() {
-        let body = jar_bytes(b"sha-mismatch");
-        let expected = ExpectedIntegrity {
-            size: None,
-            sha1: Some("0000000000000000000000000000000000000000".to_string()),
-        };
-        let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let error = rejected(
-            acquire(
-                &url,
-                &expected,
-                body.len() as u64,
-                "library:sha-mismatch",
-                &pool,
-            )
-            .await,
-            "expected mismatched SHA rejection",
-        );
-
-        assert!(error.to_string().contains("checksum does not match"));
-    }
-
-    #[tokio::test]
-    async fn rejects_size_mismatch() {
-        let body = jar_bytes(b"size-mismatch");
-        let expected = ExpectedIntegrity {
-            size: Some(body.len() as u64 + 1),
-            sha1: None,
-        };
-        let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let error = rejected(
-            acquire(
-                &url,
-                &expected,
-                body.len() as u64 + 1,
-                "library:size-mismatch",
-                &pool,
-            )
-            .await,
-            "expected mismatched size rejection",
-        );
-
-        assert!(error.to_string().contains("size does not match"));
-    }
-
-    #[tokio::test]
-    async fn rejects_declared_content_length_over_request_cap() {
-        let response = ScriptedResponse::partial(65, Vec::new());
-        let (url, _) = spawn_server(vec![response]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let error = rejected(
-            acquire(
-                &url,
-                &ExpectedIntegrity::default(),
+    async fn rejects_integrity_and_size_cap_violations_and_restores_budget() {
+        let body = jar_bytes(b"bounded");
+        let length = body.len() as u64;
+        let cases = [
+            (
+                ScriptedResponse::full(body.clone()),
+                ExpectedIntegrity {
+                    size: None,
+                    sha1: Some("0000000000000000000000000000000000000000".to_string()),
+                },
+                length,
+                "checksum does not match",
+            ),
+            (
+                ScriptedResponse::full(body.clone()),
+                ExpectedIntegrity {
+                    size: Some(length + 1),
+                    sha1: None,
+                },
+                length + 1,
+                "size does not match",
+            ),
+            (
+                ScriptedResponse::partial(65, Vec::new()),
+                ExpectedIntegrity::default(),
                 64,
-                "library:declared-oversize",
-                &pool,
-            )
-            .await,
-            "expected declared oversize rejection",
-        );
+                "exceeds the bounded scratch limit",
+            ),
+            (
+                ScriptedResponse::without_length(body.clone()),
+                ExpectedIntegrity::default(),
+                length - 1,
+                "response exceeds",
+            ),
+            (
+                ScriptedResponse::without_length(body.clone()),
+                ExpectedIntegrity {
+                    size: Some(1),
+                    sha1: None,
+                },
+                LIBRARY_SOURCE_MAX_BYTES,
+                "response exceeds",
+            ),
+        ];
+        for (response, expected, cap, message) in cases {
+            let (url, _) = spawn_server(vec![response]).await;
+            let (pool, _workers, _attempt) = source_pool_for_test();
 
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds the bounded scratch limit")
-        );
+            let error = rejected(
+                acquire(&url, &expected, cap, "library:rejected", &pool).await,
+                message,
+            );
+
+            assert!(error.to_string().contains(message), "{message}: {error}");
+            assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        }
     }
 
     #[tokio::test]
-    async fn rejects_stream_over_request_cap_without_content_length() {
-        let body = jar_bytes(b"stream-over-cap");
-        let cap = body.len() as u64 - 1;
-        let (url, _) = spawn_server(vec![ScriptedResponse::without_length(body)]).await;
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let error = rejected(
-            acquire(
-                &url,
-                &ExpectedIntegrity::default(),
-                cap,
-                "library:stream-oversize",
-                &pool,
-            )
-            .await,
-            "expected streamed oversize rejection",
-        );
-
-        assert!(error.to_string().contains("response exceeds"));
-    }
-
-    #[tokio::test]
-    async fn retries_interrupted_response_with_zero_delays() {
+    async fn retries_interrupted_and_rate_limited_responses() {
         let body = jar_bytes(b"retry-exact");
         let truncated = body[..body.len() / 2].to_vec();
-        let responses = vec![
-            ScriptedResponse::partial(body.len(), truncated.clone()),
-            ScriptedResponse::partial(body.len(), truncated),
-            ScriptedResponse::full(body.clone()),
-        ];
-        let (url, requests) = spawn_server(responses).await;
-        let expected = ExpectedIntegrity {
+        let exact = ExpectedIntegrity {
             size: Some(body.len() as u64),
             sha1: Some(sha1_hex(&body)),
         };
-        let (pool, _workers, _attempt) = source_pool_for_test();
+        for (responses, expected) in [
+            (
+                vec![
+                    ScriptedResponse::partial(body.len(), truncated.clone()),
+                    ScriptedResponse::partial(body.len(), truncated),
+                    ScriptedResponse::full(body.clone()),
+                ],
+                exact,
+            ),
+            (
+                vec![
+                    ScriptedResponse::status("429 Too Many Requests"),
+                    ScriptedResponse::full(body.clone()),
+                ],
+                ExpectedIntegrity::default(),
+            ),
+        ] {
+            let attempts = responses.len();
+            let (url, requests) = spawn_server(responses).await;
+            let (pool, _workers, _attempt) = source_pool_for_test();
 
-        let client = reqwest::Client::new();
-        let relative_path = fixture_relative_path();
-        let source = acquire_library_source_with_retry_delays(
-            LibrarySourceRequest {
-                client: &client,
-                url: &url,
-                expected: &expected,
-                relative_path: &relative_path,
-                max_bytes: body.len() as u64,
-                target: "library:retry",
-                pool: &pool,
-                fact_tx: None,
-            },
-            &[Duration::ZERO, Duration::ZERO],
-        )
-        .await
-        .expect("retry interrupted streams");
+            let source = acquire_retrying(
+                &url,
+                &expected,
+                body.len() as u64,
+                "library:retry",
+                &pool,
+                &vec![Duration::ZERO; attempts - 1],
+            )
+            .await
+            .expect("transient failures are retried");
 
-        assert_source(&source, &body, &expected, "library:retry");
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn rate_limit_status_is_retried() {
-        let body = jar_bytes(b"retry-after-rate-limit");
-        let responses = vec![
-            ScriptedResponse::status("429 Too Many Requests"),
-            ScriptedResponse::full(body.clone()),
-        ];
-        let (url, requests) = spawn_server(responses).await;
-        let client = reqwest::Client::new();
-        let expected = ExpectedIntegrity::default();
-        let relative_path = fixture_relative_path();
-        let (pool, _workers, _attempt) = source_pool_for_test();
-
-        let source = acquire_library_source_with_retry_delays(
-            LibrarySourceRequest {
-                client: &client,
-                url: &url,
-                expected: &expected,
-                relative_path: &relative_path,
-                max_bytes: LIBRARY_SOURCE_MAX_BYTES,
-                target: "library:429",
-                pool: &pool,
-                fact_tx: None,
-            },
-            &[Duration::ZERO],
-        )
-        .await
-        .expect("429 retry");
-
-        assert_source(&source, &body, &expected, "library:429");
-        assert_eq!(requests.load(Ordering::SeqCst), 2);
+            assert_source(&source, &body, &expected);
+            assert_eq!(requests.load(Ordering::SeqCst), attempts);
+        }
     }
 
     #[tokio::test]
@@ -2553,88 +2427,67 @@ mod tests {
         bytes[8..10].copy_from_slice(&entries.to_le_bytes());
         bytes[10..12].copy_from_slice(&entries.to_le_bytes());
         bytes[12..16].copy_from_slice(&directory_bytes.to_le_bytes());
-        let mut file = tempfile::tempfile().expect("preflight file");
-        file.write_all(&bytes).expect("write EOCD");
-        file.seek(SeekFrom::Start(0)).expect("rewind EOCD");
+        file_with(&bytes)
+    }
+
+    fn file_with(bytes: &[u8]) -> File {
+        let mut file = tempfile::tempfile().expect("JAR file");
+        file.write_all(bytes).expect("write JAR fixture");
+        file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
         file
     }
 
     #[test]
-    fn preflight_rejects_oversized_entry_count_and_central_directory() {
-        let mut too_many_entries = eocd(MAX_JAR_ENTRIES + 1, 1);
-        assert!(preflight_zip_central_directory(&mut too_many_entries, &uncancelled()).is_err());
-
-        let mut oversized_directory = eocd(1, MAX_JAR_CENTRAL_DIRECTORY_BYTES + 1);
-        assert!(preflight_zip_central_directory(&mut oversized_directory, &uncancelled()).is_err());
-    }
-
-    #[test]
-    fn preflight_rejects_trailing_bytes_and_fake_terminal_eocd() {
+    fn preflight_rejects_oversized_or_noncanonical_central_directory() {
         let mut trailing = jar_bytes(b"trailing");
         trailing.push(0);
-        let mut trailing_file = tempfile::tempfile().expect("trailing file");
-        trailing_file
-            .write_all(&trailing)
-            .expect("write trailing fixture");
-        assert!(preflight_zip_central_directory(&mut trailing_file, &uncancelled()).is_err());
-
         let mut fake_terminal = jar_bytes(b"fake terminal");
         fake_terminal.extend_from_slice(&[
             0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ]);
-        let mut fake_file = tempfile::tempfile().expect("fake EOCD file");
-        fake_file
-            .write_all(&fake_terminal)
-            .expect("write fake EOCD fixture");
-        assert!(preflight_zip_central_directory(&mut fake_file, &uncancelled()).is_err());
+        for (case, mut file) in [
+            ("entry count", eocd(MAX_JAR_ENTRIES + 1, 1)),
+            (
+                "directory size",
+                eocd(1, MAX_JAR_CENTRAL_DIRECTORY_BYTES + 1),
+            ),
+            ("trailing bytes", file_with(&trailing)),
+            ("fake terminal EOCD", file_with(&fake_terminal)),
+        ] {
+            assert!(
+                preflight_zip_central_directory(&mut file, &uncancelled()).is_err(),
+                "{case}"
+            );
+        }
     }
 
     #[test]
-    fn jar_validation_rejects_oversized_name_budget() {
-        let name = "x".repeat(MAX_JAR_ENTRY_NAME_BYTES + 1);
+    fn jar_validation_rejects_name_and_expansion_budget_metadata() {
         let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         writer
-            .start_file(name, SimpleFileOptions::default())
+            .start_file(
+                "x".repeat(MAX_JAR_ENTRY_NAME_BYTES + 1),
+                SimpleFileOptions::default(),
+            )
             .expect("start oversized-name entry");
         writer.write_all(b"payload").expect("write payload");
-        let bytes = writer.finish().expect("finish fixture").into_inner();
-        let mut file = tempfile::tempfile().expect("JAR file");
-        file.write_all(&bytes).expect("write JAR fixture");
-        file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
-
-        let error =
-            validate_bounded_jar(&mut file, &uncancelled()).expect_err("reject oversized name");
-
-        assert!(error.to_string().contains("entry name is too large"));
-    }
-
-    #[test]
-    fn jar_validation_rejects_single_entry_zip_bomb_metadata() {
-        let mut bytes = jar_with_entries(&[b"tiny"]);
-        patch_uncompressed_sizes(&mut bytes, &[(MAX_JAR_ENTRY_UNCOMPRESSED_BYTES + 1) as u32]);
-        let mut file = tempfile::tempfile().expect("JAR file");
-        file.write_all(&bytes).expect("write JAR fixture");
-        file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
-
-        let error =
-            validate_bounded_jar(&mut file, &uncancelled()).expect_err("reject per-entry ZIP bomb");
-
-        assert!(error.to_string().contains("entry expands beyond"));
-    }
-
-    #[test]
-    fn jar_validation_rejects_aggregate_zip_bomb_metadata() {
-        const ENTRY_SIZE: u32 = 300 << 20;
-        let mut bytes = jar_with_entries(&[b"first", b"second"]);
-        patch_uncompressed_sizes(&mut bytes, &[ENTRY_SIZE, ENTRY_SIZE]);
-        let mut file = tempfile::tempfile().expect("JAR file");
-        file.write_all(&bytes).expect("write JAR fixture");
-        file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
-
-        let error =
-            validate_bounded_jar(&mut file, &uncancelled()).expect_err("reject aggregate ZIP bomb");
-
-        assert!(error.to_string().contains("JAR expands beyond"));
+        let long_name = writer.finish().expect("finish fixture").into_inner();
+        let mut single_bomb = jar_with_entries(&[b"tiny"]);
+        patch_uncompressed_sizes(
+            &mut single_bomb,
+            &[(MAX_JAR_ENTRY_UNCOMPRESSED_BYTES + 1) as u32],
+        );
+        let mut aggregate_bomb = jar_with_entries(&[b"first", b"second"]);
+        patch_uncompressed_sizes(&mut aggregate_bomb, &[300 << 20, 300 << 20]);
+        for (bytes, message) in [
+            (long_name, "entry name is too large"),
+            (single_bomb, "entry expands beyond"),
+            (aggregate_bomb, "JAR expands beyond"),
+        ] {
+            let error = validate_bounded_jar(&mut file_with(&bytes), &uncancelled())
+                .expect_err("reject unbounded JAR metadata");
+            assert!(error.to_string().contains(message), "{message}: {error}");
+        }
     }
 
     #[tokio::test]
