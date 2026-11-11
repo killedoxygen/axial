@@ -3526,49 +3526,6 @@ impl ManagedDir {
         Ok(())
     }
 
-    pub(crate) fn sweep_orphan_temps(&self) -> Result<(), LoaderError> {
-        let entries = self.listing(MAX_MANAGED_DIRECTORY_ENTRIES)?;
-        let mut reserved = Vec::new();
-        for entry in entries {
-            let Some(name) = entry.utf8_name() else {
-                continue;
-            };
-            if !name.starts_with(RETIRED_MANAGED_TEMP_PREFIX) {
-                continue;
-            }
-            validate_managed_temp_name(name)?;
-            if reserved.len() == MAX_MANAGED_TEMP_ENTRIES {
-                return Err(LoaderError::Verify(
-                    "managed directory exceeds the bounded temp sweep".to_string(),
-                ));
-            }
-            reserved.push((name.to_string(), entry.kind()));
-        }
-
-        let mut admitted = Vec::with_capacity(reserved.len());
-        for (name, kind) in reserved {
-            if kind != EntryKind::File {
-                return Err(LoaderError::Verify(
-                    "managed temp namespace contains an unsafe entry".to_string(),
-                ));
-            }
-            let guard = self.inspect_regular_file(&name)?.ok_or_else(|| {
-                LoaderError::Verify("managed temp disappeared during admission".to_string())
-            })?;
-            if !self.managed_temp_is_orphan(&name, &guard)? {
-                return Err(LoaderError::Verify(
-                    "managed temp remained live during recovery".to_string(),
-                ));
-            }
-            admitted.push((name, guard));
-        }
-
-        for (name, guard) in admitted {
-            self.remove_guarded_file(&name, &guard)?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn remove_empty_child_guarded(
         &self,
         name: &str,
@@ -8481,55 +8438,6 @@ mod effect_transition_tests {
                 "{malformed} was accepted"
             );
         }
-    }
-
-    #[test]
-    fn orphan_temp_sweep_removes_only_admitted_regular_residue() {
-        let (temporary, directory) = managed_test_root("retired-temp-sweep");
-        let temp = ".axial-loader-tmp-42-a-0";
-        std::fs::write(temporary.path().join(temp), b"residue").expect("temp residue");
-        std::fs::write(temporary.path().join("ordinary.bin"), b"ordinary").expect("ordinary file");
-
-        directory.sweep_orphan_temps().expect("orphan sweep");
-
-        assert!(!temporary.path().join(temp).exists());
-        assert_eq!(
-            std::fs::read(temporary.path().join("ordinary.bin")).expect("ordinary file retained"),
-            b"ordinary"
-        );
-    }
-
-    #[test]
-    fn orphan_temp_sweep_plans_fail_closed_before_removing_any_entry() {
-        let (temporary, directory) = managed_test_root("retired-temp-unsafe");
-        let regular = ".axial-loader-tmp-42-a-0";
-        let unsafe_directory = ".axial-loader-tmp-42-b-0";
-        std::fs::write(temporary.path().join(regular), b"residue").expect("temp residue");
-        std::fs::create_dir(temporary.path().join(unsafe_directory))
-            .expect("unsafe temp directory");
-
-        assert!(directory.sweep_orphan_temps().is_err());
-        assert_eq!(
-            std::fs::read(temporary.path().join(regular)).expect("regular residue retained"),
-            b"residue"
-        );
-        assert!(temporary.path().join(unsafe_directory).is_dir());
-    }
-
-    #[test]
-    fn orphan_temp_sweep_enforces_aggregate_bound_before_mutation() {
-        let (temporary, directory) = managed_test_root("retired-temp-bound");
-        for index in 0..=MAX_MANAGED_TEMP_ENTRIES {
-            let name = format!(".axial-loader-tmp-42-{index:x}-0");
-            std::fs::write(temporary.path().join(name), b"residue").expect("temp residue");
-        }
-
-        assert!(directory.sweep_orphan_temps().is_err());
-        assert_eq!(
-            std::fs::read(temporary.path().join(".axial-loader-tmp-42-0-0"))
-                .expect("first residue retained"),
-            b"residue"
-        );
     }
 
     #[test]
