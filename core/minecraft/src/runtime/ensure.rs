@@ -1,6 +1,3 @@
-use super::cancellation::{
-    RuntimeCancellation, RuntimeCancellationSender, runtime_cancellation_channel,
-};
 #[cfg(test)]
 use super::cancellation::{
     RuntimeTestGate, RuntimeTestHookPoint, arm_runtime_test_hook, wait_for_runtime_test_hook,
@@ -20,6 +17,7 @@ use super::layout::ManagedRuntimeCache;
 use super::manifest::RuntimeSourceReceipt;
 use super::model::{JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId};
 use super::probe::{JavaProbeError, JavaProbeReceipt, probe_java};
+use crate::cancellation::{Cancellation, Canceller};
 use crate::launch::JavaVersion;
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use std::path::{Path, PathBuf};
@@ -41,12 +39,12 @@ pub enum RuntimeMaterializationCancellation {
 
 pub struct RuntimeMaterializationCancelHandle {
     phase: Arc<AtomicU8>,
-    cancellation: RuntimeCancellationSender,
+    cancellation: Canceller,
 }
 
 pub struct RuntimeMaterializationTaskControl {
     phase: Arc<AtomicU8>,
-    cancellation: RuntimeCancellation,
+    cancellation: Cancellation,
 }
 
 pub fn runtime_materialization_control() -> (
@@ -54,7 +52,7 @@ pub fn runtime_materialization_control() -> (
     RuntimeMaterializationTaskControl,
 ) {
     let phase = Arc::new(AtomicU8::new(RUNTIME_MATERIALIZATION_OPEN));
-    let (cancellation, cancellation_rx) = runtime_cancellation_channel();
+    let (cancellation, cancellation_rx) = crate::cancellation::channel();
     (
         RuntimeMaterializationCancelHandle {
             phase: Arc::clone(&phase),
@@ -100,7 +98,7 @@ impl RuntimeMaterializationTaskControl {
         self.cancellation.cancelled().await;
     }
 
-    fn cancellation(&mut self) -> &mut RuntimeCancellation {
+    fn cancellation(&mut self) -> &mut Cancellation {
         &mut self.cancellation
     }
 

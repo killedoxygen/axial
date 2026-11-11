@@ -1,3 +1,5 @@
+pub use crate::cancellation::Cancellation as TransferCancellation;
+use crate::cancellation::{self, Canceller, ThreadCancellation};
 use crate::managed::fs::ManagedTransferEffectSettlement;
 use axial_fs::{
     FileCapability, TransientCreationObligation, TransientDestination,
@@ -1208,20 +1210,9 @@ impl fmt::Display for TransferRedirectPolicyError {
 
 impl std::error::Error for TransferRedirectPolicyError {}
 
-struct TransferCancellationShared {
-    cancelled: AtomicBool,
-    changed: tokio::sync::watch::Sender<bool>,
-}
-
-impl TransferCancellationShared {
-    fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-        let _ = self.changed.send(true);
-    }
-}
-
+/// Cancels its transfers when dropped, so an abandoned owner cannot leave them running.
 pub struct TransferCancellationSender {
-    shared: Arc<TransferCancellationShared>,
+    canceller: Canceller,
 }
 
 impl fmt::Debug for TransferCancellationSender {
@@ -1234,87 +1225,19 @@ impl fmt::Debug for TransferCancellationSender {
 
 impl TransferCancellationSender {
     pub fn cancel(&self) {
-        self.shared.cancel();
+        self.canceller.cancel();
     }
 }
 
 impl Drop for TransferCancellationSender {
     fn drop(&mut self) {
-        self.shared.cancel();
-    }
-}
-
-#[derive(Clone)]
-pub struct TransferCancellation {
-    shared: Arc<TransferCancellationShared>,
-    changed: tokio::sync::watch::Receiver<bool>,
-}
-
-impl fmt::Debug for TransferCancellation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TransferCancellation")
-            .finish_non_exhaustive()
+        self.canceller.cancel();
     }
 }
 
 pub fn transfer_cancellation_channel() -> (TransferCancellationSender, TransferCancellation) {
-    let (changed, changed_rx) = tokio::sync::watch::channel(false);
-    let shared = Arc::new(TransferCancellationShared {
-        cancelled: AtomicBool::new(false),
-        changed,
-    });
-    (
-        TransferCancellationSender {
-            shared: Arc::clone(&shared),
-        },
-        TransferCancellation {
-            shared,
-            changed: changed_rx,
-        },
-    )
-}
-
-impl TransferCancellation {
-    pub fn is_cancelled(&self) -> bool {
-        self.shared.cancelled.load(Ordering::Acquire)
-    }
-
-    async fn cancelled(&mut self) {
-        loop {
-            if self.is_cancelled() || *self.changed.borrow_and_update() {
-                return;
-            }
-            if self.changed.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-
-    async fn wait<T>(&mut self, future: impl std::future::Future<Output = T>) -> Option<T> {
-        tokio::select! {
-            biased;
-            () = self.cancelled() => None,
-            result = future => Some(result),
-        }
-    }
-
-    fn thread_cancellation(&self) -> TransferThreadCancellation {
-        TransferThreadCancellation {
-            shared: Arc::clone(&self.shared),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct TransferThreadCancellation {
-    shared: Arc<TransferCancellationShared>,
-}
-
-impl TransferThreadCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.shared.cancelled.load(Ordering::Acquire)
-    }
+    let (canceller, cancellation) = cancellation::channel();
+    (TransferCancellationSender { canceller }, cancellation)
 }
 
 #[must_use = "transfer outcomes retain verified data or unsettled effect authority"]
@@ -1912,7 +1835,7 @@ fn verified_destination_cancel(
 
 #[must_use = "transfer tasks must be joined before their owner publishes a terminal state"]
 pub struct TransferTask<T> {
-    cancellation: Arc<TransferCancellationShared>,
+    cancellation: Canceller,
     authority: ManagedTransferAuthority,
     join: Option<tokio::task::JoinHandle<TransferOutcome<T>>>,
 }
@@ -1975,7 +1898,7 @@ pub fn start_create_only_transfer(
         destination,
         authority,
     } = target;
-    let task_cancellation = Arc::clone(&cancellation.shared);
+    let task_cancellation = cancellation.canceller();
     let task_authority = authority.retained();
     let join = tokio::spawn(async move {
         map_transfer_outcome(
@@ -2208,7 +2131,7 @@ pub fn start_source_transfer(
         destination,
         authority,
     } = target;
-    let task_cancellation = Arc::clone(&cancellation.shared);
+    let task_cancellation = cancellation.canceller();
     let task_authority = authority.retained();
     let join = tokio::spawn(async move {
         map_transfer_outcome(
@@ -2434,7 +2357,7 @@ impl Drop for AttemptCancellationGuard {
 }
 
 struct WriterCancellation {
-    transfer: TransferThreadCancellation,
+    transfer: ThreadCancellation,
     attempt: Arc<AtomicBool>,
 }
 
@@ -2469,7 +2392,7 @@ async fn run_attempt(
     let (abort_admission, mut admission_aborted) = tokio::sync::oneshot::channel::<()>();
     let mut attempt_cancellation = AttemptCancellationGuard::new();
     let writer_cancellation = WriterCancellation {
-        transfer: cancellation.thread_cancellation(),
+        transfer: cancellation.thread(),
         attempt: attempt_cancellation.flag(),
     };
     let writer_contract = contract.clone();
@@ -3646,7 +3569,7 @@ mod tests {
     #[tokio::test]
     async fn transfer_task_drop_cancels_its_supervisor() {
         let (sender, cancellation) = transfer_cancellation_channel();
-        let task_cancellation = Arc::clone(&cancellation.shared);
+        let task_cancellation = cancellation.canceller();
         let mut supervisor_cancellation = cancellation.clone();
         let (authority_owner, authority_drops, authority) = authority_probe();
         let supervisor_authority = authority.retained();
@@ -3681,7 +3604,7 @@ mod tests {
         let (owner, drops, authority) = authority_probe();
         let (cancellation_owner, cancellation) = transfer_cancellation_channel();
         let task = TransferTask::<()> {
-            cancellation: Arc::clone(&cancellation.shared),
+            cancellation: cancellation.canceller(),
             authority,
             join: Some(tokio::spawn(async move {
                 panic!("synthetic transfer supervisor failure");
@@ -3715,7 +3638,7 @@ mod tests {
             }
         });
         let task = TransferTask::<()> {
-            cancellation: Arc::clone(&cancellation.shared),
+            cancellation: cancellation.canceller(),
             authority,
             join: Some(join),
         };

@@ -21,8 +21,8 @@ use super::{
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
     publish_staged_managed_runtime_with_rotation_failure_for_test,
-    rosetta_requirement_for_managed_runtime, runtime_cancellation_channel,
-    runtime_file_download_concurrency_for, runtime_materialization_control, runtime_os_arch_for,
+    rosetta_requirement_for_managed_runtime, runtime_file_download_concurrency_for,
+    runtime_materialization_control, runtime_os_arch_for,
     runtime_publication_lock_available_for_test, runtime_windows_verbatim_path_string,
     select_runtime_manifest, stage_managed_runtime, stage_managed_runtime_until_cancelled,
     validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
@@ -1418,7 +1418,7 @@ async fn authenticated_empty_runtime_file_cancelled_after_materialization_cleans
         },
     )
     .expect("authenticated empty fixture source");
-    let (sender, mut cancellation) = runtime_cancellation_channel();
+    let (sender, mut cancellation) = crate::cancellation::channel();
     let staging_root = root.with_file_name("jre-legacy.staging");
     let mut observed_materialized_file = false;
     let staged = stage_managed_runtime_until_cancelled(
@@ -1467,7 +1467,7 @@ async fn cached_runtime_verification_holds_exact_publication_locks_until_consume
         .expect("verified managed runtime")
         .into_parts()
         .1;
-    let (_cancellation_sender, mut cancellation) = runtime_cancellation_channel();
+    let (_cancellation_sender, mut cancellation) = crate::cancellation::channel();
     let verified = match super::install::verify_cached_managed_runtime_until_cancelled(
         &cache,
         &component,
@@ -1534,7 +1534,7 @@ async fn cancelling_blocked_runtime_staging_removes_owned_sidecar() {
         },
     )
     .expect("authenticated blocked runtime source");
-    let (cancellation_tx, mut cancellation) = runtime_cancellation_channel();
+    let (cancellation_tx, mut cancellation) = crate::cancellation::channel();
     let stage_cache = cache.clone();
     let stage_component = component.clone();
     let stage_task = tokio::spawn(async move {
@@ -1606,7 +1606,7 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
     let contender_source =
         runtime_source_receipt_fixture(&component, &root, b"contender java").await;
     let gate = block_runtime_decompression_for_test(java_executable(&staging_root));
-    let (cancellation_tx, mut cancellation) = runtime_cancellation_channel();
+    let (cancellation_tx, mut cancellation) = crate::cancellation::channel();
     let stage_cache = cache.clone();
     let stage_component = component.clone();
     let mut stage_task = tokio::spawn(async move {

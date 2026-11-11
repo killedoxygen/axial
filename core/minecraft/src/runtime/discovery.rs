@@ -1,4 +1,3 @@
-use super::cancellation::runtime_cancellation_channel;
 use super::layout::{
     ManagedRuntimeCache, ManagedRuntimeComponent, managed_runtime_executable_present,
     managed_runtime_executable_ready, runtime_java_relative_path,
@@ -247,12 +246,12 @@ impl ManagedRuntimeComponent {
         if !self.executable_ready() {
             return false;
         }
-        let (_sender, cancellation) = runtime_cancellation_channel();
+        let (_sender, cancellation) = crate::cancellation::channel();
         super::install::managed_runtime_tree_matches_manifest(
             &RuntimeId::from(self.component.clone()),
             &self.root,
             &manifest,
-            &cancellation.thread_cancellation(),
+            &cancellation.thread(),
         ) && self.validate_projection().is_ok()
     }
 
@@ -267,8 +266,8 @@ impl ManagedRuntimeComponent {
             .persisted_manifest()
             .ok_or_else(|| std::io::Error::other("managed runtime manifest proof is invalid"))?;
         let component = RuntimeId::from(self.component.clone());
-        let (_sender, cancellation) = runtime_cancellation_channel();
-        let cancellation = cancellation.thread_cancellation();
+        let (_sender, cancellation) = crate::cancellation::channel();
+        let cancellation = cancellation.thread();
         if !super::install::managed_runtime_tree_matches_manifest_without_ready_marker(
             &component,
             &self.root,

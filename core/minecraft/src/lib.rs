@@ -1,4 +1,5 @@
 mod asset_index;
+mod cancellation;
 #[cfg(test)]
 pub(crate) fn test_temp_root() -> std::path::PathBuf {
     std::fs::canonicalize(std::env::temp_dir()).expect("canonical temporary test parent")

@@ -1,7 +1,4 @@
-use super::cancellation::{
-    RuntimeCancellation, RuntimeCancellationSet, RuntimeThreadCancellation,
-    runtime_cancellation_channel,
-};
+use super::cancellation::RuntimeCancellationSet;
 #[cfg(test)]
 use super::cancellation::{
     RuntimeTestGate, RuntimeTestHookPoint, arm_runtime_test_hook, wait_for_runtime_test_hook,
@@ -25,6 +22,7 @@ use super::model::{
     JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId, RuntimeRecord, RuntimeSourceFailure,
     RuntimeSourceFailureKind,
 };
+use crate::cancellation::{Cancellation, ThreadCancellation};
 use crate::managed::fs::{ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents};
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
@@ -369,7 +367,7 @@ impl OwnedRuntimeStage {
 async fn acquire_managed_runtime_publication_lease_until_cancelled(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
 ) -> Result<Option<ManagedRuntimePublicationLease>, JavaRuntimeLookupError> {
     let component_lock = match cancellation
         .wait(cache.install_lock(component.as_str()).lock_owned())
@@ -388,7 +386,7 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
     component: &RuntimeId,
     required_major: i32,
     source: RuntimeSourceReceipt,
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
 ) -> Result<CachedManagedRuntimeVerification, JavaRuntimeLookupError> {
     if source.component() != component {
         return Err(JavaRuntimeLookupError::Install(
@@ -441,7 +439,7 @@ pub(crate) async fn stage_managed_runtime(
     source: RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
 ) -> Result<StagedManagedRuntime, JavaRuntimeLookupError> {
-    let (_cancellation_tx, mut cancellation) = runtime_cancellation_channel();
+    let (_cancellation_tx, mut cancellation) = crate::cancellation::channel();
     stage_managed_runtime_until_cancelled(cache, component, source, observer, &mut cancellation)
         .await?
         .ok_or_else(|| {
@@ -456,7 +454,7 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
     component: &RuntimeId,
     source: RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
 ) -> Result<Option<StagedManagedRuntime>, JavaRuntimeLookupError> {
     if source.component() != component {
         return Err(JavaRuntimeLookupError::Install(
@@ -494,7 +492,7 @@ pub(super) async fn prepare_missing_runtime_until_cancelled(
     component: &RuntimeId,
     source: RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
 ) -> Result<Option<MissingRuntimePreparation>, JavaRuntimeLookupError> {
     if source.component() != component {
         return Err(JavaRuntimeLookupError::ManagedMutationRefused);
@@ -565,7 +563,7 @@ async fn stage_with_publication_lease(
     component: &RuntimeId,
     source: RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
     publication_lease: ManagedRuntimePublicationLease,
     admission: RuntimeManifestAdmission,
     replace_existing: bool,
@@ -1128,11 +1126,11 @@ pub(super) async fn runtime_tree_matches_source(
     root: &ManagedDir,
     source: &RuntimeSourceReceipt,
 ) -> bool {
-    let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
+    let (_cancellation_sender, cancellation) = crate::cancellation::channel();
     Box::pin(runtime_tree_matches_source_inner(
         root,
         source,
-        cancellation.thread_cancellation(),
+        cancellation.thread(),
     ))
     .await
 }
@@ -1140,12 +1138,12 @@ pub(super) async fn runtime_tree_matches_source(
 pub(super) async fn runtime_tree_matches_source_until_cancelled(
     root: &ManagedDir,
     source: &RuntimeSourceReceipt,
-    cancellation: &RuntimeCancellation,
+    cancellation: &Cancellation,
 ) -> bool {
     Box::pin(runtime_tree_matches_source_inner(
         root,
         source,
-        cancellation.thread_cancellation(),
+        cancellation.thread(),
     ))
     .await
 }
@@ -1153,7 +1151,7 @@ pub(super) async fn runtime_tree_matches_source_until_cancelled(
 async fn runtime_tree_matches_source_inner(
     root: &ManagedDir,
     source: &RuntimeSourceReceipt,
-    cancellation: RuntimeThreadCancellation,
+    cancellation: ThreadCancellation,
 ) -> bool {
     if cancellation.is_cancelled() {
         return false;
@@ -1198,7 +1196,7 @@ pub(super) fn managed_runtime_tree_matches_manifest(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
-    cancellation: &RuntimeThreadCancellation,
+    cancellation: &ThreadCancellation,
 ) -> bool {
     managed_runtime_tree_matches_manifest_inner(component, root, manifest, cancellation, true)
 }
@@ -1207,7 +1205,7 @@ pub(super) fn managed_runtime_tree_matches_manifest_without_ready_marker(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
-    cancellation: &RuntimeThreadCancellation,
+    cancellation: &ThreadCancellation,
 ) -> bool {
     managed_runtime_tree_matches_manifest_inner(component, root, manifest, cancellation, false)
 }
@@ -1216,7 +1214,7 @@ fn managed_runtime_tree_matches_manifest_inner(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
-    cancellation: &RuntimeThreadCancellation,
+    cancellation: &ThreadCancellation,
     ready_marker_present: bool,
 ) -> bool {
     // One validation window for the whole tree; a failed close refuses it.
@@ -1241,7 +1239,7 @@ fn managed_runtime_tree_matches(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
-    cancellation: &RuntimeThreadCancellation,
+    cancellation: &ThreadCancellation,
     ready_marker_present: bool,
 ) -> bool {
     let Ok(expected_proof) = component_manifest_proof_bytes(manifest) else {
@@ -1426,9 +1424,9 @@ fn runtime_tree_shape_matches_manifest_inner(
     component: &RuntimeId,
     root: &Path,
     manifest: &ComponentManifest,
-    cancellation: Option<&RuntimeThreadCancellation>,
+    cancellation: Option<&ThreadCancellation>,
 ) -> bool {
-    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+    if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
         return false;
     }
     let filesystem_root = runtime_filesystem_path(root).into_owned();
@@ -1452,7 +1450,7 @@ fn runtime_tree_shape_matches_manifest_inner(
         return false;
     }
     for (relative, file) in &manifest.files {
-        if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+        if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
             return false;
         }
         let Ok(path) = component_manifest_destination(component, Path::new(""), relative) else {
@@ -1473,14 +1471,14 @@ fn runtime_tree_shape_matches_manifest_inner(
     let mut observed_node_count = 0_usize;
     let mut directories = vec![filesystem_root.clone()];
     while let Some(directory) = directories.pop() {
-        if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+        if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
             return false;
         }
         let Ok(entries) = std::fs::read_dir(&directory) else {
             return false;
         };
         for entry in entries {
-            if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+            if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
                 return false;
             }
             observed_node_count = observed_node_count.saturating_add(1);
@@ -1837,7 +1835,7 @@ async fn materialize_runtime_tree_with_concurrency(
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     admission: RuntimeManifestAdmission,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let (_cancellation_sender, mut cancellation) = runtime_cancellation_channel();
+    let (_cancellation_sender, mut cancellation) = crate::cancellation::channel();
     materialize_runtime_tree_with_cancellation(
         component,
         dest_dir,
@@ -1857,7 +1855,7 @@ async fn materialize_runtime_tree_with_cancellation(
     source: &RuntimeSourceReceipt,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     admission: RuntimeManifestAdmission,
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     if source.component() != component {
         return Err(JavaRuntimeLookupError::Install(
@@ -2423,7 +2421,7 @@ pub(super) async fn install_runtime_manifest_files(
                         )
                     })
             })?;
-    let (_cancellation_sender, mut cancellation) = runtime_cancellation_channel();
+    let (_cancellation_sender, mut cancellation) = crate::cancellation::channel();
     install_runtime_manifest_files_with_concurrency(
         component,
         &managed,
@@ -2446,7 +2444,7 @@ async fn install_runtime_manifest_files_with_concurrency(
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     admission: RuntimeManifestAdmission,
-    cancellation: &mut RuntimeCancellation,
+    cancellation: &mut Cancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     let plan = plan_runtime_manifest_files(files);
 
@@ -2476,7 +2474,7 @@ async fn install_runtime_manifest_files_with_concurrency(
         });
     }
 
-    let (lane_cancellation_sender, lane_cancellation) = runtime_cancellation_channel();
+    let (lane_cancellation_sender, lane_cancellation) = crate::cancellation::channel();
     let source_urls = plan
         .file_entries
         .iter()
@@ -2663,7 +2661,7 @@ pub(super) async fn install_runtime_manifest_file(
         .transpose()?;
     let managed = ManagedDir::open_root(temp_dir)
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
-    let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
+    let (_cancellation_sender, cancellation) = crate::cancellation::channel();
     let mut cancellation = RuntimeCancellationSet::single(cancellation);
     Box::pin(install_runtime_manifest_file_until_cancelled(
         component,
@@ -2765,7 +2763,7 @@ async fn install_runtime_manifest_file_until_cancelled(
             source,
             RuntimeDownloadEvidence::from(&raw),
             relative_path.to_string(),
-            cancellation.thread_cancellation(),
+            cancellation.thread(),
         )
         .await?;
         temp_dir
@@ -2950,7 +2948,7 @@ async fn decompress_lzma_runtime_source(
     source: RuntimeVerifiedSource,
     expected: RuntimeDownloadEvidence,
     relative_path: String,
-    cancellation: RuntimeThreadCancellation,
+    cancellation: ThreadCancellation,
 ) -> Result<Vec<u8>, JavaRuntimeLookupError> {
     let hook_path = destination_root.path().join(&relative_path);
     let worker = tokio::spawn(async move {
@@ -3080,7 +3078,7 @@ fn decompress_lzma_stream<R: BufRead, W: Write>(
 struct RuntimeInstallReader<R> {
     input: R,
     failure: Option<String>,
-    cancellation: Option<RuntimeThreadCancellation>,
+    cancellation: Option<ThreadCancellation>,
 }
 
 impl<R> RuntimeInstallReader<R> {
@@ -3093,7 +3091,7 @@ impl<R> RuntimeInstallReader<R> {
         }
     }
 
-    fn with_cancellation(input: R, cancellation: RuntimeThreadCancellation) -> Self {
+    fn with_cancellation(input: R, cancellation: ThreadCancellation) -> Self {
         Self {
             input,
             failure: None,
@@ -3111,7 +3109,7 @@ impl<R: Read> Read for RuntimeInstallReader<R> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(RuntimeThreadCancellation::is_cancelled)
+            .is_some_and(ThreadCancellation::is_cancelled)
         {
             let error = runtime_cancellation_io_error();
             self.failure.get_or_insert_with(|| error.to_string());
@@ -3128,7 +3126,7 @@ impl<R: BufRead> BufRead for RuntimeInstallReader<R> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(RuntimeThreadCancellation::is_cancelled)
+            .is_some_and(ThreadCancellation::is_cancelled)
         {
             let error = runtime_cancellation_io_error();
             self.failure.get_or_insert_with(|| error.to_string());
@@ -3156,7 +3154,7 @@ struct RuntimeIntegrityWriter<W> {
     hasher: Sha1,
     size: u64,
     failure: Option<JavaRuntimeLookupError>,
-    cancellation: Option<RuntimeThreadCancellation>,
+    cancellation: Option<ThreadCancellation>,
 }
 
 impl<W> RuntimeIntegrityWriter<W> {
@@ -3184,7 +3182,7 @@ impl<W> RuntimeIntegrityWriter<W> {
         component: RuntimeId,
         expected: RuntimeDownloadEvidence,
         relative_path: &str,
-        cancellation: RuntimeThreadCancellation,
+        cancellation: ThreadCancellation,
     ) -> Self {
         Self {
             output,
@@ -3208,7 +3206,7 @@ impl<W: Write> Write for RuntimeIntegrityWriter<W> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(RuntimeThreadCancellation::is_cancelled)
+            .is_some_and(ThreadCancellation::is_cancelled)
         {
             let error = runtime_cancellation_io_error();
             self.failure = Some(JavaRuntimeLookupError::Install(error.to_string()));
@@ -3252,7 +3250,7 @@ impl<W: Write> Write for RuntimeIntegrityWriter<W> {
         if self
             .cancellation
             .as_ref()
-            .is_some_and(RuntimeThreadCancellation::is_cancelled)
+            .is_some_and(ThreadCancellation::is_cancelled)
         {
             let error = runtime_cancellation_io_error();
             self.failure = Some(JavaRuntimeLookupError::Install(error.to_string()));
@@ -3291,7 +3289,7 @@ async fn install_runtime_manifest_link(
         temp_dir.clone(),
         relative,
         target.to_string(),
-        cancellation.thread_cancellation(),
+        cancellation.thread(),
     ))
     .await
 }
@@ -3301,7 +3299,7 @@ async fn install_runtime_manifest_symlink(
     destination_root: ManagedDir,
     relative: PortableRelativePath,
     target: String,
-    cancellation: RuntimeThreadCancellation,
+    cancellation: ThreadCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     let admission = process_physical_work()
         .admit(PhysicalWorkRequest::foreground(
@@ -3332,7 +3330,7 @@ async fn install_runtime_manifest_symlink(
     _destination_root: ManagedDir,
     _relative: PortableRelativePath,
     _target: String,
-    _cancellation: RuntimeThreadCancellation,
+    _cancellation: ThreadCancellation,
 ) -> Result<(), JavaRuntimeLookupError> {
     Err(JavaRuntimeLookupError::Install(
         "runtime manifest link entries are unsupported on this platform".to_string(),

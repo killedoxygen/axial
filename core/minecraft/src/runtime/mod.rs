@@ -48,8 +48,6 @@ pub use model::{
 pub use probe::{JavaArchitecture, JavaProbeError, JavaProbeReceipt, probe_java};
 
 #[cfg(test)]
-use cancellation::runtime_cancellation_channel;
-#[cfg(test)]
 use file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,
     component_manifest_destination, runtime_file_download_concurrency_for,
