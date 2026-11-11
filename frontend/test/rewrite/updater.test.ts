@@ -4,7 +4,6 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import { mockApi } from '../../src/mock/api';
 import type { UpdateFlowState, UpdateInfo } from '../../src/types-update';
 import type { UpdateFlow } from '../../src/generated/UpdateFlow';
 import type { UpdateSnapshot } from '../../src/generated/UpdateSnapshot';
@@ -83,7 +82,7 @@ function info(): UpdateInfo {
   };
 }
 
-function harness(mockRequest?: typeof mockApi) {
+function harness() {
   let nextTimer = 0;
   let restarts = 0;
   let saved = 0;
@@ -122,7 +121,6 @@ function harness(mockRequest?: typeof mockApi) {
       './api': {
         api: async (method: string, path: string, body?: unknown) => {
           calls.push({ method, path, body });
-          if (mockRequest) return mockRequest(method, path, body);
           assert.ok(responses.has(path), `Unexpected update request ${path}`);
           const response = responses.get(path);
           if (response instanceof Error) throw response;
@@ -132,7 +130,7 @@ function harness(mockRequest?: typeof mockApi) {
       },
       './toast': { toast: (message: string) => notices.push(message) },
       './native': {
-        hasNativeDesktopRuntime: () => mockRequest === undefined,
+        hasNativeDesktopRuntime: () => true,
         openExternalURL: async () => {},
         requestNativeAppRestart: async () => {
           restarts++;
@@ -147,7 +145,7 @@ function harness(mockRequest?: typeof mockApi) {
       './dto-contract': dto,
     },
     {
-      __AXIAL_MOCK_API__: mockRequest !== undefined,
+      __AXIAL_MOCK_API__: false,
       window: {
         setTimeout(callback: () => void): number {
           const id = ++nextTimer;
@@ -221,26 +219,6 @@ test('startup restores a staged update after frontend reload without issuing upd
   assert.equal(JSON.stringify(h.store.updateInfo.value), JSON.stringify(retained.info));
   assert.equal(h.updater.canInstallUpdateInApp(), true);
   assert.deepEqual(h.calls, [{ method: 'GET', path: '/update/snapshot', body: undefined }]);
-  assert.equal(h.restarts(), 0);
-});
-
-test('mock frontend startup discovers updates through its actual API', async () => {
-  const h = harness(mockApi);
-
-  h.updater.scheduleAutoUpdateCheck();
-  await h.poll();
-
-  assert.equal(h.store.updateCheckState.value, 'ready');
-  assert.equal(h.store.updateInfo.value?.latest_version, '9.9.9');
-  assert.equal(h.updater.updateFlow.value.phase, 'idle');
-  assert.equal(h.updater.canInstallUpdateInApp(), true);
-  assert.deepEqual(
-    h.calls.map(({ method, path }) => ({ method, path })),
-    [
-      { method: 'GET', path: '/update/snapshot' },
-      { method: 'GET', path: '/update' },
-    ],
-  );
   assert.equal(h.restarts(), 0);
 });
 

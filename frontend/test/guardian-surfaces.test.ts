@@ -688,5 +688,3 @@ test('performance health and retained proof evidence remain backend-authored dis
   });
   assertExcludesSensitive(evidence);
 });
-
-test.todo('Guardian mode controls are deliberately deferred from the clean rewrite');

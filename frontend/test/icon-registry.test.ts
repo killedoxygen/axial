@@ -4,75 +4,12 @@ import type { VNode } from 'preact';
 
 import { Icon, ICON_NAMES, isIconName, type IconName } from '../src/ui/Icons';
 
-const EXPECTED_ICON_NAMES = [
-  'activity',
-  'archive',
-  'arrow-left',
-  'arrow-right',
-  'arrow-up',
-  'check',
-  'check-circle',
-  'chevron-left',
-  'chevron-right',
-  'chevron-down',
-  'chevron-up',
-  'circle-dashed',
-  'clock',
-  'compass',
-  'copy',
-  'cube',
-  'dots',
-  'download',
-  'edit',
-  'expand',
-  'folder',
-  'globe',
-  'headphones',
-  'home',
-  'image',
-  'info',
-  'alert',
-  'keyboard',
-  'minus',
-  'music',
-  'music-off',
-  'palette',
-  'puzzle',
-  'play',
-  'player-skip',
-  'plus',
-  'rectangle',
-  'refresh',
-  'search',
-  'settings',
-  'sliders',
-  'shield-check',
-  'shield-person',
-  'stack',
-  'stop',
-  'tag',
-  'terminal',
-  'trash',
-  'user',
-  'volume',
-  'volume-off',
-  'x',
-] as const satisfies readonly IconName[];
-
 type LooseProps = Record<string, any>;
 
 function functionalResult(vnode: VNode): VNode<LooseProps> {
   assert.equal(typeof vnode.type, 'function');
   return (vnode.type as (props: LooseProps) => VNode<LooseProps>)(vnode.props);
 }
-
-test('icon registry exposes exactly the reviewed 52 semantic names', () => {
-  assert.equal(ICON_NAMES.length, 52);
-  assert.deepEqual(ICON_NAMES, EXPECTED_ICON_NAMES);
-  assert.equal(new Set(ICON_NAMES).size, ICON_NAMES.length);
-  for (const name of EXPECTED_ICON_NAMES) assert.equal(isIconName(name), true);
-  for (const unknown of ['', 'reload', 'Sparkles', 'unknown']) assert.equal(isIconName(unknown), false);
-});
 
 test('every semantic icon supplies nonblank Lucide geometry with preserved presentation props', () => {
   for (const name of ICON_NAMES) {

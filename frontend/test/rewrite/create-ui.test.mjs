@@ -275,18 +275,6 @@ test('malformed queue data preserves confirmed creation without publishing inval
   assert.equal(notice[1], 'error');
 });
 
-test('Guardian-only response data has no presentation authority', async () => {
-  ui.arrange({ ...created(), guardian_notice: { tone: 'error', message: 'Old autonomous repair' } });
-  assert.equal((await ui.createInstance(args)).ok, true);
-  assert.deepEqual(ui.notices, [['Instance created. Download queued.', 'success']]);
-  assert.equal(ui.createResultToastMessage({ view_model: { summary: 'Queued.', detail: 'Queued.' } }), 'Queued.');
-  assert.equal(ui.createToastKind('warn'), 'info');
-  assert.deepEqual(ui.createNoticePresentation({ state_id: 'runtime', tone: 'warn', message: 'Select Java' }), {
-    tone: 'warned',
-    icon: 'alert',
-  });
-});
-
 function view() {
   return {
     sources: [

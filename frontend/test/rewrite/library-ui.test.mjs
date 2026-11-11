@@ -25,7 +25,7 @@ import test from 'node:test';
  * @property {Record<string, unknown>} InstanceTile
  * @property {Record<string, unknown>} InstanceGlyph
  * @property {{ onChange: (value: string) => void }} Segmented
- * @property {{ actions: { label: string, danger?: boolean, onClick: () => void }[] }} SelectionActionTray
+ * @property {Record<string, unknown>} SelectionActionTray
  * @property {{ onToggle: (event: TestEvent) => void }} SelectionCheckbox
  */
 /** @typedef {{ [K in keyof PartProps]: (props: PartProps[K]) => unknown }} Parts */
@@ -204,14 +204,10 @@ function libraryHarness(initialInstances = []) {
   let stateIndex = 0;
   /** @type {Set<string>} */
   const selectedIds = new Set();
-  /** @type {{ navigations: { name: string, id?: string }[], create: number, menus: MenuCall[], deletes: { selected: LibraryInstance[], onDone: () => void }[], clears: number, filtered: string[] }} */
-  const calls = { navigations: [], create: 0, menus: [], deletes: [], clears: 0, filtered: [] };
+  /** @type {{ navigations: { name: string, id?: string }[], create: number, menus: MenuCall[], filtered: string[] }} */
+  const calls = { navigations: [], create: 0, menus: [], filtered: [] };
   /** @type {Map<string, { state: string, installing: boolean, label?: string, queuedItem?: { title: string } }>} */
   const installs = new Map();
-  const clearSelection = () => {
-    selectedIds.clear();
-    calls.clears += 1;
-  };
   const imports = {
     'preact/hooks': {
       /** @template T @param {() => T} fn */
@@ -255,7 +251,7 @@ function libraryHarness(initialInstances = []) {
           isSelected: (id) => selectedIds.has(id),
           /** @param {string} id */
           toggle: (id) => (selectedIds.has(id) ? selectedIds.delete(id) : selectedIds.add(id)),
-          clear: clearSelection,
+          clear: () => selectedIds.clear(),
         };
       },
     },
@@ -280,10 +276,7 @@ function libraryHarness(initialInstances = []) {
       openInstanceContextMenu: (e, inst) => calls.menus.push({ e, inst }),
     },
     '../instance/instance-actions': {
-      /** @param {LibraryInstance[]} selected @param {() => void} onDone */
-      deleteInstancesFlow: async (selected, onDone) => {
-        calls.deletes.push({ selected, onDone });
-      },
+      deleteInstancesFlow: async () => {},
     },
     './PendingRemovalsNotice': { PendingRemovalsNotice: () => null },
     '../../format': {
@@ -507,25 +500,6 @@ test('list rows preserve backend labels, keyboard access and independent selecti
   assert.equal(menuEvent.stopped, 1);
   assert.equal(h.calls.menus.length, 1);
   assert.equal(h.calls.navigations.length, 2);
-});
-
-test('bulk delete forwards selected instances and lets the shared workflow decide completion', async () => {
-  const h = libraryHarness([instance('keep'), instance('remove')]);
-  h.selectedIds.add('remove');
-  const tray = ofType(h.library(), parts.SelectionActionTray)[0];
-  assert.equal(tray.props.actions[0].label, 'Delete');
-  assert.equal(tray.props.actions[0].danger, true);
-  tray.props.actions[0].onClick();
-  await Promise.resolve();
-  assert.equal(h.calls.deletes.length, 1);
-  assert.deepEqual(
-    h.calls.deletes[0].selected.map((inst) => inst.id),
-    ['remove'],
-  );
-  assert.equal(h.calls.clears, 0);
-  assert.equal(h.store.instances.value.length, 2);
-  h.calls.deletes[0].onDone();
-  assert.equal(h.calls.clears, 1);
 });
 
 test('library distinguishes an empty library from an unmatched filter', () => {

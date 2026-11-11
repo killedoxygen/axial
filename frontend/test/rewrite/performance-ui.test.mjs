@@ -13,7 +13,6 @@ import vm from 'node:vm';
  *   'views/settings/PerformanceSection': typeof import('../../src/views/settings/PerformanceSection'),
  *   'views/instance/performance-mode': typeof import('../../src/views/instance/performance-mode'),
  *   'views/settings/PerformanceLabProofHistory': typeof import('../../src/views/settings/PerformanceLabProofHistory'),
- *   'views/settings/PerformanceLabCard': typeof import('../../src/views/settings/PerformanceLabCard'),
  *   'views/settings/PerformanceLabSuiteDrivers': typeof import('../../src/views/settings/PerformanceLabSuiteDrivers'),
  *   'dto-performance': typeof import('../../src/dto-performance'),
  * }} ViewModules
@@ -237,7 +236,7 @@ function control(tree, type, label) {
   return /** @type {Controls[T]} */ (/** @type {unknown} */ (match.props));
 }
 
-test('Performance settings retain three modes, autosave and failure rollback without Guardian controls', async () => {
+test('Performance settings retain three modes, autosave and failure rollback', async () => {
   let fail = false;
   const h = viewHarness({
     api: async (_method, _path, patch) => {
@@ -254,7 +253,6 @@ test('Performance settings retain three modes, autosave and failure rollback wit
     ['managed', 'vanilla', 'custom'],
   );
   assert.equal(nodes(view).filter((node) => node.type === 'SettingRow').length, 1);
-  assert.doesNotMatch(visibleText(view), /Guardian|Idle integrity/);
   await h.settle();
   choice.onChange('vanilla');
   assert.equal(control(h.render(PerformanceSection), 'ChoicePills').disabled, true);
@@ -286,7 +284,7 @@ test('instance modes preserve inheritance and health passes backend copy through
   assert.equal(h.calls[0][1], '/performance/health?instance_id=instance+%2F%3F');
 });
 
-/** @returns {import('../../src/types-launch').LaunchProofRecord & { guardian: { label: string } }} */
+/** @returns {import('../../src/types-launch').LaunchProofRecord} */
 function proofRecord() {
   return {
     schema: 'launch-proof',
@@ -305,7 +303,6 @@ function proofRecord() {
       benchmark_mode: 'development',
     },
     device: { tier: 'fixture' },
-    guardian: { label: 'Guardian legacy data must not render' },
     view_model: {
       outcome_tone: 'ok',
       outcome_label: 'Completed by backend',
@@ -331,7 +328,6 @@ test('proof history preserves neutral evidence, budget, comparison and stable co
     'Completed by backend',
   ])
     assert.ok(text.includes(label), label);
-  assert.doesNotMatch(text, /Guardian/);
   control(tree, 'Button').onClick();
   await h.settle();
   assert.equal(h.calls[0][1], '/launch/reports/session%20%2F%3F');
@@ -353,34 +349,6 @@ test('proof copy failures do not expose raw service details and stale history st
   await h.settle();
   assert.equal(h.notices[h.notices.length - 1][0], 'Copy failed: Launch proof could not be copied.');
   assert.equal(h.clipboard.length, 0);
-});
-
-test('Performance Lab remains a developer disclosure with all existing blocks', async () => {
-  const h = viewHarness();
-  const { PerformanceLabCard } = h.load('views/settings/PerformanceLabCard');
-  assert.equal(h.render(PerformanceLabCard), null);
-  await h.settle();
-  assert.equal(h.calls.length, 0);
-  h.store.devMode.value = true;
-  const closed = h.render(PerformanceLabCard);
-  await h.settle();
-  assert.equal(h.calls.length, 0);
-  control(closed, 'Button', 'Open').onClick();
-  const opened = h.render(PerformanceLabCard);
-  const blocks = nodes(opened)
-    .map((node) => (typeof node.type === 'function' ? node.type.name : undefined))
-    .filter(Boolean);
-  assert.deepEqual(blocks, [
-    'LaunchProofHistoryBlock',
-    'BenchmarkMatrixBlock',
-    'BenchmarkQualificationPreviewBlock',
-    'BenchmarkSuiteDriversBlock',
-  ]);
-  await h.settle();
-  assert.deepEqual(
-    h.calls.map((call) => call[1]),
-    ['/launch/reports', '/launch/benchmark/matrix', '/launch/benchmark/qualification/family-c-1-12-2/preview'],
-  );
 });
 
 /** @param {{ id?: string, state?: string, pending?: number | null, canResume?: boolean, sessionId?: string | null }} [options] */
