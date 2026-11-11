@@ -26,11 +26,7 @@ use crate::managed::publication::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
-#[cfg(any(test, feature = "test-support"))]
-use std::collections::HashMap;
 use std::hash::Hasher;
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 const LANE_NAME: &str = "version-bundle";
@@ -151,8 +147,6 @@ struct TransactionContext {
     outcome_guard: Option<ManagedFileGuard>,
     settlement_evidence: Option<DurableVersionBundleEvidence>,
     entries: Vec<TransactionEntry>,
-    #[cfg(any(test, feature = "test-support"))]
-    test_hook: Option<PublicationTestHook>,
 }
 
 struct TransactionHandles {
@@ -163,38 +157,6 @@ struct TransactionHandles {
     intent: PersistedIntent,
     intent_guard: ManagedFileGuard,
 }
-
-#[cfg(any(test, feature = "test-support"))]
-enum PublicationTestHook {
-    FailAfter {
-        promotions: usize,
-    },
-    #[cfg(test)]
-    PauseAfter {
-        promotions: usize,
-        reached: Option<tokio::sync::oneshot::Sender<()>>,
-        release: Option<tokio::sync::oneshot::Receiver<()>>,
-    },
-    #[cfg(test)]
-    CrashAfterPromotion {
-        kind: KnownGoodArtifactKind,
-    },
-    #[cfg(test)]
-    ReportFirstMoveUnsettled,
-    #[cfg(test)]
-    FailAfterIntent,
-    #[cfg(test)]
-    FailSettlementOnce,
-    #[cfg(test)]
-    FailSettlementPermanently,
-    #[cfg(test)]
-    FailAfterSettlementMarkerOnce,
-    #[cfg(test)]
-    FailAfterCommittedOutcomeOnce,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-static TEST_HOOKS: OnceLock<Mutex<HashMap<String, PublicationTestHook>>> = OnceLock::new();
 
 pub(crate) struct VersionBundleTransactionCommitReceipt {
     context: Arc<TransactionContext>,
@@ -415,8 +377,6 @@ impl VersionBundleTransactionRecovery {
                     recovery.version_id,
                     recovery.activation_contract_id,
                     recovery.fingerprints,
-                    #[cfg(any(test, feature = "test-support"))]
-                    None,
                 )
                 .await;
                 settle_version_bundle_publication(publication).await
@@ -520,12 +480,6 @@ pub(crate) async fn publish_version_bundle(
         return Err(VersionBundleTransactionError::ProjectionMismatch);
     }
     let version_id = source.version_id().to_string();
-    #[cfg(any(test, feature = "test-support"))]
-    let test_hook = TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&version_id);
     let fingerprints = own_fingerprints(&projection)?;
     validate_portable_aliases(&fingerprints)?;
     validate_bundle_topology(&version_id, &fingerprints)?;
@@ -535,8 +489,6 @@ pub(crate) async fn publish_version_bundle(
         version_id,
         activation_contract_id,
         fingerprints,
-        #[cfg(any(test, feature = "test-support"))]
-        test_hook,
     )
     .await
 }
@@ -547,11 +499,8 @@ async fn continue_version_bundle_publication(
     version_id: String,
     activation_contract_id: ManagedInstallActivationContractId,
     fingerprints: Vec<EntryFingerprint>,
-    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<VersionBundleTransactionCommitReceipt, VersionBundleTransactionError> {
     let mut lease = lease;
-    #[cfg(any(test, feature = "test-support"))]
-    let mut test_hook = test_hook;
     let mut retry_delay = std::time::Duration::from_millis(25);
     let maximum_retry_delay = std::time::Duration::from_secs(1);
     let mut recovery_attempts = 0usize;
@@ -561,21 +510,6 @@ async fn continue_version_bundle_publication(
         let attempt_version_id = version_id.clone();
         let attempt_activation_contract_id = activation_contract_id.clone();
         let attempt_fingerprints = fingerprints.clone();
-        #[cfg(any(test, feature = "test-support"))]
-        let attempt_test_hook = test_hook.take();
-        #[cfg(any(test, feature = "test-support"))]
-        let attempt = run_publication_blocking(move || {
-            prepare_transaction(
-                lease,
-                attempt_source,
-                attempt_version_id,
-                attempt_activation_contract_id,
-                attempt_fingerprints,
-                attempt_test_hook,
-            )
-        })
-        .await;
-        #[cfg(not(any(test, feature = "test-support")))]
         let attempt = run_publication_blocking(move || {
             prepare_transaction(
                 lease,
@@ -979,7 +913,6 @@ fn prepare_transaction(
     version_id: String,
     activation_contract_id: ManagedInstallActivationContractId,
     fingerprints: Vec<EntryFingerprint>,
-    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<PreparationOutcome, VersionBundleTransactionError> {
     let mut planned = bind_sources(source, fingerprints)?;
     let lane = open_lane(&lease)?;
@@ -1003,8 +936,6 @@ fn prepare_transaction(
                 },
                 outcome,
                 outcome_guard,
-                #[cfg(any(test, feature = "test-support"))]
-                test_hook,
             )?;
             return match terminal {
                 PersistedTerminalOutcome::Committed => {
@@ -1044,8 +975,6 @@ fn prepare_transaction(
                 },
                 outcome,
                 outcome_guard,
-                #[cfg(any(test, feature = "test-support"))]
-                test_hook,
             )?;
             return Ok(PreparationOutcome::Committed(committed_receipt(context)));
         }
@@ -1064,8 +993,6 @@ fn prepare_transaction(
             },
             root_identity,
             &mut planned,
-            #[cfg(any(test, feature = "test-support"))]
-            test_hook,
         )?;
         return Ok(PreparationOutcome::Ready(Box::new(context)));
     }
@@ -1103,13 +1030,12 @@ fn prepare_transaction(
             return Err(VersionBundleTransactionError::RecoveryAmbiguous);
         }
     };
-    #[cfg(test)]
-    if matches!(test_hook, Some(PublicationTestHook::FailAfterIntent)) {
-        return Err(VersionBundleTransactionError::Preparation);
-    }
     lease
         .revalidate()
         .map_err(|_| VersionBundleTransactionError::Preparation)?;
+    if fault::hit(lane.path(), Fault::IntentAfterLeaseRevalidated) {
+        return Err(VersionBundleTransactionError::Preparation);
+    }
     let (staging, quarantine) = open_or_create_slots_after_intent(&lease, &lane)?;
     let root_identity = lease
         .root()
@@ -1126,8 +1052,6 @@ fn prepare_transaction(
         },
         root_identity,
         &mut planned,
-        #[cfg(any(test, feature = "test-support"))]
-        test_hook,
     )
     .map(Box::new)
     .map(PreparationOutcome::Ready)
@@ -1882,7 +1806,6 @@ fn context_from_prepared(
     handles: TransactionHandles,
     root_identity: ManagedDirectoryIdentity,
     planned: &mut [PlannedEntry],
-    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<TransactionContext, VersionBundleTransactionError> {
     let TransactionHandles {
         lease,
@@ -1965,8 +1888,6 @@ fn context_from_prepared(
         outcome_guard: None,
         settlement_evidence: None,
         entries,
-        #[cfg(any(test, feature = "test-support"))]
-        test_hook,
     })
 }
 
@@ -2516,7 +2437,6 @@ fn reconstruct_terminal_context(
     handles: TransactionHandles,
     outcome: PersistedOutcome,
     outcome_guard: ManagedFileGuard,
-    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<TransactionContext, VersionBundleTransactionError> {
     let TransactionHandles {
         lease,
@@ -2677,8 +2597,6 @@ fn reconstruct_terminal_context(
         outcome_guard: Some(outcome_guard),
         settlement_evidence: None,
         entries,
-        #[cfg(any(test, feature = "test-support"))]
-        test_hook,
     };
     match outcome.outcome {
         PersistedTerminalOutcome::Committed => revalidate_committed(&context),
@@ -2802,8 +2720,8 @@ fn mutate_in_place(
                 };
             }
         }
-        #[cfg(any(test, feature = "test-support"))]
-        if apply_test_hook(context, index + 1) {
+        fault::hit(context.lane.path(), Fault::AfterRow);
+        if fault::hit(context.lane.path(), Fault::RowFailure) {
             return rollback_mutation_failure(
                 context,
                 VersionBundleTransactionEffect::Promotion,
@@ -2838,12 +2756,7 @@ fn mutate_in_place(
         }
     };
     context.outcome_guard = Some(outcome_guard);
-    #[cfg(test)]
-    if matches!(
-        context.test_hook.as_ref(),
-        Some(PublicationTestHook::FailAfterCommittedOutcomeOnce)
-    ) {
-        context.test_hook = None;
+    if fault::hit(context.lane.path(), Fault::OutcomeUnacknowledged) {
         return MutationDecision::Pending {
             effect: VersionBundleTransactionEffect::Postcheck,
         };
@@ -2974,8 +2887,7 @@ fn promote_entry(
         &target.parent,
         &target.name,
     )?;
-    #[cfg(test)]
-    if take_report_first_move_unsettled(&mut context.test_hook) {
+    if fault::hit(context.lane.path(), Fault::RowUnsettled) {
         return Err(EntryPromotionFailure::EffectUnsettled);
     }
     entry.canonical_guard = entry.stage_guard.take();
@@ -3329,181 +3241,6 @@ fn revalidate_failure(context: &TransactionContext) -> Result<(), LoaderError> {
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-support"))]
-fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool {
-    #[cfg(test)]
-    let promoted_kind = promotions
-        .checked_sub(1)
-        .and_then(|index| context.entries.get(index))
-        .map(|entry| entry.fingerprint.kind);
-    match context.test_hook.as_mut() {
-        Some(PublicationTestHook::FailAfter {
-            promotions: expected,
-        }) if *expected == promotions => true,
-        #[cfg(test)]
-        Some(PublicationTestHook::PauseAfter {
-            promotions: expected,
-            reached,
-            release,
-        }) if *expected == promotions => {
-            if let Some(reached) = reached.take() {
-                let _ = reached.send(());
-            }
-            if let Some(release) = release.take() {
-                let _ = release.blocking_recv();
-            }
-            false
-        }
-        #[cfg(test)]
-        Some(PublicationTestHook::CrashAfterPromotion { kind }) if Some(*kind) == promoted_kind => {
-            panic!("injected version bundle crash after promotion");
-        }
-        Some(PublicationTestHook::FailAfter { .. }) | None => false,
-        #[cfg(test)]
-        Some(
-            PublicationTestHook::PauseAfter { .. }
-            | PublicationTestHook::CrashAfterPromotion { .. }
-            | PublicationTestHook::ReportFirstMoveUnsettled
-            | PublicationTestHook::FailAfterIntent
-            | PublicationTestHook::FailSettlementOnce
-            | PublicationTestHook::FailSettlementPermanently
-            | PublicationTestHook::FailAfterSettlementMarkerOnce
-            | PublicationTestHook::FailAfterCommittedOutcomeOnce,
-        ) => false,
-    }
-}
-
-#[cfg(test)]
-fn take_report_first_move_unsettled(hook: &mut Option<PublicationTestHook>) -> bool {
-    if matches!(hook, Some(PublicationTestHook::ReportFirstMoveUnsettled)) {
-        *hook = None;
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub fn fail_after_promotions_for_test(version_id: &str, promotions: usize) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::FailAfter { promotions },
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn fail_after_intent_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(version_id.to_string(), PublicationTestHook::FailAfterIntent);
-}
-
-#[cfg(test)]
-pub(crate) fn pause_after_promotions_for_test(
-    version_id: &str,
-    promotions: usize,
-) -> (
-    tokio::sync::oneshot::Receiver<()>,
-    tokio::sync::oneshot::Sender<()>,
-) {
-    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::PauseAfter {
-                promotions,
-                reached: Some(reached_tx),
-                release: Some(release_rx),
-            },
-        );
-    (reached_rx, release_tx)
-}
-
-#[cfg(test)]
-pub(crate) fn crash_after_artifact_promotion_for_test(
-    version_id: &str,
-    kind: KnownGoodArtifactKind,
-) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::CrashAfterPromotion { kind },
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn report_first_move_unsettled_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::ReportFirstMoveUnsettled,
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn fail_after_committed_outcome_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::FailAfterCommittedOutcomeOnce,
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn fail_settlement_once_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::FailSettlementOnce,
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn fail_settlement_permanently_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::FailSettlementPermanently,
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn fail_after_settlement_marker_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::FailAfterSettlementMarkerOnce,
-        );
-}
-
 async fn settle_owned_context(
     context: TransactionContext,
     expectation: SettlementExpectation,
@@ -3735,23 +3472,9 @@ fn settle_context(
         SettlementExpectation::PendingFailure { effect } => prove_pending_outcome(context, effect)?,
     };
     *expectation = SettlementExpectation::Proven(expected_outcome);
-    #[cfg(test)]
-    if matches!(
-        context.test_hook.as_ref(),
-        Some(PublicationTestHook::FailSettlementOnce)
-    ) {
-        context.test_hook = None;
+    if fault::hit(context.lane.path(), Fault::BeforeSettlementPromotion) {
         return Err(LoaderError::Verify(
             "injected version bundle settlement failure".to_string(),
-        ));
-    }
-    #[cfg(test)]
-    if matches!(
-        context.test_hook.as_ref(),
-        Some(PublicationTestHook::FailSettlementPermanently)
-    ) {
-        return Err(LoaderError::Verify(
-            "injected permanent version bundle settlement failure".to_string(),
         ));
     }
     let outcome = PersistedOutcome {
@@ -3786,12 +3509,7 @@ fn settle_context(
     )
     .map_err(publication_error_as_loader)?;
     context.settlement_evidence = Some(evidence.clone());
-    #[cfg(test)]
-    if matches!(
-        context.test_hook.as_ref(),
-        Some(PublicationTestHook::FailAfterSettlementMarkerOnce)
-    ) {
-        context.test_hook = None;
+    if fault::hit(context.lane.path(), Fault::AfterSettlementPromotion) {
         return Err(LoaderError::Verify(
             "injected version bundle post-marker settlement failure".to_string(),
         ));
@@ -4213,7 +3931,7 @@ mod settlement_tests {
         version_id: &'static str,
     }
 
-    async fn pending_settlement_fixture(test_hook: PublicationTestHook) -> SettlementFixture {
+    async fn pending_settlement_fixture(fault: Option<Fault>) -> SettlementFixture {
         let temporary =
             tempfile::tempdir_in(crate::test_temp_root()).expect("settlement retry root");
         let root_path = temporary.path().join("library");
@@ -4326,8 +4044,10 @@ mod settlement_tests {
             outcome_guard: None,
             settlement_evidence: None,
             entries,
-            test_hook: Some(test_hook),
         };
+        if let Some(fault) = fault {
+            fault::arm(lane.path(), fault, None);
+        }
 
         SettlementFixture {
             _temporary: temporary,
@@ -4342,9 +4062,7 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn superseded_publication_marker_schemas_are_rejected_explicitly() {
-        let fixture = pending_settlement_fixture(PublicationTestHook::FailAfter {
-            promotions: usize::MAX,
-        })
+        let fixture = pending_settlement_fixture(None)
         .await;
         let mut old_intent = fixture.context.intent.clone();
         old_intent.schema = "axial.version_bundle_publication.intent.v3".to_string();
@@ -4394,9 +4112,7 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn publication_markers_persist_digests_without_provider_or_source_material() {
-        let fixture = pending_settlement_fixture(PublicationTestHook::FailAfter {
-            promotions: usize::MAX,
-        })
+        let fixture = pending_settlement_fixture(None)
         .await;
         let provider_url = "https://credentials.invalid/provider/source?token=never-persist";
         let mut intent = fixture.context.intent.clone();
@@ -4510,7 +4226,7 @@ mod settlement_tests {
             quarantine,
             version_parent,
             version_id,
-        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        } = pending_settlement_fixture(Some(Fault::BeforeSettlementPromotion)).await;
         let settlement = settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {
@@ -4669,8 +4385,8 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn post_intent_failure_reenters_owned_publication_recovery() {
-        assert_intent_retry_commits("version-bundle-post-intent-retry", |_, version_id| {
-            fail_after_intent_for_test(version_id)
+        assert_intent_retry_commits("version-bundle-post-intent-retry", |root, _| {
+            fault::arm(root, Fault::IntentAfterLeaseRevalidated, None)
         })
         .await;
     }
@@ -4680,7 +4396,7 @@ mod settlement_tests {
         const VERSION_ID: &str = "fixture-version-bundle-unsettled-move";
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("unsettled move root");
         let root = ManagedDir::open_root(temporary.path()).expect("open unsettled move root");
-        report_first_move_unsettled_for_test(VERSION_ID);
+        fault::arm(temporary.path(), Fault::RowUnsettled, None);
 
         let (_, settled) = publish_fixture(VERSION_ID, root).await;
         let lease = match settled.expect("unsettled move must enter durable reconciliation") {
@@ -4733,7 +4449,7 @@ mod settlement_tests {
             quarantine,
             version_id,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        } = pending_settlement_fixture(Some(Fault::BeforeSettlementPromotion)).await;
         let retry = settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {
@@ -4783,7 +4499,7 @@ mod settlement_tests {
             context,
             version_id,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        } = pending_settlement_fixture(Some(Fault::BeforeSettlementPromotion)).await;
         let retry = settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {
@@ -4988,9 +4704,7 @@ mod settlement_tests {
             quarantine,
             version_id,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailAfter {
-            promotions: usize::MAX,
-        })
+        } = pending_settlement_fixture(None)
         .await;
         fault::arm(
             temporary.path(),
@@ -5070,7 +4784,7 @@ mod settlement_tests {
             quarantine,
             version_id,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        } = pending_settlement_fixture(Some(Fault::BeforeSettlementPromotion)).await;
         let context = Arc::new(context);
         let retained_context = Arc::clone(&context);
         let publication = Err(VersionBundleTransactionError::Effect(Box::new(
@@ -5117,7 +4831,7 @@ mod settlement_tests {
             mut context,
             lane,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        } = pending_settlement_fixture(Some(Fault::BeforeSettlementPromotion)).await;
         let effect = VersionBundleTransactionEffect::Promotion;
         prove_pending_outcome(&mut context, effect).expect("publish exact pending outcome");
         let retained_identity = context
@@ -5156,7 +4870,7 @@ mod settlement_tests {
             mut context,
             lane,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailSettlementOnce).await;
+        } = pending_settlement_fixture(Some(Fault::BeforeSettlementPromotion)).await;
         let effect = VersionBundleTransactionEffect::Promotion;
         prove_pending_outcome(&mut context, effect).expect("publish exact pending outcome");
         let retained_identity = context
@@ -5263,7 +4977,7 @@ mod settlement_tests {
             quarantine,
             version_id,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailAfterSettlementMarkerOnce).await;
+        } = pending_settlement_fixture(Some(Fault::AfterSettlementPromotion)).await;
 
         let settlement = settle_owned_context(
             context,
@@ -5309,7 +5023,7 @@ mod settlement_tests {
             context,
             lane,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailAfterSettlementMarkerOnce).await;
+        } = pending_settlement_fixture(Some(Fault::AfterSettlementPromotion)).await;
         let retry = settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {
@@ -5343,7 +5057,7 @@ mod settlement_tests {
             context,
             lane,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::FailAfterSettlementMarkerOnce).await;
+        } = pending_settlement_fixture(Some(Fault::AfterSettlementPromotion)).await;
         let retry = settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {

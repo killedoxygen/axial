@@ -28,6 +28,7 @@ use crate::loaders::{
     LoaderInstallStrategy, LoaderInstallability,
 };
 use crate::managed::blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
+use crate::managed::fault::{self, Fault};
 use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
 use crate::managed::publication::ManagedRootPublicationLease;
 use crate::manifest::VersionManifest;
@@ -859,7 +860,7 @@ async fn registered_known_good_bootstrap_refuses_rolled_back_publication_without
     let root = temp_dir(version_id);
     let authority =
         ManagedLibraryTestAuthority::open(&root).expect("open rolled-back reconstruction root");
-    crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 1);
+    fault::arm(&version_bundle_lane(&root), Fault::RowFailure, None);
     publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
         .await
         .expect_err("injected VersionBundle promotion failure must roll back");
@@ -1775,7 +1776,7 @@ async fn normal_install_accepts_effect_failure_that_settles_committed() {
     let version_id = "normal-effect-committed";
     let root = temp_dir(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
-    crate::version_bundle_publication::fail_after_committed_outcome_for_test(version_id);
+    fault::arm(&version_bundle_lane(&root), Fault::OutcomeUnacknowledged, None);
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
     let receipt = timeout(
@@ -1799,9 +1800,12 @@ async fn normal_install_settles_crash_after_artifact_promotion_before_returning(
     let version_id = "normal-crash-after-promotion";
     let root = temp_dir(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
-    crate::version_bundle_publication::crash_after_artifact_promotion_for_test(
-        version_id,
-        KnownGoodArtifactKind::ClientJar,
+    // Rows run in path order: log config, client jar, metadata.
+    fault::arm_after(
+        &version_bundle_lane(&root),
+        Fault::AfterRow,
+        1,
+        Some(Box::new(|| panic!("injected crash after client jar promotion"))),
     );
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
@@ -1851,7 +1855,7 @@ async fn normal_install_rolls_back_bundle_replacements_before_returning_error() 
     .expect("seed previous client jar");
     fs::write(&log_path, previous_log).expect("seed previous log config");
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
-    crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 2);
+    fault::arm_after(&version_bundle_lane(&root), Fault::RowFailure, 1, None);
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
     let error = timeout(
@@ -1886,8 +1890,7 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
     let version_id = "normal-publication-cancellation";
     let root = temp_dir(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
-    let (reached, release) =
-        crate::version_bundle_publication::pause_after_promotions_for_test(version_id, 1);
+    let (reached, release) = fault::pause_after(&version_bundle_lane(&root), Fault::AfterRow, 0);
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
     let checkpoint_operation = downloader.managed_operation_for_test().clone();
 
@@ -1975,8 +1978,7 @@ async fn managed_install_owner_panic_retains_recovery_across_retry_cancellation(
     );
     assert!(progress_events.iter().all(|event| !event.done));
 
-    let (reached, release) =
-        crate::version_bundle_publication::pause_after_promotions_for_test(version_id, 1);
+    let (reached, release) = fault::pause_after(&version_bundle_lane(&root), Fault::AfterRow, 0);
     let retry = tokio::spawn(recovery.retry());
     timeout(DURABLE_OPERATION_TIMEOUT, reached)
         .await
@@ -2053,7 +2055,14 @@ async fn managed_install_active_retry_owner_panic_falls_back_to_durable_recovery
     let root = temp_dir(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
-    crate::version_bundle_publication::fail_settlement_permanently_for_test(version_id);
+    // Every bounded in-process settlement attempt fails.
+    for _ in 0..8 {
+        fault::arm(
+            &version_bundle_lane(&root),
+            Fault::BeforeSettlementPromotion,
+            None,
+        );
+    }
 
     let recovery = match timeout(
         DURABLE_OPERATION_TIMEOUT,
@@ -2159,20 +2168,17 @@ async fn cancelling_normal_install_while_waiting_for_lease_detaches_publication_
 #[tokio::test]
 async fn normal_install_retries_local_version_bundle_settlement() {
     let cases = [
-        (
-            "normal-settlement-retry",
-            crate::version_bundle_publication::fail_settlement_once_for_test as fn(&str),
-        ),
+        ("normal-settlement-retry", Fault::BeforeSettlementPromotion),
         (
             "normal-settlement-marker-retry",
-            crate::version_bundle_publication::fail_after_settlement_marker_for_test,
+            Fault::AfterSettlementPromotion,
         ),
     ];
 
-    for (version_id, inject_failure) in cases {
+    for (version_id, fault) in cases {
         let root = temp_dir(version_id);
         let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
-        inject_failure(version_id);
+        fault::arm(&version_bundle_lane(&root), fault, None);
         let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
         let receipt = timeout(
@@ -3242,8 +3248,12 @@ fn version_bundle_lane_is_settled(root: &Path) -> bool {
         && fs::read_dir(lane.join("staging")).is_ok_and(|mut entries| entries.next().is_none())
 }
 
+fn version_bundle_lane(root: &Path) -> PathBuf {
+    root.join(".axial-publication/version-bundle")
+}
+
 fn version_bundle_lane_has_durable_witness(root: &Path) -> bool {
-    let lane = root.join(".axial-publication/version-bundle");
+    let lane = version_bundle_lane(root);
     let Ok(entries) = fs::read_dir(&lane) else {
         return false;
     };

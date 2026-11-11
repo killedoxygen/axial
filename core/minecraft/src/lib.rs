@@ -136,8 +136,6 @@ pub use version::{
     VersionBundleReadGuard, VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind,
     VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions_snapshot,
 };
-#[cfg(feature = "test-support")]
-pub use version_bundle_publication::fail_after_promotions_for_test;
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, compare_version_entries,
     compare_version_like, enrich_loader_game_versions, enrich_version_entries,

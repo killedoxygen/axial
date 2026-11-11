@@ -4425,7 +4425,11 @@ printf '%s' 'processor-terminal' > "$last"
         )
         .expect("base client before failed publication");
         let prepared = prepared_test_legacy_bundle(&root, &record, b"failed child client");
-        crate::version_bundle_publication::fail_after_promotions_for_test(&record.version_id, 1);
+        crate::managed::fault::arm(
+            &root.join(".axial-publication/version-bundle"),
+            crate::managed::fault::Fault::RowFailure,
+            None,
+        );
         let library_root = test_library_operation(&root);
 
         let error = super::publish_loader_managed_install(&library_root, prepared)
@@ -4577,9 +4581,10 @@ printf '%s' 'processor-terminal' > "$last"
         write_base_version(&root, &record.minecraft_version);
         let child_client: &[u8] = b"detached child client";
         let prepared = prepared_test_legacy_bundle(&root, &record, child_client);
-        let (reached, release) = crate::version_bundle_publication::pause_after_promotions_for_test(
-            &record.version_id,
-            1,
+        let (reached, release) = crate::managed::fault::pause_after(
+            &root.join(".axial-publication/version-bundle"),
+            crate::managed::fault::Fault::AfterRow,
+            0,
         );
         let library_root = test_library_operation(&root);
         let task_root = library_root.operation().clone();

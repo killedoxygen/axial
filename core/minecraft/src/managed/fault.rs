@@ -33,6 +33,8 @@ pub(crate) enum Fault {
     IntentUnacknowledged,
     /// Intent publication fails after the lease revalidates.
     IntentAfterLeaseRevalidated,
+    /// Execution completed a row; probes only run the armed action.
+    AfterRow,
     /// Component execution fails after a row and rolls back live.
     RowFailure,
     /// Component execution stops unsettled after a row.
@@ -51,6 +53,8 @@ pub(crate) enum Fault {
     VersionIntentUnacknowledged,
     /// The version bundle settlement marker is promoted without acknowledgement.
     VersionSettlementUnacknowledged,
+    /// Receipt settlement fails before promoting its settlement marker.
+    BeforeSettlementPromotion,
     /// Component settlement stops after each durable frontier.
     AfterSettlementPromotion,
     AfterAncestorBucket,
@@ -92,6 +96,7 @@ mod armed {
     struct Armed {
         scope: Scope,
         fault: Fault,
+        skips: usize,
         action: Option<Box<dyn FnOnce() + Send>>,
     }
 
@@ -107,17 +112,54 @@ mod armed {
         armed().push(Armed {
             scope: Scope::Thread(std::thread::current().id()),
             fault,
+            skips: 0,
             action,
         });
     }
 
     /// Arm `fault` for probes under `root`, on any thread.
     pub(crate) fn arm(root: &Path, fault: Fault, action: Option<Box<dyn FnOnce() + Send>>) {
+        arm_after(root, fault, 0, action);
+    }
+
+    /// Arm `fault` for probes under `root`, letting the first `skips` matching probes pass.
+    pub(crate) fn arm_after(
+        root: &Path,
+        fault: Fault,
+        skips: usize,
+        action: Option<Box<dyn FnOnce() + Send>>,
+    ) {
         armed().push(Armed {
             scope: Scope::Root(root.to_path_buf()),
             fault,
+            skips,
             action,
         });
+    }
+
+    /// Hold the `skips + 1`th matching probe under `root` until the returned sender fires.
+    /// The receiver resolves once the probe is reached.
+    #[cfg(test)]
+    pub(crate) fn pause_after(
+        root: &Path,
+        fault: Fault,
+        skips: usize,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        arm_after(
+            root,
+            fault,
+            skips,
+            Some(Box::new(move || {
+                let _ = reached_tx.send(());
+                let _ = release_rx.blocking_recv();
+            })),
+        );
+        (reached_rx, release_tx)
     }
 
     #[cfg(feature = "test-support")]
@@ -157,6 +199,10 @@ mod armed {
         }) else {
             return false;
         };
+        if armed[index].skips > 0 {
+            armed[index].skips -= 1;
+            return false;
+        }
         let action = armed.remove(index).action;
         drop(armed);
         if let Some(action) = action {
