@@ -914,6 +914,56 @@ fn validation_rejects_invalid_emergency_disables() {
 }
 
 #[test]
+fn builtin_manifest_binds_all_managed_artifacts_to_immutable_provider_identities() {
+    let manifest = manifest();
+    let expected_project_ids = [
+        ("sodium", "AANobbMI"),
+        ("lithium", "gvQqBUqZ"),
+        ("ferrite-core", "uXXizFIs"),
+        ("immediatelyfast", "5ZwdcRci"),
+        ("dynamic-fps", "LQ3K71Q1"),
+        ("modernfix", "nmDcB62a"),
+        ("entityculling", "NNAgCjsB"),
+        ("c2me-fabric", "VSNURh3q"),
+        ("moreculling", "51shyZVL"),
+        ("cloth-config", "9s6osm5g"),
+        ("krypton", "fQEb0iXm"),
+        ("enhancedblockentities", "OVuFYfre"),
+        ("memoryleakfix", "NRjRiSSD"),
+        ("clumps", "Wnxd13zP"),
+        ("foamfix", "jupr7Bf5"),
+        ("ai-improvements", "DSVgwcji"),
+        ("lazydfu", "hvFnDODi"),
+        ("smooth-boot-reloaded", "z53V2L4P"),
+        ("starlight", "H8CaAYZC"),
+        ("nvidium", "SfMw2IZN"),
+        ("embeddium", "sk9rgfiA"),
+        ("scalablelux", "Ps1zyz6x"),
+        ("particle-core", "RSeLon5O"),
+        ("threadtweak", "vSEH1ERy"),
+        ("badoptimizations", "g96Z4WVZ"),
+    ];
+    assert_eq!(manifest.artifacts.len(), expected_project_ids.len());
+    for (artifact_id, project_id) in expected_project_ids {
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == artifact_id)
+            .expect("audited artifact authority");
+        assert_eq!(artifact.source.project_id, project_id, "{artifact_id}");
+        assert!(
+            manifest
+                .compositions
+                .iter()
+                .flat_map(|composition| &composition.mods)
+                .filter(|managed_mod| managed_mod.artifact_id == artifact_id)
+                .all(|managed_mod| managed_mod.project_id == project_id),
+            "{artifact_id}"
+        );
+    }
+}
+
+#[test]
 fn validation_accepts_the_builtin_manifest_and_valid_variants() {
     accepts(|_| {});
     for minimum_app_version in [env!("CARGO_PKG_VERSION"), "0.3.0", "0.3.1-alpha.1"] {

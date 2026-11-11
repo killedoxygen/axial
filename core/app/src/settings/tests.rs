@@ -93,10 +93,27 @@ fn preferences_survive_real_database_reopen_without_reinitializing() {
             .unwrap();
         saved
     };
-    assert_eq!(
-        (saved.theme, saved.music_track, saved.performance_mode),
-        (ConfigTheme::Nether, 7, ConfigPerformanceMode::Vanilla)
-    );
+    let expected = ConfigView {
+        revision: 1,
+        theme: ConfigTheme::Nether,
+        min_memory_mb: 1024,
+        max_memory_mb: 6144,
+        window_width: 1280,
+        window_height: 720,
+        onboarding_done: true,
+        jvm_preset: ConfigJvmPreset::Smooth,
+        performance_mode: ConfigPerformanceMode::Vanilla,
+        custom_hue: Some(123),
+        custom_vibrancy: Some(77),
+        lightness: Some(55),
+        music_enabled: Some(true),
+        music_volume: Some(31),
+        music_track: 7,
+        discord_rpc_enabled: false,
+        discord_rpc_onboarding_seen: true,
+        ..ConfigView::default()
+    };
+    assert_eq!(saved, expected);
     let metadata = Arc::new(MetadataStore::open(&database).unwrap());
     metadata.migrate(&[SETTINGS_MIGRATION]).unwrap();
     let settings = SettingsStore::new(metadata).unwrap();
@@ -104,7 +121,7 @@ fn preferences_survive_real_database_reopen_without_reinitializing() {
         settings.current().unwrap(),
         ConfigView {
             revision: 2,
-            ..saved
+            ..expected
         }
     );
     assert!(settings.list_flags().unwrap().flags[0].enabled);
