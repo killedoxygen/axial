@@ -2722,8 +2722,6 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use std::ffi::OsStr;
-    #[cfg(target_os = "linux")]
-    use std::io::SeekFrom;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -2739,10 +2737,35 @@ mod tests {
         }
     }
 
+    fn fixture() -> (tempfile::TempDir, RootSession, Directory) {
+        let temporary = crate::test_tempdir().unwrap();
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().unwrap();
+        (temporary, session, root)
+    }
+
+    fn revoke(session: RootSession, root: Directory) {
+        drop(root);
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    }
+
+    /// Live transient records and outstanding effects.
+    fn effects(session: &RootSession) -> (usize, usize) {
+        let state = session.authority.operations.lock().unwrap();
+        (state.transients.len(), state.outstanding_effects)
+    }
+
+    fn leaves(names: &[&str]) -> Vec<LeafName> {
+        names
+            .iter()
+            .map(|name| LeafName::new(name).unwrap())
+            .collect()
+    }
+
     fn test_stage(root: &Directory, name: &str) -> Option<TransientStage> {
         let destination = root
-            .admit_transient_destination(LeafName::new(name).expect("transient leaf"))
-            .expect("transient destination admission");
+            .admit_transient_destination(LeafName::new(name).unwrap())
+            .unwrap();
         match destination.create_stage() {
             TransientStageCreateOutcome::Created(stage) => Some(stage),
             TransientStageCreateOutcome::NoEffect { error, .. }
@@ -2762,10 +2785,32 @@ mod tests {
         }
     }
 
+    fn cancel(destination: TransientDestination) {
+        assert!(matches!(
+            destination.cancel(),
+            TransientDestinationCancelOutcome::Cancelled
+        ));
+    }
+
+    fn discard_and_cancel(outcome: TransientDiscardOutcome) {
+        let TransientDiscardOutcome::Discarded(destination) = outcome else {
+            panic!("transient discard remained pending")
+        };
+        cancel(destination);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn published(outcome: TransientPublicationBatchOutcome) -> Vec<FileCapability> {
+        match outcome {
+            TransientPublicationBatchOutcome::Published(files) => files,
+            other => panic!("publication was not complete: {other:?}"),
+        }
+    }
+
     fn namespace_leaf(parent: &Directory, name: &str) -> NamespaceLeaf {
         NamespaceLeaf {
             parent: parent.clone(),
-            name: LeafName::new(name).expect("namespace leaf"),
+            name: LeafName::new(name).unwrap(),
         }
     }
 
@@ -2775,12 +2820,17 @@ mod tests {
         directory: &Directory,
         name: &str,
     ) -> io::Result<TransientEffectToken> {
-        let plan = DestinationBatchPlan::new(vec![LeafName::new(name).expect("transient leaf")])?;
+        let plan = DestinationBatchPlan::new(leaves(&[name]))?;
         let mut tokens =
             TransientEffectToken::reserve_batch(authority, operation, directory, &plan)?;
-        Ok(tokens
-            .pop()
-            .expect("singleton transient reservation is nonempty"))
+        Ok(tokens.pop().expect("singleton transient reservation"))
+    }
+
+    fn settle_transient(mut token: TransientEffectToken, operation: &CapabilityOperation) {
+        token
+            .mark_disposition(TransientEffectDisposition::NoEffect)
+            .unwrap();
+        token.settle_with(operation).unwrap();
     }
 
     fn with_inventory_hook<T>(hook: impl FnMut() + 'static, action: impl FnOnce() -> T) -> T {
@@ -2797,62 +2847,42 @@ mod tests {
         action()
     }
 
-    fn create_and_remove_sibling_fixture(root: &std::path::Path) {
+    fn create_and_remove_sibling(root: &std::path::Path) {
         let path = root.join("inventory-sibling-scratch");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
-        drop(file);
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap(),
+        );
         std::fs::remove_file(path).unwrap();
-    }
-
-    fn cancel_test_destination(destination: TransientDestination) {
-        assert!(matches!(
-            destination.cancel(),
-            TransientDestinationCancelOutcome::Cancelled
-        ));
     }
 
     #[test]
     fn destination_inventory_rescans_after_sibling_stage_cleanup() {
-        let temporary = crate::test_tempdir().unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
+        let (temporary, session, root) = fixture();
         let mut sibling = Some(temporary.path().to_path_buf());
         let batch = with_inventory_hook(
             move || {
                 if let Some(sibling) = sibling.take() {
-                    create_and_remove_sibling_fixture(&sibling);
+                    create_and_remove_sibling(&sibling);
                 }
             },
-            || {
-                root.admit_transient_destinations(vec![
-                    LeafName::new("first.bin").unwrap(),
-                    LeafName::new("second.bin").unwrap(),
-                ])
-            },
+            || root.admit_transient_destinations(leaves(&["first.bin", "second.bin"])),
         )
         .expect("unrelated scratch cleanup must not fail destination admission");
-        for destination in batch.into_destinations() {
-            cancel_test_destination(destination);
-        }
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        batch.into_destinations().into_iter().for_each(cancel);
+        revoke(session, root);
     }
 
     #[test]
     fn destination_inventory_bounds_churn_and_releases_failed_reservations() {
-        let temporary = crate::test_tempdir().unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
+        let (temporary, session, root) = fixture();
         let sibling = temporary.path().to_path_buf();
-        let names = vec![
-            LeafName::new("first.bin").unwrap(),
-            LeafName::new("second.bin").unwrap(),
-        ];
+        let names = leaves(&["first.bin", "second.bin"]);
         let error = with_inventory_hook(
-            move || create_and_remove_sibling_fixture(&sibling),
+            move || create_and_remove_sibling(&sibling),
             || root.admit_transient_destinations(names.clone()),
         )
         .expect_err("continuous namespace churn must remain bounded");
@@ -2860,17 +2890,13 @@ mod tests {
         let batch = root
             .admit_transient_destinations(names)
             .expect("failed inventory must settle every destination reservation");
-        for destination in batch.into_destinations() {
-            cancel_test_destination(destination);
-        }
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        batch.into_destinations().into_iter().for_each(cancel);
+        revoke(session, root);
     }
 
     #[test]
     fn destination_inventory_rescan_preserves_portable_collision_during_churn() {
-        let temporary = crate::test_tempdir().unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
+        let (temporary, session, root) = fixture();
         let alias = temporary.path().join("ARTIFACT.BIN");
         let mut introduce_alias = Some(alias.clone());
         let sibling = temporary.path().to_path_buf();
@@ -2879,136 +2905,68 @@ mod tests {
                 if let Some(alias) = introduce_alias.take() {
                     std::fs::write(alias, b"external contents").unwrap();
                 }
-                create_and_remove_sibling_fixture(&sibling);
+                create_and_remove_sibling(&sibling);
             },
             || root.admit_transient_destination(LeafName::new("artifact.bin").unwrap()),
         )
         .expect_err("a newly observed portable alias must not be hidden by churn");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(alias).unwrap(), b"external contents");
-        cancel_test_destination(
+        cancel(
             root.admit_transient_destination(LeafName::new("other.bin").unwrap())
                 .unwrap(),
         );
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        revoke(session, root);
     }
 
     #[test]
-    fn batch_aliases_are_rejected_before_effect_reservation() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let error = root
-            .admit_transient_destinations(vec![
-                LeafName::new("Artifact.bin").expect("first batch leaf"),
-                LeafName::new("artifact.BIN").expect("alias batch leaf"),
-            ])
-            .expect_err("portable aliases must not be admitted together");
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
-            assert!(state.transients.is_empty());
-            assert_eq!(state.outstanding_effects, 0);
+    fn batch_collisions_are_rejected_before_effect_reservation() {
+        for (occupant, names) in [
+            (None, ["Artifact.bin", "artifact.BIN"]),
+            (Some("Occupied.bin"), ["occupied.BIN", "vacant.bin"]),
+        ] {
+            let (temporary, session, root) = fixture();
+            if let Some(occupant) = occupant {
+                std::fs::write(temporary.path().join(occupant), b"occupied").unwrap();
+            }
+            let error = root
+                .admit_transient_destinations(leaves(&names))
+                .expect_err("portable collision must reject the batch");
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(effects(&session), (0, 0));
+            revoke(session, root);
         }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn external_batch_collision_settles_every_reservation() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        std::fs::write(temporary.path().join("Occupied.bin"), b"occupied")
-            .expect("external occupied file");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let error = root
-            .admit_transient_destinations(vec![
-                LeafName::new("occupied.BIN").expect("occupied alias leaf"),
-                LeafName::new("vacant.bin").expect("vacant batch leaf"),
-            ])
-            .expect_err("external portable alias must reject the batch");
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
-            assert!(state.transients.is_empty());
-            assert_eq!(state.outstanding_effects, 0);
-        }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[test]
     fn held_destination_blocks_batch_until_explicit_cancellation() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
+        let (_temporary, session, root) = fixture();
         let held = root
-            .admit_transient_destination(LeafName::new("Held.bin").expect("held destination leaf"))
-            .expect("held destination admission");
+            .admit_transient_destination(LeafName::new("Held.bin").unwrap())
+            .unwrap();
         let error = root
-            .admit_transient_destinations(vec![
-                LeafName::new("held.BIN").expect("held destination alias"),
-            ])
+            .admit_transient_destinations(leaves(&["held.BIN"]))
             .expect_err("held destination must block a competing batch");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        match held.cancel() {
-            TransientDestinationCancelOutcome::Cancelled => {}
-            TransientDestinationCancelOutcome::Pending(obligation) => {
-                panic!(
-                    "held destination cancellation remained pending: {}",
-                    obligation.error()
-                )
-            }
-        }
-        let mut retried = root
-            .admit_transient_destinations(vec![
-                LeafName::new("held.BIN").expect("retried destination leaf"),
-            ])
-            .expect("destination admission after cancellation")
-            .into_destinations();
-        let retried = retried.pop().expect("retried singleton batch is nonempty");
-        match retried.cancel() {
-            TransientDestinationCancelOutcome::Cancelled => {}
-            TransientDestinationCancelOutcome::Pending(obligation) => {
-                panic!(
-                    "retried destination cancellation remained pending: {}",
-                    obligation.error()
-                )
-            }
-        }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        cancel(held);
+        assert_eq!(effects(&session), (0, 0));
+        let retried = root
+            .admit_transient_destinations(leaves(&["held.BIN"]))
+            .expect("destination admission after cancellation");
+        retried.into_destinations().into_iter().for_each(cancel);
+        revoke(session, root);
     }
 
     #[test]
-    fn batch_admission_reserves_every_destination_atomically() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
+    fn batch_admission_reserves_every_destination_and_drop_abandons_without_effect() {
+        let (_temporary, session, root) = fixture();
         let batch = root
-            .admit_transient_destinations(vec![
-                LeafName::new("first.bin").expect("first batch leaf"),
-                LeafName::new("second.bin").expect("second batch leaf"),
-            ])
-            .expect("transient destination batch admission");
+            .admit_transient_destinations(leaves(&["first.bin", "second.bin"]))
+            .unwrap();
         assert_eq!(batch.len(), 2);
-        assert!(!batch.is_empty());
         {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
-            assert_eq!(state.transients.len(), 2);
-            assert_eq!(state.outstanding_effects, 2);
+            let state = session.authority.operations.lock().unwrap();
+            assert_eq!((state.transients.len(), state.outstanding_effects), (2, 2));
             assert!(state.transients.values().all(|record| {
                 record.phase == TransientEffectPhase::Reserved
                     && record.disposition == TransientEffectDisposition::Reserved
@@ -3016,245 +2974,85 @@ mod tests {
         }
         drop(batch);
         {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
+            let state = session.authority.operations.lock().unwrap();
             assert!(state.transients.values().all(|record| {
                 record.phase == TransientEffectPhase::Abandoned
                     && record.disposition == TransientEffectDisposition::NoEffect
             }));
         }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn explicit_destination_cancellation_releases_its_reservation() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let destination = root
-            .admit_transient_destination(
-                LeafName::new("cancelled.bin").expect("cancelled destination leaf"),
-            )
-            .expect("cancelled destination admission");
-        match destination.cancel() {
-            TransientDestinationCancelOutcome::Cancelled => {}
-            TransientDestinationCancelOutcome::Pending(obligation) => {
-                panic!(
-                    "destination cancellation remained pending: {}",
-                    obligation.error()
-                )
-            }
-        }
-        let state = session
-            .authority
-            .operations
-            .lock()
-            .expect("filesystem operation state");
-        assert!(state.transients.is_empty());
-        assert_eq!(state.outstanding_effects, 0);
-        drop(state);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn discarded_stage_reuses_the_exact_destination_reservation() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let Some(first) = test_stage(&root, "retry.bin") else {
-            drop(root);
-            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-            return;
+        let (_temporary, session, root) = fixture();
+        let first = test_stage(&root, "retry.bin").expect("transient platform");
+        let reservation = first.token.as_ref().unwrap().id;
+        let TransientDiscardOutcome::Discarded(destination) = first.discard() else {
+            panic!("first discard remained pending")
         };
-        let reservation_id = first.token.as_ref().expect("first stage effect token").id;
-        let destination = match first.discard() {
-            TransientDiscardOutcome::Discarded(destination) => destination,
-            TransientDiscardOutcome::Pending(obligation) => {
-                panic!(
-                    "first stage discard remained pending: {}",
-                    obligation.error()
-                )
-            }
-        };
-        assert_eq!(
-            destination
-                .token
-                .as_ref()
-                .expect("discarded stage returned its destination token")
-                .token()
-                .id,
-            reservation_id,
-        );
+        assert_eq!(destination.token.as_ref().unwrap().token().id, reservation);
         let error = root
-            .admit_transient_destinations(vec![
-                LeafName::new("RETRY.BIN").expect("retry destination alias"),
-            ])
+            .admit_transient_destinations(leaves(&["RETRY.BIN"]))
             .expect_err("discarded destination must retain its reservation");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        let second = match destination.create_stage() {
-            TransientStageCreateOutcome::Created(stage) => stage,
-            TransientStageCreateOutcome::NoEffect { error, .. } => {
-                panic!("second stage creation had no effect: {error}")
-            }
-            TransientStageCreateOutcome::Pending(obligation) => {
-                panic!(
-                    "second stage creation remained pending: {}",
-                    obligation.error()
-                )
-            }
+        let TransientStageCreateOutcome::Created(second) = destination.create_stage() else {
+            panic!("second stage creation failed")
         };
-        assert_eq!(
-            second.token.as_ref().expect("second stage effect token").id,
-            reservation_id,
-        );
-        let destination = match second.discard() {
-            TransientDiscardOutcome::Discarded(destination) => destination,
-            TransientDiscardOutcome::Pending(obligation) => {
-                panic!(
-                    "second stage discard remained pending: {}",
-                    obligation.error()
-                )
-            }
-        };
-        match destination.cancel() {
-            TransientDestinationCancelOutcome::Cancelled => {}
-            TransientDestinationCancelOutcome::Pending(obligation) => {
-                panic!(
-                    "retried destination cancellation remained pending: {}",
-                    obligation.error()
-                )
-            }
-        }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[test]
-    fn reserved_token_unwind_is_root_cleanable_no_effect() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let authority = session.authority.clone();
-        let operation = authority.enter().expect("reservation operation");
-        let token =
-            reserve_test_transient(&authority, &operation, &root, "unwound-reservation.bin")
-                .expect("transient reservation");
-        drop(token);
-        drop(operation);
-        {
-            let state = authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
-            let record = state
-                .transients
-                .values()
-                .next()
-                .expect("abandoned reservation record");
-            assert!(record.phase == TransientEffectPhase::Abandoned);
-            assert!(record.disposition == TransientEffectDisposition::NoEffect);
-        }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(second.token.as_ref().unwrap().id, reservation);
+        discard_and_cancel(second.discard());
+        revoke(session, root);
     }
 
     #[test]
     fn move_and_transient_reservations_reject_conflicts_in_either_order() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
+        let (_temporary, session, root) = fixture();
         let authority = session.authority.clone();
+        let operation = authority.enter().unwrap();
+        let mut movement = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            namespace_leaf(&root, "source.bin"),
+            namespace_leaf(&root, "Destination.bin"),
+            None,
+            None,
+        )
+        .unwrap();
+        let conflict = reserve_test_transient(&authority, &operation, &root, "destination.BIN");
+        assert!(matches!(conflict, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        movement.settle(&operation).unwrap();
 
-        {
-            let operation = authority.enter().expect("move-first operation");
-            let mut movement = MoveEffectToken::reserve(
-                &authority,
-                &operation,
-                namespace_leaf(&root, "source.bin"),
-                namespace_leaf(&root, "Destination.bin"),
-                None,
-                None,
-            )
-            .expect("move-first reservation");
-            let conflict = reserve_test_transient(&authority, &operation, &root, "destination.BIN");
-            match conflict {
-                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
-                Ok(mut unexpected) => {
-                    unexpected
-                        .mark_disposition(TransientEffectDisposition::NoEffect)
-                        .expect("unexpected transient disposition");
-                    unexpected
-                        .settle_with(&operation)
-                        .expect("unexpected transient settlement");
-                    movement
-                        .settle(&operation)
-                        .expect("move-first cleanup settlement");
-                    panic!("move-first conflict was admitted");
-                }
-            }
-            movement.settle(&operation).expect("move-first settlement");
-        }
-
-        {
-            let operation = authority.enter().expect("transient-first operation");
-            let mut transient = reserve_test_transient(&authority, &operation, &root, "Source.bin")
-                .expect("transient-first reservation");
-            let conflict = MoveEffectToken::reserve(
-                &authority,
-                &operation,
-                namespace_leaf(&root, "source.BIN"),
-                namespace_leaf(&root, "other.bin"),
-                None,
-                None,
-            );
-            match conflict {
-                Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
-                Ok(mut unexpected) => {
-                    unexpected
-                        .settle(&operation)
-                        .expect("unexpected move settlement");
-                    transient
-                        .mark_disposition(TransientEffectDisposition::NoEffect)
-                        .expect("transient-first cleanup disposition");
-                    transient
-                        .settle_with(&operation)
-                        .expect("transient-first cleanup settlement");
-                    panic!("transient-first conflict was admitted");
-                }
-            }
-            transient
-                .mark_disposition(TransientEffectDisposition::NoEffect)
-                .expect("transient disposition");
-            transient
-                .settle_with(&operation)
-                .expect("transient-first settlement");
-        }
-
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        let transient =
+            reserve_test_transient(&authority, &operation, &root, "Source.bin").unwrap();
+        let conflict = MoveEffectToken::reserve(
+            &authority,
+            &operation,
+            namespace_leaf(&root, "source.BIN"),
+            namespace_leaf(&root, "other.bin"),
+            None,
+            None,
+        );
+        assert!(matches!(conflict, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        settle_transient(transient, &operation);
+        drop(operation);
+        revoke(session, root);
     }
 
     #[test]
     fn unrelated_sibling_tree_reservations_proceed_together() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        std::fs::create_dir(temporary.path().join("move-tree")).expect("move tree");
-        std::fs::create_dir(temporary.path().join("transient-tree")).expect("transient tree");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
+        let (temporary, session, root) = fixture();
+        for tree in ["move-tree", "transient-tree"] {
+            std::fs::create_dir(temporary.path().join(tree)).unwrap();
+        }
         let move_tree = root
-            .open_directory(&LeafName::new("move-tree").expect("move tree leaf"))
-            .expect("move tree directory");
+            .open_directory(&LeafName::new("move-tree").unwrap())
+            .unwrap();
         let transient_tree = root
-            .open_directory(&LeafName::new("transient-tree").expect("transient tree leaf"))
-            .expect("transient tree directory");
+            .open_directory(&LeafName::new("transient-tree").unwrap())
+            .unwrap();
         let authority = session.authority.clone();
-        let operation = authority.enter().expect("sibling reservation operation");
+        let operation = authority.enter().unwrap();
         let mut movement = MoveEffectToken::reserve(
             &authority,
             &operation,
@@ -3263,126 +3061,105 @@ mod tests {
             None,
             None,
         )
-        .expect("sibling move reservation");
-        let mut transient =
+        .unwrap();
+        let transient =
             reserve_test_transient(&authority, &operation, &transient_tree, "destination.bin")
                 .expect("unrelated transient reservation");
-
-        transient
-            .mark_disposition(TransientEffectDisposition::NoEffect)
-            .expect("transient disposition");
-        transient
-            .settle_with(&operation)
-            .expect("transient settlement");
-        movement.settle(&operation).expect("move settlement");
-        drop(operation);
-        drop((transient_tree, move_tree, root));
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        settle_transient(transient, &operation);
+        movement.settle(&operation).unwrap();
+        drop((operation, transient_tree, move_tree));
+        revoke(session, root);
     }
 
     #[test]
     fn simultaneous_move_and_transient_reservations_admit_exactly_one() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
+        let (_temporary, session, root) = fixture();
         let authority = session.authority.clone();
-        let start = Arc::new(Barrier::new(2));
-        let finish = Arc::new(Barrier::new(2));
-
-        let move_thread = {
-            let authority = Arc::clone(&authority);
-            let root = root.clone();
-            let start = Arc::clone(&start);
-            let finish = Arc::clone(&finish);
+        let barriers = Arc::new((Barrier::new(2), Barrier::new(2)));
+        let race = |transient: bool| {
+            let (authority, root, barriers) =
+                (Arc::clone(&authority), root.clone(), Arc::clone(&barriers));
             thread::spawn(move || {
-                let operation = authority.enter().expect("move race operation");
-                start.wait();
-                let reservation = MoveEffectToken::reserve(
-                    &authority,
-                    &operation,
-                    namespace_leaf(&root, "source.bin"),
-                    namespace_leaf(&root, "Race.bin"),
-                    None,
-                    None,
-                );
-                finish.wait();
+                let operation = authority.enter().unwrap();
+                barriers.0.wait();
+                let reservation = if transient {
+                    reserve_test_transient(&authority, &operation, &root, "race.BIN")
+                        .map(Ok)
+                } else {
+                    MoveEffectToken::reserve(
+                        &authority,
+                        &operation,
+                        namespace_leaf(&root, "source.bin"),
+                        namespace_leaf(&root, "Race.bin"),
+                        None,
+                        None,
+                    )
+                    .map(Err)
+                };
+                barriers.1.wait();
                 match reservation {
-                    Ok(mut token) => {
-                        token.settle(&operation).expect("move race settlement");
-                        true
-                    }
+                    Ok(Ok(token)) => settle_transient(token, &operation),
+                    Ok(Err(mut token)) => token.settle(&operation).unwrap(),
                     Err(error) => {
                         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                        false
+                        return false;
                     }
                 }
+                true
             })
         };
-        let transient_thread = {
-            let authority = Arc::clone(&authority);
-            let root = root.clone();
-            let start = Arc::clone(&start);
-            let finish = Arc::clone(&finish);
-            thread::spawn(move || {
-                let operation = authority.enter().expect("transient race operation");
-                start.wait();
-                let reservation = reserve_test_transient(&authority, &operation, &root, "race.BIN");
-                finish.wait();
-                match reservation {
-                    Ok(mut token) => {
-                        token
-                            .mark_disposition(TransientEffectDisposition::NoEffect)
-                            .expect("transient race disposition");
-                        token
-                            .settle_with(&operation)
-                            .expect("transient race settlement");
-                        true
-                    }
-                    Err(error) => {
-                        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-                        false
-                    }
-                }
-            })
-        };
-
-        let move_admitted = move_thread.join().expect("move race thread");
-        let transient_admitted = transient_thread.join().expect("transient race thread");
-        assert_ne!(move_admitted, transient_admitted);
+        let (moving, transient) = (race(false), race(true));
+        assert_ne!(moving.join().unwrap(), transient.join().unwrap());
         {
-            let state = authority.operations.lock().expect("settled race state");
+            let state = authority.operations.lock().unwrap();
             assert!(state.moves.is_empty());
             assert!(state.transients.is_empty());
             assert_eq!(state.outstanding_effects, 0);
         }
+        revoke(session, root);
+    }
 
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+    #[cfg(target_os = "linux")]
+    fn token_id(sealed: &TransientStageSealed) -> u64 {
+        sealed.stage.token.as_ref().unwrap().id
+    }
+
+    #[cfg(target_os = "linux")]
+    fn link(sealed: &mut TransientStageSealed, root: &Directory, name: &str) -> io::Result<()> {
+        platform::link_transient_file(
+            sealed.stage.file.as_mut().unwrap(),
+            root.inner.handle(),
+            OsStr::new(name),
+        )
     }
 
     #[cfg(target_os = "linux")]
     fn linked_test_stage(root: &Directory, name: &str) -> (TransientStageSealed, u64) {
-        let mut sealed = test_stage(root, name)
-            .expect("transient platform")
-            .seal()
-            .expect("sealed transient stage");
-        platform::link_transient_file(
-            sealed
-                .stage
-                .file
-                .as_mut()
-                .expect("sealed stage retains native file"),
-            root.inner.handle(),
-            OsStr::new(name),
-        )
-        .expect("linked transient stage");
-        let id = sealed
-            .stage
-            .token
-            .as_ref()
-            .expect("linked stage retains effect token")
-            .id;
+        let mut sealed = test_stage(root, name).unwrap().seal().unwrap();
+        link(&mut sealed, root, name).unwrap();
+        let id = token_id(&sealed);
         (sealed, id)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sealed_batch(root: &Directory, names: &[&str]) -> TransientPublicationBatch {
+        TransientPublicationBatch::new(
+            names
+                .iter()
+                .map(|name| test_stage(root, name).unwrap().seal().unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn classify_collision(batch: TransientPublicationBatch) -> TransientPublicationBatchOutcome {
+        let operation = enter_transient_operation(batch.stages[0].stage.destination()).unwrap();
+        classify_publication_batch(
+            io::Error::new(io::ErrorKind::AlreadyExists, "injected collision"),
+            batch,
+            &operation,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -3391,11 +3168,7 @@ mod tests {
         id: u64,
         disposition: TransientEffectDisposition,
     ) {
-        let state = session
-            .authority
-            .operations
-            .lock()
-            .expect("filesystem operation state");
+        let state = session.authority.operations.lock().unwrap();
         let record = state
             .transients
             .get(&id)
@@ -3407,50 +3180,29 @@ mod tests {
 
     #[test]
     fn dropped_pending_carriers_remain_root_owned_until_terminal_cleanup() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-
+        let (_temporary, session, root) = fixture();
         let Some(create_stage) = test_stage(&root, "create-pending.bin") else {
-            drop(root);
-            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-            return;
+            return revoke(session, root);
         };
-        let create_pending = TransientCreationObligation {
+        drop(TransientCreationObligation {
             error: io::Error::other("injected creation settlement"),
             state: Some(TransientCreationState::Stage(create_stage)),
-        };
-        drop(create_pending);
-
-        let publication_stage = test_stage(&root, "publication-pending.bin")
-            .expect("transient platform remained available");
-        let publication_pending = TransientPublicationBatchObligation {
+        });
+        let publication_stage = test_stage(&root, "publication-pending.bin").unwrap();
+        drop(TransientPublicationBatchObligation {
             error: io::Error::other("injected publication settlement"),
             batch: Some(
-                TransientPublicationBatch::new(vec![
-                    publication_stage.seal().expect("sealed publication stage"),
-                ])
-                .expect("singleton publication batch"),
+                TransientPublicationBatch::new(vec![publication_stage.seal().unwrap()]).unwrap(),
             ),
-        };
-        drop(publication_pending);
-
-        let discard_stage = test_stage(&root, "discard-pending.bin")
-            .expect("transient platform remained available");
-        let discard_pending = TransientDiscardObligation {
+        });
+        let discard_stage = test_stage(&root, "discard-pending.bin").unwrap();
+        drop(TransientDiscardObligation {
             error: io::Error::other("injected discard settlement"),
             state: Some(TransientDiscardState::Stage(discard_stage)),
-        };
-        drop(discard_pending);
-
+        });
         {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("filesystem operation state");
-            assert_eq!(state.transients.len(), 3);
-            assert_eq!(state.outstanding_effects, 3);
+            let state = session.authority.operations.lock().unwrap();
+            assert_eq!((state.transients.len(), state.outstanding_effects), (3, 3));
             assert!(
                 state
                     .transients
@@ -3458,701 +3210,243 @@ mod tests {
                     .all(|record| record.phase == TransientEffectPhase::Abandoned)
             );
         }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn anonymous_stage_publishes_exact_single_link_content() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let Some(mut stage) = test_stage(&root, "published.bin") else {
-            drop(root);
-            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-            return;
-        };
-        stage
-            .write_all(b"managed payload")
-            .expect("stream stage write");
-        let sealed = stage.seal().expect("stream stage seal");
+    fn grouped_publication_binds_exact_single_link_content() {
+        let (temporary, session, root) = fixture();
+        let mut first = test_stage(&root, "group-first.bin").unwrap();
+        let mut second = test_stage(&root, "group-second.bin").unwrap();
+        first.write_all(b"first").unwrap();
+        second.write_all(b"second").unwrap();
         let batch =
-            TransientPublicationBatch::new(vec![sealed]).expect("singleton publication batch");
-        let published = match batch.publish_create_new() {
-            TransientPublicationBatchOutcome::Published(mut files) => {
-                files.pop().expect("singleton published file")
-            }
-            TransientPublicationBatchOutcome::NoEffect { error, .. } => {
-                panic!("publication had no effect: {error}")
-            }
-            TransientPublicationBatchOutcome::Partial { error, .. } => {
-                panic!("publication was partial: {error}")
-            }
-            TransientPublicationBatchOutcome::Pending(obligation) => {
-                panic!("publication remained pending: {}", obligation.error())
-            }
-        };
-        assert_eq!(
-            std::fs::read(temporary.path().join("published.bin")).expect("published payload read"),
-            b"managed payload",
-        );
-        assert_eq!(
-            platform::exact_file_link_count(
-                root.inner.handle(),
-                OsStr::new("published.bin"),
-                published.identity,
-            )
-            .expect("published link count"),
-            Some(1),
-        );
-        drop(published);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn grouped_publication_releases_every_file_after_one_terminal_outcome() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let mut first = test_stage(&root, "group-first.bin").expect("first transient stage");
-        let mut second = test_stage(&root, "group-second.bin").expect("second transient stage");
-        first.write_all(b"first").expect("first stage write");
-        second.write_all(b"second").expect("second stage write");
-        let batch = TransientPublicationBatch::new(vec![
-            first.seal().expect("first stage seal"),
-            second.seal().expect("second stage seal"),
-        ])
-        .expect("grouped publication batch");
-        let files = match batch.publish_create_new() {
-            TransientPublicationBatchOutcome::Published(files) => files,
-            TransientPublicationBatchOutcome::NoEffect { error, .. } => {
-                panic!("grouped publication had no effect: {error}")
-            }
-            TransientPublicationBatchOutcome::Partial { error, .. } => {
-                panic!("grouped publication was partial: {error}")
-            }
-            TransientPublicationBatchOutcome::Pending(obligation) => {
-                panic!(
-                    "grouped publication remained pending: {}",
-                    obligation.error()
+            TransientPublicationBatch::new(vec![first.seal().unwrap(), second.seal().unwrap()])
+                .unwrap();
+        let files = published(batch.publish_create_new());
+        for (file, (name, bytes)) in files.iter().zip([
+            ("group-first.bin", b"first".as_slice()),
+            ("group-second.bin", b"second"),
+        ]) {
+            assert_eq!(std::fs::read(temporary.path().join(name)).unwrap(), bytes);
+            assert_eq!(
+                platform::exact_file_link_count(
+                    root.inner.handle(),
+                    OsStr::new(name),
+                    file.identity
                 )
-            }
-        };
-        assert_eq!(files.len(), 2);
-        assert_eq!(
-            std::fs::read(temporary.path().join("group-first.bin"))
-                .expect("first published payload"),
-            b"first",
-        );
-        assert_eq!(
-            std::fs::read(temporary.path().join("group-second.bin"))
-                .expect("second published payload"),
-            b"second",
-        );
+                .unwrap(),
+                Some(1),
+            );
+        }
+        assert_eq!(effects(&session), (0, 0));
         drop(files);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn grouped_partial_publication_preserves_original_member_order() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let first = test_stage(&root, "partial-first.bin").expect("first transient stage");
-        let second = test_stage(&root, "partial-second.bin").expect("second transient stage");
-        let stages = vec![
-            first.seal().expect("first stage seal"),
-            second.seal().expect("second stage seal"),
-        ];
-        let mut batch =
-            TransientPublicationBatch::new(stages).expect("partial grouped publication batch");
-        let first_id = batch.stages[0]
-            .stage
-            .token
-            .as_ref()
-            .expect("first stage effect token")
-            .id;
-        let second_id = batch.stages[1]
-            .stage
-            .token
-            .as_ref()
-            .expect("second stage effect token")
-            .id;
-        platform::link_transient_file(
-            batch.stages[0]
-                .stage
-                .file
-                .as_mut()
-                .expect("first stage retains its native file"),
-            root.inner.handle(),
-            OsStr::new("partial-first.bin"),
-        )
-        .expect("partial grouped publication");
-        std::fs::write(
-            temporary.path().join("partial-second.bin"),
-            b"external collision",
-        )
-        .expect("stable external collision");
-        let operation = enter_transient_operation(batch.stages[0].stage.destination())
-            .expect("partial publication operation");
-        let members = match classify_publication_batch(
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "injected partial grouped publication collision",
-            ),
-            batch,
-            &operation,
-        ) {
-            TransientPublicationBatchOutcome::Partial { members, .. } => members,
-            TransientPublicationBatchOutcome::Pending(obligation) => {
-                panic!("grouped partial remained pending: {}", obligation.error())
-            }
-            _ => panic!("grouped publication was not classified as partial"),
-        };
-        drop(operation);
-        {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("partial publication state");
-            assert!(!state.transients.contains_key(&first_id));
-            let unpublished = state
-                .transients
-                .get(&second_id)
-                .expect("unpublished reservation remains live");
-            assert!(unpublished.phase == TransientEffectPhase::Live);
-            assert!(unpublished.disposition == TransientEffectDisposition::Staged);
-            assert!(unpublished.retained.is_none());
-            assert_eq!(state.outstanding_effects, 1);
-        }
-        let mut members = members.into_iter();
-        match members.next().expect("first classified member") {
-            TransientPublicationMember::Published(file) => drop(file),
-            TransientPublicationMember::Unpublished(_) => {
-                panic!("first classified member lost its published position")
-            }
-        }
-        let stage = match members.next().expect("second classified member") {
-            TransientPublicationMember::Published(_) => {
-                panic!("second classified member lost its unpublished position")
-            }
-            TransientPublicationMember::Unpublished(stage) => stage,
-        };
-        assert!(members.next().is_none());
-        let destination = match stage.discard() {
-            TransientDiscardOutcome::Discarded(destination) => destination,
-            TransientDiscardOutcome::Pending(obligation) => {
-                panic!(
-                    "partial stage discard remained pending: {}",
-                    obligation.error()
-                )
-            }
-        };
-        match destination.cancel() {
-            TransientDestinationCancelOutcome::Cancelled => {}
-            TransientDestinationCancelOutcome::Pending(obligation) => {
-                panic!(
-                    "partial destination cancellation remained pending: {}",
-                    obligation.error()
-                )
-            }
-        }
-        assert!(temporary.path().join("partial-first.bin").exists());
-        assert_eq!(
-            std::fs::read(temporary.path().join("partial-second.bin"))
-                .expect("external collision remains"),
-            b"external collision",
-        );
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn grouped_partial_accepts_stable_unpublished_alias_and_wrong_kind_collisions() {
-        for (case, target_name, collision_name, collision_is_directory) in [
-            (
-                "portable-alias",
-                "portable-target.bin",
-                "PORTABLE-TARGET.BIN",
-                false,
-            ),
-            (
-                "wrong-kind",
-                "wrong-kind-target.bin",
-                "wrong-kind-target.bin",
-                true,
-            ),
+    fn grouped_partial_publication_keeps_member_order_for_each_stable_collision() {
+        for (target, collision, directory) in [
+            ("exact-target.bin", "exact-target.bin", false),
+            ("portable-target.bin", "PORTABLE-TARGET.BIN", false),
+            ("wrong-kind-target.bin", "wrong-kind-target.bin", true),
         ] {
-            let temporary = crate::test_tempdir().expect("temporary transient root");
-            let session = acquire_test_root(temporary.path());
-            let root = session.root().expect("root directory");
-            let first_name = format!("{case}-published.bin");
-            let first = test_stage(&root, &first_name).expect("first transient stage");
-            let second = test_stage(&root, target_name).expect("second transient stage");
-            let mut batch = TransientPublicationBatch::new(vec![
-                first.seal().expect("first stage seal"),
-                second.seal().expect("second stage seal"),
-            ])
-            .expect("collision publication batch");
-            platform::link_transient_file(
-                batch.stages[0]
-                    .stage
-                    .file
-                    .as_mut()
-                    .expect("first stage native file"),
-                root.inner.handle(),
-                OsStr::new(first_name.as_str()),
-            )
-            .expect("published prefix");
-            let collision_path = temporary.path().join(collision_name);
-            if collision_is_directory {
-                std::fs::create_dir(&collision_path).expect("wrong-kind external collision");
+            let (temporary, session, root) = fixture();
+            let mut batch = sealed_batch(&root, &["published.bin", target]);
+            let (first_id, second_id) = (token_id(&batch.stages[0]), token_id(&batch.stages[1]));
+            link(&mut batch.stages[0], &root, "published.bin").unwrap();
+            let collision = temporary.path().join(collision);
+            if directory {
+                std::fs::create_dir(&collision).unwrap();
             } else {
-                std::fs::write(&collision_path, b"portable alias collision")
-                    .expect("portable alias external collision");
+                std::fs::write(&collision, b"external collision").unwrap();
             }
-            let operation = enter_transient_operation(batch.stages[0].stage.destination())
-                .expect("collision classification operation");
-            let members = match classify_publication_batch(
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "injected stable external collision",
-                ),
-                batch,
-                &operation,
-            ) {
-                TransientPublicationBatchOutcome::Partial { members, .. } => members,
-                TransientPublicationBatchOutcome::Pending(obligation) => {
-                    panic!("stable collision remained pending: {}", obligation.error())
-                }
-                _ => panic!("stable collision was not classified as partial"),
+            let TransientPublicationBatchOutcome::Partial { members, .. } =
+                classify_collision(batch)
+            else {
+                panic!("{target}: stable collision was not classified as partial")
             };
-            drop(operation);
-            let mut members = members.into_iter();
-            match members.next().expect("published prefix member") {
-                TransientPublicationMember::Published(file) => drop(file),
-                TransientPublicationMember::Unpublished(_) => {
-                    panic!("published prefix lost its ordered classification")
-                }
+            {
+                let state = session.authority.operations.lock().unwrap();
+                assert!(!state.transients.contains_key(&first_id));
+                let unpublished = &state.transients[&second_id];
+                assert!(unpublished.phase == TransientEffectPhase::Live);
+                assert!(unpublished.disposition == TransientEffectDisposition::Staged);
+                assert!(unpublished.retained.is_none());
+                assert_eq!(state.outstanding_effects, 1);
             }
-            let stage = match members.next().expect("unpublished collision member") {
-                TransientPublicationMember::Published(_) => {
-                    panic!("external collision was classified as published")
-                }
-                TransientPublicationMember::Unpublished(stage) => stage,
+            let [
+                TransientPublicationMember::Published(file),
+                TransientPublicationMember::Unpublished(stage),
+            ] = <[_; 2]>::try_from(members).ok().expect("two members")
+            else {
+                panic!("{target}: partial members lost their order")
             };
-            assert!(members.next().is_none());
-            let destination = match stage.discard() {
-                TransientDiscardOutcome::Discarded(destination) => destination,
-                TransientDiscardOutcome::Pending(obligation) => {
-                    panic!(
-                        "collision stage discard remained pending: {}",
-                        obligation.error()
-                    )
-                }
-            };
-            match destination.cancel() {
-                TransientDestinationCancelOutcome::Cancelled => {}
-                TransientDestinationCancelOutcome::Pending(obligation) => {
-                    panic!(
-                        "collision cancellation remained pending: {}",
-                        obligation.error()
-                    )
-                }
+            drop(file);
+            discard_and_cancel(stage.discard());
+            assert!(temporary.path().join("published.bin").is_file());
+            assert!(collision.exists());
+            if !directory {
+                assert_eq!(std::fs::read(&collision).unwrap(), b"external collision");
             }
-            assert!(collision_path.exists());
-            drop(root);
-            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+            revoke(session, root);
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn dropped_mixed_pending_batch_retains_root_cleanable_authority() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let first = test_stage(&root, "pending-first.bin").expect("first transient stage");
-        let second = test_stage(&root, "pending-second.bin").expect("second transient stage");
-        let mut batch = TransientPublicationBatch::new(vec![
-            first.seal().expect("first stage seal"),
-            second.seal().expect("second stage seal"),
-        ])
-        .expect("mixed pending batch");
-        let first_id = batch.stages[0]
-            .stage
-            .token
-            .as_ref()
-            .expect("first stage effect token")
-            .id;
-        let second_id = batch.stages[1]
-            .stage
-            .token
-            .as_ref()
-            .expect("second stage effect token")
-            .id;
-        platform::link_transient_file(
-            batch.stages[0]
-                .stage
-                .file
-                .as_mut()
-                .expect("first stage native file"),
-            root.inner.handle(),
-            OsStr::new("pending-first.bin"),
-        )
-        .expect("published prefix");
-        drop(TransientPublicationBatchObligation {
-            error: io::Error::other("injected mixed pending classification"),
-            batch: Some(batch),
-        });
-
-        assert_retained_transient(&session, first_id, TransientEffectDisposition::Published);
-        {
-            let state = session
-                .authority
-                .operations
-                .lock()
-                .expect("dropped mixed pending state");
-            let unpublished = state
-                .transients
-                .get(&second_id)
-                .expect("unpublished effect remains root owned");
-            assert!(unpublished.phase == TransientEffectPhase::Abandoned);
-            assert!(unpublished.disposition == TransientEffectDisposition::NoEffect);
-            assert!(unpublished.retained.is_none());
-            assert_eq!(state.outstanding_effects, 2);
-        }
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn grouped_zero_publication_returns_the_intact_no_effect_batch() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let first = test_stage(&root, "zero-first.bin").expect("first transient stage");
-        let second = test_stage(&root, "zero-second.bin").expect("second transient stage");
-        let batch = TransientPublicationBatch::new(vec![
-            first.seal().expect("first stage seal"),
-            second.seal().expect("second stage seal"),
-        ])
-        .expect("zero-publication batch");
-        std::fs::write(temporary.path().join("zero-first.bin"), b"first collision")
-            .expect("first external collision");
-        std::fs::write(
-            temporary.path().join("zero-second.bin"),
-            b"second collision",
-        )
-        .expect("second external collision");
-        let operation = enter_transient_operation(batch.stages[0].stage.destination())
-            .expect("zero-publication operation");
-        let batch = match classify_publication_batch(
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "injected zero-publication collision",
-            ),
-            batch,
-            &operation,
-        ) {
-            TransientPublicationBatchOutcome::NoEffect { batch, .. } => batch,
-            TransientPublicationBatchOutcome::Pending(obligation) => {
-                panic!(
-                    "zero-publication batch remained pending: {}",
-                    obligation.error()
-                )
-            }
-            _ => panic!("zero-publication batch did not remain retryable as no effect"),
+        let (temporary, session, root) = fixture();
+        let batch = sealed_batch(&root, &["zero-first.bin", "zero-second.bin"]);
+        for name in ["zero-first.bin", "zero-second.bin"] {
+            std::fs::write(temporary.path().join(name), name).unwrap();
+        }
+        let TransientPublicationBatchOutcome::NoEffect { batch, .. } = classify_collision(batch)
+        else {
+            panic!("zero-publication batch did not remain retryable as no effect")
         };
-        drop(operation);
         assert_eq!(batch.len(), 2);
         for stage in batch.into_stages() {
-            let destination = match stage.discard() {
-                TransientDiscardOutcome::Discarded(destination) => destination,
-                TransientDiscardOutcome::Pending(obligation) => {
-                    panic!(
-                        "zero-publication discard remained pending: {}",
-                        obligation.error()
-                    )
-                }
-            };
-            match destination.cancel() {
-                TransientDestinationCancelOutcome::Cancelled => {}
-                TransientDestinationCancelOutcome::Pending(obligation) => {
-                    panic!(
-                        "zero-publication cancellation remained pending: {}",
-                        obligation.error()
-                    )
-                }
-            }
+            discard_and_cancel(stage.discard());
         }
-        assert_eq!(
-            std::fs::read(temporary.path().join("zero-first.bin"))
-                .expect("first external collision remains"),
-            b"first collision",
-        );
-        assert_eq!(
-            std::fs::read(temporary.path().join("zero-second.bin"))
-                .expect("second external collision remains"),
-            b"second collision",
-        );
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        for name in ["zero-first.bin", "zero-second.bin"] {
+            assert_eq!(
+                std::fs::read(temporary.path().join(name)).unwrap(),
+                name.as_bytes()
+            );
+        }
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn sealed_stage_reads_and_seeks_within_its_admitted_size_before_publication() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let Some(mut stage) = test_stage(&root, "readable.bin") else {
-            drop(root);
-            assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-            return;
-        };
-        stage.write_all(b"0123456789").expect("stream stage write");
-        let mut sealed = stage.seal().expect("stream stage seal");
+    fn dropped_mixed_pending_batch_retains_root_cleanable_authority() {
+        let (_temporary, session, root) = fixture();
+        let mut batch = sealed_batch(&root, &["pending-first.bin", "pending-second.bin"]);
+        let (first_id, second_id) = (token_id(&batch.stages[0]), token_id(&batch.stages[1]));
+        link(&mut batch.stages[0], &root, "pending-first.bin").unwrap();
+        drop(TransientPublicationBatchObligation {
+            error: io::Error::other("injected mixed pending classification"),
+            batch: Some(batch),
+        });
+        assert_retained_transient(&session, first_id, TransientEffectDisposition::Published);
+        {
+            let state = session.authority.operations.lock().unwrap();
+            let unpublished = &state.transients[&second_id];
+            assert!(unpublished.phase == TransientEffectPhase::Abandoned);
+            assert!(unpublished.disposition == TransientEffectDisposition::NoEffect);
+            assert!(unpublished.retained.is_none());
+            assert_eq!(state.outstanding_effects, 2);
+        }
+        revoke(session, root);
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_stage_reads_and_seeks_within_its_admitted_size() {
+        let (_temporary, session, root) = fixture();
+        let mut stage = test_stage(&root, "readable.bin").unwrap();
+        stage.write_all(b"0123456789").unwrap();
+        let mut sealed = stage.seal().unwrap();
         let mut prefix = [0_u8; 4];
-        sealed.read_exact(&mut prefix).expect("sealed prefix read");
+        sealed.read_exact(&mut prefix).unwrap();
         assert_eq!(&prefix, b"0123");
-        assert_eq!(sealed.seek(SeekFrom::Current(2)).expect("forward seek"), 6);
+        assert_eq!(sealed.seek(SeekFrom::Current(2)).unwrap(), 6);
         let mut suffix = Vec::new();
-        sealed.read_to_end(&mut suffix).expect("sealed suffix read");
+        sealed.read_to_end(&mut suffix).unwrap();
         assert_eq!(suffix, b"6789");
         assert!(sealed.seek(SeekFrom::Start(11)).is_err());
         assert!(sealed.seek(SeekFrom::End(-11)).is_err());
-        assert_eq!(sealed.stream_position().expect("retained cursor"), 10);
-        assert_eq!(sealed.seek(SeekFrom::End(-3)).expect("tail seek"), 7);
+        assert_eq!(sealed.stream_position().unwrap(), 10);
+        assert_eq!(sealed.seek(SeekFrom::End(-3)).unwrap(), 7);
         let mut tail = [0_u8; 3];
-        sealed.read_exact(&mut tail).expect("sealed tail read");
+        sealed.read_exact(&mut tail).unwrap();
         assert_eq!(&tail, b"789");
-        assert_eq!(sealed.read(&mut prefix).expect("bounded eof"), 0);
+        assert_eq!(sealed.read(&mut prefix).unwrap(), 0);
+        discard_and_cancel(sealed.discard());
+        revoke(session, root);
+    }
 
-        let batch =
-            TransientPublicationBatch::new(vec![sealed]).expect("singleton publication batch");
-        let published = match batch.publish_create_new() {
-            TransientPublicationBatchOutcome::Published(mut files) => {
-                files.pop().expect("singleton published file")
-            }
-            TransientPublicationBatchOutcome::NoEffect { error, .. } => {
-                panic!("publication had no effect: {error}")
-            }
-            TransientPublicationBatchOutcome::Partial { error, .. } => {
-                panic!("publication was partial: {error}")
-            }
-            TransientPublicationBatchOutcome::Pending(obligation) => {
-                panic!("publication remained pending: {}", obligation.error())
-            }
-        };
-        assert_eq!(
-            std::fs::read(temporary.path().join("readable.bin"))
-                .expect("published readable payload"),
-            b"0123456789",
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unwind_after_native_link_retains_root_authority() {
+        let (_temporary, session, root) = fixture();
+        let (sealed, transition) = linked_test_stage(&root, "transition-unwind.bin");
+        let (batched, batch) = linked_test_stage(&root, "batch-unwind.bin");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _transition = TransientPublicationTransition::from_linked(sealed);
+                panic!("injected unwind after native carrier extraction");
+            }))
+            .is_err()
         );
-        drop(published);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn dropped_published_obligation_transfers_exact_handle_to_root() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let (sealed, id) = linked_test_stage(&root, "root-retained.bin");
-        let obligation = TransientPublicationBatchObligation {
-            error: io::Error::other("injected published settlement"),
-            batch: Some(
-                TransientPublicationBatch::new(vec![sealed]).expect("singleton publication batch"),
-            ),
-        };
-        drop(obligation);
-
-        assert_retained_transient(&session, id, TransientEffectDisposition::Published);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn publication_transition_unwind_after_carrier_extraction_retains_root_authority() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let (sealed, id) = linked_test_stage(&root, "extraction-unwind.bin");
-
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _transition = TransientPublicationTransition::from_linked(sealed);
-            panic!("injected unwind after native carrier extraction");
-        }));
-        assert!(unwind.is_err());
-        assert_retained_transient(&session, id, TransientEffectDisposition::Published);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn publication_batch_unwind_after_partial_link_retains_root_authority() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let (sealed, id) = linked_test_stage(&root, "classification-unwind.bin");
-
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _batch =
-                TransientPublicationBatch::new(vec![sealed]).expect("singleton publication batch");
-            panic!("injected unwind after publication classification");
-        }));
-        assert!(unwind.is_err());
-        assert_retained_transient(&session, id, TransientEffectDisposition::Published);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _batch = TransientPublicationBatch::new(vec![batched]).unwrap();
+                panic!("injected unwind after publication classification");
+            }))
+            .is_err()
+        );
+        for id in [transition, batch] {
+            assert_retained_transient(&session, id, TransientEffectDisposition::Published);
+        }
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn held_transient_rejects_replacement_then_discards_unlinked_payload() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
-        let mut stage = test_stage(&root, "aba.bin").expect("transient platform");
-        stage.write_all(b"held original").expect("original write");
-        let mut sealed = stage.seal().expect("sealed original");
-        platform::link_transient_file(
-            sealed
-                .stage
-                .file
-                .as_mut()
-                .expect("sealed stage retains native file"),
-            root.inner.handle(),
-            OsStr::new("aba.bin"),
-        )
-        .expect("initial original link");
+        let (temporary, session, root) = fixture();
+        let path = temporary.path().join("aba.bin");
+        let mut stage = test_stage(&root, "aba.bin").unwrap();
+        stage.write_all(b"held original").unwrap();
+        let mut sealed = stage.seal().unwrap();
+        link(&mut sealed, &root, "aba.bin").unwrap();
 
-        std::fs::remove_file(temporary.path().join("aba.bin")).expect("unlink original name");
-        std::fs::write(temporary.path().join("aba.bin"), b"replacement")
-            .expect("install replacement");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
         {
-            let operation = enter_transient_operation(sealed.stage.destination())
-                .expect("transient validation operation");
+            let operation = enter_transient_operation(sealed.stage.destination()).unwrap();
             assert!(validate_linked_publication(&sealed, &operation).is_err());
         }
-        assert_eq!(
-            std::fs::read(temporary.path().join("aba.bin")).expect("replacement read"),
-            b"replacement",
-        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
 
-        std::fs::remove_file(temporary.path().join("aba.bin")).expect("remove replacement");
-        let relink = platform::link_transient_file(
-            sealed
-                .stage
-                .file
-                .as_mut()
-                .expect("held original remains available"),
-            root.inner.handle(),
-            OsStr::new("aba.bin"),
-        );
-        assert_eq!(
-            relink
-                .expect_err("an unlinked published O_TMPFILE cannot be relinked")
-                .kind(),
-            io::ErrorKind::NotFound,
-        );
-        assert!(!temporary.path().join("aba.bin").exists());
-        let destination = match sealed.discard() {
-            TransientDiscardOutcome::Discarded(destination) => destination,
-            TransientDiscardOutcome::Pending(obligation) => {
-                panic!(
-                    "unlinked transient discard remained pending: {}",
-                    obligation.error()
-                )
-            }
+        std::fs::remove_file(&path).unwrap();
+        let relink = link(&mut sealed, &root, "aba.bin")
+            .expect_err("an unlinked published O_TMPFILE cannot be relinked");
+        assert_eq!(relink.kind(), io::ErrorKind::NotFound);
+        assert!(!path.exists());
+        let TransientDiscardOutcome::Discarded(destination) = sealed.discard() else {
+            panic!("unlinked transient discard remained pending")
         };
         drop(destination);
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn prepublication_collision_is_deferred_to_publish_and_preserves_the_stage() {
-        let temporary = crate::test_tempdir().expect("temporary transient root");
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().expect("root directory");
+        let (temporary, session, root) = fixture();
         let destination = root
-            .admit_transient_destination(LeafName::new("collision.bin").expect("collision leaf"))
-            .expect("collision destination admission");
-        std::fs::write(temporary.path().join("COLLISION.BIN"), b"user payload")
-            .expect("portable collision injection");
-        let stage = match destination.create_stage() {
-            TransientStageCreateOutcome::Created(stage) => stage,
-            TransientStageCreateOutcome::NoEffect { error, .. } => {
-                panic!("collision prevented namespace-independent staging: {error}")
-            }
-            TransientStageCreateOutcome::Pending(obligation) => {
-                panic!(
-                    "collision admission remained pending: {}",
-                    obligation.error()
-                )
-            }
+            .admit_transient_destination(LeafName::new("collision.bin").unwrap())
+            .unwrap();
+        std::fs::write(temporary.path().join("COLLISION.BIN"), b"user payload").unwrap();
+        let TransientStageCreateOutcome::Created(stage) = destination.create_stage() else {
+            panic!("collision prevented namespace-independent staging")
         };
-        let sealed = stage.seal().expect("collision stage seal");
-        let batch =
-            TransientPublicationBatch::new(vec![sealed]).expect("singleton publication batch");
-        let preserved = match batch.publish_create_new() {
-            TransientPublicationBatchOutcome::NoEffect { batch, .. } => batch
-                .into_stages()
-                .pop()
-                .expect("singleton preserved stage"),
-            TransientPublicationBatchOutcome::Published(_) => {
-                panic!("portable collision unexpectedly published")
-            }
-            TransientPublicationBatchOutcome::Partial { .. } => {
-                panic!("prepublication collision unexpectedly became partial")
-            }
-            TransientPublicationBatchOutcome::Pending(obligation) => {
-                panic!(
-                    "collision publication remained pending: {}",
-                    obligation.error()
-                )
-            }
+        let batch = TransientPublicationBatch::new(vec![stage.seal().unwrap()]).unwrap();
+        let TransientPublicationBatchOutcome::NoEffect { batch, .. } = batch.publish_create_new()
+        else {
+            panic!("portable collision did not preserve the stage")
         };
-        let destination = match preserved.discard() {
-            TransientDiscardOutcome::Discarded(destination) => destination,
-            TransientDiscardOutcome::Pending(obligation) => {
-                panic!(
-                    "collision stage discard remained pending: {}",
-                    obligation.error()
-                )
-            }
-        };
-        match destination.cancel() {
-            TransientDestinationCancelOutcome::Cancelled => {}
-            TransientDestinationCancelOutcome::Pending(obligation) => {
-                panic!(
-                    "collision destination cancellation remained pending: {}",
-                    obligation.error()
-                )
-            }
-        }
+        discard_and_cancel(batch.into_stages().pop().unwrap().discard());
         assert_eq!(
-            std::fs::read(temporary.path().join("COLLISION.BIN")).expect("collision payload read"),
+            std::fs::read(temporary.path().join("COLLISION.BIN")).unwrap(),
             b"user payload",
         );
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        revoke(session, root);
     }
 
     #[cfg(target_os = "linux")]
@@ -4202,27 +3496,23 @@ mod tests {
         assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
         let reopened = acquire_test_root(&root_path);
         assert!(matches!(reopened.revoke(), RootRevokeOutcome::Revoked));
-        assert_eq!(
-            std::fs::read(displaced.join("original.png")).unwrap(),
-            b"complete original bytes"
-        );
-        assert_eq!(
-            std::fs::read(displaced.join("saved.png")).unwrap(),
-            b"replacement"
-        );
-        assert_eq!(
-            std::fs::read(parent.join("saved.png")).unwrap(),
-            b"new parent occupant"
-        );
+        for (path, bytes) in [
+            (
+                displaced.join("original.png"),
+                b"complete original bytes".as_slice(),
+            ),
+            (displaced.join("saved.png"), b"replacement"),
+            (parent.join("saved.png"), b"new parent occupant"),
+        ] {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
     }
 
     #[test]
     fn external_preservation_does_not_waive_managed_transient_ownership() {
-        let temporary = crate::test_tempdir().unwrap();
-        let session = acquire_test_root(temporary.path());
-        let root = session.root().unwrap();
+        let (_temporary, session, root) = fixture();
         let Some(stage) = test_stage(&root, "internal.bin") else {
-            return;
+            return revoke(session, root);
         };
         let obligation = TransientPublicationBatchObligation {
             error: io::Error::other("unclassified fixture"),
@@ -4236,15 +3526,7 @@ mod tests {
         else {
             panic!("unpublished managed stage")
         };
-        let stage = batch.into_stages().pop().unwrap();
-        let TransientDiscardOutcome::Discarded(destination) = stage.discard() else {
-            panic!("exact discard")
-        };
-        assert!(matches!(
-            destination.cancel(),
-            TransientDestinationCancelOutcome::Cancelled
-        ));
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        discard_and_cancel(batch.into_stages().pop().unwrap().discard());
+        revoke(session, root);
     }
 }
