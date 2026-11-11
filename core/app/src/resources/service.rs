@@ -1013,6 +1013,7 @@ mod tests {
             tasks.clone(),
             Arc::new(crate::content::catalog::ContentService::new(client.clone()).unwrap()),
             crate::performance::public_transfer_resolver(),
+            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
         let content = ContentMutations::new(directories.clone(), client, tasks.clone())

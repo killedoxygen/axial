@@ -42,7 +42,7 @@ enum ManagedEffectContinuation {
     FileMove(FileMoveReceipt),
     DirectoryMove(DirectoryMoveReceipt),
     StateReplace(DurableReplaceObligation),
-    ArtifactTransfer(crate::install::ManagedArtifactTransferRecovery),
+    ArtifactTransfer(super::ManagedArtifactTransferRecovery),
 }
 
 #[derive(Clone)]
@@ -282,7 +282,7 @@ impl ManagedInstanceEffectAuthority {
 
     pub(crate) fn retain_artifact_transfer(
         &self,
-        recovery: crate::install::ManagedArtifactTransferRecovery,
+        recovery: super::ManagedArtifactTransferRecovery,
     ) -> io::Error {
         self.store_continuation(ManagedEffectContinuation::ArtifactTransfer(recovery));
         pending_effect_error()

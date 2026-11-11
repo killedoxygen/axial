@@ -4,6 +4,7 @@ use super::benchmarks::{
     BenchmarkSuiteManifest, BenchmarkSuiteManifestRun, BenchmarkSuiteRunSpec,
     benchmark_suite_run_id, bounded_descriptor_token,
 };
+use super::model::{BundleHealth, CompositionState, ManagedArtifactProvider, OwnershipClass};
 use super::proofs::{
     LaunchProofComparison, LaunchProofRecord, LaunchProofResourceBudget,
     comparison_baseline_matches_report,
@@ -569,8 +570,8 @@ fn family_c_qualification_target_view_model(
 }
 
 pub fn managed_install_evidence(
-    composition_state: &axial_performance::CompositionState,
-    health: axial_performance::BundleHealth,
+    composition_state: &CompositionState,
+    health: BundleHealth,
 ) -> ManagedInstallEvidence {
     let mut evidence = ManagedInstallEvidence {
         missing: Vec::new(),
@@ -582,14 +583,16 @@ pub fn managed_install_evidence(
     let expected_artifacts_present =
         has_installed && family_c_managed_expected_artifacts_present(composition_state);
     let ownership = has_installed
-        && composition_state.installed_mods.iter().all(|installed| {
-            installed.ownership_class == axial_performance::OwnershipClass::CompositionManaged
-        });
+        && composition_state
+            .installed_mods
+            .iter()
+            .all(|installed| installed.ownership_class == OwnershipClass::CompositionManaged);
     let source = has_installed
-        && composition_state.installed_mods.iter().all(|installed| {
-            installed.source.provider == axial_performance::ManagedArtifactProvider::Modrinth
-        });
-    let integrity = matches!(health, axial_performance::BundleHealth::Healthy)
+        && composition_state
+            .installed_mods
+            .iter()
+            .all(|installed| installed.source.provider == ManagedArtifactProvider::Modrinth);
+    let integrity = matches!(health, BundleHealth::Healthy)
         && has_installed
         && composition_state.installed_mods.iter().all(|installed| {
             installed.integrity.sha512.len() == 128
@@ -655,9 +658,7 @@ fn unobserved_managed_install_evidence(
     }
 }
 
-fn family_c_managed_expected_artifacts_present(
-    composition_state: &axial_performance::CompositionState,
-) -> bool {
+fn family_c_managed_expected_artifacts_present(composition_state: &CompositionState) -> bool {
     FAMILY_C_MANAGED_EXPECTED_PROJECT_IDS
         .iter()
         .all(|project_id| {

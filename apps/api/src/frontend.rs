@@ -191,9 +191,15 @@ mod tests {
     #[tokio::test]
     async fn native_mode_has_no_http_frontend_even_when_the_feature_is_unified() {
         let temp = tempfile::tempdir().unwrap();
-        let services = crate::start_profile(temp.path().join("native"), None, true, None)
-            .await
-            .unwrap();
+        let services = crate::start_profile(
+            temp.path().join("native"),
+            None,
+            true,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         let bootstrap = services.server.bootstrap();
         let response = reqwest::Client::new()
             .get(format!("{}/index.html", bootstrap.base_url))

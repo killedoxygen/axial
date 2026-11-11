@@ -1,13 +1,11 @@
+use super::InstallError;
 use super::artifact::{ManagedArtifactStage, state_from_plan};
-use super::model::InstallError;
-use super::mutation::{commit_staged_graph, managed_stage_selection, remove_managed_transaction};
-use super::{
-    ManagedArtifactPin, ManagedArtifactRole, ManagedCompositionInstallPlan, ManagedDependencyEdge,
-};
-use crate::types::{
+use super::{ManagedArtifactPin, ManagedCompositionInstallPlan, ManagedDependencyEdge};
+use super::{commit_staged_graph, managed_stage_selection, remove_managed_transaction};
+use crate::performance::model::{
     CompositionPlan, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
-    ManagedArtifactProvider, ManagedArtifactSource, ManagedMod, ModCondition, OwnershipClass,
-    PerformanceMode, VersionFamily,
+    ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource, ManagedMod, ModCondition,
+    OwnershipClass, PerformanceMode, VersionFamily,
 };
 use axial_fs::{
     FileCreateObligation, FileCreateOutcome, FileCreateResolution, FilePromotionObligation,
@@ -38,7 +36,7 @@ impl ManagedArtifactStage for FakeOwnedStage {
 
     fn publish_create_new(
         self,
-        destination: &crate::storage::ManagedStorageDirectory,
+        destination: &super::storage::ManagedStorageDirectory,
     ) -> Result<(), InstallError> {
         if self.fail_publication {
             return Err(InstallError::Io(std::io::Error::other(
@@ -46,9 +44,9 @@ impl ManagedArtifactStage for FakeOwnedStage {
             )));
         }
         let addition =
-            crate::state::prepare_managed_artifact_addition(destination, &self.installed)?;
+            super::state::prepare_managed_artifact_addition(destination, &self.installed)?;
         publish_test_bytes_create_new(destination, &self.installed.filename, &self.bytes)?;
-        crate::state::publish_managed_artifact_addition(destination, &self.installed, &addition)
+        super::state::publish_managed_artifact_addition(destination, &self.installed, &addition)
             .map_err(Into::into)
     }
 }
@@ -67,7 +65,7 @@ fn sealed_graph_state_retains_required_dependency_identity() {
             .iter()
             .any(|installed| installed.role == ManagedArtifactRole::RequiredDependency)
     );
-    crate::install::plan::validate_state_graph(&state).expect("valid sealed state graph");
+    super::plan::validate_state_graph(&state).expect("valid sealed state graph");
 }
 
 #[test]
@@ -77,7 +75,7 @@ fn exact_healthy_graph_skips_provider_and_snapshot_work() {
     let plan = graph_plan(b"root", b"dependency");
     let state = state_from_plan(&plan, installed_from_plan(&plan));
     write_graph_files(&root, b"root", b"dependency");
-    crate::state::save_state(storage.directory(), &state).expect("save state");
+    super::state::save_state(storage.directory(), &state).expect("save state");
 
     let admitted = managed_stage_selection(storage.directory(), &plan)
         .expect("inspect exact graph")
@@ -86,7 +84,7 @@ fn exact_healthy_graph_skips_provider_and_snapshot_work() {
 
     assert_eq!(admitted, state);
     assert!(
-        crate::state::load_rollback_snapshot(storage.directory())
+        super::state::load_rollback_snapshot(storage.directory())
             .expect("load rollback")
             .is_none()
     );
@@ -100,7 +98,7 @@ fn changed_graph_requests_provider_only_for_the_changed_pin() {
     let previous_plan = graph_plan(b"root", b"dependency");
     let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
     write_graph_files(&root, b"root", b"dependency");
-    crate::state::save_state(storage.directory(), &previous).expect("save previous state");
+    super::state::save_state(storage.directory(), &previous).expect("save previous state");
     let next_plan = graph_plan(b"replacement-root", b"dependency");
 
     let selection =
@@ -128,7 +126,7 @@ fn changed_graph_revalidates_retained_pin_before_commit_effects() {
     let previous_plan = graph_plan(b"root", b"dependency");
     let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
     write_graph_files(&root, b"root", b"dependency");
-    crate::state::save_state(storage.directory(), &previous).expect("save previous state");
+    super::state::save_state(storage.directory(), &previous).expect("save previous state");
     let lock_before = fs::read(root.join(".axial-lock.json")).expect("lock bytes");
     let next_plan = graph_plan(b"replacement-root", b"dependency");
     let next = state_from_plan(&next_plan, installed_from_plan(&next_plan));
@@ -161,25 +159,25 @@ fn dependency_complete_graph_commits_and_rolls_back_to_absence() {
     let storage = anchor(&root);
     let plan = graph_plan(b"root", b"dependency");
     let state = state_from_plan(&plan, installed_from_plan(&plan));
-    crate::state::save_absent_rollback_snapshot(storage.directory()).expect("snapshot absence");
+    super::state::save_absent_rollback_snapshot(storage.directory()).expect("snapshot absence");
 
     commit_staged_graph(storage.directory(), None, &state, fake_stages(&plan, false))
         .expect("commit full graph");
 
     assert_graph_files(&root, b"root", b"dependency");
     assert_eq!(
-        crate::state::load_state(storage.directory())
+        super::state::load_state(storage.directory())
             .expect("load state")
             .expect("managed state"),
         state
     );
-    let snapshot = crate::state::load_rollback_snapshot(storage.directory())
+    let snapshot = super::state::load_rollback_snapshot(storage.directory())
         .expect("load rollback")
         .expect("absence rollback");
     assert!(matches!(
-        crate::state::restore_rollback_snapshot(storage.directory(), &snapshot)
+        super::state::restore_rollback_snapshot(storage.directory(), &snapshot)
             .expect("restore absence"),
-        crate::state::ManagedRollbackOutcome::ManagedStateAbsent
+        super::state::ManagedRollbackOutcome::ManagedStateAbsent
     ));
     assert!(!root.join("root.jar").exists());
     assert!(!root.join("dependency.jar").exists());
@@ -195,37 +193,32 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let previous_plan = graph_plan(b"root", b"dependency");
     let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
     write_graph_files(&mods, b"root", b"dependency");
-    crate::state::save_state(mods_storage.directory(), &previous).expect("save previous state");
+    super::state::save_state(mods_storage.directory(), &previous).expect("save previous state");
     let lock_before = fs::read(mods.join(".axial-lock.json")).expect("lock bytes");
     let failed_plan = graph_plan_at(
         b"replacement-root",
         b"replacement-dependency",
         "https://127.0.0.1:1",
     );
-    let manager = super::PerformanceManager::new().expect("manager");
     let instance_anchor = anchor(&instance);
 
     let callback_called = Arc::new(AtomicBool::new(false));
     let callback_probe = callback_called.clone();
-    let error = manager
-        .ensure_installed(
-            &failed_plan,
-            test_transfer_resolver(),
-            instance_anchor.directory(),
-            move || async move {
-                callback_probe.store(true, Ordering::Release);
-                Ok::<(), ()>(())
-            },
-        )
-        .await
-        .expect_err("provider stage must fail");
+    let error = super::install_graph(
+        &failed_plan,
+        test_transfer_resolver(),
+        instance_anchor.directory(),
+        move || async move {
+            callback_probe.store(true, Ordering::Release);
+            Ok::<(), ()>(())
+        },
+    )
+    .await
+    .expect_err("provider stage must fail");
 
     assert!(matches!(
         error,
-        super::ManagedInstallExecutionError::Mutation {
-            rollback_ready: false,
-            ..
-        }
+        super::ManagedInstallExecutionError::Mutation(_)
     ));
     assert!(!callback_called.load(Ordering::Acquire));
     assert_graph_files(&mods, b"root", b"dependency");
@@ -234,7 +227,7 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
         lock_before
     );
     assert!(
-        crate::state::load_rollback_snapshot(mods_storage.directory())
+        super::state::load_rollback_snapshot(mods_storage.directory())
             .expect("load rollback")
             .is_none()
     );
@@ -245,15 +238,14 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let fresh_instance = test_root("provider-failure-fresh-instance");
     let fresh_mods = fresh_instance.join("mods");
     let fresh_instance_anchor = anchor(&fresh_instance);
-    manager
-        .ensure_installed(
-            &failed_plan,
-            test_transfer_resolver(),
-            fresh_instance_anchor.directory(),
-            || async { Ok::<(), ()>(()) },
-        )
-        .await
-        .expect_err("fresh provider stage must fail");
+    super::install_graph(
+        &failed_plan,
+        test_transfer_resolver(),
+        fresh_instance_anchor.directory(),
+        || async { Ok::<(), ()>(()) },
+    )
+    .await
+    .expect_err("fresh provider stage must fail");
     assert!(fresh_mods.is_dir());
     let fresh_mods_storage = fresh_instance_anchor
         .directory()
@@ -261,10 +253,10 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
         .expect("open fresh mods after candidate rollback")
         .expect("candidate intent creates the managed mods root");
     assert_eq!(
-        crate::state::load_state(&fresh_mods_storage).expect("load fresh state"),
+        super::state::load_state(&fresh_mods_storage).expect("load fresh state"),
         None
     );
-    crate::state::prove_managed_storage_recovered(&fresh_mods_storage, None)
+    super::state::prove_managed_storage_recovered(&fresh_mods_storage, None)
         .expect("provider failure settles every candidate intent");
     drop(fresh_mods_storage);
     drop(fresh_instance_anchor);
@@ -278,19 +270,17 @@ async fn managed_graph_transfers_two_candidates_before_publication() {
     let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
 
     let instance = test_root("concurrent-candidate-transfers");
-    let manager = super::PerformanceManager::new().expect("manager");
     let instance_anchor = anchor(&instance);
     let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
 
-    let outcome = manager
-        .ensure_installed(
-            &plan,
-            test_transfer_resolver(),
-            instance_anchor.directory(),
-            || async { Ok::<(), ()>(()) },
-        )
-        .await
-        .expect("download and publish the complete graph");
+    let outcome = super::install_graph(
+        &plan,
+        test_transfer_resolver(),
+        instance_anchor.directory(),
+        || async { Ok::<(), ()>(()) },
+    )
+    .await
+    .expect("download and publish the complete graph");
     tokio::time::timeout(std::time::Duration::from_secs(5), server)
         .await
         .expect("transfer fixture completed")
@@ -305,11 +295,11 @@ async fn managed_graph_transfers_two_candidates_before_publication() {
         .open_child("mods")
         .expect("open installed mods")
         .expect("managed mods directory");
-    let state = crate::state::load_state(&mods_storage)
+    let state = super::state::load_state(&mods_storage)
         .expect("load installed state")
         .expect("installed state");
     assert_eq!(state, outcome.into_state());
-    crate::state::prove_managed_storage_recovered(&mods_storage, Some(&state))
+    super::state::prove_managed_storage_recovered(&mods_storage, Some(&state))
         .expect("all transfer candidates and intents settled");
     drop(mods_storage);
     drop(instance_anchor);
@@ -322,25 +312,20 @@ async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
     let dependency_bytes = b"downloaded-dependency";
     let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
     let instance = test_root("rejected-target-checkpoint");
-    let manager = super::PerformanceManager::new().expect("manager");
     let instance_anchor = anchor(&instance);
     let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
 
-    let error = manager
-        .ensure_installed(
-            &plan,
-            test_transfer_resolver(),
-            instance_anchor.directory(),
-            || async { Err::<(), _>("checkpoint rejected") },
-        )
-        .await
-        .expect_err("target checkpoint must reject publication");
+    let error = super::install_graph(
+        &plan,
+        test_transfer_resolver(),
+        instance_anchor.directory(),
+        || async { Err::<(), _>("checkpoint rejected") },
+    )
+    .await
+    .expect_err("target checkpoint must reject publication");
     assert!(matches!(
         error,
-        super::ManagedInstallExecutionError::BeforeTargetEffect {
-            error: "checkpoint rejected",
-            rollback_ready: true,
-        }
+        super::ManagedInstallExecutionError::BeforeTargetEffect("checkpoint rejected")
     ));
     tokio::time::timeout(std::time::Duration::from_secs(5), server)
         .await
@@ -354,15 +339,15 @@ async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
         .expect("open rejected mods")
         .expect("candidate preparation creates mods");
     assert_eq!(
-        crate::state::load_state(&mods).expect("load rejected state"),
+        super::state::load_state(&mods).expect("load rejected state"),
         None
     );
     assert!(
-        crate::state::load_rollback_snapshot(&mods)
+        super::state::load_rollback_snapshot(&mods)
             .expect("load absence rollback")
             .is_some()
     );
-    crate::state::prove_managed_storage_recovered(&mods, None)
+    super::state::prove_managed_storage_recovered(&mods, None)
         .expect("checkpoint rejection settles candidate state");
     assert!(!instance.join("mods/root.jar").exists());
     assert!(!instance.join("mods/dependency.jar").exists());
@@ -380,30 +365,27 @@ async fn exact_graph_noop_skips_the_target_effect_boundary() {
     let plan = graph_plan(b"root", b"dependency");
     let state = state_from_plan(&plan, installed_from_plan(&plan));
     write_graph_files(&mods, b"root", b"dependency");
-    crate::state::save_state(mods_storage.directory(), &state).expect("save exact managed state");
-    let manager = super::PerformanceManager::new().expect("manager");
+    super::state::save_state(mods_storage.directory(), &state).expect("save exact managed state");
     let instance_anchor = anchor(&instance);
     let callback_called = Arc::new(AtomicBool::new(false));
     let callback_probe = callback_called.clone();
 
-    let outcome = manager
-        .ensure_installed(
-            &plan,
-            test_transfer_resolver(),
-            instance_anchor.directory(),
-            move || async move {
-                callback_probe.store(true, Ordering::Release);
-                Ok::<(), ()>(())
-            },
-        )
-        .await
-        .expect("exact graph is a no-op");
+    let outcome = super::install_graph(
+        &plan,
+        test_transfer_resolver(),
+        instance_anchor.directory(),
+        move || async move {
+            callback_probe.store(true, Ordering::Release);
+            Ok::<(), ()>(())
+        },
+    )
+    .await
+    .expect("exact graph is a no-op");
 
     assert!(!outcome.target_changed());
-    assert!(!outcome.rollback_ready());
     assert!(!callback_called.load(Ordering::Acquire));
     assert!(
-        crate::state::load_rollback_snapshot(mods_storage.directory())
+        super::state::load_rollback_snapshot(mods_storage.directory())
             .expect("load rollback")
             .is_none()
     );
@@ -421,7 +403,7 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
     let previous_plan = graph_plan(b"root", b"dependency");
     let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
     write_graph_files(&mods, b"root", b"dependency");
-    crate::state::save_state(mods_storage.directory(), &previous)
+    super::state::save_state(mods_storage.directory(), &previous)
         .expect("save previous managed state");
     let next_plan = graph_plan_named_at(
         "replacement-core",
@@ -429,38 +411,35 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
         b"dependency",
         "https://cdn.example.invalid",
     );
-    let manager = super::PerformanceManager::new().expect("manager");
     let instance_anchor = anchor(&instance);
     let callback_mods = mods.clone();
     let callback_storage = mods_storage.directory().clone();
 
-    let outcome = manager
-        .ensure_installed(
-            &next_plan,
-            test_transfer_resolver(),
-            instance_anchor.directory(),
-            move || async move {
-                assert!(
-                    crate::state::load_rollback_snapshot(&callback_storage)
-                        .expect("load rollback at effect boundary")
-                        .is_some()
-                );
-                assert_eq!(
-                    crate::state::load_state(&callback_storage)
-                        .expect("load state at effect boundary")
-                        .expect("previous state")
-                        .composition_id,
-                    "core"
-                );
-                assert_graph_files(&callback_mods, b"root", b"dependency");
-                Ok::<(), ()>(())
-            },
-        )
-        .await
-        .expect("commit replacement composition");
+    let outcome = super::install_graph(
+        &next_plan,
+        test_transfer_resolver(),
+        instance_anchor.directory(),
+        move || async move {
+            assert!(
+                super::state::load_rollback_snapshot(&callback_storage)
+                    .expect("load rollback at effect boundary")
+                    .is_some()
+            );
+            assert_eq!(
+                super::state::load_state(&callback_storage)
+                    .expect("load state at effect boundary")
+                    .expect("previous state")
+                    .composition_id,
+                "core"
+            );
+            assert_graph_files(&callback_mods, b"root", b"dependency");
+            Ok::<(), ()>(())
+        },
+    )
+    .await
+    .expect("commit replacement composition");
 
     assert!(outcome.target_changed());
-    assert!(outcome.rollback_ready());
     assert_eq!(outcome.into_state().composition_id, "replacement-core");
     drop(mods_storage);
     drop(instance_anchor);
@@ -474,9 +453,9 @@ fn mid_commit_failure_restores_exact_prior_graph() {
     let previous_plan = graph_plan(b"root", b"dependency");
     let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
     write_graph_files(&root, b"root", b"dependency");
-    crate::state::save_state(storage.directory(), &previous).expect("save previous state");
+    super::state::save_state(storage.directory(), &previous).expect("save previous state");
     let lock_before = fs::read(root.join(".axial-lock.json")).expect("lock bytes");
-    crate::state::save_rollback_snapshot(storage.directory(), &previous).expect("save rollback");
+    super::state::save_rollback_snapshot(storage.directory(), &previous).expect("save rollback");
 
     let replacement_plan = graph_plan(b"replacement-root", b"replacement-dependency");
     let replacement = state_from_plan(&replacement_plan, installed_from_plan(&replacement_plan));
@@ -484,10 +463,10 @@ fn mid_commit_failure_restores_exact_prior_graph() {
     stages[1].fail_publication = true;
     commit_staged_graph(storage.directory(), Some(&previous), &replacement, stages)
         .expect_err("injected mid-commit failure");
-    let snapshot = crate::state::load_rollback_snapshot(storage.directory())
+    let snapshot = super::state::load_rollback_snapshot(storage.directory())
         .expect("load rollback")
         .expect("rollback");
-    crate::state::restore_rollback_snapshot(storage.directory(), &snapshot)
+    super::state::restore_rollback_snapshot(storage.directory(), &snapshot)
         .expect("restore prior graph");
 
     assert_graph_files(&root, b"root", b"dependency");
@@ -496,7 +475,7 @@ fn mid_commit_failure_restores_exact_prior_graph() {
         lock_before
     );
     assert_eq!(
-        crate::state::load_state(storage.directory())
+        super::state::load_state(storage.directory())
             .expect("load state")
             .expect("prior state"),
         previous
@@ -514,7 +493,7 @@ fn commit_collision_never_claims_or_removes_user_owned_destination() {
 
     commit_staged_graph(storage.directory(), None, &state, fake_stages(&plan, false))
         .expect_err("untracked destination must block publication");
-    crate::state::reconcile_managed_addition_obligations(storage.directory(), None)
+    super::state::reconcile_managed_addition_obligations(storage.directory(), None)
         .expect("discard untracked managed obligations");
 
     assert_eq!(
@@ -523,7 +502,7 @@ fn commit_collision_never_claims_or_removes_user_owned_destination() {
     );
     assert!(!root.join("dependency.jar").exists());
     assert!(
-        crate::state::load_state(storage.directory())
+        super::state::load_state(storage.directory())
             .expect("load state")
             .is_none()
     );
@@ -542,13 +521,13 @@ fn full_graph_remove_and_rollback_preserve_dependencies() {
     remove_managed_transaction(storage.directory()).expect("remove graph");
     assert!(!root.join("root.jar").exists());
     assert!(!root.join("dependency.jar").exists());
-    let snapshot = crate::state::load_rollback_snapshot(storage.directory())
+    let snapshot = super::state::load_rollback_snapshot(storage.directory())
         .expect("load rollback")
         .expect("rollback");
     assert!(matches!(
-        crate::state::restore_rollback_snapshot(storage.directory(), &snapshot)
+        super::state::restore_rollback_snapshot(storage.directory(), &snapshot)
             .expect("restore graph"),
-        crate::state::ManagedRollbackOutcome::ManagedComposition(_)
+        super::state::ManagedRollbackOutcome::ManagedComposition(_)
     ));
     assert_graph_files(&root, b"root", b"dependency");
     let _ = fs::remove_dir_all(root);
@@ -782,13 +761,13 @@ fn assert_graph_files(root: &Path, root_bytes: &[u8], dependency_bytes: &[u8]) {
 }
 
 struct TestManagedRoot {
-    directory: crate::storage::ManagedStorageDirectory,
+    directory: super::storage::ManagedStorageDirectory,
     _session: RootSession,
     _cleanup: TestAuthorityRootCleanup,
 }
 
 impl TestManagedRoot {
-    fn directory(&self) -> &crate::storage::ManagedStorageDirectory {
+    fn directory(&self) -> &super::storage::ManagedStorageDirectory {
         &self.directory
     }
 }
@@ -814,10 +793,10 @@ fn anchor(root: &Path) -> TestManagedRoot {
         .root()
         .and_then(|authority| authority.open_directory(&name))
         .expect("admit managed test directory");
-    let effects = crate::storage::ManagedInstanceEffectAuthority::bind(&directory)
+    let effects = super::storage::ManagedInstanceEffectAuthority::bind(&directory)
         .expect("bind managed test effect authority");
     TestManagedRoot {
-        directory: crate::storage::ManagedStorageDirectory::bind_instance_root(directory, effects)
+        directory: super::storage::ManagedStorageDirectory::bind_instance_root(directory, effects)
             .expect("bind managed test directory"),
         _session: session,
         _cleanup: TestAuthorityRootCleanup(authority_root),
@@ -854,7 +833,7 @@ fn acquire_test_root_session(root: &Path) -> RootSession {
 }
 
 fn publish_test_bytes_create_new(
-    destination: &crate::storage::ManagedStorageDirectory,
+    destination: &super::storage::ManagedStorageDirectory,
     filename: &str,
     bytes: &[u8],
 ) -> Result<(), InstallError> {

@@ -1,99 +1,79 @@
-use crate::health::BundleHealth;
-use crate::rules_cache::RulesCacheStatus;
-use crate::types::{
-    CompositionTier, EmergencyDisableTarget, Manifest, OwnershipClass, VersionFamily,
+//! Public status projection of the active rules.
+
+use super::ActiveRules;
+use crate::performance::model::{
+    BundleHealth, CompositionTier, EmergencyDisableDiagnostic, FamilyCoverage, Manifest,
+    OwnershipClass, PerformanceRulesStatus, PerformanceRulesStatusResponse,
+    PerformanceRulesStatusViewModel, RuleChannel, RuleSource, RulesCacheState, RulesValidation,
+    VersionFamily, ViewModelTone,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleSource {
-    BuiltIn,
-    Remote,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleChannel {
-    Bundled,
-    Local,
-    Remote,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RulesValidation {
-    Valid,
-    Invalid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PerformanceRulesStatus {
-    pub rule_source: RuleSource,
-    pub rule_channel: RuleChannel,
-    pub rules_cache: RulesCacheStatus,
-    pub schema_version: i32,
-    pub generated_at: String,
-    pub composition_count: usize,
-    pub family_coverage: Vec<FamilyCoverage>,
-    pub remote_refresh: bool,
-    pub last_refresh_at: Option<String>,
-    pub validation: RulesValidation,
-    pub health_states: Vec<BundleHealth>,
-    pub ownership_classes: Vec<OwnershipClass>,
-    pub emergency_disable_count: usize,
-    pub emergency_disables: Vec<EmergencyDisableDiagnostic>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FamilyCoverage {
-    pub family: VersionFamily,
-    pub composition_count: usize,
-    pub loaders: Vec<String>,
-    pub tiers: Vec<CompositionTier>,
-    pub managed_mod_count: usize,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmergencyDisableDiagnostic {
-    pub id: String,
-    pub target: EmergencyDisableTarget,
-    pub target_id: String,
-    pub reason: String,
-    pub families: Vec<VersionFamily>,
-    pub loaders: Vec<String>,
-    pub tiers: Vec<CompositionTier>,
-}
-
-pub fn rules_status_for(
-    manifest: &Manifest,
-    rule_source: RuleSource,
-    rule_channel: RuleChannel,
-    rules_cache: RulesCacheStatus,
+pub(super) fn response(
+    active: &ActiveRules,
     remote_refresh: bool,
-    last_refresh_at: Option<String>,
-    validation: RulesValidation,
-) -> PerformanceRulesStatus {
-    let warnings = rules_cache
-        .warning
-        .clone()
-        .map(|warning| vec![warning])
-        .unwrap_or_default();
+) -> PerformanceRulesStatusResponse {
+    let status = rules_status(active, remote_refresh);
+    let valid = status.validation == RulesValidation::Valid
+        && status.rules_cache.state != RulesCacheState::Invalid;
+    let view_model = PerformanceRulesStatusViewModel {
+        source_label: match status.rule_source {
+            RuleSource::BuiltIn => "Built-in rules",
+            RuleSource::Remote => "Remote rules",
+        }
+        .into(),
+        channel_label: match status.rule_channel {
+            RuleChannel::Bundled => "Bundled",
+            RuleChannel::Local => "Local",
+            RuleChannel::Remote => "Remote",
+        }
+        .into(),
+        validation_label: if valid { "Valid" } else { "Needs attention" }.into(),
+        validation_tone: if valid {
+            ViewModelTone::Ok
+        } else {
+            ViewModelTone::Warn
+        },
+        validation_icon: if valid { "check" } else { "alert-triangle" }.into(),
+        summary: format!("{} performance compositions", status.composition_count),
+        refresh_label: if status.remote_refresh {
+            "Refresh rules"
+        } else {
+            "Remote refresh is not configured"
+        }
+        .into(),
+        generated_label: status.generated_at.clone(),
+        cache_label: if status.rules_cache.recorded {
+            "Cached"
+        } else {
+            "No verified remote cache"
+        }
+        .into(),
+        emergency_disable_label: format!("{} emergency disables", status.emergency_disable_count),
+        details_label: "Performance rules".into(),
+        health_states_label: "Healthy, disabled, invalid".into(),
+        ownership_label: "Composition-managed files and user-managed files".into(),
+        warnings: status.warnings.clone(),
+    };
+    PerformanceRulesStatusResponse { status, view_model }
+}
 
+fn rules_status(active: &ActiveRules, remote_refresh: bool) -> PerformanceRulesStatus {
+    let manifest = &active.manifest;
     PerformanceRulesStatus {
-        rule_source,
-        rule_channel,
-        rules_cache,
+        rule_source: active.source,
+        rule_channel: match active.source {
+            RuleSource::BuiltIn => RuleChannel::Bundled,
+            RuleSource::Remote => RuleChannel::Remote,
+        },
+        rules_cache: active.cache.clone(),
         schema_version: manifest.schema_version,
         generated_at: manifest.generated_at.clone(),
         composition_count: manifest.compositions.len(),
         family_coverage: family_coverage(manifest),
         remote_refresh,
-        last_refresh_at,
-        validation,
+        last_refresh_at: active.cache.updated_at.clone(),
+        validation: RulesValidation::Valid,
         health_states: vec![
             BundleHealth::Healthy,
             BundleHealth::Disabled,
@@ -117,7 +97,7 @@ pub fn rules_status_for(
                 tiers: disable.tiers.clone(),
             })
             .collect(),
-        warnings,
+        warnings: active.cache.warning.clone().into_iter().collect(),
     }
 }
 
@@ -188,34 +168,24 @@ fn coverage_for_family(manifest: &Manifest, family: VersionFamily) -> FamilyCove
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status_for,
+    use super::super::ActiveRules;
+    use super::rules_status;
+    use crate::performance::model::{
+        BundleHealth, CompositionTier, EmergencyDisable, EmergencyDisableTarget, Manifest,
+        OwnershipClass, PerformanceRulesStatus, RuleChannel, RuleSource, RulesCacheState,
+        RulesValidation, VersionFamily,
     };
-    use crate::health::BundleHealth;
-    use crate::resolve::builtin_manifest;
-    use crate::rules_cache::{RulesCacheState, RulesCacheStatus};
-    use crate::types::{
-        CompositionTier, EmergencyDisable, EmergencyDisableTarget, Manifest, OwnershipClass,
-        VersionFamily,
-    };
+    use crate::performance::resolve::builtin_manifest;
 
-    fn rules_status(manifest: &Manifest) -> PerformanceRulesStatus {
-        rules_status_for(
-            manifest,
-            RuleSource::BuiltIn,
-            RuleChannel::Bundled,
-            RulesCacheStatus::unavailable(),
-            false,
-            None,
-            RulesValidation::Valid,
-        )
+    fn status(manifest: &Manifest) -> PerformanceRulesStatus {
+        rules_status(&ActiveRules::builtin(manifest.clone()), false)
     }
 
     #[test]
     fn bundled_manifest_status_is_truthful_about_current_foundation() {
         let manifest = builtin_manifest().expect("builtin manifest should validate");
 
-        let status = rules_status(&manifest);
+        let status = status(&manifest);
 
         assert_eq!(status.rule_source, RuleSource::BuiltIn);
         assert_eq!(status.rule_channel, RuleChannel::Bundled);
@@ -261,7 +231,7 @@ mod tests {
             tiers: Vec::new(),
         });
 
-        let status = rules_status(&manifest);
+        let status = status(&manifest);
 
         assert_eq!(status.emergency_disable_count, 1);
         assert_eq!(status.emergency_disables[0].id, "disable-family-f-extended");
@@ -276,7 +246,7 @@ mod tests {
     fn bundled_manifest_status_reports_all_family_coverage() {
         let manifest = builtin_manifest().expect("builtin manifest should validate");
 
-        let status = rules_status(&manifest);
+        let status = status(&manifest);
         let families = status
             .family_coverage
             .iter()
@@ -306,7 +276,7 @@ mod tests {
     fn vanilla_enhanced_only_and_managed_covered_families_report_current_status() {
         let manifest = builtin_manifest().expect("builtin manifest should validate");
 
-        let status = rules_status(&manifest);
+        let status = status(&manifest);
 
         for family in [VersionFamily::A, VersionFamily::B, VersionFamily::D] {
             let coverage = status

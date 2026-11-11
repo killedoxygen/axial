@@ -5,7 +5,6 @@ members = [
   "core/app",
   "core/fs",
   "core/minecraft",
-  "core/performance",
   "core/resource",
 ]
 resolver = "3"
@@ -72,7 +71,6 @@ axial-fs = { path = "core/fs" }
 axial-resource = { path = "core/resource" }
 axial-minecraft = { path = "core/minecraft" }
 axial-app = { path = "core/app" }
-axial-performance = { path = "core/performance" }
 rusqlite = { version = "0.37", features = ["bundled", "hooks"] }
 ts-rs = { version = "12.0.1", features = ["serde-compat", "uuid-impl"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }

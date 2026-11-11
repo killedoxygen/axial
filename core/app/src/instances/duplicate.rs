@@ -424,9 +424,11 @@ mod tests {
                     .unwrap()
                     .verify_staged(copied.directory())
                     .unwrap();
-                let manager = Arc::new(axial_performance::PerformanceManager::new().unwrap());
-                let (authority, identity) = manager
-                    .bind_admitted_instance(id.as_str(), copied.directory().capability().clone())
+                let (authority, identity) =
+                    crate::performance::composition::ManagedCompositionAuthority::bind(
+                        id.as_str(),
+                        copied.directory().capability().clone(),
+                    )
                     .unwrap();
                 let effects = authority
                     .bind_instance_effect_authority(&identity)
@@ -438,7 +440,7 @@ mod tests {
                         .rollback_managed(&identity, &effects)
                         .await
                         .unwrap(),
-                    axial_performance::ManagedRollbackOutcome::ManagedComposition(_)
+                    crate::performance::composition::ManagedRollbackOutcome::ManagedComposition(_)
                 ));
                 assert_eq!(service.registry().list().unwrap().len(), 2);
             }
@@ -536,7 +538,7 @@ mod tests {
                         )
                         .unwrap();
                     assert!(
-                        axial_performance::ManagedDuplicatePayload::admit(directory.capability())
+                        crate::performance::composition::ManagedDuplicatePayload::admit(directory.capability())
                             .is_ok()
                     );
                 }

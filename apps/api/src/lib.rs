@@ -12,8 +12,6 @@ mod open_folder;
 #[cfg(test)]
 mod reset_tests;
 pub mod routes;
-#[cfg(test)]
-mod rules_tests;
 pub mod transport;
 
 use axial_app::{
@@ -38,7 +36,7 @@ use axial_app::{
     library::{LibraryId, LibraryLifecycle, LibraryOpenOutcome},
     music::MusicService,
     network::{ClientConfig, ProviderClient},
-    performance::{PerformanceService, benchmarks::BenchmarkService},
+    performance::{PerformanceService, benchmarks::BenchmarkService, rules::RulesSettings},
     profile::{Profile, Recovery},
     public::DEVELOPMENT_APPLICATION_ID,
     resources::{ResourceService, folders::FolderService},
@@ -413,6 +411,7 @@ pub async fn start_desktop(extra_origin: Option<&str>) -> Result<DesktopServices
         extra_origin,
         true,
         configured_telemetry(),
+        configured_rules(),
     )
     .await
 }
@@ -423,6 +422,7 @@ pub async fn start_browser(extra_origin: Option<&str>) -> Result<DesktopServices
         extra_origin,
         false,
         configured_telemetry(),
+        configured_rules(),
     )
     .await
 }
@@ -453,13 +453,29 @@ fn configured_telemetry() -> Option<CollectorConfig> {
     }
 }
 
+fn configured_rules() -> RulesSettings {
+    let value = |name| std::env::var(name).ok();
+    RulesSettings::new(
+        value("AXIAL_PERFORMANCE_RULES_URL").as_deref(),
+        value("AXIAL_PERFORMANCE_RULES_ED25519_PUBLIC_KEY").as_deref(),
+        value("AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS").as_deref(),
+    )
+}
+
 /// Explicit profile injection keeps browser, desktop, and acceptance tests on
-/// the same composition without changing process-global environment variables.
+/// the same composition without reading process-global configuration.
 pub async fn start_in_profile(
     profile_root: PathBuf,
     extra_origin: Option<&str>,
 ) -> Result<DesktopServices, StartupError> {
-    start_profile(profile_root, extra_origin, false, None).await
+    start_profile(
+        profile_root,
+        extra_origin,
+        false,
+        None,
+        RulesSettings::default(),
+    )
+    .await
 }
 
 async fn start_profile(
@@ -467,6 +483,7 @@ async fn start_profile(
     extra_origin: Option<&str>,
     native_login: bool,
     collector: Option<CollectorConfig>,
+    rules: RulesSettings,
 ) -> Result<DesktopServices, StartupError> {
     let telemetry = Arc::new(Telemetry::new(collector));
     let result = start_profile_inner(
@@ -474,6 +491,7 @@ async fn start_profile(
         extra_origin,
         native_login,
         telemetry.clone(),
+        rules,
         #[cfg(test)]
         TestInputs::default(),
     )
@@ -489,19 +507,25 @@ async fn start_profile(
 #[derive(Default)]
 struct TestInputs {
     endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
-    content: Option<(String, axial_performance::ManagedArtifactTransferResolver)>,
+    content: Option<(
+        String,
+        axial_app::performance::composition::ManagedArtifactTransferResolver,
+    )>,
+    rules: RulesSettings,
 }
 
 #[cfg(test)]
 async fn start_profile_for_test(
     profile_root: PathBuf,
-    inputs: TestInputs,
+    mut inputs: TestInputs,
 ) -> Result<DesktopServices, StartupError> {
+    let rules = std::mem::take(&mut inputs.rules);
     start_profile_inner(
         profile_root,
         None,
         false,
         Arc::new(Telemetry::new(None)),
+        rules,
         inputs,
     )
     .await
@@ -527,7 +551,7 @@ async fn start_profile_with_test_endpoints(
 async fn start_profile_with_performance_test_inputs(
     profile_root: PathBuf,
     content_base_url: String,
-    transfers: axial_performance::ManagedArtifactTransferResolver,
+    transfers: axial_app::performance::composition::ManagedArtifactTransferResolver,
 ) -> Result<DesktopServices, StartupError> {
     let content = Some((content_base_url, transfers));
     start_profile_for_test(
@@ -564,12 +588,14 @@ async fn start_profile_inner(
     extra_origin: Option<&str>,
     native_login: bool,
     telemetry: Arc<Telemetry>,
+    rules: RulesSettings,
     #[cfg(test)] inputs: TestInputs,
 ) -> Result<DesktopServices, StartupError> {
     #[cfg(test)]
     let TestInputs {
         endpoints: test_endpoints,
         content: performance_inputs,
+        ..
     } = inputs;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -760,6 +786,7 @@ async fn start_profile_inner(
                     tasks.clone(),
                     content.clone(),
                     transfers,
+                    rules,
                 )
                 .map_err(|error| error.to_string())?;
                 let content_mutations = Arc::new(
@@ -1187,602 +1214,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_rules_refreshes_on_startup_without_an_http_command() {
-        use ed25519_dalek::{Signer, SigningKey};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let temporary =
-            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/rules", listener.local_addr().unwrap());
-        let mut manifest = axial_performance::builtin_manifest().unwrap();
-        manifest.generated_at = "2001-01-01T00:00:00Z".into();
-        let body = axial_performance::canonical_manifest_payload(&manifest).unwrap();
-        let key = SigningKey::from_bytes(&[23; 32]);
-        let signature = hex::encode(key.sign(&body).to_bytes());
-        let provider = tokio::spawn(async move {
-            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
-                .await
-                .expect("startup never contacted configured rules provider")
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0; 1024];
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                let count = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(count > 0 && request.len() + count <= 8192);
-                request.extend_from_slice(&chunk[..count]);
-            }
-            assert!(request.starts_with(b"GET /rules HTTP/1.1\r\n"));
-            stream.write_all(format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-axial-rules-signature-ed25519: {signature}\r\nConnection: close\r\n\r\n",
-                body.len(),
-            ).as_bytes()).await.unwrap();
-            stream.write_all(&body).await.unwrap();
-        });
-        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::configured_rules_startup_helper",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(
-                "AXIAL_TEST_RULES_PROFILE",
-                temporary.path().join("replacement"),
-            )
-            .env(axial_performance::PERFORMANCE_RULES_URL_ENV, url)
-            .env(
-                axial_performance::PERFORMANCE_RULES_PUBLIC_KEY_ENV,
-                hex::encode(key.verifying_key().to_bytes()),
-            )
-            .env("AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS", "900")
-            .output()
-            .await
-            .unwrap();
-        let served = provider.await;
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        served.unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "configured startup child isolates process-wide provider configuration"]
-    async fn configured_rules_startup_helper() {
-        let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
-        let services = start_in_profile(root, None).await.unwrap();
-        let refreshed = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let status = services.performance.rules().status().status;
-                if status.rule_source == axial_performance::RuleSource::Remote
-                    && status.generated_at == "2001-01-01T00:00:00Z"
-                    && services.tasks.status().is_idle()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .is_ok();
-        let idle_close = services.tasks.try_close_idle().is_ok();
-        let shutdown = services.server.shutdown().await;
-        let settled = services.server.is_shutdown_settled();
-        drop(services);
-        assert!(
-            refreshed,
-            "configured rules did not publish through actual startup"
-        );
-        assert!(
-            idle_close,
-            "sleeping rules worker blocked native idle closure"
-        );
-        shutdown.unwrap();
-        assert!(settled);
-    }
-
-    #[tokio::test]
-    async fn unconfigured_rules_refresh_retains_safe_http_refusal() {
-        run_rules_http_child("tests::unconfigured_rules_refusal_helper", "", "").await;
-    }
-
-    pub(super) async fn run_rules_http_child(
-        helper: &str,
-        url: &str,
-        key: &str,
-    ) -> tempfile::TempDir {
-        use std::process::Stdio;
-        use tokio::io::AsyncReadExt;
-
-        const OUTPUT_LIMIT: usize = 16 * 1024;
-        let temporary =
-            tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", helper, "--ignored", "--nocapture"])
-            .env("AXIAL_TEST_RULES_PROFILE", temporary.path().join("profile"))
-            .env(axial_performance::PERFORMANCE_RULES_URL_ENV, url)
-            .env(axial_performance::PERFORMANCE_RULES_PUBLIC_KEY_ENV, key)
-            .env("AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS", "900")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut stdout = child.stdout.take().unwrap().take((OUTPUT_LIMIT + 1) as u64);
-        let mut stderr = child.stderr.take().unwrap().take((OUTPUT_LIMIT + 1) as u64);
-        let mut out = Vec::with_capacity(OUTPUT_LIMIT + 1);
-        let mut err = Vec::with_capacity(OUTPUT_LIMIT + 1);
-        let joined = tokio::time::timeout(Duration::from_secs(180), async {
-            tokio::join!(
-                child.wait(),
-                stdout.read_to_end(&mut out),
-                stderr.read_to_end(&mut err),
-            )
-        })
-        .await;
-        if joined.is_err() {
-            let retained = temporary.keep();
-            let _ = child.start_kill();
-            let reaped = matches!(
-                tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
-                Ok(Ok(_))
-            );
-            panic!(
-                "rules refusal helper exceeded its deadline; child reaped: {reaped}; retained {}",
-                retained.display()
-            );
-        }
-        let (exit, out_read, err_read) = joined.unwrap();
-        if exit.is_err() {
-            let retained = temporary.keep();
-            let _ = child.start_kill();
-            let reaped = matches!(
-                tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
-                Ok(Ok(_))
-            );
-            panic!(
-                "rules refusal helper wait failed; child reaped: {reaped}; retained {}",
-                retained.display()
-            );
-        }
-        let output_complete = out_read.is_ok()
-            && err_read.is_ok()
-            && out.len() <= OUTPUT_LIMIT
-            && err.len() <= OUTPUT_LIMIT;
-        let out = String::from_utf8_lossy(&out[..out.len().min(OUTPUT_LIMIT)]);
-        let err = String::from_utf8_lossy(&err[..err.len().min(OUTPUT_LIMIT)]);
-        let passed = matches!(exit, Ok(status) if status.success())
-            && output_complete
-            && out.contains("running 1 test")
-            && out.contains(&format!("test {helper} ... ok"))
-            && out.contains("test result: ok. 1 passed; 0 failed; 0 ignored;");
-        if !passed {
-            panic!(
-                "rules refusal helper did not pass exactly once; output complete: {output_complete}; retained {}\n{out}\n{err}",
-                temporary.keep().display()
-            );
-        }
-        temporary
-    }
-
-    pub(super) async fn read_rules_http_json(
-        client: &reqwest::Client,
-        bootstrap: &ApiTransportBootstrap,
-        method: reqwest::Method,
-        path: &str,
-        remaining_response_bytes: &mut usize,
-    ) -> Result<(reqwest::StatusCode, serde_json::Value), &'static str> {
-        const RESPONSE_LIMIT: usize = 64 * 1024;
-        *remaining_response_bytes = remaining_response_bytes
-            .checked_sub(RESPONSE_LIMIT)
-            .ok_or("rules request budget exhausted")?;
-        let mut response = client
-            .request(method, format!("{}{path}", bootstrap.base_url))
-            .header(transport::CAPABILITY_HEADER, &bootstrap.capability)
-            .header("origin", "http://localhost:1420")
-            .send()
-            .await
-            .map_err(|_| "rules request failed")?;
-        let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|size| size > RESPONSE_LIMIT as u64)
-        {
-            return Err("rules response exceeded its bound");
-        }
-        let mut bytes = Vec::with_capacity(RESPONSE_LIMIT);
-        while let Some(chunk) = response.chunk().await.map_err(|_| "rules body failed")? {
-            if chunk.len() > RESPONSE_LIMIT - bytes.len() {
-                return Err("rules response exceeded its bound");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value = serde_json::from_slice(&bytes).map_err(|_| "rules response was not JSON")?;
-        Ok((status, value))
-    }
-
-    #[tokio::test]
-    #[ignore = "rules refusal child isolates process-wide provider configuration"]
-    async fn unconfigured_rules_refusal_helper() {
-        use axial_app::performance::model::PerformanceRulesStatusResponse;
-        use futures_util::FutureExt;
-        use reqwest::{Method, StatusCode};
-        use serde_json::json;
-
-        let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        let mut response_budget = 7 * 64 * 1024;
-        let mut observations = Vec::with_capacity(7);
-        for first in [true, false] {
-            let services = match start_in_profile(root.clone(), Some("http://localhost:1420")).await
-            {
-                Ok(services) => services,
-                Err(failure) => {
-                    if let Err(retained) = failure.try_preserve() {
-                        std::mem::forget(retained);
-                    }
-                    panic!("rules refusal profile could not start; parent retains fixture");
-                }
-            };
-            let bootstrap = services.server.bootstrap();
-            let reads = std::panic::AssertUnwindSafe(async {
-                observations.push(
-                    read_rules_http_json(
-                        &client,
-                        &bootstrap,
-                        Method::GET,
-                        "/api/v1/performance/status",
-                        &mut response_budget,
-                    )
-                    .await?,
-                );
-                observations.push(
-                    read_rules_http_json(
-                        &client,
-                        &bootstrap,
-                        Method::GET,
-                        "/api/v1/config",
-                        &mut response_budget,
-                    )
-                    .await?,
-                );
-                if first {
-                    observations.push(
-                        read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::POST,
-                            "/api/v1/performance/rules/refresh",
-                            &mut response_budget,
-                        )
-                        .await?,
-                    );
-                    observations.push(
-                        read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::GET,
-                            "/api/v1/performance/status",
-                            &mut response_budget,
-                        )
-                        .await?,
-                    );
-                    observations.push(
-                        read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::GET,
-                            "/api/v1/config",
-                            &mut response_budget,
-                        )
-                        .await?,
-                    );
-                }
-                Ok::<_, &'static str>(())
-            })
-            .catch_unwind()
-            .await;
-            let shutdown = std::panic::AssertUnwindSafe(tokio::time::timeout(
-                Duration::from_secs(45),
-                services.server.shutdown(),
-            ))
-            .catch_unwind()
-            .await;
-            let settled = services.server.is_shutdown_settled();
-            if !matches!(shutdown, Ok(Ok(Ok(())))) || !settled {
-                std::mem::forget(services);
-                panic!("rules refusal shutdown did not settle; parent retains fixture");
-            }
-            drop(services);
-            reads
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                .unwrap();
-        }
-
-        assert_eq!(observations.len(), 7);
-        for index in [0, 1, 3, 4, 5, 6] {
-            assert_eq!(observations[index].0, StatusCode::OK);
-        }
-        let initial: PerformanceRulesStatusResponse =
-            serde_json::from_value(observations[0].1.clone()).unwrap();
-        assert!(!initial.status.remote_refresh);
-        assert_eq!(observations[2].0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            observations[2].1,
-            json!({"error":"performance remote rules url is not configured"})
-        );
-        assert_eq!(observations[3].1, observations[0].1);
-        assert_eq!(observations[5].1, observations[0].1);
-        assert_eq!(observations[4].1, observations[1].1);
-        assert_eq!(observations[6].1, observations[1].1);
-    }
-
-    #[tokio::test]
-    async fn provider_rules_refusal_retains_verified_cache_after_reopen() {
-        use ed25519_dalek::{Signer, SigningKey};
-        use futures_util::FutureExt;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut manifest = axial_performance::builtin_manifest().unwrap();
-        manifest.generated_at = "2001-01-01T00:00:00Z".into();
-        let body = axial_performance::canonical_manifest_payload(&manifest).unwrap();
-        assert!(body.len() <= 1024 * 1024);
-        let key = SigningKey::from_bytes(&[23; 32]);
-        let public_key = hex::encode(key.verifying_key().to_bytes());
-        let signature = hex::encode(key.sign(&body).to_bytes());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/rules", listener.local_addr().unwrap());
-        let provider = tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(120), async {
-                let mut request_budget: usize = 3 * 8192;
-                let mut response_budget: usize = 1024 * 1024 + 4096;
-                for index in 0..3 {
-                    request_budget = request_budget.checked_sub(8192)
-                        .ok_or("provider request budget exhausted")?;
-                    let (mut stream, _) = listener.accept().await
-                        .map_err(|_| "provider accept failed")?;
-                    let mut request = vec![0; 8192];
-                    let mut length = 0;
-                    while !request[..length].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                        if length == request.len() {
-                            return Err("provider request exceeded its bound");
-                        }
-                        let count = stream.read(&mut request[length..]).await
-                            .map_err(|_| "provider request read failed")?;
-                        if count == 0 {
-                            return Err("provider request ended early");
-                        }
-                        length += count;
-                    }
-                    if !request[..length].starts_with(b"GET /rules HTTP/1.1\r\n") {
-                        return Err("provider request was not the expected GET");
-                    }
-                    let headers = if index == 0 {
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-axial-rules-signature-ed25519: {signature}\r\nConnection: close\r\n\r\n",
-                            body.len(),
-                        )
-                    } else {
-                        "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
-                    };
-                    let response_size = headers.len() + if index == 0 { body.len() } else { 0 };
-                    response_budget = response_budget.checked_sub(response_size)
-                        .ok_or("provider response budget exhausted")?;
-                    stream.write_all(headers.as_bytes()).await
-                        .map_err(|_| "provider headers failed")?;
-                    if index == 0 {
-                        stream.write_all(&body).await.map_err(|_| "provider body failed")?;
-                    }
-                    stream.shutdown().await.map_err(|_| "provider close failed")?;
-                }
-                Ok::<_, &'static str>(())
-            })
-            .await
-            .map_err(|_| "provider exceeded its deadline")?
-        });
-        let child = std::panic::AssertUnwindSafe(run_rules_http_child(
-            "tests::provider_rules_refusal_helper",
-            &url,
-            &public_key,
-        ))
-        .catch_unwind()
-        .await;
-        let provided = provider.await;
-        let temporary = child.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        if !matches!(provided, Ok(Ok(()))) {
-            panic!(
-                "rules provider did not join after its three responses; retained {}",
-                temporary.keep().display()
-            );
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "rules provider child isolates process-wide trust configuration"]
-    async fn provider_rules_refusal_helper() {
-        use axial_app::performance::model::PerformanceRulesStatusResponse;
-        use axial_performance::{RuleChannel, RuleSource, RulesCacheState, RulesValidation};
-        use futures_util::FutureExt;
-        use reqwest::{Method, StatusCode};
-        use serde_json::json;
-
-        let root = PathBuf::from(std::env::var_os("AXIAL_TEST_RULES_PROFILE").unwrap());
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
-        // Two polls admit at most 64 reads each; the remaining five requests are fixed.
-        let mut response_budget = (2 * 64 + 5) * 64 * 1024;
-        let mut observations = Vec::with_capacity(7);
-        for first in [true, false] {
-            let services = match start_in_profile(root.clone(), Some("http://localhost:1420")).await
-            {
-                Ok(services) => services,
-                Err(failure) => {
-                    if let Err(retained) = failure.try_preserve() {
-                        std::mem::forget(retained);
-                    }
-                    panic!("provider rules profile could not start; parent retains fixture");
-                }
-            };
-            let bootstrap = services.server.bootstrap();
-            let reads = std::panic::AssertUnwindSafe(async {
-                let ready = tokio::time::timeout(Duration::from_secs(15), async {
-                    for _ in 0..64 {
-                        let response = read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::GET,
-                            "/api/v1/performance/status",
-                            &mut response_budget,
-                        )
-                        .await?;
-                        if response.0 != StatusCode::OK {
-                            return Err("rules status was unavailable");
-                        }
-                        let decoded: PerformanceRulesStatusResponse =
-                            serde_json::from_value(response.1.clone())
-                                .map_err(|_| "rules status did not decode")?;
-                        if decoded.status.rule_source == RuleSource::Remote
-                            && decoded.status.generated_at == "2001-01-01T00:00:00Z"
-                            && (first || decoded.status.rules_cache.warning.is_some())
-                        {
-                            return Ok(response);
-                        }
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    Err("rules startup observation exhausted its request bound")
-                })
-                .await
-                .map_err(|_| "rules startup observation exceeded its deadline")??;
-                observations.push(ready);
-                observations.push(
-                    read_rules_http_json(
-                        &client,
-                        &bootstrap,
-                        Method::GET,
-                        "/api/v1/config",
-                        &mut response_budget,
-                    )
-                    .await?,
-                );
-                if first {
-                    observations.push(
-                        read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::POST,
-                            "/api/v1/performance/rules/refresh",
-                            &mut response_budget,
-                        )
-                        .await?,
-                    );
-                    observations.push(
-                        read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::GET,
-                            "/api/v1/performance/status",
-                            &mut response_budget,
-                        )
-                        .await?,
-                    );
-                    observations.push(
-                        read_rules_http_json(
-                            &client,
-                            &bootstrap,
-                            Method::GET,
-                            "/api/v1/config",
-                            &mut response_budget,
-                        )
-                        .await?,
-                    );
-                }
-                Ok::<_, &'static str>(())
-            })
-            .catch_unwind()
-            .await;
-            let shutdown = std::panic::AssertUnwindSafe(tokio::time::timeout(
-                Duration::from_secs(45),
-                services.server.shutdown(),
-            ))
-            .catch_unwind()
-            .await;
-            let settled = services.server.is_shutdown_settled();
-            if !matches!(shutdown, Ok(Ok(Ok(())))) || !settled {
-                std::mem::forget(services);
-                panic!("provider rules shutdown did not settle; parent retains fixture");
-            }
-            drop(services);
-            reads
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                .unwrap();
-        }
-
-        assert_eq!(observations.len(), 7);
-        for index in [0, 1, 3, 4, 5, 6] {
-            assert_eq!(observations[index].0, StatusCode::OK);
-        }
-        let initial: PerformanceRulesStatusResponse =
-            serde_json::from_value(observations[0].1.clone()).unwrap();
-        assert_eq!(initial.status.rule_source, RuleSource::Remote);
-        assert_eq!(initial.status.rule_channel, RuleChannel::Remote);
-        assert_eq!(initial.status.validation, RulesValidation::Valid);
-        assert!(initial.status.remote_refresh && initial.status.rules_cache.recorded);
-        assert_eq!(initial.status.rules_cache.state, RulesCacheState::Recorded);
-        assert!(initial.status.last_refresh_at.is_some());
-        assert_eq!(
-            initial.status.last_refresh_at,
-            initial.status.rules_cache.updated_at
-        );
-        assert!(initial.status.rules_cache.loaded_at.is_some());
-        assert!(initial.status.rules_cache.warning.is_none() && initial.status.warnings.is_empty());
-        for index in [3, 5] {
-            let observed: PerformanceRulesStatusResponse =
-                serde_json::from_value(observations[index].1.clone()).unwrap();
-            let warning = observed.status.rules_cache.warning.clone().unwrap();
-            assert!(!warning.is_empty());
-            assert_eq!(observed.status.warnings, vec![warning.clone()]);
-            assert_eq!(observed.view_model.warnings, vec![warning]);
-            let mut normalized = observations[index].1.clone();
-            normalized["rules_cache"]["warning"] =
-                observations[0].1["rules_cache"]["warning"].clone();
-            normalized["warnings"] = observations[0].1["warnings"].clone();
-            normalized["view_model"]["warnings"] =
-                observations[0].1["view_model"]["warnings"].clone();
-            if index == 5 {
-                assert!(observed.status.rules_cache.loaded_at.is_some());
-                normalized["rules_cache"]["loaded_at"] =
-                    observations[0].1["rules_cache"]["loaded_at"].clone();
-            }
-            assert_eq!(normalized, observations[0].1);
-        }
-        assert_eq!(observations[4].1, observations[1].1);
-        assert_eq!(observations[6].1, observations[1].1);
-        assert_eq!(observations[2].0, StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            observations[2].1,
-            json!({
-                "error":"Performance rules provider response could not be verified. Try again later."
-            })
-        );
-    }
-
-    #[tokio::test]
     async fn loopback_server_authenticates_real_settings_and_reopens_profile() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("replacement");
@@ -1983,7 +1414,7 @@ mod tests {
         };
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("replacement");
-        let services = start_profile(root.clone(), None, false, collector())
+        let services = start_profile(root.clone(), None, false, collector(), Default::default())
             .await
             .unwrap();
         assert!(!services.telemetry.report_startup_failure());
@@ -2005,7 +1436,9 @@ mod tests {
         let first_batches: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
         // The initial launch occurred without consent. The reopened launch
         // must observe persisted consent before publishing its startup event.
-        let reopened = start_profile(root, None, false, collector()).await.unwrap();
+        let reopened = start_profile(root, None, false, collector(), Default::default())
+            .await
+            .unwrap();
         assert_eq!(
             reopened.settings.telemetry_identity().unwrap().as_deref(),
             Some(identity.as_str())
@@ -2051,9 +1484,10 @@ mod tests {
             let temporary =
                 tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             let root = temporary.path().join("profile");
-            let services = start_profile(root.clone(), None, false, collector())
-                .await
-                .unwrap();
+            let services =
+                start_profile(root.clone(), None, false, collector(), Default::default())
+                    .await
+                    .unwrap();
             let bootstrap = services.server.bootstrap();
             reqwest::Client::new()
                 .put(format!("{}/api/v1/config", bootstrap.base_url))
@@ -2085,6 +1519,7 @@ mod tests {
                 None,
                 false,
                 configured.then(collector).flatten(),
+                Default::default(),
             )
             .await
             .err()

@@ -323,6 +323,7 @@ pub(super) mod tests {
                 ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap(),
             ),
             crate::performance::public_transfer_resolver(),
+            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
         let performance = performance
@@ -331,7 +332,7 @@ pub(super) mod tests {
                 performance.resolution_request(
                     version_id.into(),
                     "vanilla".into(),
-                    axial_performance::PerformanceMode::Vanilla,
+                    crate::performance::model::PerformanceMode::Vanilla,
                 ),
             )
             .await

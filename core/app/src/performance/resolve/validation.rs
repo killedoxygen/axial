@@ -1,7 +1,7 @@
 use super::app_version::validate_app_version_compatibility;
-use super::model::ResolveError;
+use super::error::ResolveError;
 use super::version::{parse_version, split_range_condition};
-use crate::types::{
+use crate::performance::model::{
     EmergencyDisableTarget, ManagedArtifactDefinition, ManagedMod, Manifest, OwnershipClass,
 };
 

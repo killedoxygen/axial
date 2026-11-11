@@ -1,12 +1,12 @@
-use super::model::InstallError;
+use super::InstallError;
 use super::plan::{ManagedArtifactPin, ManagedCompositionInstallPlan};
-use crate::state::{
+use super::state::{
     ManagedArtifactCandidateIntent, prepare_managed_artifact_addition,
     prepare_managed_artifact_candidate, publish_managed_artifact_addition,
     reconcile_managed_candidate_intents,
 };
-use crate::storage::{ManagedInstanceEffectAuthority, ManagedStorageDirectory, ManagedStorageFile};
-use crate::types::{
+use super::storage::{ManagedInstanceEffectAuthority, ManagedStorageDirectory, ManagedStorageFile};
+use crate::performance::model::{
     CompositionState, InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider,
     ManagedArtifactSource, ManagedDependencyStateEdge, OwnershipClass,
 };
@@ -87,7 +87,7 @@ impl ManagedArtifactStage for StagedManagedArtifact {
         destination.copy_file_create_new(
             &self.candidate,
             std::path::Path::new(&self.installed.filename),
-            crate::MANAGED_ARTIFACT_MAX_BYTES,
+            super::MANAGED_ARTIFACT_MAX_BYTES,
         )?;
         publish_managed_artifact_addition(destination, &self.installed, &addition)?;
         Ok(())
@@ -182,12 +182,11 @@ pub(super) async fn stage_managed_graph(
     }
     let effect_authority = Arc::new(instance_mods.effect_owner().clone());
     let root = instance_mods.clone();
-    let prepared =
-        super::mutation::run_managed_blocking(axial_resource::PhysicalIoClass::Write, move || {
-            prepare_transfer_targets(&root, pins, effect_authority)
-        })
-        .await
-        .map_err(|_| InstallError::Io(io::Error::other("managed candidate preparation stopped")))?;
+    let prepared = super::run_managed_blocking(axial_resource::PhysicalIoClass::Write, move || {
+        prepare_transfer_targets(&root, pins, effect_authority)
+    })
+    .await
+    .map_err(|_| InstallError::Io(io::Error::other("managed candidate preparation stopped")))?;
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err((error, prepared)) => {
@@ -267,7 +266,7 @@ pub(super) async fn stage_managed_graph(
     }
 
     let root = instance_mods.clone();
-    super::mutation::run_managed_blocking(axial_resource::PhysicalIoClass::Heavy, move || {
+    super::run_managed_blocking(axial_resource::PhysicalIoClass::Heavy, move || {
         publish_transfer_candidates(&root, complete)
     })
     .await
@@ -381,7 +380,7 @@ async fn abort_prepared_transfers(
     original: InstallError,
 ) -> Result<Vec<StagedManagedArtifact>, InstallError> {
     let root = instance_mods.clone();
-    super::mutation::run_managed_blocking(axial_resource::PhysicalIoClass::Heavy, move || {
+    super::run_managed_blocking(axial_resource::PhysicalIoClass::Heavy, move || {
         for prepared in prepared {
             if let TransferTargetCancelOutcome::Pending(obligation) = prepared.target.cancel() {
                 members.push(TransferRecoveryMember::TargetCancel(obligation));
@@ -505,7 +504,7 @@ fn publish_transfer_candidates(
                         .bind_transient_publication(intent.candidate_name(), file)?;
                     if candidate.size() != installed.size
                         || !candidate
-                            .sha512(crate::MANAGED_ARTIFACT_MAX_BYTES)?
+                            .sha512(super::MANAGED_ARTIFACT_MAX_BYTES)?
                             .eq_ignore_ascii_case(&installed.integrity.sha512)
                     {
                         return Err(invalid_transfer_plan());

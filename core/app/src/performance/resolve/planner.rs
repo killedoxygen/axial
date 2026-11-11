@@ -1,5 +1,5 @@
 use super::version::{compare_release_version, parse_version, version_in_range};
-use crate::types::{
+use crate::performance::model::{
     CompositionDef, CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget,
     HardwareProfile, ManagedMod, Manifest, ModCondition, PerformanceMode, ResolutionRequest,
     VersionFamily,

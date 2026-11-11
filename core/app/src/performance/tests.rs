@@ -1,12 +1,12 @@
 use super::*;
+use crate::performance::composition::{
+    ManagedCompositionAuthority, ManagedCompositionInstallPlan, ManagedRollbackOutcome,
+};
+use crate::performance::model::{CompositionPlan, CompositionTier, PerformanceMode};
 use crate::{
     files::PortableName,
     library::{LibraryLifecycle, LibraryOpenOutcome},
     storage::MetadataStore,
-};
-use axial_performance::{
-    CompositionPlan, CompositionTier, ManagedCompositionInstallPlan, ManagedRollbackOutcome,
-    PerformanceManager, PerformanceMode,
 };
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ fn empty_plan() -> ManagedCompositionInstallPlan {
     ManagedCompositionInstallPlan::seal(
         CompositionPlan {
             composition_id: "fixture-managed".into(),
-            family: axial_performance::types::VersionFamily::F,
+            family: crate::performance::model::VersionFamily::F,
             loader: "fabric".into(),
             mode: PerformanceMode::Managed,
             tier: CompositionTier::Core,
@@ -60,13 +60,11 @@ async fn capability_bound_apply_remove_and_rollback_preserve_unmanaged_files_and
         .unwrap()
         .open_directory(&PortableName::new_exact("registered").unwrap())
         .unwrap();
-    let manager = Arc::new(PerformanceManager::new().unwrap());
-    let (authority, identity) = manager
-        .bind_admitted_instance(
-            "1c53a187-80d2-4396-9dc8-1d11dc3f03d0",
-            scope.capability().clone(),
-        )
-        .unwrap();
+    let (authority, identity) = ManagedCompositionAuthority::bind(
+        "1c53a187-80d2-4396-9dc8-1d11dc3f03d0",
+        scope.capability().clone(),
+    )
+    .unwrap();
     let effects = authority
         .bind_instance_effect_authority(&identity)
         .await
@@ -135,13 +133,10 @@ async fn admitted_identity_cannot_be_substituted_across_directory_authorities() 
     let b = root
         .open_directory(&PortableName::new_exact("b").unwrap())
         .unwrap();
-    let manager = Arc::new(PerformanceManager::new().unwrap());
-    let (authority_a, identity_a) = manager
-        .bind_admitted_instance("same-label", a.capability().clone())
-        .unwrap();
-    let (authority_b, identity_b) = manager
-        .bind_admitted_instance("same-label", b.capability().clone())
-        .unwrap();
+    let (authority_a, identity_a) =
+        ManagedCompositionAuthority::bind("same-label", a.capability().clone()).unwrap();
+    let (authority_b, identity_b) =
+        ManagedCompositionAuthority::bind("same-label", b.capability().clone()).unwrap();
     assert!(
         authority_a
             .bind_instance_effect_authority(&identity_b)
@@ -195,10 +190,8 @@ async fn cancelled_target_checkpoint_does_not_publish_managed_state() {
     let library = open_library(fixture.path());
     let pin = library.admit().unwrap();
     let scope = pin.files().unwrap();
-    let manager = Arc::new(PerformanceManager::new().unwrap());
-    let (authority, identity) = manager
-        .bind_admitted_instance("registered", scope.capability().clone())
-        .unwrap();
+    let (authority, identity) =
+        ManagedCompositionAuthority::bind("registered", scope.capability().clone()).unwrap();
     let effects = authority
         .bind_instance_effect_authority(&identity)
         .await
@@ -238,9 +231,9 @@ async fn cancelled_target_checkpoint_does_not_publish_managed_state() {
 async fn active_rule_lease_prevents_refresh_from_replacing_a_prepared_plan() {
     let storage = Arc::new(MetadataStore::in_memory().unwrap());
     storage.migrate(&[rules::MIGRATION]).unwrap();
-    let rules = rules::PerformanceRules::with_remote(storage, None, None).unwrap();
+    let rules = rules::PerformanceRules::new(storage, Default::default()).unwrap();
     let planned = rules
-        .plan(axial_performance::ResolutionRequest {
+        .plan(crate::performance::model::ResolutionRequest {
             game_version: "1.21.1".into(),
             loader: "fabric".into(),
             mode: PerformanceMode::Managed,

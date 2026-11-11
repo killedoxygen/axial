@@ -239,14 +239,23 @@ mod tests {
     use super::*;
     use crate::fixture::Profile;
     use axial_app::{
-        instances::model::InstancePatch, performance::rules::PerformanceRules,
+        instances::model::InstancePatch,
+        performance::{
+            composition::{
+                ManagedArtifactPin, ManagedArtifactTransferResolver, ManagedCompositionInstallPlan,
+            },
+            model::{
+                BundleHealth, CompositionPlan, CompositionTier, ManagedArtifactRole, ManagedMod,
+                ModCondition, PerformanceMode, RuleChannel, RuleSource, RulesValidation,
+                VersionFamily,
+            },
+            resolve::builtin_manifest,
+            rules::{
+                PerformanceRules, RulesCacheSnapshot, RulesSettings, RulesSignatureMetadata,
+                canonical_manifest_payload,
+            },
+        },
         storage::StorageError,
-    };
-    use axial_performance::{
-        CompositionPlan, CompositionTier, ManagedArtifactPin, ManagedArtifactRole,
-        ManagedArtifactTransferResolver, ManagedCompositionInstallPlan, PerformanceMode,
-        RulesCacheSnapshot, RulesSignatureMetadata,
-        types::{ManagedMod, ModCondition, VersionFamily},
     };
     use axum::{
         body::{Body, to_bytes},
@@ -308,7 +317,7 @@ mod tests {
 
         fn signed_rules_router(&self) -> Router {
             let key = SigningKey::from_bytes(&[23; 32]);
-            let mut manifest = axial_performance::builtin_manifest().unwrap();
+            let mut manifest = builtin_manifest().unwrap();
             manifest.generated_at = "2026-10-02T00:00:00Z".into();
             for composition in &mut manifest.compositions {
                 for artifact in &mut composition.mods {
@@ -318,15 +327,14 @@ mod tests {
                     }
                 }
             }
-            let signature =
-                key.sign(&axial_performance::canonical_manifest_payload(&manifest).unwrap());
+            let signature = key.sign(&canonical_manifest_payload(&manifest).unwrap());
             let snapshot = RulesCacheSnapshot {
-                rule_source: axial_performance::RuleSource::Remote,
-                rule_channel: axial_performance::RuleChannel::Remote,
+                rule_source: RuleSource::Remote,
+                rule_channel: RuleChannel::Remote,
                 schema_version: manifest.schema_version,
                 generated_at: manifest.generated_at.clone(),
                 updated_at: manifest.generated_at.clone(),
-                validation: axial_performance::RulesValidation::Valid,
+                validation: RulesValidation::Valid,
                 manifest,
                 signature: RulesSignatureMetadata {
                     signature: hex::encode(signature.to_bytes()),
@@ -345,10 +353,13 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            let rules = PerformanceRules::with_remote(
+            let rules = PerformanceRules::new(
                 self.profile.services.settings.metadata().clone(),
-                Some("https://example.invalid/rules".into()),
-                Some(hex::encode(key.verifying_key().to_bytes())),
+                RulesSettings::new(
+                    Some("https://example.invalid/rules"),
+                    Some(&hex::encode(key.verifying_key().to_bytes())),
+                    None,
+                ),
             )
             .unwrap();
             let service = self
@@ -453,7 +464,7 @@ mod tests {
                 .install_plan_for_test(&self.instance, plan, transfers)
                 .await
                 .unwrap();
-            assert_eq!(inspection.health, axial_performance::BundleHealth::Healthy);
+            assert_eq!(inspection.health, BundleHealth::Healthy);
             assert_eq!(inspection.state.unwrap().installed_mods.len(), 1);
             assert!(!inspection.rollback_snapshots.is_empty());
             stop.send(()).unwrap();
@@ -775,5 +786,173 @@ mod tests {
         }
         assert_eq!(before, after);
         assert_eq!(pending, 0);
+    }
+
+    const STARTUP_RULES: &str = "2001-01-01T00:00:00Z";
+    const EXPLICIT_RULES: &str = "2001-02-01T00:00:00Z";
+
+    fn signed_rules_response(key: &SigningKey, generated_at: &str) -> String {
+        let mut manifest = builtin_manifest().unwrap();
+        manifest.generated_at = generated_at.into();
+        let body = String::from_utf8(canonical_manifest_payload(&manifest).unwrap()).unwrap();
+        let signature = hex::encode(key.sign(body.as_bytes()).to_bytes());
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nx-axial-rules-signature-ed25519: {signature}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Serves one canned response per request, in order. Each request is
+    /// reported once its head is read; a gated response waits for release.
+    fn rules_provider(
+        responses: Vec<(Option<tokio::sync::oneshot::Receiver<()>>, String)>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/rules", listener.local_addr().unwrap());
+        let (accepted, requests) = tokio::sync::mpsc::unbounded_channel();
+        let provider = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            for (gate, response) in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut chunk = [0; 1024];
+                while !head.ends_with(b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0 && head.len() + count <= 8192);
+                    head.extend_from_slice(&chunk[..count]);
+                }
+                assert!(head.starts_with(b"GET /rules HTTP/1.1\r\n"));
+                accepted.send(()).unwrap();
+                if let Some(gate) = gate {
+                    gate.await.unwrap();
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        (url, requests, provider)
+    }
+
+    async fn configured_profile(url: &str, key: &SigningKey) -> Profile {
+        Profile::start_with(crate::TestInputs {
+            rules: RulesSettings::new(
+                Some(url),
+                Some(&hex::encode(key.verifying_key().to_bytes())),
+                None,
+            ),
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn configured_rules_refresh_at_startup_and_explicit_refresh_outlives_its_caller() {
+        let key = SigningKey::from_bytes(&[23; 32]);
+        let (release, held) = tokio::sync::oneshot::channel();
+        let (url, mut requests, provider) = rules_provider(vec![
+            (None, signed_rules_response(&key, STARTUP_RULES)),
+            (Some(held), signed_rules_response(&key, EXPLICIT_RULES)),
+        ]);
+        let profile = configured_profile(&url, &key).await;
+        let rules = profile.services.performance.rules().clone();
+        let tasks = profile.services.tasks.clone();
+        requests.recv().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rules.status().status.generated_at != STARTUP_RULES || !tasks.status().is_idle() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup did not publish the configured provider's rules");
+
+        let caller = tokio::spawn(
+            profile
+                .api
+                .builder(reqwest::Method::POST, "/api/v1/performance/rules/refresh")
+                .send(),
+        );
+        requests.recv().await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(
+            !tasks.status().is_idle(),
+            "caller loss released the accepted refresh"
+        );
+
+        let shutdown = profile.services.server.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), shutdown.as_mut())
+                .await
+                .is_err(),
+            "shutdown completed before the accepted refresh settled"
+        );
+        release.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert!(profile.services.server.is_shutdown_settled());
+        provider.await.unwrap();
+        let status = rules.status().status;
+        assert_eq!(status.generated_at, EXPLICIT_RULES);
+        assert_eq!(status.rule_source, RuleSource::Remote);
+        assert!(status.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rules_refresh_refusals_keep_their_public_errors() {
+        let unconfigured = Profile::start().await;
+        let refusal = unconfigured
+            .api
+            .response(
+                reqwest::Method::POST,
+                "/api/v1/performance/rules/refresh",
+                None,
+            )
+            .await;
+        unconfigured.close().await;
+        assert_eq!(
+            refusal,
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":"performance remote rules url is not configured"})
+            )
+        );
+
+        let key = SigningKey::from_bytes(&[23; 32]);
+        let unavailable =
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, mut requests, provider) =
+            rules_provider(vec![(None, unavailable.into()), (None, unavailable.into())]);
+        let profile = configured_profile(&url, &key).await;
+        requests.recv().await.unwrap();
+        let refusal = profile
+            .api
+            .response(
+                reqwest::Method::POST,
+                "/api/v1/performance/rules/refresh",
+                None,
+            )
+            .await;
+        let status = profile.services.performance.rules().status();
+        profile.close().await;
+        provider.await.unwrap();
+        assert_eq!(
+            refusal,
+            (
+                StatusCode::BAD_GATEWAY,
+                json!({"error":"Performance rules provider response could not be verified. Try again later."})
+            )
+        );
+        assert_eq!(status.status.rule_source, RuleSource::BuiltIn);
+        assert_eq!(
+            status.status.warnings,
+            vec!["Remote rules refresh failed: remote rules returned HTTP 503".to_string()]
+        );
+        assert_eq!(status.view_model.warnings, status.status.warnings);
     }
 }

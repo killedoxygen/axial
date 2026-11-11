@@ -1,8 +1,8 @@
 //! Read-only Performance admission for the instance owner's publication workflow.
 
 use super::PerformanceMutationError;
+use crate::performance::composition::{ManagedDuplicateFile, ManagedDuplicatePayload};
 use crate::{files::ScopedDirectory, instances::directory::RegisteredInstance};
-use axial_performance::{ManagedDuplicateFile, ManagedDuplicatePayload};
 
 pub(crate) struct PreparedDuplicate {
     source: RegisteredInstance,
@@ -64,22 +64,22 @@ pub(crate) fn verify_recovered(
 #[cfg(test)]
 pub(crate) async fn seed_managed(
     source: &RegisteredInstance,
-) -> axial_performance::CompositionState {
-    use axial_performance::{
+) -> crate::performance::model::CompositionState {
+    use crate::performance::composition::{
+        ManagedArtifactPin, ManagedCompositionAuthority, ManagedCompositionInstallPlan,
+        ManagedRollbackOutcome,
+    };
+    use crate::performance::model::{
         CompositionPlan, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
-        ManagedArtifactPin, ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource,
-        ManagedCompositionInstallPlan, ManagedRollbackOutcome, OwnershipClass, PerformanceManager,
-        PerformanceMode,
-        types::{ManagedMod, ModCondition},
+        ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource, ManagedMod,
+        ModCondition, OwnershipClass, PerformanceMode,
     };
     use sha2::{Digest, Sha512};
-    let manager = std::sync::Arc::new(PerformanceManager::new().unwrap());
-    let (authority, identity) = manager
-        .bind_admitted_instance(
-            source.record().instance.id.as_str(),
-            source.directory().capability().clone(),
-        )
-        .unwrap();
+    let (authority, identity) = ManagedCompositionAuthority::bind(
+        source.record().instance.id.as_str(),
+        source.directory().capability().clone(),
+    )
+    .unwrap();
     let effects = authority
         .bind_instance_effect_authority(&identity)
         .await
@@ -87,7 +87,7 @@ pub(crate) async fn seed_managed(
     let plan = ManagedCompositionInstallPlan::seal(
         CompositionPlan {
             composition_id: "duplicate-fixture".into(),
-            family: axial_performance::types::VersionFamily::F,
+            family: crate::performance::model::VersionFamily::F,
             loader: "fabric".into(),
             mode: PerformanceMode::Managed,
             tier: CompositionTier::Core,
@@ -197,7 +197,9 @@ mod tests {
         create::tests::{create, fixture, payload_path},
         duplicate::DuplicateRequest,
     };
-    use axial_performance::{ManagedRollbackOutcome, PerformanceManager, RollbackSnapshotTarget};
+    use crate::performance::composition::{
+        ManagedCompositionAuthority, ManagedRollbackOutcome, RollbackSnapshotTarget,
+    };
 
     #[tokio::test]
     async fn duplicate_preserves_managed_history_and_rollback_changes_only_the_new_instance() {
@@ -218,10 +220,11 @@ mod tests {
             .unwrap();
         let copied_path = payload_path(&service, &copied.id);
         let copy = service.directories().admit(&copied.id).unwrap();
-        let manager = std::sync::Arc::new(PerformanceManager::new().unwrap());
-        let (authority, identity) = manager
-            .bind_admitted_instance(copied.id.as_str(), copy.directory().capability().clone())
-            .unwrap();
+        let (authority, identity) = ManagedCompositionAuthority::bind(
+            copied.id.as_str(),
+            copy.directory().capability().clone(),
+        )
+        .unwrap();
         let effects = authority
             .bind_instance_effect_authority(&identity)
             .await

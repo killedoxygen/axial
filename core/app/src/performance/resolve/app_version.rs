@@ -1,4 +1,4 @@
-use super::model::ResolveError;
+use super::error::ResolveError;
 
 const RUNNING_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

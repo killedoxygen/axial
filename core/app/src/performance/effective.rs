@@ -1,7 +1,6 @@
-use crate::health::BundleHealth;
-use crate::types::{
-    CompositionPlan, CompositionTier, ManagedMod, ModCondition, OwnershipClass, PerformanceMode,
-    VersionFamily,
+use super::model::{
+    BundleHealth, CompositionPlan, CompositionTier, ManagedMod, ModCondition, OwnershipClass,
+    PerformanceMode, VersionFamily,
 };
 use serde::{Deserialize, Serialize};
 
@@ -373,8 +372,8 @@ mod tests {
         EffectiveContributionSource, EffectiveLaunchSmoothingPolicy, EffectiveLoaderPosture,
         effective_performance_plan,
     };
-    use crate::health::BundleHealth;
-    use crate::types::{
+    use crate::performance::model::BundleHealth;
+    use crate::performance::model::{
         CompositionPlan, CompositionTier, HardwareRequirement, ManagedMod, ModCondition,
         OwnershipClass, PerformanceMode, VersionFamily,
     };

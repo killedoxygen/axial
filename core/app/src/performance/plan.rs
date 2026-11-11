@@ -1,5 +1,14 @@
 //! Complete managed dependency plans. Provider graphs are sealed before effects.
 
+use super::composition::{
+    ManagedArtifactPin, ManagedCompositionInstallPlan, ManagedDependencyEdge,
+};
+use super::effective::effective_performance_plan;
+use super::model::{
+    CompositionPlan, ManagedArtifactRole, ModeSource, PerformanceMode, PerformancePlanResponse,
+    PlanInputError, ResolvedPerformanceMode,
+};
+use super::resolve::parse_mode;
 use crate::content::catalog::ContentService;
 use crate::content::model::{CanonicalId, ContentKind, DependencyKind, ProviderId};
 use crate::content::provenance::{ContentManifest, LiveManagedContent};
@@ -7,17 +16,8 @@ use crate::content::resolve::{
     ContentResolution, ResolutionReason, ResolutionSelection, ResolutionTarget,
     ResolvedContentItem, resolve_content,
 };
-use axial_performance::{
-    CompositionPlan, ManagedArtifactPin, ManagedArtifactRole, ManagedCompositionInstallPlan,
-    ManagedDependencyEdge,
-};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-
-use super::model::{
-    ModeSource, PerformanceMode, PerformancePlanResponse, PlanInputError, ResolvedPerformanceMode,
-};
-pub use axial_performance::{effective_performance_plan, parse_mode, resolve_plan};
 
 /// An explicit invalid choice is rejected. Empty instance values inherit the
 /// user's selected global default; Managed, Vanilla and Custom all survive.
@@ -348,7 +348,7 @@ mod tests {
     use super::*;
     use crate::content::model::{ContentDependency, FileRef};
     use crate::content::resolve::{ResolutionConflict, ResolutionConflictReason};
-    use axial_performance::types::{
+    use crate::performance::model::{
         CompositionTier, ManagedMod, ModCondition, PerformanceMode, VersionFamily,
     };
 

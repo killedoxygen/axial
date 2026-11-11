@@ -1,9 +1,20 @@
 //! Accepted Performance work owns its registered instance until exact settlement.
 
+use super::composition::{
+    ManagedArtifactTransferResolver, ManagedArtifactWitnessProof, ManagedCompositionAuthority,
+    ManagedCompositionInspection, ManagedCompositionInstallPlan, ManagedInstallExecutionError,
+    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError,
+    ManagedResolvedInspection, ManagedRollbackOutcome, RollbackSnapshotSummary,
+};
+use super::effective::{EffectivePerformancePlan, effective_performance_plan};
+use super::model::{
+    BundleHealth, CompositionPlan, CompositionState, PerformanceMode,
+    PerformanceRulesStatusResponse, ResolutionRequest,
+};
 use super::{
     plan::{PreparedManagedPlan, prepare_managed_install},
     rollback::{ExpectedComposition, RestartDisposition, classify_recovered, select_snapshot},
-    rules::{PerformanceRules, PlannedPerformance, RulesWorkflowError},
+    rules::{PerformanceRules, PlannedPerformance, RulesSettings, RulesWorkflowError},
 };
 use crate::{
     content::catalog::ContentService,
@@ -16,11 +27,6 @@ use crate::{
         rusqlite::{self, Connection, OptionalExtension, Transaction, params},
     },
     tasks::{CancellationToken, TaskHandle, TaskOwner},
-};
-use axial_performance::{
-    CompositionPlan, CompositionState, ManagedArtifactTransferResolver,
-    ManagedCompositionAuthority, ManagedCompositionInspection, ManagedInstanceEffectAuthority,
-    ManagedInstanceIdentity, ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -420,8 +426,8 @@ impl PreparedPerformance {
     pub fn plan(&self) -> &CompositionPlan {
         self.planned.plan()
     }
-    pub fn effective(&self) -> axial_performance::EffectivePerformancePlan {
-        axial_performance::effective_performance_plan(self.plan())
+    pub fn effective(&self) -> EffectivePerformancePlan {
+        effective_performance_plan(self.plan())
     }
     pub fn validate_current(&self) -> Result<(), PerformanceMutationError> {
         self.instance
@@ -439,8 +445,9 @@ impl PerformanceService {
         tasks: TaskOwner,
         content: Arc<ContentService>,
         transfers: ManagedArtifactTransferResolver,
+        rules: RulesSettings,
     ) -> Result<Self, PerformanceMutationError> {
-        let rules = PerformanceRules::new(storage.clone())?;
+        let rules = PerformanceRules::new(storage.clone(), rules)?;
         let service = Self {
             storage,
             instances,
@@ -503,7 +510,7 @@ impl PerformanceService {
 
     pub async fn refresh_rules(
         &self,
-    ) -> Result<super::model::PerformanceRulesStatusResponse, RulesWorkflowError> {
+    ) -> Result<PerformanceRulesStatusResponse, RulesWorkflowError> {
         let rules = self.rules.clone();
         self.tasks
             .try_spawn(rules.clone(), move |_| async move { rules.refresh().await })
@@ -524,7 +531,7 @@ impl PerformanceService {
     pub async fn install_plan_for_test(
         &self,
         id: &InstanceId,
-        plan: axial_performance::ManagedCompositionInstallPlan,
+        plan: ManagedCompositionInstallPlan,
         transfers: ManagedArtifactTransferResolver,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
         let instance = self
@@ -583,7 +590,7 @@ impl PerformanceService {
     pub async fn managed_witness_proofs(
         &self,
         instance: &RegisteredInstance,
-    ) -> Result<Vec<axial_performance::ManagedArtifactWitnessProof>, PerformanceMutationError> {
+    ) -> Result<Vec<ManagedArtifactWitnessProof>, PerformanceMutationError> {
         let instance = instance.clone();
         let service = self.clone();
         self.tasks
@@ -784,7 +791,7 @@ impl PerformanceService {
             game_version,
             loader,
             mode,
-            hardware: self.rules.manager().hardware(),
+            hardware: self.rules.hardware(),
             installed_mods: Vec::new(),
         }
     }
@@ -802,9 +809,9 @@ impl PerformanceService {
         &self,
         id: &InstanceId,
         request: ResolutionRequest,
-    ) -> Result<axial_performance::ManagedResolvedInspection, PerformanceMutationError> {
+    ) -> Result<ManagedResolvedInspection, PerformanceMutationError> {
         let (inspection, plan) = self.inspect_owned(id, Some(request)).await?;
-        Ok(axial_performance::ManagedResolvedInspection {
+        Ok(ManagedResolvedInspection {
             inspection,
             plan: plan.ok_or(PerformanceMutationError::PlanUnavailable)?,
         })
@@ -843,16 +850,12 @@ impl PerformanceService {
                 let checkpoint_bound = bound.clone();
                 let admit = move || {
                     admission.validate_current().map_err(|_| {
-                        axial_performance::ManagedMutationError::reconciliation_required(
-                            "instance_changed",
-                        )
+                        ManagedMutationError::reconciliation_required("instance_changed")
                     })?;
                     checkpoint_service
                         .begin(&checkpoint_for_admission)
                         .map_err(|_| {
-                            axial_performance::ManagedMutationError::reconciliation_required(
-                                "inspection_checkpoint",
-                            )
+                            ManagedMutationError::reconciliation_required("inspection_checkpoint")
                         })?;
                     checkpoint_service.retain(admission.clone(), Some(checkpoint_bound));
                     Ok(admission)
@@ -862,9 +865,16 @@ impl PerformanceService {
                         // Keep validated rules pinned while the leaf replaces
                         // caller evidence with this admitted instance's files.
                         let _rules = service.rules.plan(request.clone()).await?;
+                        let rules = service.rules.clone();
                         bound
                             .authority
-                            .resolve_and_inspect(&bound.identity, &bound.effects, request, admit)
+                            .resolve_and_inspect(
+                                &bound.identity,
+                                &bound.effects,
+                                request,
+                                move |request| rules.resolve(request),
+                                admit,
+                            )
                             .await
                             .map(|resolved| (resolved.inspection, Some(resolved.plan)))
                     }
@@ -982,7 +992,7 @@ impl PerformanceService {
             .try_spawn(instance.clone(), move |_| async move {
                 let bound = service.bind(instance.clone()).await?;
                 let inspection = service.recover_bound(&bound).await?;
-                if inspection.health == axial_performance::BundleHealth::Invalid {
+                if inspection.health == BundleHealth::Invalid {
                     return Err(PerformanceMutationError::PlanUnavailable);
                 }
                 let mut request = request;
@@ -1032,7 +1042,7 @@ impl PerformanceService {
                     .map_err(|_| PerformanceMutationError::Unsettled)?;
                 let bound = self.bind(instance).await?;
                 let inspection = self.recover_bound(&bound).await?;
-                if inspection.health == axial_performance::BundleHealth::Invalid {
+                if inspection.health == BundleHealth::Invalid {
                     return Err(PerformanceMutationError::Unsettled);
                 }
                 let command = self.storage.read(|db| pending_command(db, &pending))?;
@@ -1159,7 +1169,7 @@ impl PerformanceService {
                 return Err(PerformanceMutationError::PlanUnavailable);
             }
             let inspection = self.recover_bound(bound).await?;
-            if inspection.health == axial_performance::BundleHealth::Invalid {
+            if inspection.health == BundleHealth::Invalid {
                 return Err(PerformanceMutationError::Unsettled);
             }
             if inspection.state != pending.before {
@@ -1223,14 +1233,11 @@ impl PerformanceService {
         {
             return Ok(bound);
         }
-        let (authority, identity) = self
-            .rules
-            .manager()
-            .bind_admitted_instance(
-                instance.record().instance.id.as_str(),
-                instance.directory().capability().clone(),
-            )
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+        let (authority, identity) = ManagedCompositionAuthority::bind(
+            instance.record().instance.id.as_str(),
+            instance.directory().capability().clone(),
+        )
+        .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
         let effects = authority
             .bind_instance_effect_authority(&identity)
             .await
@@ -1363,11 +1370,8 @@ impl PerformanceService {
                         Some(outcome.into_state())
                     })
                     .map_err(|error| match error {
-                        axial_performance::ManagedInstallExecutionError::BeforeTargetEffect {
-                            error,
-                            ..
-                        } => error,
-                        axial_performance::ManagedInstallExecutionError::Mutation { .. } => {
+                        ManagedInstallExecutionError::BeforeTargetEffect(error) => error,
+                        ManagedInstallExecutionError::Mutation(_) => {
                             PerformanceMutationError::Failed
                         }
                     })
@@ -1410,7 +1414,7 @@ impl PerformanceService {
             .filter(|stored| same_preparation(stored, &pending))
             .ok_or(PerformanceMutationError::Unsettled)?;
         let inspection = self.recover_bound(&bound).await?;
-        if inspection.health == axial_performance::BundleHealth::Invalid {
+        if inspection.health == BundleHealth::Invalid {
             return Err(PerformanceMutationError::Unsettled);
         }
         let completed = pending.result.as_ref().map(CompletedComposition::state);
@@ -1571,7 +1575,7 @@ impl PerformanceService {
 enum Action {
     Apply(PreparedManagedPlan),
     Remove,
-    Rollback(axial_performance::RollbackSnapshotSummary),
+    Rollback(RollbackSnapshotSummary),
 }
 
 impl Action {
@@ -1656,6 +1660,7 @@ mod tests {
             service.tasks.clone(),
             service.content.clone(),
             service.transfers.clone(),
+            RulesSettings::default(),
         )
     }
 
@@ -2229,16 +2234,15 @@ mod tests {
         let content = ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap())
             .unwrap()
             .with_cancellation(cancelled);
-        let mut service = PerformanceService::new(
+        PerformanceService::new(
             storage.clone(),
             directories,
             TaskOwner::new(8).unwrap(),
             Arc::new(content),
             super::super::public_transfer_resolver(),
+            RulesSettings::default(),
         )
-        .unwrap();
-        service.rules = PerformanceRules::with_remote(storage, None, None).unwrap();
-        service
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2287,7 +2291,7 @@ mod tests {
                         !snapshot.latest
                             && snapshot.rollback_available
                             && snapshot.target
-                                == axial_performance::RollbackSnapshotTarget::ManagedStateAbsent
+                                == crate::performance::composition::RollbackSnapshotTarget::ManagedStateAbsent
                     })
                     .unwrap()
                     .id
@@ -3214,6 +3218,7 @@ mod tests {
             TaskOwner::new(8).unwrap(),
             content,
             transfers,
+            RulesSettings::default(),
         )
         .unwrap();
         assert_eq!(
@@ -3329,15 +3334,15 @@ mod tests {
         let content = ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap())
             .unwrap()
             .with_cancellation(cancelled);
-        let mut service = PerformanceService::new(
+        let service = PerformanceService::new(
             storage.clone(),
             directories.clone(),
             tasks,
             Arc::new(content),
             super::super::public_transfer_resolver(),
+            RulesSettings::default(),
         )
         .unwrap();
-        service.rules = PerformanceRules::with_remote(storage, None, None).unwrap();
         let admitted = directories.admit(&instance.id).unwrap();
         (root, service, admitted)
     }
@@ -3396,7 +3401,7 @@ mod tests {
         );
         assert_eq!(
             prepared.effective(),
-            axial_performance::effective_performance_plan(prepared.plan())
+            crate::performance::effective::effective_performance_plan(prepared.plan())
         );
         prepared.validate_current().unwrap();
         assert_eq!(payload_files(&path), before);

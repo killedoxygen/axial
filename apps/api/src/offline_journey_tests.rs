@@ -622,7 +622,10 @@ impl PerformanceProvider {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let make_routes = |mod_version: &str| {
             let mut routes = BTreeMap::new();
-            for artifact in axial_performance::builtin_manifest().unwrap().artifacts {
+            for artifact in axial_app::performance::resolve::builtin_manifest()
+                .unwrap()
+                .artifacts
+            {
                 let project = artifact.source.project_id;
                 let bytes = archive(
                     "fabric.mod.json",
@@ -763,12 +766,14 @@ impl Drop for PerformanceProvider {
     }
 }
 
-fn performance_fixture_transfers(base: &str) -> axial_performance::ManagedArtifactTransferResolver {
+fn performance_fixture_transfers(
+    base: &str,
+) -> axial_app::performance::composition::ManagedArtifactTransferResolver {
     use axial_minecraft::download::{
         RetryPolicy, TransferClient, TransferClientConfig, TransferOrigin,
     };
     let expected = url::Url::parse(base).unwrap().origin();
-    axial_performance::ManagedArtifactTransferResolver::new(
+    axial_app::performance::composition::ManagedArtifactTransferResolver::new(
         move |url| {
             let expected = expected.clone();
             async move {

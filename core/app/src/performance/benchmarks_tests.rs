@@ -85,6 +85,7 @@ fn service_with_directories(
         tasks.clone(),
         content,
         super::super::public_transfer_resolver(),
+        crate::performance::rules::RulesSettings::default(),
     )
     .unwrap();
     let pin = library.admit_application_root().unwrap();

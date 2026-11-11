@@ -1,7 +1,7 @@
-use crate::MANAGED_ARTIFACT_MAX_BYTES;
-use crate::types::{
-    CompositionPlan, CompositionState, CompositionTier, ManagedDependencyStateEdge,
-    PerformanceMode, VersionFamily,
+use super::MANAGED_ARTIFACT_MAX_BYTES;
+use crate::performance::model::{
+    CompositionPlan, CompositionState, CompositionTier, ManagedArtifactRole,
+    ManagedDependencyStateEdge, PerformanceMode, VersionFamily,
 };
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use reqwest::Url;
@@ -25,8 +25,6 @@ impl ManagedArtifactRole {
         }
     }
 }
-
-pub use crate::types::ManagedArtifactRole;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedArtifactPin {
@@ -506,7 +504,7 @@ impl<'a> CanonicalGraphNode<'a> {
         }
     }
 
-    fn from_installed(installed: &'a crate::types::InstalledMod) -> Self {
+    fn from_installed(installed: &'a crate::performance::model::InstalledMod) -> Self {
         Self {
             project_id: &installed.project_id,
             version_id: &installed.version_id,
@@ -782,7 +780,7 @@ fn tier_name(tier: CompositionTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ManagedMod, ModCondition};
+    use crate::performance::model::{ManagedMod, ModCondition};
 
     const ROOT_A: &str = "AANobbMI";
     const ROOT_B: &str = "gvQqBUqZ";

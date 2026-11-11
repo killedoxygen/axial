@@ -4,10 +4,10 @@
 //! copies and publication receipts. A status row is never a substitute for those
 //! receipts and never grants cleanup authority.
 
-use axial_performance::{
-    CompositionState, ManagedCompositionInstallPlan, RollbackSnapshotSummary,
-    RollbackSnapshotTarget,
+use super::composition::{
+    ManagedCompositionInstallPlan, RollbackSnapshotSummary, RollbackSnapshotTarget,
 };
+use super::model::{CompositionState, OwnershipClass};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,8 +112,7 @@ impl ExpectedComposition {
                                     .integrity
                                     .sha512
                                     .eq_ignore_ascii_case(&expected.sha512)
-                                && installed.ownership_class
-                                    == axial_performance::OwnershipClass::CompositionManaged
+                                && installed.ownership_class == OwnershipClass::CompositionManaged
                         })
                     })
             }
@@ -199,12 +198,12 @@ mod tests {
         let summary = |id: &str| RollbackSnapshotSummary {
             id: id.into(),
             created_at: "2026-09-08T00:00:00Z".into(),
-            target: axial_performance::RollbackSnapshotTarget::ManagedStateAbsent,
+            target: crate::performance::composition::RollbackSnapshotTarget::ManagedStateAbsent,
             composition_id: None,
             tier: None,
             installed_count: 0,
             artifact_count: 0,
-            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
+            ownership_class: crate::performance::model::OwnershipClass::CompositionManaged,
             rollback_available: true,
             latest: true,
         };

@@ -1,15 +1,17 @@
-use crate::resolve::validate_manifest;
-use crate::types::Manifest;
+//! Ed25519 authentication of remote rules manifests.
+
+use crate::performance::model::Manifest;
+use crate::performance::resolve::{ResolveError, validate_manifest};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
-pub const PERFORMANCE_RULES_PUBLIC_KEY_ENV: &str = "AXIAL_PERFORMANCE_RULES_ED25519_PUBLIC_KEY";
-pub const RULES_SIGNATURE_HEADER: &str = "x-axial-rules-signature-ed25519";
-pub const RULES_KEY_ID_HEADER: &str = "x-axial-rules-key-id";
+pub(super) const SIGNATURE_HEADER: &str = "x-axial-rules-signature-ed25519";
+pub(super) const KEY_ID_HEADER: &str = "x-axial-rules-key-id";
 
 const PUBLIC_KEY_BYTES: usize = 32;
 const SIGNATURE_BYTES: usize = 64;
+const MAX_KEY_ID_CHARS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,12 +29,12 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+/// The configured trust anchor. Absent or malformed keys refuse every remote manifest.
 #[derive(Debug, Clone)]
-pub enum RemoteRulesVerifier {
-    Disabled,
+pub(super) enum RemoteRulesVerifier {
     MissingPublicKey,
-    InvalidPublicKey { warning: String },
-    Ready { public_key: VerifyingKey },
+    InvalidPublicKey,
+    Ready(VerifyingKey),
 }
 
 #[derive(Debug, Error)]
@@ -52,58 +54,39 @@ pub enum RulesSignatureError {
     #[error("failed to serialize remote rules signature payload: {0}")]
     Payload(#[from] serde_json::Error),
     #[error("remote performance manifest failed validation: {0}")]
-    Validation(#[from] crate::resolve::ResolveError),
+    Validation(#[from] ResolveError),
 }
 
 impl RemoteRulesVerifier {
-    pub fn disabled() -> Self {
-        Self::Disabled
-    }
-
-    pub fn from_public_key_hex(value: Option<String>) -> Self {
-        let Some(value) = value.map(|value| value.trim().to_string()) else {
-            return Self::MissingPublicKey;
-        };
-        if value.is_empty() {
-            return Self::MissingPublicKey;
-        }
-
-        match parse_public_key(&value) {
-            Ok(public_key) => Self::Ready { public_key },
-            Err(error) => Self::InvalidPublicKey {
-                warning: error.to_string(),
-            },
+    pub(super) fn from_public_key_hex(value: Option<&str>) -> Self {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Self::MissingPublicKey,
+            Some(value) => parse_public_key(value).map_or(Self::InvalidPublicKey, Self::Ready),
         }
     }
 
-    pub fn acceptance_warning(&self) -> Option<String> {
+    pub(super) fn public_key(&self) -> Result<&VerifyingKey, RulesSignatureError> {
         match self {
-            Self::Disabled | Self::Ready { .. } => None,
-            Self::MissingPublicKey => Some(
-                "Remote rules public key is not configured; using the built-in manifest."
-                    .to_string(),
-            ),
-            Self::InvalidPublicKey { warning } => {
-                Some(format!("{warning}; using the built-in manifest."))
-            }
+            Self::MissingPublicKey => Err(RulesSignatureError::MissingPublicKey),
+            Self::InvalidPublicKey => Err(RulesSignatureError::InvalidPublicKey),
+            Self::Ready(public_key) => Ok(public_key),
         }
     }
 
-    pub fn verify_manifest(
+    pub(super) fn verify_manifest(
         &self,
         manifest: &Manifest,
         metadata: &RulesSignatureMetadata,
     ) -> Result<(), RulesSignatureError> {
-        let Self::Ready { public_key } = self else {
-            return Err(match self {
-                Self::Disabled | Self::MissingPublicKey => RulesSignatureError::MissingPublicKey,
-                Self::InvalidPublicKey { .. } => RulesSignatureError::InvalidPublicKey,
-                Self::Ready { .. } => unreachable!(),
-            });
-        };
-
+        let public_key = self.public_key()?;
         validate_manifest(manifest)?;
-        validate_signature_metadata(metadata)?;
+        if metadata
+            .key_id
+            .as_deref()
+            .is_some_and(|key_id| !valid_key_id(key_id))
+        {
+            return Err(RulesSignatureError::InvalidKeyId);
+        }
         let payload = canonical_manifest_payload(manifest)?;
         let signature = parse_signature(&metadata.signature)?;
         public_key
@@ -112,25 +95,18 @@ impl RemoteRulesVerifier {
     }
 }
 
-fn validate_signature_metadata(
-    metadata: &RulesSignatureMetadata,
-) -> Result<(), RulesSignatureError> {
-    if let Some(key_id) = metadata.key_id.as_deref()
-        && (key_id.is_empty()
-            || key_id.trim() != key_id
-            || key_id.chars().count() > 64
-            || key_id.chars().any(char::is_control))
-    {
-        return Err(RulesSignatureError::InvalidKeyId);
-    }
-    Ok(())
+fn valid_key_id(key_id: &str) -> bool {
+    !key_id.is_empty()
+        && key_id.trim() == key_id
+        && key_id.chars().count() <= MAX_KEY_ID_CHARS
+        && !key_id.chars().any(char::is_control)
 }
 
 pub fn canonical_manifest_payload(manifest: &Manifest) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(manifest)
 }
 
-pub fn signature_metadata_from_header(
+pub(super) fn signature_metadata_from_header(
     signature: Option<&str>,
     key_id: Option<&str>,
 ) -> Result<RulesSignatureMetadata, RulesSignatureError> {
@@ -138,21 +114,12 @@ pub fn signature_metadata_from_header(
         return Err(RulesSignatureError::MissingSignature);
     };
     parse_signature(signature)?;
-    let key_id = match key_id {
-        Some(value)
-            if value.is_empty()
-                || value.trim() != value
-                || value.chars().count() > 64
-                || value.chars().any(char::is_control) =>
-        {
-            return Err(RulesSignatureError::InvalidKeyId);
-        }
-        Some(value) => Some(value.to_string()),
-        None => None,
-    };
+    if key_id.is_some_and(|key_id| !valid_key_id(key_id)) {
+        return Err(RulesSignatureError::InvalidKeyId);
+    }
     Ok(RulesSignatureMetadata {
         signature: signature.to_ascii_lowercase(),
-        key_id,
+        key_id: key_id.map(str::to_string),
     })
 }
 
@@ -178,14 +145,14 @@ mod tests {
         RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata,
         signature_metadata_from_header,
     };
-    use crate::resolve::builtin_manifest;
+    use crate::performance::resolve::builtin_manifest;
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn verifies_current_schema_manifest_payload() {
         let manifest = builtin_manifest().expect("builtin manifest");
         let (public_key, metadata) = signed_metadata(&manifest);
-        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(public_key));
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(&public_key));
 
         verifier
             .verify_manifest(&manifest, &metadata)
@@ -198,7 +165,7 @@ mod tests {
         let (public_key, metadata) = signed_metadata(&manifest);
         let mut changed = manifest.clone();
         changed.generated_at = "2026-05-30T15:00:00Z".to_string();
-        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(public_key));
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(&public_key));
 
         let error = verifier
             .verify_manifest(&changed, &metadata)
@@ -233,7 +200,9 @@ mod tests {
         ));
     }
 
-    fn signed_metadata(manifest: &crate::types::Manifest) -> (String, RulesSignatureMetadata) {
+    fn signed_metadata(
+        manifest: &crate::performance::model::Manifest,
+    ) -> (String, RulesSignatureMetadata) {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let payload = super::canonical_manifest_payload(manifest).expect("payload");
         let signature = signing_key.sign(&payload);

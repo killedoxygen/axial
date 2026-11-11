@@ -39,7 +39,6 @@ sha2.workspace = true
 [dev-dependencies]
 axial-app = { workspace = true, features = ["test-support"] }
 axial-minecraft = { workspace = true, features = ["test-support"] }
-axial-performance.workspace = true
 axial-resource.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true

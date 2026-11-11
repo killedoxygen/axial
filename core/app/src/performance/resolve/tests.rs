@@ -8,7 +8,7 @@ use super::{
     PERFORMANCE_MANIFEST_SCHEMA_VERSION, ResolveError, builtin_manifest, parse_mode, resolve_plan,
     validate_manifest,
 };
-use crate::types::{
+use crate::performance::model::{
     CompositionPlan, CompositionTier, EmergencyDisable, EmergencyDisableTarget, HardwareProfile,
     HardwareRequirement, ManagedMod, Manifest, ModCondition, OwnershipClass, PerformanceMode,
     ResolutionRequest, VersionFamily,

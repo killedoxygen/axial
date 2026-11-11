@@ -1,29 +1,86 @@
-use super::artifact::{
-    ManagedArtifactStage, ManagedArtifactTransferResolver, StagedManagedArtifact,
-    installed_graph_from_plan, stage_managed_graph, state_from_plan,
+//! Managed composition files: exact install, removal, rollback and recovery
+//! under one bound instance authority.
+
+mod artifact;
+pub(crate) mod plan;
+pub(crate) mod state;
+pub(crate) mod storage;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use artifact::ManagedArtifactTransferRecovery;
+pub use artifact::ManagedArtifactTransferResolver;
+pub use plan::{
+    ManagedArtifactPin, ManagedCompositionInstallPlan, ManagedDependencyEdge,
+    ManagedInstallPlanError,
 };
-use super::manager::{ManagedCompositionAuthority, ManagedInstanceIdentity, PerformanceManager};
-use super::model::InstallError;
-use super::plan::{ManagedArtifactPin, ManagedCompositionInstallPlan};
-use crate::state::{
-    ManagedRollbackOutcome, RollbackRestoreError, RollbackSnapshotSummary, load_rollback_snapshot,
-    load_rollback_snapshot_async, load_rollback_snapshot_by_id_async, load_state, remove_state,
-    restore_rollback_snapshot, restore_rollback_snapshot_classified_async,
-    save_absent_rollback_snapshot_async, save_rollback_snapshot, save_rollback_snapshot_async,
-    save_state, settle_managed_artifact_removal, stage_managed_artifact_removal,
+pub use state::{
+    ManagedDuplicateFile, ManagedDuplicatePayload, ManagedRollbackOutcome, RollbackSnapshotSummary,
+    RollbackSnapshotTarget, StateError,
 };
-use crate::storage::{ManagedInstanceEffectAuthority, ManagedStorageDirectory};
-use crate::types::{CompositionPlan, CompositionState, InstalledMod, ResolutionRequest};
+pub use storage::ManagedInstanceEffectAuthority;
+
+use super::model::{CompositionPlan, CompositionState, InstalledMod, ResolutionRequest};
+use artifact::{
+    ManagedArtifactStage, StagedManagedArtifact, installed_graph_from_plan, stage_managed_graph,
+    state_from_plan,
+};
 use axial_fs::{Directory, DirectoryListingState, EntryKind};
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
 use axial_resource::{
     PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
 };
+use state::{
+    RollbackRestoreError, load_rollback_snapshot, load_rollback_snapshot_async,
+    load_rollback_snapshot_by_id_async, load_state, remove_state, restore_rollback_snapshot,
+    restore_rollback_snapshot_classified_async, save_absent_rollback_snapshot_async,
+    save_rollback_snapshot, save_rollback_snapshot_async, save_state,
+    settle_managed_artifact_removal, stage_managed_artifact_removal,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use storage::{ManagedStorageDirectory, WeakManagedInstanceEffectAuthority};
+
+pub(crate) const MANAGED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
+
+#[derive(Debug, thiserror::Error)]
+pub enum InstallError {
+    #[error("failed to load performance manifest: {0}")]
+    Manifest(#[from] super::resolve::ResolveError),
+    #[error("failed to access performance state: {0}")]
+    State(#[from] StateError),
+    #[error("filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("managed artifact transfer failed")]
+    Transfer,
+    #[error("no performance rollback snapshot available")]
+    NoRollbackSnapshot,
+    #[error("performance rollback snapshot not found")]
+    RollbackSnapshotNotFound,
+}
+
+#[derive(Clone)]
+pub struct ManagedCompositionAuthority {
+    instances_root_directory: Arc<Directory>,
+    instance_effect_authorities: Arc<Mutex<HashMap<String, WeakManagedInstanceEffectAuthority>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedInstanceIdentity {
+    instance_id: Arc<str>,
+    admitted_directory: Directory,
+}
+
+impl ManagedInstanceIdentity {
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ManagedCompositionInspection {
     pub state: Option<CompositionState>,
-    pub health: crate::health::BundleHealth,
+    pub health: super::model::BundleHealth,
     pub warnings: Vec<String>,
     pub installed_mod_evidence: Vec<String>,
     pub rollback_snapshots: Vec<RollbackSnapshotSummary>,
@@ -39,7 +96,6 @@ pub struct ManagedResolvedInspection {
 pub struct ManagedInstallExecutionOutcome {
     state: CompositionState,
     target_changed: bool,
-    rollback_ready: bool,
 }
 
 impl ManagedInstallExecutionOutcome {
@@ -50,53 +106,25 @@ impl ManagedInstallExecutionOutcome {
     pub fn target_changed(&self) -> bool {
         self.target_changed
     }
-
-    pub fn rollback_ready(&self) -> bool {
-        self.rollback_ready
-    }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ManagedInstallExecutionError<BeforeTargetEffectError> {
-    #[error("{source}")]
-    Mutation {
-        #[source]
-        source: ManagedMutationError,
-        rollback_ready: bool,
-    },
-    #[error("managed composition target-effect checkpoint was rejected")]
-    BeforeTargetEffect {
-        error: BeforeTargetEffectError,
-        rollback_ready: bool,
-    },
+    Mutation(ManagedMutationError),
+    /// The caller's checkpoint refused the target effect; staged candidates were settled.
+    BeforeTargetEffect(BeforeTargetEffectError),
 }
 
-impl<BeforeTargetEffectError> ManagedInstallExecutionError<BeforeTargetEffectError> {
-    pub fn from_mutation(source: ManagedMutationError, rollback_ready: bool) -> Self {
-        Self::Mutation {
-            source,
-            rollback_ready,
-        }
-    }
-
-    pub fn rollback_ready(&self) -> bool {
-        match self {
-            Self::Mutation { rollback_ready, .. }
-            | Self::BeforeTargetEffect { rollback_ready, .. } => *rollback_ready,
-        }
-    }
-
-    pub fn mutation_error(&self) -> Option<&ManagedMutationError> {
-        match self {
-            Self::Mutation { source, .. } => Some(source),
-            Self::BeforeTargetEffect { .. } => None,
-        }
+impl<BeforeTargetEffectError> From<ManagedMutationError>
+    for ManagedInstallExecutionError<BeforeTargetEffectError>
+{
+    fn from(error: ManagedMutationError) -> Self {
+        Self::Mutation(error)
     }
 }
 
 pub struct ManagedArtifactWitnessProof {
     filename: PortablePathKey,
-    sha512: String,
 }
 
 impl ManagedArtifactWitnessProof {
@@ -108,11 +136,6 @@ impl ManagedArtifactWitnessProof {
             .filter(|(_, extension)| extension.eq_ignore_ascii_case("disabled"))
             .map_or(filename, |(enabled, _)| enabled);
         PortableFileName::new_exact(enabled).is_ok_and(|filename| filename.key() == self.filename)
-    }
-
-    pub fn matches_observation(&self, filename: &str, sha512: &str) -> bool {
-        PortableFileName::new_exact(filename).is_ok_and(|filename| filename.key() == self.filename)
-            && self.sha512.eq_ignore_ascii_case(sha512)
     }
 }
 
@@ -142,25 +165,19 @@ enum ManagedIndeterminateSource {
     ReconciliationRequired,
 }
 
-impl ManagedIndeterminate {
-    pub fn operation(&self) -> &'static str {
-        self.operation
-    }
-}
-
 impl ManagedMutationError {
-    pub(super) fn definite(error: impl Into<InstallError>) -> Self {
+    fn definite(error: impl Into<InstallError>) -> Self {
         Self::Definite(error.into())
     }
 
-    pub(super) fn indeterminate(operation: &'static str, error: impl Into<InstallError>) -> Self {
+    fn indeterminate(operation: &'static str, error: impl Into<InstallError>) -> Self {
         Self::Indeterminate(ManagedIndeterminate {
             operation,
             source: ManagedIndeterminateSource::Install(error.into()),
         })
     }
 
-    pub fn owner_stopped(operation: &'static str) -> Self {
+    fn task_stopped(operation: &'static str) -> Self {
         Self::Indeterminate(ManagedIndeterminate {
             operation,
             source: ManagedIndeterminateSource::TaskStopped,
@@ -173,13 +190,34 @@ impl ManagedMutationError {
             source: ManagedIndeterminateSource::ReconciliationRequired,
         })
     }
-
-    fn task_stopped(operation: &'static str) -> Self {
-        Self::owner_stopped(operation)
-    }
 }
 
 impl ManagedCompositionAuthority {
+    /// The identifier labels effects; the already admitted directory grants access.
+    /// Callers retain registry admission until every effect and receipt settles.
+    pub fn bind(
+        instance_id: &str,
+        directory: Directory,
+    ) -> Result<(Self, ManagedInstanceIdentity), std::io::Error> {
+        directory.identity()?;
+        axial_fs::LeafName::new(instance_id).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid managed instance label",
+            )
+        })?;
+        Ok((
+            Self {
+                instances_root_directory: Arc::new(directory.clone()),
+                instance_effect_authorities: Arc::new(Mutex::new(HashMap::new())),
+            },
+            ManagedInstanceIdentity {
+                instance_id: Arc::from(instance_id),
+                admitted_directory: directory,
+            },
+        ))
+    }
+
     pub async fn bind_instance_effect_authority(
         &self,
         identity: &ManagedInstanceIdentity,
@@ -239,7 +277,7 @@ impl ManagedCompositionAuthority {
         };
         run_managed_blocking(PhysicalIoClass::Read, move || {
             let state =
-                crate::state::load_state_admitted(&mods).map_err(ManagedMutationError::definite)?;
+                state::load_state_admitted(&mods).map_err(ManagedMutationError::definite)?;
             let mut proofs = state
                 .into_iter()
                 .flat_map(|state| state.installed_mods)
@@ -247,15 +285,10 @@ impl ManagedCompositionAuthority {
                     filename: PortableFileName::new_exact(&installed.filename)
                         .expect("admitted performance state has portable filenames")
                         .key(),
-                    sha512: installed.integrity.sha512,
                 })
                 .collect::<Vec<_>>();
-            proofs.sort_by(|left, right| {
-                (&left.filename, &left.sha512).cmp(&(&right.filename, &right.sha512))
-            });
-            proofs.dedup_by(|left, right| {
-                left.filename == right.filename && left.sha512 == right.sha512
-            });
+            proofs.sort_by(|left, right| left.filename.cmp(&right.filename));
+            proofs.dedup_by(|left, right| left.filename == right.filename);
             Ok(proofs)
         })
         .await
@@ -280,7 +313,7 @@ impl ManagedCompositionAuthority {
             if let Some(mods) = open_mods_if_present(instance.clone(), "recover").await? {
                 let recovery_mods = mods.clone();
                 run_managed_blocking(PhysicalIoClass::Heavy, move || {
-                    crate::state::recover_managed_storage(&recovery_mods)
+                    state::recover_managed_storage(&recovery_mods)
                 })
                 .await
                 .map_err(|_| ManagedMutationError::task_stopped("recover"))?
@@ -317,13 +350,8 @@ impl ManagedCompositionAuthority {
         BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
         BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
     {
-        let instance = self
-            .validate_identity(identity, effects)
-            .await
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-        self.manager
-            .ensure_installed(plan, resolver, &instance, before_target_effect)
-            .await
+        let instance = self.validate_identity(identity, effects).await?;
+        install_graph(plan, resolver, &instance, before_target_effect).await
     }
 
     pub async fn remove_managed(
@@ -335,7 +363,12 @@ impl ManagedCompositionAuthority {
         let Some(mods) = open_mods_if_present(instance, "remove").await? else {
             return Ok(());
         };
-        self.manager.remove_managed_async(mods).await
+        run_managed_blocking(PhysicalIoClass::Heavy, move || {
+            remove_managed_transaction(&mods)
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("remove"))?
+        .map_err(|error| classify_install_reconciliation_error("remove", error))
     }
 
     pub async fn rollback_managed(
@@ -349,7 +382,13 @@ impl ManagedCompositionAuthority {
                 InstallError::NoRollbackSnapshot,
             ));
         };
-        self.manager.rollback_managed_async(mods).await
+        let snapshot = load_rollback_snapshot_async(&mods)
+            .await
+            .map_err(|error| classify_state_reconciliation_error("rollback_preflight", error))?
+            .ok_or_else(|| ManagedMutationError::definite(InstallError::NoRollbackSnapshot))?;
+        restore_rollback_snapshot_classified_async(&mods, &snapshot)
+            .await
+            .map_err(classify_rollback_restore_error)
     }
 
     pub async fn rollback_managed_snapshot(
@@ -364,9 +403,17 @@ impl ManagedCompositionAuthority {
                 InstallError::RollbackSnapshotNotFound,
             ));
         };
-        self.manager
-            .rollback_managed_snapshot_async(mods, snapshot_id)
+        state::validate_rollback_snapshot_id(snapshot_id)
+            .map_err(ManagedMutationError::definite)?;
+        let snapshot = load_rollback_snapshot_by_id_async(&mods, snapshot_id)
             .await
+            .map_err(|error| classify_state_reconciliation_error("rollback_preflight", error))?
+            .ok_or_else(|| {
+                ManagedMutationError::definite(InstallError::RollbackSnapshotNotFound)
+            })?;
+        restore_rollback_snapshot_classified_async(&mods, &snapshot)
+            .await
+            .map_err(classify_rollback_restore_error)
     }
 
     pub async fn inspect<AdmitMutation, MutationPermit>(
@@ -390,10 +437,10 @@ impl ManagedCompositionAuthority {
             move || -> Result<_, ManagedMutationError> {
                 let (state, mutation_permit) = admitted_inspection_state(&mods, admit_mutation)?;
                 let (health, warnings) =
-                    crate::health::derive_health(state.as_ref(), plan.as_ref(), None, Some(&mods));
+                    super::health::derive_health(state.as_ref(), plan.as_ref(), None, Some(&mods));
                 let installed_mod_evidence = installed_mod_evidence(&mods, state.as_ref())
                     .map_err(ManagedMutationError::definite)?;
-                let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods)
+                let rollback_snapshots = state::list_rollback_snapshots_admitted(&mods)
                     .map_err(ManagedMutationError::definite)?;
                 let inspection = ManagedCompositionInspection {
                     state,
@@ -410,24 +457,26 @@ impl ManagedCompositionAuthority {
         .map_err(|_| ManagedMutationError::task_stopped("inspect"))?
     }
 
-    pub async fn resolve_and_inspect<AdmitMutation, MutationPermit>(
+    /// `resolve` plans from the admitted instance's own installed-mod evidence.
+    pub async fn resolve_and_inspect<Resolve, AdmitMutation, MutationPermit>(
         &self,
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
         mut request: ResolutionRequest,
+        resolve: Resolve,
         admit_mutation: AdmitMutation,
     ) -> Result<ManagedResolvedInspection, ManagedMutationError>
     where
+        Resolve: FnOnce(ResolutionRequest) -> CompositionPlan + Send + 'static,
         AdmitMutation: FnOnce() -> Result<MutationPermit, ManagedMutationError> + Send + 'static,
         MutationPermit: Send + 'static,
     {
         let instance = self.validate_identity(identity, effects).await?;
         let mods = open_mods_if_present(instance.clone(), "inspect").await?;
-        let manager = self.manager.clone();
         if mods.is_none() {
             request.installed_mods.clear();
             let expected_game_version = request.game_version.clone();
-            let plan = manager.get_plan(request);
+            let plan = resolve(request);
             return Ok(ManagedResolvedInspection {
                 inspection: absent_inspection(Some(&plan), Some(&expected_game_version)),
                 plan,
@@ -442,14 +491,14 @@ impl ManagedCompositionAuthority {
                     .map_err(ManagedMutationError::definite)?;
                 request.installed_mods = installed_mod_evidence.clone();
                 let expected_game_version = request.game_version.clone();
-                let plan = manager.get_plan(request);
-                let (health, warnings) = crate::health::derive_health(
+                let plan = resolve(request);
+                let (health, warnings) = super::health::derive_health(
                     state.as_ref(),
                     Some(&plan),
                     Some(&expected_game_version),
                     Some(&mods),
                 );
-                let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods)
+                let rollback_snapshots = state::list_rollback_snapshots_admitted(&mods)
                     .map_err(ManagedMutationError::definite)?;
                 let inspection = ManagedResolvedInspection {
                     inspection: ManagedCompositionInspection {
@@ -488,7 +537,7 @@ impl ManagedCompositionAuthority {
             .identity()
             .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
         let bound = self
-            .instances_root_directory()
+            .instances_root_directory
             .identity()
             .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
         if current != bound {
@@ -528,7 +577,7 @@ async fn open_mods_if_present(
     .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
 }
 
-pub(super) async fn run_managed_blocking<T, Work>(
+async fn run_managed_blocking<T, Work>(
     io: PhysicalIoClass,
     work: Work,
 ) -> Result<T, PhysicalWorkError>
@@ -547,7 +596,7 @@ fn absent_inspection(
     plan: Option<&CompositionPlan>,
     expected_game_version: Option<&str>,
 ) -> ManagedCompositionInspection {
-    let (health, warnings) = crate::health::derive_health(None, plan, expected_game_version, None);
+    let (health, warnings) = super::health::derive_health(None, plan, expected_game_version, None);
     ManagedCompositionInspection {
         state: None,
         health,
@@ -560,15 +609,15 @@ fn absent_inspection(
 fn recovered_inspection(
     instance_mods: ManagedStorageDirectory,
 ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
-    let state = crate::state::load_state_admitted(&instance_mods)
+    let state = state::load_state_admitted(&instance_mods)
         .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
-    crate::state::prove_managed_storage_recovered(&instance_mods, state.as_ref())
+    state::prove_managed_storage_recovered(&instance_mods, state.as_ref())
         .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
     let (health, warnings) =
-        crate::health::derive_health(state.as_ref(), None, None, Some(&instance_mods));
+        super::health::derive_health(state.as_ref(), None, None, Some(&instance_mods));
     let installed_mod_evidence = installed_mod_evidence(&instance_mods, state.as_ref())
         .map_err(ManagedMutationError::definite)?;
-    let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&instance_mods)
+    let rollback_snapshots = state::list_rollback_snapshots_admitted(&instance_mods)
         .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
     Ok(ManagedCompositionInspection {
         state,
@@ -588,7 +637,7 @@ where
 {
     let mut admit_mutation = Some(admit_mutation);
     let mut mutation_permit = None;
-    if crate::state::managed_effect_reconciliation_required(instance_mods) {
+    if state::managed_effect_reconciliation_required(instance_mods) {
         mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
         instance_mods
             .settle_pending_effects()
@@ -597,24 +646,20 @@ where
                 ManagedMutationError::indeterminate("inspect_effect_reconcile", error)
             })?;
     }
-    let preflight = crate::state::preflight_managed_inspection_reconciliation(instance_mods)
+    let preflight = state::preflight_managed_inspection_reconciliation(instance_mods)
         .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
     if preflight.state_publication_required() && mutation_permit.is_none() {
         mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
     }
-    crate::state::reconcile_managed_inspection_publication(instance_mods, preflight)
+    state::reconcile_managed_inspection_publication(instance_mods, preflight)
         .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
     let state =
-        crate::state::load_state_admitted(instance_mods).map_err(ManagedMutationError::definite)?;
+        state::load_state_admitted(instance_mods).map_err(ManagedMutationError::definite)?;
     if mutation_permit.is_none() && preflight.admitted_state_reconciliation_required() {
         mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
     }
-    crate::state::reconcile_managed_inspection_obligations(
-        instance_mods,
-        preflight,
-        state.as_ref(),
-    )
-    .map_err(|error| classify_state_reconciliation_error("inspect_reconcile", error))?;
+    state::reconcile_managed_inspection_obligations(instance_mods, preflight, state.as_ref())
+        .map_err(|error| classify_state_reconciliation_error("inspect_reconcile", error))?;
     Ok((state, mutation_permit))
 }
 
@@ -639,10 +684,10 @@ fn installed_mod_evidence(
         add_mod_evidence(&mut evidence, &installed.filename);
     }
     let listing = instance_mods
-        .entries(crate::state::RECOVERY_ENTRY_LIMIT + 1)
+        .entries(state::RECOVERY_ENTRY_LIMIT + 1)
         .map_err(InstallError::Io)?;
     if listing.state() != DirectoryListingState::Complete
-        || listing.entries().len() > crate::state::RECOVERY_ENTRY_LIMIT
+        || listing.entries().len() > state::RECOVERY_ENTRY_LIMIT
     {
         return Err(InstallError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -699,196 +744,120 @@ fn starts_with_digit(value: &str) -> bool {
         .is_some_and(|value| value.is_ascii_digit())
 }
 
-impl PerformanceManager {
-    pub(super) async fn ensure_installed<
-        BeforeTargetEffect,
-        BeforeTargetEffectFuture,
-        BeforeTargetEffectError,
-    >(
-        &self,
-        plan: &ManagedCompositionInstallPlan,
-        resolver: ManagedArtifactTransferResolver,
-        instance: &ManagedStorageDirectory,
-        before_target_effect: BeforeTargetEffect,
-    ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
-    where
-        BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
-        BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
-    {
-        let existing_mods = open_mods_if_present(instance.clone(), "install_preflight")
-            .await
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-        let selection = match existing_mods.as_ref() {
-            Some(mods) => managed_stage_selection(mods, plan),
-            None => Ok(ManagedStageSelection {
-                exact_state: None,
-                pins: plan.pins().to_vec(),
-            }),
-        }
-        .map_err(ManagedMutationError::definite)
-        .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-        if let Some(state) = selection.exact_state {
-            return Ok(ManagedInstallExecutionOutcome {
-                state,
-                target_changed: false,
-                rollback_ready: false,
-            });
-        }
-        let mods = if let Some(mods) = existing_mods {
-            mods
-        } else {
-            let instance = instance.clone();
-            run_managed_blocking(PhysicalIoClass::Write, move || {
-                instance.open_or_create_child("mods")
-            })
-            .await
-            .map_err(|_| ManagedMutationError::task_stopped("install_preflight"))
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
-            .map_err(ManagedMutationError::definite)
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
-        };
-        let previous_state = load_state(&mods)
-            .map_err(|error| classify_state_reconciliation_error("install_preflight", error))
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-
-        // Candidate intent and the exact transient leaf are durable before DNS
-        // resolution or a provider request. Verified candidates remain internal
-        // and cannot affect a live mod name before the target-effect boundary.
-        let staged = stage_managed_graph(resolver, selection.pins, &mods)
-            .await
-            .map_err(ManagedMutationError::definite)
-            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-        let snapshot = match previous_state.as_ref() {
-            Some(previous_state) => save_rollback_snapshot_async(&mods, previous_state)
-                .await
-                .map_err(|error| classify_state_reconciliation_error("install_snapshot", error))
-                .map(|_| ()),
-            None => save_absent_rollback_snapshot_async(&mods)
-                .await
-                .map_err(|error| classify_state_reconciliation_error("install_snapshot", error))
-                .map(|_| ()),
-        };
-        if let Err(error) = snapshot {
-            settle_pre_target_candidates(&mods, staged)
-                .await
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
-            return Err(ManagedInstallExecutionError::from_mutation(error, false));
-        }
-
-        if let Err(error) = crate::state::require_cleanup_quarantine_empty(&mods)
-            .map_err(ManagedMutationError::definite)
-        {
-            settle_pre_target_candidates(&mods, staged)
-                .await
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
-            return Err(ManagedInstallExecutionError::from_mutation(error, true));
-        }
-
-        if let Err(error) = before_target_effect().await {
-            settle_pre_target_candidates(&mods, staged)
-                .await
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
-            return Err(ManagedInstallExecutionError::BeforeTargetEffect {
-                error,
-                rollback_ready: true,
-            });
-        }
-
-        let mods_for_commit = mods.clone();
-        let previous_for_commit = previous_state.clone();
-        let state = state_from_plan(plan, installed_graph_from_plan(plan));
-        let state_for_commit = state.clone();
-        let commit = run_managed_blocking(PhysicalIoClass::Heavy, move || {
-            commit_staged_graph(
-                &mods_for_commit,
-                previous_for_commit.as_ref(),
-                &state_for_commit,
-                staged,
-            )
-        })
-        .await
-        .unwrap_or_else(|_| {
-            Err(InstallError::Io(std::io::Error::other(
-                "managed graph commit task stopped before reporting completion",
-            )))
-        });
-        if let Err(error) = commit {
-            let snapshot = load_rollback_snapshot_async(&mods)
-                .await
-                .map_err(|rollback| {
-                    classify_state_reconciliation_error("install_restore", rollback)
-                })
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?
-                .ok_or_else(|| {
-                    ManagedMutationError::indeterminate(
-                        "install_restore",
-                        InstallError::NoRollbackSnapshot,
-                    )
-                })
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
-            restore_rollback_snapshot_classified_async(&mods, &snapshot)
-                .await
-                .map_err(|rollback| match rollback {
-                    RollbackRestoreError::Definite(rollback)
-                    | RollbackRestoreError::Indeterminate(rollback) => {
-                        ManagedMutationError::indeterminate("install_restore", rollback)
-                    }
-                })
-                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
-            return Err(ManagedInstallExecutionError::from_mutation(
-                ManagedMutationError::definite(error),
-                true,
-            ));
-        }
-        Ok(ManagedInstallExecutionOutcome {
+async fn install_graph<BeforeTargetEffect, BeforeTargetEffectFuture, BeforeTargetEffectError>(
+    plan: &ManagedCompositionInstallPlan,
+    resolver: ManagedArtifactTransferResolver,
+    instance: &ManagedStorageDirectory,
+    before_target_effect: BeforeTargetEffect,
+) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
+where
+    BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
+    BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
+{
+    let existing_mods = open_mods_if_present(instance.clone(), "install_preflight").await?;
+    let selection = match existing_mods.as_ref() {
+        Some(mods) => managed_stage_selection(mods, plan),
+        None => Ok(ManagedStageSelection {
+            exact_state: None,
+            pins: plan.pins().to_vec(),
+        }),
+    }
+    .map_err(ManagedMutationError::definite)?;
+    if let Some(state) = selection.exact_state {
+        return Ok(ManagedInstallExecutionOutcome {
             state,
-            target_changed: true,
-            rollback_ready: true,
-        })
+            target_changed: false,
+        });
     }
-
-    pub(super) async fn remove_managed_async(
-        &self,
-        instance_mods: ManagedStorageDirectory,
-    ) -> Result<(), ManagedMutationError> {
-        run_managed_blocking(PhysicalIoClass::Heavy, move || {
-            remove_managed_transaction(&instance_mods)
+    let mods = if let Some(mods) = existing_mods {
+        mods
+    } else {
+        let instance = instance.clone();
+        run_managed_blocking(PhysicalIoClass::Write, move || {
+            instance.open_or_create_child("mods")
         })
         .await
-        .map_err(|_| ManagedMutationError::task_stopped("remove"))?
-        .map_err(|error| classify_install_reconciliation_error("remove", error))
+        .map_err(|_| ManagedMutationError::task_stopped("install_preflight"))?
+        .map_err(ManagedMutationError::definite)?
+    };
+    let previous_state = load_state(&mods)
+        .map_err(|error| classify_state_reconciliation_error("install_preflight", error))?;
+
+    // Candidate intent and the exact transient leaf are durable before DNS
+    // resolution or a provider request. Verified candidates remain internal
+    // and cannot affect a live mod name before the target-effect boundary.
+    let staged = stage_managed_graph(resolver, selection.pins, &mods)
+        .await
+        .map_err(ManagedMutationError::definite)?;
+    let snapshot = match previous_state.as_ref() {
+        Some(previous_state) => save_rollback_snapshot_async(&mods, previous_state)
+            .await
+            .map_err(|error| classify_state_reconciliation_error("install_snapshot", error))
+            .map(|_| ()),
+        None => save_absent_rollback_snapshot_async(&mods)
+            .await
+            .map_err(|error| classify_state_reconciliation_error("install_snapshot", error))
+            .map(|_| ()),
+    };
+    if let Err(error) = snapshot {
+        settle_pre_target_candidates(&mods, staged).await?;
+        return Err(error.into());
     }
 
-    pub(super) async fn rollback_managed_async(
-        &self,
-        instance_mods: ManagedStorageDirectory,
-    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
-        let snapshot = load_rollback_snapshot_async(&instance_mods)
-            .await
-            .map_err(|error| classify_state_reconciliation_error("rollback_preflight", error))?
-            .ok_or_else(|| ManagedMutationError::definite(InstallError::NoRollbackSnapshot))?;
-        restore_rollback_snapshot_classified_async(&instance_mods, &snapshot)
-            .await
-            .map_err(classify_rollback_restore_error)
+    if let Err(error) =
+        state::require_cleanup_quarantine_empty(&mods).map_err(ManagedMutationError::definite)
+    {
+        settle_pre_target_candidates(&mods, staged).await?;
+        return Err(error.into());
     }
 
-    pub(super) async fn rollback_managed_snapshot_async(
-        &self,
-        instance_mods: ManagedStorageDirectory,
-        snapshot_id: &str,
-    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
-        crate::state::validate_rollback_snapshot_id(snapshot_id)
-            .map_err(ManagedMutationError::definite)?;
-        let snapshot = load_rollback_snapshot_by_id_async(&instance_mods, snapshot_id)
+    if let Err(error) = before_target_effect().await {
+        settle_pre_target_candidates(&mods, staged).await?;
+        return Err(ManagedInstallExecutionError::BeforeTargetEffect(error));
+    }
+
+    let mods_for_commit = mods.clone();
+    let previous_for_commit = previous_state.clone();
+    let state = state_from_plan(plan, installed_graph_from_plan(plan));
+    let state_for_commit = state.clone();
+    let commit = run_managed_blocking(PhysicalIoClass::Heavy, move || {
+        commit_staged_graph(
+            &mods_for_commit,
+            previous_for_commit.as_ref(),
+            &state_for_commit,
+            staged,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(InstallError::Io(std::io::Error::other(
+            "managed graph commit task stopped before reporting completion",
+        )))
+    });
+    if let Err(error) = commit {
+        let snapshot = load_rollback_snapshot_async(&mods)
             .await
-            .map_err(|error| classify_state_reconciliation_error("rollback_preflight", error))?
+            .map_err(|rollback| classify_state_reconciliation_error("install_restore", rollback))?
             .ok_or_else(|| {
-                ManagedMutationError::definite(InstallError::RollbackSnapshotNotFound)
+                ManagedMutationError::indeterminate(
+                    "install_restore",
+                    InstallError::NoRollbackSnapshot,
+                )
             })?;
-        restore_rollback_snapshot_classified_async(&instance_mods, &snapshot)
+        restore_rollback_snapshot_classified_async(&mods, &snapshot)
             .await
-            .map_err(classify_rollback_restore_error)
+            .map_err(|rollback| match rollback {
+                RollbackRestoreError::Definite(rollback)
+                | RollbackRestoreError::Indeterminate(rollback) => {
+                    ManagedMutationError::indeterminate("install_restore", rollback)
+                }
+            })?;
+        return Err(ManagedMutationError::definite(error).into());
     }
+    Ok(ManagedInstallExecutionOutcome {
+        state,
+        target_changed: true,
+    })
 }
 
 async fn settle_pre_target_candidates(
@@ -898,20 +867,20 @@ async fn settle_pre_target_candidates(
     let instance_mods = instance_mods.clone();
     run_managed_blocking(PhysicalIoClass::Heavy, move || {
         drop(staged);
-        crate::state::reconcile_managed_storage(&instance_mods)
+        state::reconcile_managed_storage(&instance_mods)
     })
     .await
     .map_err(|_| ManagedMutationError::task_stopped("install_candidate_cleanup"))?
     .map_err(|error| ManagedMutationError::indeterminate("install_candidate_cleanup", error))
 }
 
-pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
+fn commit_staged_graph<Stage: ManagedArtifactStage>(
     instance_mods: &ManagedStorageDirectory,
     previous_state: Option<&CompositionState>,
     state: &CompositionState,
     staged: Vec<Stage>,
 ) -> Result<(), InstallError> {
-    crate::state::require_cleanup_quarantine_empty(instance_mods)?;
+    state::require_cleanup_quarantine_empty(instance_mods)?;
     let desired_by_filename = state
         .installed_mods
         .iter()
@@ -939,7 +908,7 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
             .flat_map(|state| state.installed_mods.iter())
             .find(|previous| same_artifact_metadata(previous, desired));
         let retained = if previous.is_some() {
-            crate::state::managed_artifact_matches(instance_mods, desired)?
+            state::managed_artifact_matches(instance_mods, desired)?
         } else {
             false
         };
@@ -968,9 +937,9 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
         artifact.publish_create_new(instance_mods)?;
     }
 
-    crate::state::reconcile_managed_candidate_intents(instance_mods)?;
+    state::reconcile_managed_candidate_intents(instance_mods)?;
     save_state(instance_mods, state)?;
-    crate::state::reconcile_managed_addition_obligations(instance_mods, Some(state))?;
+    state::reconcile_managed_addition_obligations(instance_mods, Some(state))?;
     for previous in previous_state
         .into_iter()
         .flat_map(|state| state.installed_mods.iter())
@@ -995,16 +964,16 @@ fn commit_filename_key(filename: &str) -> Result<PortablePathKey, InstallError> 
         .map_err(|_| invalid_commit_graph())
 }
 
-pub(super) struct ManagedStageSelection {
-    pub(super) exact_state: Option<CompositionState>,
-    pub(super) pins: Vec<ManagedArtifactPin>,
+struct ManagedStageSelection {
+    exact_state: Option<CompositionState>,
+    pins: Vec<ManagedArtifactPin>,
 }
 
-pub(super) fn managed_stage_selection(
+fn managed_stage_selection(
     instance_mods: &ManagedStorageDirectory,
     plan: &ManagedCompositionInstallPlan,
 ) -> Result<ManagedStageSelection, InstallError> {
-    let preflight = crate::state::preflight_managed_inspection_reconciliation(instance_mods)?;
+    let preflight = state::preflight_managed_inspection_reconciliation(instance_mods)?;
     if preflight.state_publication_required() || preflight.admitted_state_reconciliation_required()
     {
         return Ok(ManagedStageSelection {
@@ -1012,15 +981,14 @@ pub(super) fn managed_stage_selection(
             pins: plan.pins().to_vec(),
         });
     }
-    let Some(state) = crate::state::load_state_admitted(instance_mods)? else {
+    let Some(state) = state::load_state_admitted(instance_mods)? else {
         return Ok(ManagedStageSelection {
             exact_state: None,
             pins: plan.pins().to_vec(),
         });
     };
-    crate::install::plan::validate_state_graph(&state).map_err(|error| {
-        InstallError::State(crate::state::StateError::InvalidState(error.to_string()))
-    })?;
+    plan::validate_state_graph(&state)
+        .map_err(|error| InstallError::State(state::StateError::InvalidState(error.to_string())))?;
     let target_matches = state.graph_sha512 == plan.graph_digest()
         && state.composition_id == plan.composition_id()
         && state.game_version == plan.game_version()
@@ -1036,7 +1004,7 @@ pub(super) fn managed_stage_selection(
             .iter()
             .find(|installed| installed.project_id == desired.project_id)
             .is_some_and(|installed| same_artifact_metadata(installed, desired))
-            && crate::state::managed_artifact_matches(instance_mods, desired)?;
+            && state::managed_artifact_matches(instance_mods, desired)?;
         if !reusable {
             pins.push(pin.clone());
         }
@@ -1075,12 +1043,9 @@ fn classify_rollback_restore_error(error: RollbackRestoreError) -> ManagedMutati
 
 fn classify_state_reconciliation_error(
     operation: &'static str,
-    error: crate::state::StateError,
+    error: state::StateError,
 ) -> ManagedMutationError {
-    if matches!(
-        &error,
-        crate::state::StateError::RollbackCandidateUnresumable
-    ) {
+    if matches!(&error, state::StateError::RollbackCandidateUnresumable) {
         ManagedMutationError::definite(error)
     } else {
         ManagedMutationError::indeterminate(operation, error)
@@ -1093,7 +1058,7 @@ fn classify_install_reconciliation_error(
 ) -> ManagedMutationError {
     if matches!(
         &error,
-        InstallError::State(crate::state::StateError::RollbackCandidateUnresumable)
+        InstallError::State(state::StateError::RollbackCandidateUnresumable)
     ) {
         ManagedMutationError::definite(error)
     } else {
@@ -1101,9 +1066,7 @@ fn classify_install_reconciliation_error(
     }
 }
 
-pub(super) fn remove_managed_transaction(
-    instance_mods: &ManagedStorageDirectory,
-) -> Result<(), InstallError> {
+fn remove_managed_transaction(instance_mods: &ManagedStorageDirectory) -> Result<(), InstallError> {
     let Some(state) = load_state(instance_mods)? else {
         return Ok(());
     };
@@ -1142,11 +1105,9 @@ mod witness_tests {
     fn ownership_protects_enabled_and_disabled_aliases_even_when_bytes_changed() {
         let proof = ManagedArtifactWitnessProof {
             filename: PortableFileName::new_exact("Sodium.jar").unwrap().key(),
-            sha512: "a".repeat(128),
         };
         assert!(proof.protects_filename("sodium.jar"));
         assert!(proof.protects_filename("SODIUM.JAR.DISABLED"));
-        assert!(!proof.matches_observation("sodium.jar", &"b".repeat(128)));
         assert!(!proof.protects_filename("other.jar"));
         assert!(!proof.protects_filename("../Sodium.jar"));
     }
