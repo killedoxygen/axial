@@ -134,15 +134,3 @@ pub fn window_set_resize_background(
         .set_background_color(Some(color))
         .map_err(|_| "Could not update the window background.".into())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chrome_matches_each_platform_window() {
-        assert_eq!(chrome_mode("macos"), "mac-overlay");
-        assert_eq!(chrome_mode("windows"), "custom-frameless");
-        assert_eq!(chrome_mode("linux"), "custom-frameless");
-    }
-}

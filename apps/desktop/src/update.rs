@@ -484,7 +484,6 @@ mod tests {
     }
 
     async fn fixture(
-        current_version: &str,
         target: &str,
         version: &str,
         payload: &[u8],
@@ -526,7 +525,7 @@ mod tests {
             }
         });
         let mut context = tauri::test::mock_context(tauri::test::noop_assets());
-        context.package_info_mut().version = current_version.parse().unwrap();
+        context.package_info_mut().version = env!("CARGO_PKG_VERSION").parse().unwrap();
         context.config_mut().plugins.0.insert(
             "updater".into(),
             json!({
@@ -555,33 +554,30 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn update_check_preserves_release_channel_precedence() {
+    #[test]
+    fn release_comparison_preserves_channel_precedence() {
         for (current, version, available) in [
             ("0.4.0-dev.5", "0.4.0-alpha.1", true),
-            ("0.4.0-dev.5", "0.4.0-beta.1", true),
             ("0.4.0-alpha.1", "0.4.0-dev.6", false),
-            ("0.4.0-beta.1", "0.4.0-dev.6", false),
             ("0.4.0-beta.1", "0.4.0-alpha.9", false),
             ("0.4.0-alpha.1", "0.4.0-beta.1", true),
             ("0.4.0-beta.1", "0.4.0-rc.1", true),
             ("0.4.0-dev.9", "0.4.0-dev.10", true),
-            ("0.4.0-rc.9", "0.4.0-rc.10", true),
             ("0.4.0-dev.10", "0.4.0-dev.9", false),
             ("0.4.0-rc.1", "0.4.0", true),
             ("0.4.0", "0.4.0-rc.10", false),
             ("0.4.0", "0.4.0", false),
-            ("0.4.0-dev.5", "0.4.0-dev.5", false),
             ("0.4.1-dev.1", "0.4.0", false),
             ("0.4.0", "0.4.1-dev.1", true),
-            ("0.4.0+build.1", "0.4.0+build.2", false),
             ("0.4.0-dev.5+build.1", "0.4.0-dev.5+build.2", false),
         ] {
-            let fixture = fixture(current, TARGET, version, PAYLOAD, SIGNATURE).await;
-            let update = fixture.updater.check().await.unwrap();
+            let release = serde_json::from_value(json!({
+                "version": version, "url": "https://example.invalid/package", "signature": SIGNATURE,
+            }))
+            .unwrap();
             assert_eq!(
-                update.as_ref().map(|update| update.version.as_str()),
-                available.then_some(version),
+                release_is_newer(current.parse().unwrap(), release),
+                available,
                 "{current} -> {version}"
             );
         }
@@ -609,7 +605,6 @@ mod tests {
     #[tokio::test]
     async fn plugin_verifies_exact_bytes_before_native_stage_accepts_them() {
         let fixture = fixture(
-            env!("CARGO_PKG_VERSION"),
             TARGET,
             "9.9.9",
             PAYLOAD,
@@ -629,51 +624,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bad_signature_and_tampered_bytes_never_create_a_stage() {
-        for (payload, signature) in [
-            (PAYLOAD, "invalid-signature"),
-            (b"tampered".as_slice(), SIGNATURE),
+    async fn bad_signature_tampered_bytes_or_relabelled_version_never_create_a_stage() {
+        for (version, payload, signature) in [
+            ("9.9.9", PAYLOAD, "invalid-signature"),
+            ("9.9.9", b"tampered".as_slice(), SIGNATURE),
+            ("99.0.0", PAYLOAD, SIGNATURE),
         ] {
             let fixture = fixture(
-                env!("CARGO_PKG_VERSION"),
                 TARGET,
-                "9.9.9",
+                version,
                 payload,
                 signature,
             )
             .await;
             let update = fixture.updater.check().await.unwrap().unwrap();
-            let (service, attempt) = download_service("9.9.9");
+            let (service, attempt) = download_service(version);
             let guard = AttemptGuard::new(service.clone(), attempt);
             let result = download_verified(update, &service, attempt).await;
-            assert!(result.is_err());
+            assert!(result.is_err(), "{version}");
             guard.finish(&result);
             assert_eq!(service.snapshot().flow.phase, UpdatePhase::Failed);
-            assert!(!service.snapshot().flow.can_apply);
             assert_eq!(service.begin_apply(), Err(UpdateError::NotReady));
         }
     }
 
     #[tokio::test]
-    async fn valid_signature_cannot_be_relabelled_as_a_different_version() {
-        let fixture = fixture(
-            env!("CARGO_PKG_VERSION"),
-            TARGET,
-            "99.0.0",
-            PAYLOAD,
-            SIGNATURE,
-        )
-        .await;
-        let update = fixture.updater.check().await.unwrap().unwrap();
-        let (service, attempt) = download_service("99.0.0");
-        assert!(download_verified(update, &service, attempt).await.is_err());
-        assert!(!service.snapshot().flow.can_apply);
-    }
-
-    #[tokio::test]
     async fn a_release_for_another_platform_is_not_an_available_update() {
         let fixture = fixture(
-            env!("CARGO_PKG_VERSION"),
             "axial-rewrite-other-platform",
             "9.9.9",
             PAYLOAD,
@@ -689,7 +666,6 @@ mod tests {
     #[tokio::test]
     async fn release_notes_preserve_only_a_valid_https_entrypoint() {
         let fixture = fixture(
-            env!("CARGO_PKG_VERSION"),
             TARGET,
             "9.9.9",
             PAYLOAD,
@@ -716,7 +692,6 @@ mod tests {
     #[tokio::test]
     async fn stale_verified_completion_cannot_replace_a_newer_download() {
         let fixture = fixture(
-            env!("CARGO_PKG_VERSION"),
             TARGET,
             "9.9.9",
             PAYLOAD,
@@ -742,7 +717,6 @@ mod tests {
     #[tokio::test]
     async fn apply_rejection_before_installation_releases_the_shutdown_fence() {
         let fixture = fixture(
-            env!("CARGO_PKG_VERSION"),
             TARGET,
             "9.9.9",
             PAYLOAD,

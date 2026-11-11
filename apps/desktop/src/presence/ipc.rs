@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn paths_cover_packaged_clients_without_duplicate_candidates() {
         let paths = candidates_from_roots(&["/tmp".into(), "/tmp".into()]);
-        assert_eq!(paths.len(), 90);
+        assert_eq!(paths, candidates_from_roots(&["/tmp".into()]));
         for path in [
             "/tmp/discord-ipc-9",
             "/tmp/app/com.discordapp.Discord/discord-ipc-0",

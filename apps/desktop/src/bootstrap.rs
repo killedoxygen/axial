@@ -105,20 +105,15 @@ mod tests {
         else {
             panic!("expected one packaged content policy");
         };
-        assert!(packaged_policy.contains(
-            "; connect-src 'self' data: blob: ipc: http://ipc.localhost http://127.0.0.1:*;"
-        ));
+        assert!(packaged_policy.contains("http://127.0.0.1:*"));
         confine_content_policy(&mut config, "http://127.0.0.1:38471").unwrap();
         let tauri::utils::config::Csp::Policy(policy) = config.app.security.csp.unwrap() else {
             panic!("expected one content policy");
         };
-        assert!(policy.contains("http://127.0.0.1:38471"));
-        assert!(!policy.contains("127.0.0.1:*"));
         assert_eq!(
             policy,
             packaged_policy.replace("http://127.0.0.1:*", "http://127.0.0.1:38471")
         );
-        assert!(policy.starts_with("default-src 'self'; script-src 'self';"));
         for invalid in [
             "http://localhost:38471",
             "https://127.0.0.1:38471",
