@@ -24,6 +24,7 @@ const PREFERENCES_ACK_INVALID: &str = "The interface preference request is no lo
 const TERMINAL_CONFLICT: &str = "Another desktop shutdown action is already in progress.";
 const SHUTDOWN_INCOMPLETE: &str =
     "Application shutdown is incomplete. Settle active work and try again.";
+const RESET_BLOCKED: &str = "Reset is blocked while file changes still require recovery.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalIntent {
@@ -310,8 +311,14 @@ impl DesktopLifecycle {
         if !admitted {
             match intent {
                 TerminalIntent::Close => {}
-                TerminalIntent::Restart | TerminalIntent::Reset => {
-                    recovery.ensure_no_interrupted_launch()?
+                TerminalIntent::Restart => recovery.ensure_no_interrupted_launch()?,
+                TerminalIntent::Reset => {
+                    recovery.ensure_no_interrupted_launch()?;
+                    // Active work is cancelled first; its durable remainder
+                    // is rechecked after quiescence.
+                    if self.tasks.status().is_idle() {
+                        recovery.ensure_update_allowed().map_err(|_| RESET_BLOCKED)?;
+                    }
                 }
                 TerminalIntent::Update => recovery.ensure_update_allowed()?,
             }
@@ -343,8 +350,11 @@ impl DesktopLifecycle {
         }
         self.settle(&services, intent != TerminalIntent::Update)
             .await?;
-        if intent == TerminalIntent::Update {
-            recovery.ensure_update_allowed()?;
+        match intent {
+            TerminalIntent::Update => recovery.ensure_update_allowed()?,
+            // A refused reset leaves preserve-only Close available.
+            TerminalIntent::Reset => recovery.ensure_update_allowed().map_err(|_| RESET_BLOCKED)?,
+            TerminalIntent::Close | TerminalIntent::Restart => {}
         }
         Ok(())
     }
