@@ -104,6 +104,7 @@ fn compose_fixture(
         tasks.clone(),
         content,
         crate::performance::public_transfer_resolver(),
+        crate::performance::rules::RulesSettings::default(),
     )
     .unwrap();
     let root_pin = library.admit_application_root().unwrap();
@@ -938,6 +939,70 @@ fn read_request_head(stream: &mut std::net::TcpStream, label: &str) -> Vec<u8> {
     request[..length].to_vec()
 }
 
+const FABRIC_BUILDS: &[u8] = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
+
+/// Answers `paths` in order with `200 OK` and `body`. The last response is
+/// held: after its headers, the request is reported on the returned receiver
+/// and the body waits for release. The thread returns whether that body was
+/// delivered; a departed client is tolerated only when `may_disconnect`.
+fn serve_held(
+    listener: std::net::TcpListener,
+    label: &'static str,
+    paths: Vec<String>,
+    body: Vec<u8>,
+    may_disconnect: bool,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<bool>,
+) {
+    use std::io::Write;
+
+    let (requested, observed) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut requested = Some(requested);
+        let mut delivered = true;
+        for (index, path) in paths.iter().enumerate() {
+            let (mut stream, request) = accept_request(&listener, label);
+            assert!(request.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            let held = index + 1 == paths.len();
+            if held {
+                requested
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap_or_else(|_| panic!("{label} request observer dropped"));
+                released
+                    .recv_timeout(std::time::Duration::from_secs(8))
+                    .unwrap_or_else(|_| panic!("{label} body was not released"));
+            }
+            match stream.write_all(&body) {
+                Ok(()) => {}
+                Err(error)
+                    if held
+                        && may_disconnect
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                {
+                    delivered = false;
+                }
+                Err(error) => panic!("{label} body write failed: {error}"),
+            }
+        }
+        delivered
+    });
+    (observed, release, server)
+}
+
 fn profile_build(
     component: LoaderComponentId,
     minecraft: &str,
@@ -1757,7 +1822,7 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
             );
             let request = read_request_head(&mut stream, "resolution");
             if request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n") {
-                let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
+                let body = FABRIC_BUILDS;
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2070,7 +2135,6 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
 #[tokio::test]
 async fn shutdown_preserves_created_instance_while_install_provider_is_pending() {
     use futures_util::FutureExt;
-    use std::io::Write;
     use std::time::Duration;
 
     let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
@@ -2088,46 +2152,16 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
                 .unwrap(),
         ),
     );
-    let (requested, observed) = tokio::sync::oneshot::channel();
-    let (release, released) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let mut requested = Some(requested);
-        let mut routes = Vec::new();
-        for path in ["/v2/versions/loader/1.21.4", "/pending-install-resolution"] {
-            let (mut stream, request) = accept_request(&listener, "creation provider");
-            assert!(request.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
-            let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            routes.push(path);
-            let held = path == "/pending-install-resolution";
-            if held {
-                requested
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .expect("creation request observer dropped");
-                released
-                    .recv_timeout(Duration::from_secs(8))
-                    .expect("creation provider body was not released");
-            }
-            match stream.write_all(body) {
-                Ok(()) => {}
-                Err(error)
-                    if held
-                        && matches!(
-                            error.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        ) => {}
-                Err(error) => panic!("creation provider body write failed: {error}"),
-            }
-        }
-        routes
-    });
+    let (observed, release, server) = serve_held(
+        listener,
+        "creation provider",
+        vec![
+            "/v2/versions/loader/1.21.4".into(),
+            "/pending-install-resolution".into(),
+        ],
+        FABRIC_BUILDS.to_vec(),
+        true,
+    );
     let service = Arc::new(service);
     let mut caller = None;
     let cache = root
@@ -2324,14 +2358,10 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
             matches!(observers, Ok(Ok(()))),
             "queue observers did not join"
         );
-        let routes = server
+        server
             .expect("provider server join timed out")
             .expect("provider join task failed")
             .expect("provider server failed");
-        assert_eq!(
-            routes,
-            ["/v2/versions/loader/1.21.4", "/pending-install-resolution"]
-        );
         assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
         assert!(
             pins.is_ok(),
@@ -2437,7 +2467,6 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
 #[tokio::test]
 async fn explicit_build_resolution_cancels_without_publishing() {
     use futures_util::FutureExt;
-    use std::io::Write;
     use std::time::Duration;
 
     for cancel_fetch in [false, true] {
@@ -2457,36 +2486,13 @@ async fn explicit_build_resolution_cancels_without_publishing() {
                 .unwrap(),
             ),
         );
-        let (requested, observed) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, request) = accept_request(&listener, "explicit build");
-            assert!(request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
-            let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            requested.send(()).expect("explicit build observer dropped");
-            released
-                .recv_timeout(Duration::from_secs(8))
-                .expect("explicit build body was not released");
-            match stream.write_all(body) {
-                Ok(()) => true,
-                Err(error)
-                    if cancel_fetch
-                        && matches!(
-                            error.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        ) =>
-                {
-                    false
-                }
-                Err(error) => panic!("explicit build body write failed: {error}"),
-            }
-        });
+        let (observed, release, server) = serve_held(
+            listener,
+            "explicit build",
+            vec!["/v2/versions/loader/1.21.4".into()],
+            FABRIC_BUILDS.to_vec(),
+            cancel_fetch,
+        );
         let service = Arc::new(service);
         let mut release = Some(release);
         let mut caller = None;
@@ -2796,35 +2802,13 @@ async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
             .parse()
             .unwrap(),
         );
-        let (requested, observed) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, request) = accept_request(&listener, "loader");
-            assert!(request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n"));
-            let body = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            requested.send(()).expect("loader request observer dropped");
-            released
-                .recv_timeout(Duration::from_secs(8))
-                .expect("loader body was not released");
-            match stream.write_all(body) {
-                Ok(()) => true,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    false
-                }
-                Err(error) => panic!("loader body write failed: {error}"),
-            }
-        });
+        let (observed, release, server) = serve_held(
+            listener,
+            "loader",
+            vec!["/v2/versions/loader/1.21.4".into()],
+            FABRIC_BUILDS.to_vec(),
+            true,
+        );
         let service = Arc::new(service);
         let mut release = Some(release);
         let mut caller = None;
@@ -3128,7 +3112,7 @@ async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
 async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
     use axial_minecraft::loaders::types::CachedCatalog;
     use futures_util::FutureExt;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     for (hold_manifest, cancel_fetch) in
@@ -3167,50 +3151,22 @@ async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
                 .parse()
                 .unwrap(),
         );
-        let (request_line, body): (&[u8], Vec<u8>) = if hold_manifest {
+        let (path, body) = if hold_manifest {
             service.loader_manifest_url = Some(
                 format!("http://{}/manifest.json", listener.local_addr().unwrap())
                     .parse()
                     .unwrap(),
             );
-            (b"GET /manifest.json HTTP/1.1\r\n", manifest.clone())
+            ("/manifest.json", manifest.clone())
         } else {
             (
-                b"GET /v2/versions/game HTTP/1.1\r\n",
+                "/v2/versions/game",
                 br#"[{"version":"1.21.4","stable":true},{"version":"25w01a","stable":false}]"#
                     .to_vec(),
             )
         };
-        let (requested, observed) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let server = std::thread::spawn(move || {
-            let (mut stream, request) = accept_request(&listener, "supported-version");
-            assert!(request.starts_with(request_line));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            requested
-                .send(())
-                .expect("supported-version observer dropped");
-            released
-                .recv_timeout(Duration::from_secs(8))
-                .expect("supported-version body was not released");
-            match stream.write_all(&body) {
-                Ok(()) => true,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    false
-                }
-                Err(error) => panic!("supported-version body write failed: {error}"),
-            }
-        });
+        let (observed, release, server) =
+            serve_held(listener, "supported-version", vec![path.into()], body, true);
         let service = Arc::new(service);
         let mut caller = None;
         let mut release = Some(release);
