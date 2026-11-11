@@ -493,35 +493,6 @@ impl AuthService {
         Ok(snapshot)
     }
 
-    /// Retained /auth/logout semantics clear all Microsoft identities while
-    /// leaving offline identities available, including when one is selected.
-    pub async fn logout(&self) -> Result<AccountSnapshot, AuthError> {
-        self.cancel_login();
-        let service = self.clone();
-        self.retain(async move {
-            let _gate = service.mutation.lock().await;
-            let snapshot = service.directory.snapshot()?;
-            for account in snapshot
-                .accounts
-                .iter()
-                .filter(|account| account.kind == AccountKind::Microsoft)
-            {
-                let capture = service.directory.capture(account.account_id.as_str())?;
-                let receipt = service
-                    .credentials
-                    .delete(capture.account_id(), None)
-                    .await?;
-                if receipt.cleanup_pending() {
-                    return Err(CredentialError::CleanupPending.into());
-                }
-                service.directory.remove_microsoft(&capture)?;
-                service.notify_account_removed(capture.account_id());
-            }
-            service.directory.snapshot().map_err(Into::into)
-        })
-        .await
-    }
-
     pub(crate) async fn retain<T: Send + 'static>(
         &self,
         operation: impl Future<Output = Result<T, AuthError>> + Send + 'static,
@@ -818,11 +789,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_revokes_refresh_and_old_completion_cannot_resurrect_relogin() {
+    async fn removal_revokes_refresh_and_old_completion_cannot_resurrect_relogin() {
         let service = service();
         let original = login(&service, FIRST, "PlayerOne").await;
         let (fence, _) = service.begin_refresh(&original).await.unwrap();
-        service.logout().await.unwrap();
+        service
+            .remove_account(original.account_id().into(), AccountPreconditions::default())
+            .await
+            .unwrap();
         assert_eq!(
             service.credentials.status(FIRST).await.unwrap().state,
             CredentialState::Deleted
@@ -874,20 +848,6 @@ mod tests {
         let recovered = login(&service, FIRST, "PlayerOne").await;
         assert!(recovered.credential_revision() > capture.credential_revision());
         assert!(service.launch_credentials(&recovered).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn logout_clears_all_microsoft_accounts_even_with_offline_selection() {
-        let service = service();
-        login(&service, FIRST, "PlayerOne").await;
-        login(&service, SECOND, "PlayerTwo").await;
-        service.directory.create_offline_account("Steve").unwrap();
-        let result = service.logout().await.unwrap();
-        assert_eq!(result.accounts.len(), 1);
-        assert_eq!(result.active_account().unwrap().display_name, "Steve");
-        for id in [FIRST, SECOND] {
-            assert!(service.credentials.load(id).await.unwrap().is_none());
-        }
     }
 
     #[tokio::test]
@@ -1001,7 +961,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(observed.lock().unwrap().as_slice(), [first.account_id()]);
-        service.logout().await.unwrap();
+        service
+            .remove_account(
+                microsoft_account_id(SECOND).unwrap(),
+                AccountPreconditions::default(),
+            )
+            .await
+            .unwrap();
         let removed = observed.lock().unwrap();
         assert_eq!(removed.len(), 2);
         assert_eq!(removed[1], microsoft_account_id(SECOND).unwrap());

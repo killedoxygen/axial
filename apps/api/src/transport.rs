@@ -357,9 +357,7 @@ fn is_media_path(path: &str) -> bool {
             path,
             "/api/v1/skin/profile/file"
                 | "/api/v1/skin/cape/file"
-                | "/api/v1/skin/head"
                 | "/api/v1/skin/lookup/file"
-                | "/api/v1/skin/lookup/head"
                 | "/api/v1/skin/lookup/cape"
         )
         || matches!(parts.as_slice(), ["", "api", "v1", "skins", key, "file"] if media_segment(key))

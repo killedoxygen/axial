@@ -1575,7 +1575,11 @@ mod tests {
                 .mark_applied_if_current(capture.account_id(), &first, saved.revision,)
                 .unwrap()
         );
-        service.auth.logout().await.unwrap();
+        service
+            .auth
+            .remove_account(capture.account_id().into(), Default::default())
+            .await
+            .unwrap();
         assert!(
             service
                 .accounts
@@ -1808,7 +1812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_while_provider_write_finishes_cannot_restore_profile_or_applied_marker() {
+    async fn removal_while_provider_write_finishes_cannot_restore_profile_or_applied_marker() {
         let (resume, paused) = oneshot::channel();
         let mut upload = Reply::json(profile(Some(FIRST_URL), false));
         upload.resume = Some(paused);
@@ -1821,7 +1825,11 @@ mod tests {
         let waiter = tokio::spawn(async move { waiter_service.flush_account(&account).await });
         assert!(requests.recv().await.unwrap().starts_with("GET"));
         assert!(requests.recv().await.unwrap().starts_with("POST"));
-        service.auth.logout().await.unwrap();
+        service
+            .auth
+            .remove_account(capture.account_id().into(), Default::default())
+            .await
+            .unwrap();
         resume.send(()).unwrap();
         assert!(waiter.await.unwrap().is_err());
         assert!(service.accounts.capture(capture.account_id()).is_err());
