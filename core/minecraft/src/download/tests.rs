@@ -790,55 +790,125 @@ async fn version_bundle_settlement_frontier_failures_retry_to_a_retained_witness
     }
 }
 
+const SETTLEMENT_FRONTIERS: [Fault; 9] = [
+    Fault::BeforeSettlementPromotion,
+    Fault::AfterSettlementPromotion,
+    Fault::AfterAncestorBucket,
+    Fault::AfterAncestorRecord,
+    Fault::AfterStagingBucket,
+    Fault::AfterQuarantineBucket,
+    Fault::AfterTableShard,
+    Fault::AfterOutcomeRemoval,
+    Fault::AfterIntentRemoval,
+];
+
+#[tokio::test]
+#[ignore = "subprocess helper exiting at a durable settlement frontier"]
+async fn version_bundle_settlement_crash_helper() {
+    let root = PathBuf::from(std::env::var_os("AXIAL_SETTLEMENT_CRASH_ROOT").unwrap());
+    let index: usize = std::env::var("AXIAL_SETTLEMENT_CRASH_FRONTIER")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let version_id = format!("bundle-released-settlement-{index}");
+    let authority = ManagedLibraryTestAuthority::open(&root).expect("open crash root");
+    fault::arm(
+        &version_bundle_lane(&root),
+        SETTLEMENT_FRONTIERS[index],
+        Some(Box::new(|| std::process::exit(74))),
+    );
+    let _ =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), &version_id).await;
+    panic!("settlement crash frontier did not fire");
+}
+
 #[tokio::test]
 async fn released_unsettled_version_bundle_settles_through_durable_classification() {
-    for (index, frontier) in [Fault::BeforeSettlementPromotion, Fault::AfterStagingBucket]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, frontier) in SETTLEMENT_FRONTIERS.into_iter().enumerate() {
         let version_id = format!("bundle-released-settlement-{index}");
         let root = temp_dir(&version_id);
-        let authority = ManagedLibraryTestAuthority::open(&root).expect("open released root");
-        // Every bounded in-process attempt stops at the frontier.
-        for _ in 0..8 {
-            fault::arm(&version_bundle_lane(&root), frontier, None);
-        }
-
-        let error =
-            publish_managed_install_fixture_for_test(authority.operation().clone(), &version_id)
-                .await
-                .expect_err("an unsettled bundle must not return a receipt");
-        let DownloadError::PublicationIndeterminate(recovery) = error else {
-            panic!("{frontier:?} must surface its retained recovery: {error}");
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "download::tests::version_bundle_settlement_crash_helper",
+            ])
+            .env("AXIAL_SETTLEMENT_CRASH_ROOT", &root)
+            .env("AXIAL_SETTLEMENT_CRASH_FRONTIER", index.to_string())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start settlement crash helper");
+        let status = match timeout(DURABLE_OPERATION_TIMEOUT, child.wait()).await {
+            Ok(status) => status.expect("join settlement crash helper"),
+            Err(_) => {
+                child.kill().await.expect("kill timed out crash helper");
+                child.wait().await.expect("reap timed out crash helper");
+                panic!("{frontier:?} crash helper hung");
+            }
         };
-        assert!(!fault::pending(&version_bundle_lane(&root)), "{frontier:?}");
-        drop(recovery);
-
-        let receipt =
-            crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(&version_id)
-                .expect("reconstruction receipt");
+        assert_eq!(
+            status.code(),
+            Some(74),
+            "{frontier:?} must crash at its frontier"
+        );
+        let authority = ManagedLibraryTestAuthority::open(&root).expect("reopen crashed root");
+        assert!(matches!(
+            classify_managed_install_publication(
+                authority.operation().clone(),
+                "another-version"
+            )
+            .await,
+            ManagedInstallDurableOutcome::Mismatch
+        ));
         let evidence = classify_committed(authority.operation(), &version_id).await;
         assert!(
             version_bundle_lane_has_durable_witness(&root),
             "{frontier:?}"
         );
-        drop(
-            evidence
-                .verify_reconstruction_receipt(receipt)
-                .expect("released publication binds its activation contract"),
-        );
-        assert_eq!(
-            checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), &version_id)
-                .await,
-            Ok(ManagedInstallSettlementForTest::Committed)
-        );
+        assert!(matches!(
+            acknowledge_committed_fixture(evidence, &version_id).await,
+            ManagedInstallAcknowledgementOutcome::Acknowledged
+        ));
         assert_settled_version_bundle_lane(&root);
         for file in fixture_bundle_files(&root, &version_id) {
             assert!(file.is_file(), "{frontier:?} must keep {}", file.display());
         }
         drop(authority);
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[tokio::test]
+async fn exhausted_version_bundle_settlement_handle_retries_with_a_fresh_budget() {
+    let version_id = "bundle-exhausted-handle";
+    let root = temp_dir(version_id);
+    let authority = ManagedLibraryTestAuthority::open(&root).expect("open retry root");
+    for _ in 0..8 {
+        fault::arm(
+            &version_bundle_lane(&root),
+            Fault::BeforeSettlementPromotion,
+            None,
+        );
+    }
+    let result =
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id).await;
+    let Err(DownloadError::PublicationIndeterminate(recovery)) = result else {
+        panic!("eight failed attempts must retain a retry handle");
+    };
+    let pending = fault::pending(&version_bundle_lane(&root));
+    let retried = recovery.retry().await;
+    assert!(!pending, "all eight attempts must have run");
+    assert_eq!(
+        retried.expect("retry retained settlement").version_id(),
+        version_id
+    );
+    assert_eq!(
+        checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
+            .await,
+        Ok(ManagedInstallSettlementForTest::Committed)
+    );
+    drop(authority);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -875,6 +945,54 @@ async fn unsettled_version_bundle_move_reconciles_to_a_rolled_back_witness() {
     assert_settled_version_bundle_lane(&root);
     drop(authority);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn version_bundle_ancestors_roll_back_and_later_share_the_assets_root() {
+    for existing_assets in [false, true] {
+        let version_id = "bundle-assets-ancestors";
+        let root = temp_dir(version_id);
+        if existing_assets {
+            fs::create_dir_all(root.join("assets")).unwrap();
+        }
+        let authority = ManagedLibraryTestAuthority::open(&root).unwrap();
+        fault::arm(&version_bundle_lane(&root), Fault::RowUnsettled, None);
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect_err("unsettled log config must roll back");
+        assert_eq!(root.join("assets").exists(), existing_assets);
+        assert!(!root.join("assets/log_configs").exists());
+        assert_eq!(
+            checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
+                .await,
+            Ok(ManagedInstallSettlementForTest::RolledBack)
+        );
+        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+            .await
+            .expect("bundle creates assets ancestors");
+        assert_eq!(
+            checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
+                .await,
+            Ok(ManagedInstallSettlementForTest::Committed)
+        );
+        drop(authority);
+        let next = "assets-after-bundle";
+        let fixture = spawn_nonempty_asset_install_server(next).await;
+        let downloader =
+            test_manifest_downloader(&root, next, &fixture.version_url, &fixture.version_sha1)
+                .with_test_asset_object_base_url(fixture.object_base_url.clone());
+        downloader
+            .install_version(next, |_| {})
+            .await
+            .expect("Assets lane shares bundle-created root");
+        assert!(
+            root.join("assets/log_configs/guardian-version-bundle.xml")
+                .is_file()
+        );
+        checkpoint_and_ack_version_bundle(downloader.managed_operation_for_test(), next).await;
+        drop(downloader);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test]

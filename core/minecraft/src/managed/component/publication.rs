@@ -789,30 +789,51 @@ mod tests {
 
     #[test]
     fn settlement_accepts_the_exact_maximum_bound_and_rejects_oversize() {
-        let intent = maximum_intent_bytes();
-        assert_eq!(intent.len(), MAX_COMPONENT_INTENT_BYTES);
-        let outcome = ComponentOutcomeRecord::for_intent(
-            &intent,
-            ComponentTerminalOutcome::RolledBack,
-            ComponentRollbackEffect::Reconciliation,
-        )
-        .unwrap();
-        let settlement = encode_component_settlement(&outcome, &intent, [0x5e; 16], &[]).unwrap();
-        // Only a retained settlement carries its table shard.
-        assert_eq!(
-            settlement.len(),
-            MAX_COMPONENT_SETTLEMENT_BYTES - MAX_COMPONENT_TABLE_SHARD_BYTES
-        );
-        assert_eq!(
-            decode_component_settlement(&settlement)
-                .unwrap()
-                .encoded_intent,
-            intent,
-        );
-        assert_eq!(
-            decode_component_settlement(&vec![0; MAX_COMPONENT_SETTLEMENT_BYTES + 1]),
-            Err(ComponentPublicationRecordError),
-        );
+        for component in [
+            ManagedComponentKind::Libraries,
+            ManagedComponentKind::Assets,
+        ] {
+            let mut manifest = decode_component_intent_manifest(&maximum_intent_bytes()).unwrap();
+            manifest.component = component;
+            let intent = encode_component_intent_manifest(&manifest).unwrap();
+            assert_eq!(intent.len(), MAX_COMPONENT_INTENT_BYTES);
+            let outcome = ComponentOutcomeRecord::for_intent(
+                &intent,
+                ComponentTerminalOutcome::RolledBack,
+                ComponentRollbackEffect::Reconciliation,
+            )
+            .unwrap();
+            let outcome_bytes = encode_component_outcome(&outcome).unwrap();
+            let settlement =
+                encode_component_settlement(&outcome, &intent, [0x5e; 16], &[]).unwrap();
+            for bytes in [&intent, &outcome_bytes, &settlement] {
+                assert_eq!(&bytes[8..10], &3_u16.to_le_bytes());
+            }
+            let mut old_intent = intent.clone();
+            old_intent[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            assert!(decode_component_intent_manifest(&old_intent).is_err());
+            let mut old_outcome = outcome_bytes;
+            old_outcome[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            assert!(decode_component_outcome(&old_outcome).is_err());
+            let mut old_settlement = settlement.clone();
+            old_settlement[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            assert!(decode_component_settlement(&old_settlement).is_err());
+            // Only a retained settlement carries its table shard.
+            assert_eq!(
+                settlement.len(),
+                MAX_COMPONENT_SETTLEMENT_BYTES - MAX_COMPONENT_TABLE_SHARD_BYTES
+            );
+            assert_eq!(
+                decode_component_settlement(&settlement)
+                    .unwrap()
+                    .encoded_intent,
+                intent,
+            );
+            assert_eq!(
+                decode_component_settlement(&vec![0; MAX_COMPONENT_SETTLEMENT_BYTES + 1]),
+                Err(ComponentPublicationRecordError),
+            );
+        }
     }
 
     #[test]
