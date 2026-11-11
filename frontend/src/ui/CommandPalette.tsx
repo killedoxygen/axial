@@ -311,6 +311,7 @@ export function CommandPalette(): JSX.Element | null {
   return (
     <div
       class="cp-cmd-overlay"
+      data-window-drag-strip
       onClick={(event) => {
         if (event.target === event.currentTarget) close();
       }}

@@ -12,7 +12,6 @@ import { launchSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailures, downloadQueue } from '../machines/downloads';
 import { hasVisibleUpdate, updateFlow, updateFlowActive } from '../updater';
 import { minecraftVersionLabel } from '../version-display';
-import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
 import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
 import type { LaunchSession } from '../types-launch';
 
@@ -262,21 +261,7 @@ function useWindowCalm(): boolean {
 }
 
 export function Topbar(): JSX.Element {
-  const [usesCustomDrag] = useState(hasCustomDragRegion());
   const calm = useWindowCalm();
-
-  const onDragAreaDoubleClick = (e: MouseEvent): void => {
-    if (!usesCustomDrag) return;
-    if ((e.target as HTMLElement)?.closest('.cp-nodrag')) return;
-    void windowToggleMaximize();
-  };
-
-  const onDragAreaMouseDown = (e: MouseEvent): void => {
-    if (!usesCustomDrag) return;
-    if ((e.target as HTMLElement)?.closest('.cp-nodrag')) return;
-    if (e.button !== 0) return;
-    void windowStartDragging();
-  };
 
   const crumbs = crumbsFor();
   const sessionActive = Object.keys(launchSessions.value).length > 0;
@@ -286,12 +271,7 @@ export function Topbar(): JSX.Element {
   const updateIndeterminate = flow.percent == null || flow.phase === 'applying';
   const updateRatio = flow.percent != null ? Math.min(100, Math.max(0, flow.percent)) / 100 : 0;
   return (
-    <div
-      class={`cp-topbar${usesCustomDrag ? ' cp-drag' : ''}`}
-      data-calm={calm}
-      onMouseDown={onDragAreaMouseDown}
-      onDblClick={onDragAreaDoubleClick}
-    >
+    <div class="cp-topbar cp-drag" data-calm={calm}>
       <div class="cp-topbar-nav cp-nodrag">
         <IconButton icon="arrow-left" size={28} tooltip="Back" onClick={goBack} />
         <IconButton icon="arrow-right" size={28} tooltip="Forward" onClick={goForward} />

@@ -2,7 +2,6 @@ import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { startApplicationBootstrap } from '../bootstrap';
 import { bootstrapError, bootstrapState } from '../store';
-import { hasCustomDragRegion, windowStartDragging } from '../native';
 import { Logo } from '../ui/Logo';
 
 const MIN_DISPLAY_MS = 500;
@@ -40,7 +39,6 @@ export function BootSplash(): JSX.Element | null {
   const [leaving, setLeaving] = useState(false);
   const [gone, setGone] = useState(false);
   const mountedAt = useRef(Date.now());
-  const usesCustomDrag = useRef(hasCustomDragRegion());
 
   useEffect(() => {
     if (state !== 'loading') return;
@@ -69,18 +67,12 @@ export function BootSplash(): JSX.Element | null {
 
   if (gone) return null;
 
-  const onMouseDown = (e: MouseEvent): void => {
-    if (!usesCustomDrag.current || e.button !== 0) return;
-    void windowStartDragging();
-  };
-
   return (
     <div
-      class="cp-boot"
+      class="cp-boot cp-drag"
       data-leaving={leaving || undefined}
       role={state === 'error' ? 'alert' : 'status'}
       aria-live={state === 'error' ? 'assertive' : 'polite'}
-      onMouseDown={onMouseDown}
     >
       <div class="cp-boot-stack">
         <Logo className="cp-boot-logo" motion="assembly" size={64} style={bootLogoStyle(progress)} />

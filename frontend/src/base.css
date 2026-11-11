@@ -103,15 +103,6 @@ input::placeholder {
   color: var(--text-mute);
 }
 
-.cp-drag {
-  -webkit-app-region: drag;
-  app-region: drag;
-}
-.cp-nodrag {
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
-}
-
 :root {
   color-scheme: dark;
   /* Neutrals, darkest first: the frame, the panel, a quiet holder, the three control fills, an overlay. */

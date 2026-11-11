@@ -84,6 +84,7 @@ function ModalContent({
       <div
         data-slot="modal-overlay"
         class="cp-modal-overlay"
+        data-window-drag-strip
         onClick={suspended ? undefined : close}
         inert={suspended}
         aria-hidden="true"

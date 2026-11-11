@@ -41,7 +41,7 @@
   position: absolute;
   inset: 0 0 auto;
   z-index: 1;
-  height: var(--cp-window-onboarding-strip-h, 36px);
+  height: var(--cp-window-drag-strip-h, 36px);
   display: flex;
   justify-content: flex-end;
   padding-right: 2px;

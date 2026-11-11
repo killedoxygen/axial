@@ -1,11 +1,11 @@
 :root {
   --cp-window-titlebar-safe-h: 0px;
-  --cp-window-onboarding-strip-h: 36px;
+  --cp-window-drag-strip-h: 36px;
 }
 
 html[data-desktop-chrome='mac-overlay'] {
   --cp-window-titlebar-safe-h: 38px;
-  --cp-window-onboarding-strip-h: 40px;
+  --cp-window-drag-strip-h: 40px;
 }
 
 .cp-frame {

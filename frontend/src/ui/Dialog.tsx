@@ -246,6 +246,7 @@ export function DialogHost(): JSX.Element | null {
   return (
     <div
       class="cp-dialog-overlay"
+      data-window-drag-strip
       onClick={(e) => {
         if (e.target === e.currentTarget) resolveAs(false);
       }}

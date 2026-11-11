@@ -407,6 +407,44 @@ export async function windowStartDragging(): Promise<boolean> {
   return true;
 }
 
+// WKWebView and WebKitGTK ignore CSS app-region, so one delegated listener moves the window.
+// `.cp-drag` drags across its whole area; `[data-window-drag-strip]` backdrops only within the top strip.
+const WINDOW_DRAG_EXCLUDED = '.cp-nodrag, button, input, select, textarea, a, [role="button"]';
+
+function windowDragStripHeight(): number {
+  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--cp-window-drag-strip-h')) || 0;
+}
+
+function isWindowDragTarget(event: MouseEvent): boolean {
+  const target = event.target;
+  if (!hasCustomDragRegion() || event.button !== 0 || !(target instanceof Element)) return false;
+  if (target.closest(WINDOW_DRAG_EXCLUDED)) return false;
+  if (target.closest('.cp-drag')) return true;
+  return target.matches('[data-window-drag-strip]') && event.clientY < windowDragStripHeight();
+}
+
+export function installWindowDrag(): void {
+  document.addEventListener('mousedown', (event) => {
+    if (!isWindowDragTarget(event)) return;
+    event.preventDefault();
+    void (event.detail === 2 ? windowToggleMaximize() : windowStartDragging());
+  });
+  // A press on a backdrop's drag strip moves the window; it must not also dismiss the overlay.
+  document.addEventListener(
+    'click',
+    (event) => {
+      if (
+        event.target instanceof Element &&
+        event.target.matches('[data-window-drag-strip]') &&
+        isWindowDragTarget(event)
+      ) {
+        event.stopPropagation();
+      }
+    },
+    true,
+  );
+}
+
 export async function windowSetResizeBackground(dark: boolean): Promise<boolean> {
   const tauri = getTauriBinding();
   if (!tauri?.core) return false;

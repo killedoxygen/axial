@@ -9,6 +9,7 @@ import { Sound, bindButtonSounds } from './sound';
 import {
   applyDesktopChromeAttributes,
   hasNativeDesktopRuntime,
+  installWindowDrag,
   nativeDesktopCloseBlockedEventName,
   onNativeEvent,
 } from './native';
@@ -21,11 +22,14 @@ async function init(): Promise<void> {
   if (hasNativeDesktopRuntime()) Sound.enabled = false;
   initErrorReporting();
   await applyDesktopChromeAttributes();
+  installWindowDrag();
 
   // Theme before anything else so the first paint is tinted correctly
   if (!hasNativeDesktopRuntime()) {
     applyTheme(local.theme, local.customHue, {
-      silent: true, vibrancy: local.customVibrancy, lightness: local.lightness,
+      silent: true,
+      vibrancy: local.customVibrancy,
+      lightness: local.lightness,
     });
   }
 
@@ -39,14 +43,18 @@ async function init(): Promise<void> {
     bindButtonSounds();
   }
 
-  window.addEventListener('keydown', (event) => {
-    if (!hasNativeDesktopRuntime()) return;
-    if (event.key === 'F5' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r')) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      void reloadApplication();
-    }
-  }, true);
+  window.addEventListener(
+    'keydown',
+    (event) => {
+      if (!hasNativeDesktopRuntime()) return;
+      if (event.key === 'F5' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        void reloadApplication();
+      }
+    },
+    true,
+  );
 
   await startApplicationBootstrap();
 
