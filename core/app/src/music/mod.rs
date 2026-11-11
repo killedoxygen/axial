@@ -4,7 +4,7 @@ mod cache;
 
 use crate::{
     library::{ApplicationRootPin, LibraryLifecycle},
-    tasks::{CancellationToken, TaskOwner},
+    tasks::{CancellationToken, RetainedEffects, TaskOwner},
 };
 use axial_minecraft::download::{
     CreateOnlyTransferTarget, ManagedTransferAuthority, RetryPolicy, TransferClient,
@@ -68,7 +68,7 @@ struct Shared {
     sources: [reqwest::Url; 2],
     flights: Mutex<[Option<watch::Receiver<FlightResult>>; 2]>,
     directory_creation: Mutex<()>,
-    effects: Mutex<Vec<cache::RetainedEffect>>,
+    effects: RetainedEffects<Vec<cache::RetainedEffect>>,
 }
 
 impl MusicService {
@@ -111,7 +111,7 @@ impl MusicService {
                 sources,
                 flights: Mutex::new([None, None]),
                 directory_creation: Mutex::new(()),
-                effects: Mutex::new(Vec::new()),
+                effects: RetainedEffects::default(),
             }),
         })
     }
@@ -193,28 +193,23 @@ impl MusicService {
     /// Call on a blocking worker after the shared TaskOwner drains and before
     /// releasing the library root. Unresolved effects retain their exact pin.
     pub fn settle(&self) -> Result<(), MusicError> {
-        let mut effects = self
-            .shared
-            .effects
-            .lock()
-            .map_err(|_| MusicError::Unavailable)?;
-        let remaining = std::mem::take(&mut *effects)
-            .into_iter()
-            .filter_map(cache::RetainedEffect::reconcile)
-            .collect();
-        *effects = remaining;
-        if effects.is_empty() {
-            Ok(())
-        } else {
+        {
+            let mut effects = self.shared.effects.lock();
+            let remaining = std::mem::take(&mut *effects)
+                .into_iter()
+                .filter_map(cache::RetainedEffect::reconcile)
+                .collect();
+            *effects = remaining;
+        }
+        if self.has_unsettled_effects() {
             Err(MusicError::Unavailable)
+        } else {
+            Ok(())
         }
     }
 
     pub fn has_unsettled_effects(&self) -> bool {
-        self.shared
-            .effects
-            .lock()
-            .map_or(true, |effects| !effects.is_empty())
+        !self.shared.effects.is_settled(Vec::is_empty)
     }
 
     async fn load_track(
@@ -281,7 +276,6 @@ impl MusicService {
         self.shared
             .effects
             .lock()
-            .expect("music effect lock poisoned")
             .push(cache::RetainedEffect { pin, effect });
     }
 }

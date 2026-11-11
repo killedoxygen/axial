@@ -8,14 +8,11 @@ use crate::{
     },
     files::{PortableName, ScopedDirectory},
     instances::{directory::InstanceDirectories, model::InstanceId},
-    tasks::{TaskHandle, TaskOwner},
+    tasks::{RetainedEffects, TaskHandle, TaskOwner},
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{
-    io,
-    sync::{Arc, Mutex},
-};
+use std::{io, sync::Arc};
 use ts_rs::TS;
 
 #[derive(Debug, thiserror::Error)]
@@ -147,7 +144,7 @@ pub struct ResourceService {
     directories: InstanceDirectories,
     content: ContentMutations,
     tasks: TaskOwner,
-    retained: Arc<Mutex<Vec<Box<dyn Send>>>>,
+    retained: Arc<RetainedEffects<Vec<Box<dyn Send>>>>,
 }
 
 impl ResourceService {
@@ -160,23 +157,16 @@ impl ResourceService {
             directories,
             content,
             tasks,
-            retained: Arc::new(Mutex::new(Vec::new())),
+            retained: Arc::default(),
         }
     }
 
     pub fn has_unsettled_effects(&self) -> bool {
-        !self
-            .retained
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_empty()
+        !self.retained.is_settled(Vec::is_empty)
     }
 
     fn retain(&self, obligation: impl Send + 'static) -> ResourceError {
-        self.retained
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(Box::new(obligation));
+        self.retained.lock().push(Box::new(obligation));
         ResourceError::Pending
     }
 

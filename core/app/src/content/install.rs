@@ -26,7 +26,7 @@ use crate::{
         MetadataStore, Migration, StorageError,
         rusqlite::{self, OptionalExtension, params},
     },
-    tasks::{CancellationToken, TaskHandle, TaskOwner},
+    tasks::{CancellationToken, RetainedEffects, TaskHandle, TaskOwner},
 };
 use axial_minecraft::{
     DownloadProgress,
@@ -563,7 +563,7 @@ pub struct ContentMutations {
     directories: InstanceDirectories,
     _client: ProviderClient,
     tasks: TaskOwner,
-    pending: Arc<Mutex<HashMap<InstanceId, PendingBatch>>>,
+    pending: Arc<RetainedEffects<HashMap<InstanceId, PendingBatch>>>,
     resuming: Arc<Mutex<HashSet<InstanceId>>>,
     performance: Option<crate::performance::mutation::PerformanceService>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
@@ -583,7 +583,7 @@ impl ContentMutations {
             directories,
             _client: client,
             tasks,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::default(),
             resuming: Arc::new(Mutex::new(HashSet::new())),
             performance: None,
             progress: None,
@@ -1014,12 +1014,7 @@ impl ContentMutations {
     }
 
     pub fn has_unsettled_effects(&self) -> bool {
-        if !self
-            .pending
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .is_empty()
-        {
+        if !self.pending.is_settled(HashMap::is_empty) {
             return true;
         }
         self.directories
@@ -1044,10 +1039,7 @@ impl ContentMutations {
         if !receipt.belongs_to(&self.tasks) {
             return Err(MutationError::Unavailable);
         }
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| MutationError::Unavailable)?;
+        let mut pending = self.pending.intact().ok_or(MutationError::Unavailable)?;
         if pending
             .values()
             .any(|batch| !batch.restart_blocked || !batch.effects.is_empty())
@@ -1816,8 +1808,8 @@ impl ContentMutations {
         };
         let retained = self
             .pending
-            .lock()
-            .map_err(|_| MutationError::Unavailable)?
+            .intact()
+            .ok_or(MutationError::Unavailable)?
             .get(id)
             .map(|batch| batch.instance.clone());
         let instance = match retained {
@@ -1849,14 +1841,14 @@ impl ContentMutations {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     if !matches!(error, MutationError::NotFound) {
-                        owner.pending.lock().map_err(|_| MutationError::Unavailable)?
+                        owner.pending.lock()
                             .entry(instance.record().instance.id.clone())
                             .or_insert(PendingBatch { instance, effects: Vec::new(), restart_blocked: true });
                     }
                     return Err(error);
                 }
             };
-            let batch = owner.pending.lock().map_err(|_| MutationError::Unavailable)?.remove(&instance.record().instance.id);
+            let batch = owner.pending.intact().ok_or(MutationError::Unavailable)?.remove(&instance.record().instance.id);
             let restarting = batch.as_ref().is_none_or(|batch| batch.restart_blocked);
             let effects = batch.map(|batch| batch.effects).unwrap_or_default();
             let mut remaining: Vec<_> = effects.into_iter().map(|effect| effect.settle(&owner, &mut receipt)).collect();
@@ -2050,17 +2042,14 @@ impl ContentMutations {
         effects: Vec<Effect>,
         restart_blocked: bool,
     ) -> Result<MutationReceipt, MutationError> {
-        self.pending
-            .lock()
-            .map_err(|_| MutationError::Unavailable)?
-            .insert(
-                instance.record().instance.id.clone(),
-                PendingBatch {
-                    instance,
-                    effects,
-                    restart_blocked,
-                },
-            );
+        self.pending.lock().insert(
+            instance.record().instance.id.clone(),
+            PendingBatch {
+                instance,
+                effects,
+                restart_blocked,
+            },
+        );
         Err(MutationError::Pending)
     }
 }
@@ -6365,7 +6354,7 @@ pub(crate) mod tests {
             assert!(matches!(result, Err(MutationError::Changed)), "{result:?}");
             assert!(!committing.load(Ordering::SeqCst));
             assert!(!has_pending(storage, &id).unwrap());
-            assert!(owner.pending.lock().unwrap().is_empty());
+            assert!(owner.pending.lock().is_empty());
             assert_eq!(std::fs::read(game.join(MANIFEST_FILE)).ok(), original);
             assert!(!game.join("config/checkpoint.txt").exists());
         }
@@ -6744,7 +6733,7 @@ pub(crate) mod tests {
         let canary = locate_canary(&private, &canary_name);
         let fenced = owner.directories.admit(&id).is_err();
         let task_retained = owner.tasks.status().running.contains(&task_id);
-        let premature_recovery = owner.pending.lock().unwrap().get(&id).is_some_and(|batch| {
+        let premature_recovery = owner.pending.lock().get(&id).is_some_and(|batch| {
             batch
                 .effects
                 .iter()
@@ -7225,7 +7214,7 @@ pub(crate) mod tests {
                 receipt.after_manifest
             );
             {
-                let pending = owner.pending.lock().unwrap();
+                let pending = owner.pending.lock();
                 let batch = pending.get(&id).unwrap();
                 assert!(!batch.restart_blocked);
                 if acknowledgement == "UPDATE" {
@@ -7257,7 +7246,7 @@ pub(crate) mod tests {
                 Err(MutationError::Pending)
             ));
             assert!(owner.has_unsettled_effects());
-            assert_eq!(owner.pending.lock().unwrap().len(), 1);
+            assert_eq!(owner.pending.lock().len(), 1);
             assert!(owner.directories.admit_content_settlement(&id).is_err());
             assert_eq!(recorded(), before);
             assert_eq!(
@@ -7788,7 +7777,7 @@ pub(crate) mod tests {
             owner
                 .release_shutdown_admissions(&owner.tasks.shutdown_receipt().unwrap())
                 .unwrap();
-            assert!(owner.pending.lock().unwrap().is_empty());
+            assert!(owner.pending.lock().is_empty());
             owner.directories.library().try_preserve().unwrap();
             if let Some(result) = rollback {
                 assert!(

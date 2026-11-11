@@ -16,7 +16,7 @@ use crate::{
         Migration,
         rusqlite::{OptionalExtension, params},
     },
-    tasks::{CancellationToken, ExclusionLease, TaskHandle, TaskOwner},
+    tasks::{CancellationToken, ExclusionLease, RetainedEffects, TaskHandle, TaskOwner},
     telemetry::{Telemetry, TelemetryEvent, TelemetryLoader},
 };
 use serde::{Deserialize, Serialize};
@@ -204,7 +204,7 @@ pub struct InstanceService {
     pub(crate) tasks: TaskOwner,
     // A domain error cannot revoke a native effect or its physical generation.
     // Composition must refuse shutdown/reset while these obligations remain.
-    retained: Arc<Mutex<BTreeMap<Option<InstanceId>, Vec<NativeEffect>>>>,
+    retained: Arc<RetainedEffects<BTreeMap<Option<InstanceId>, Vec<NativeEffect>>>>,
     admissions: Arc<Mutex<BTreeMap<InstanceId, PendingAdmission>>>,
     operation: Option<InstanceId>,
     telemetry: Option<Arc<Telemetry>>,
@@ -239,7 +239,7 @@ impl InstanceService {
         Self {
             directories,
             tasks,
-            retained: Arc::new(Mutex::new(BTreeMap::new())),
+            retained: Arc::default(),
             admissions: Arc::new(Mutex::new(BTreeMap::new())),
             operation: None,
             telemetry: None,
@@ -266,11 +266,7 @@ impl InstanceService {
         self.directories.registry()
     }
     pub fn has_unsettled_effects(&self) -> bool {
-        !self
-            .retained
-            .lock()
-            .expect("instance effects lock poisoned")
-            .is_empty()
+        !self.retained.is_settled(BTreeMap::is_empty)
             || !self
                 .admissions
                 .lock()
@@ -301,7 +297,6 @@ impl InstanceService {
     pub(crate) fn retain(&self, effect: NativeEffect) {
         self.retained
             .lock()
-            .expect("instance effects lock poisoned")
             .entry(self.operation.clone())
             .or_default()
             .push(effect);
@@ -331,7 +326,6 @@ impl InstanceService {
         let effects = self
             .retained
             .lock()
-            .expect("instance effects lock poisoned")
             .remove(&self.operation)
             .unwrap_or_default();
         for effect in effects {
@@ -341,13 +335,11 @@ impl InstanceService {
         }
         if self
             .retained
-            .lock()
-            .expect("instance effects lock poisoned")
-            .contains_key(&self.operation)
+            .is_settled(|retained| !retained.contains_key(&self.operation))
         {
-            Err(InstanceError::SettlementRequired)
-        } else {
             Ok(())
+        } else {
+            Err(InstanceError::SettlementRequired)
         }
     }
 
@@ -581,13 +573,7 @@ impl InstanceService {
 
     pub async fn recover_pending(&self) -> InstanceResult<()> {
         let mut failed = false;
-        let effects = self
-            .retained
-            .lock()
-            .expect("instance effects lock poisoned")
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let effects = self.retained.lock().keys().cloned().collect::<Vec<_>>();
         for operation in effects {
             let mut service = self.clone();
             service.operation = operation;
