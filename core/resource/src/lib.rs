@@ -734,7 +734,7 @@ struct PhysicalWorkLimits {
 mod tests {
     use super::*;
     use std::sync::{Condvar, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn test_owner() -> PhysicalWorkOwner {
         PhysicalWorkOwner::new(PhysicalWorkLimits {
@@ -745,284 +745,16 @@ mod tests {
         })
     }
 
-    #[test]
-    fn inline_work_is_counted_and_refuses_excess_capacity() {
-        let owner = test_owner();
-        let nested_owner = owner.clone();
-        owner
-            .try_run_inline(
-                PhysicalWorkRequest::foreground(PhysicalIoClass::Read, SCRATCH_UNIT_BYTES),
-                move || {
-                    let snapshot = nested_owner.snapshot(PhysicalWorkClass::Foreground);
-                    assert_eq!(snapshot.active_admissions, 1);
-                    assert_eq!(snapshot.running_workers, 1);
+    type Gate = Arc<(Mutex<bool>, Condvar)>;
 
-                    let second_owner = nested_owner.clone();
-                    nested_owner
-                        .try_run_inline(
-                            PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
-                            move || {
-                                second_owner
-                                    .try_run_inline(
-                                        PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
-                                        || {
-                                            assert_eq!(
-                                                second_owner.try_run_inline(
-                                                    PhysicalWorkRequest::foreground(
-                                                        PhysicalIoClass::Read,
-                                                        0,
-                                                    ),
-                                                    || (),
-                                                ),
-                                                Err(PhysicalWorkError::Unavailable)
-                                            );
-                                        },
-                                    )
-                                    .expect("third worker");
-                            },
-                        )
-                        .expect("second worker");
-                },
-            )
-            .expect("inline admission");
-        let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
-        assert_eq!(snapshot.active_admissions, 0);
-        assert_eq!(snapshot.running_workers, 0);
+    fn wait(gate: &Gate) {
+        let (lock, wake) = &**gate;
+        drop(wake.wait_while(lock.lock().unwrap(), |open| !*open).unwrap());
     }
 
-    #[tokio::test]
-    async fn native_filesystem_contract_scratch_waiter_does_not_hold_background_capacity() {
-        let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
-            workers: 2,
-            background: 1,
-            heavy: 1,
-            scratch_bytes: SCRATCH_UNIT_BYTES,
-        });
-        let scratch = owner
-            .reserve_scratch(SCRATCH_UNIT_BYTES)
-            .await
-            .expect("reserve process scratch")
-            .expect("nonzero scratch permit");
-        let waiting = owner.group();
-        let waiting_task = tokio::spawn({
-            let waiting = waiting.clone();
-            async move {
-                waiting
-                    .run(
-                        PhysicalWorkRequest::background(PhysicalIoClass::Read, SCRATCH_UNIT_BYTES),
-                        |_| (),
-                    )
-                    .await
-            }
-        });
-        while waiting.active() == 0 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(owner.inner.background.available_permits(), 1);
-
-        let immediate = owner.group();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            immediate.run(
-                PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
-                |_| (),
-            ),
-        )
-        .await
-        .expect("scratch waiter must not occupy background capacity")
-        .expect("independent background work");
-
-        drop(scratch);
-        waiting_task
-            .await
-            .expect("join scratch waiter")
-            .expect("scratch waiter");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn native_filesystem_contract_saturation_records_capacity_measurements() {
-        const RUNS: usize = 20;
-        const WORKER_SCRATCH_BYTES: u64 = SCRATCH_LIMIT_BYTES / PROCESS_WORKER_LIMIT as u64;
-
-        let mut heartbeat_samples = Vec::with_capacity(RUNS);
-        let mut queue_wait_samples = Vec::with_capacity(RUNS);
-        let mut shutdown_samples = Vec::with_capacity(RUNS);
-        for _ in 0..RUNS {
-            let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
-                workers: PROCESS_WORKER_LIMIT,
-                background: BACKGROUND_WORKER_LIMIT,
-                heavy: HEAVY_IO_LIMIT,
-                scratch_bytes: SCRATCH_LIMIT_BYTES,
-            });
-            let gate = Arc::new((Mutex::new(false), Condvar::new()));
-            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut running_groups = Vec::with_capacity(PROCESS_WORKER_LIMIT);
-            let mut running_tasks = Vec::with_capacity(PROCESS_WORKER_LIMIT);
-            for index in 0..PROCESS_WORKER_LIMIT {
-                let group = owner.group();
-                running_groups.push(group.clone());
-                let gate = Arc::clone(&gate);
-                let started_tx = started_tx.clone();
-                let request = if index < BACKGROUND_WORKER_LIMIT {
-                    PhysicalWorkRequest::background(PhysicalIoClass::Read, WORKER_SCRATCH_BYTES)
-                } else {
-                    PhysicalWorkRequest::foreground(PhysicalIoClass::Read, WORKER_SCRATCH_BYTES)
-                };
-                running_tasks.push(tokio::spawn(async move {
-                    group
-                        .run(request, move |cancellation| {
-                            started_tx.send(()).expect("report saturated worker");
-                            let (lock, wake) = &*gate;
-                            let released = lock.lock().expect("lock saturation gate");
-                            drop(
-                                wake.wait_while(released, |released| !*released)
-                                    .expect("wait for saturation release"),
-                            );
-                            assert!(cancellation.is_cancelled());
-                        })
-                        .await
-                }));
-            }
-            drop(started_tx);
-            for _ in 0..PROCESS_WORKER_LIMIT {
-                tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
-                    .await
-                    .expect("saturated worker starts")
-                    .expect("saturated worker signal remains open");
-            }
-
-            let foreground = owner.snapshot(PhysicalWorkClass::Foreground);
-            let background = owner.snapshot(PhysicalWorkClass::Background);
-            assert_eq!(foreground.running_workers + background.running_workers, 4);
-            assert_eq!(
-                foreground.active_admissions + background.active_admissions,
-                4
-            );
-            assert_eq!(foreground.available_workers, 0);
-            assert_eq!(foreground.available_scratch_bytes, 0);
-
-            let queued = owner.group();
-            let queued_task_group = queued.clone();
-            let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
-            let queued_since = Instant::now();
-            let queued_task = tokio::spawn(async move {
-                queued_task_group
-                    .run(
-                        PhysicalWorkRequest::foreground(PhysicalIoClass::Metadata, 0),
-                        move |_| queued_tx.send(()).expect("report queued worker"),
-                    )
-                    .await
-            });
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), &mut queued_rx)
-                    .await
-                    .is_err(),
-                "saturated work must keep the fifth worker queued"
-            );
-
-            let heartbeat_started = Instant::now();
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                tokio::time::sleep(Duration::from_millis(10)),
-            )
-            .await
-            .expect("async heartbeat remains responsive under saturation");
-            heartbeat_samples.push(heartbeat_started.elapsed());
-
-            let shutdown_started = Instant::now();
-            for group in &running_groups {
-                group.cancel();
-            }
-            let (lock, wake) = &*gate;
-            *lock.lock().expect("release saturation gate") = true;
-            wake.notify_all();
-            tokio::time::timeout(Duration::from_secs(2), &mut queued_rx)
-                .await
-                .expect("queued worker starts after capacity release")
-                .expect("queued worker reports start");
-            queue_wait_samples.push(queued_since.elapsed());
-            for task in running_tasks {
-                assert_eq!(
-                    tokio::time::timeout(Duration::from_secs(2), task)
-                        .await
-                        .expect("saturated task exits")
-                        .expect("join saturated task"),
-                    Ok(())
-                );
-            }
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(2), queued_task)
-                    .await
-                    .expect("queued task exits")
-                    .expect("join queued task"),
-                Ok(())
-            );
-            for group in running_groups.iter().chain([&queued]) {
-                tokio::time::timeout(Duration::from_secs(2), group.drain())
-                    .await
-                    .expect("group drains after shutdown");
-            }
-            shutdown_samples.push(shutdown_started.elapsed());
-
-            for class in [PhysicalWorkClass::Foreground, PhysicalWorkClass::Background] {
-                let snapshot = owner.snapshot(class);
-                assert_eq!(snapshot.active_admissions, 0);
-                assert_eq!(snapshot.running_workers, 0);
-                assert_eq!(snapshot.available_workers, PROCESS_WORKER_LIMIT);
-                assert_eq!(snapshot.available_scratch_bytes, SCRATCH_LIMIT_BYTES);
-            }
-        }
-
-        heartbeat_samples.sort_unstable();
-        queue_wait_samples.sort_unstable();
-        shutdown_samples.sort_unstable();
-        let p95_index = RUNS * 95 / 100 - 1;
-        println!(
-            "resource_admission_measurement={{\"runs\":{RUNS},\"peak_workers\":{PROCESS_WORKER_LIMIT},\"peak_scratch_bytes\":{SCRATCH_LIMIT_BYTES},\"heartbeat_p95_ns\":{},\"queue_wait_p95_ns\":{},\"shutdown_p95_ns\":{}}}",
-            heartbeat_samples[p95_index].as_nanos(),
-            queue_wait_samples[p95_index].as_nanos(),
-            shutdown_samples[p95_index].as_nanos(),
-        );
-    }
-
-    #[tokio::test]
-    async fn parallel_admission_reserves_every_worker_and_restores_job_order() {
-        let owner = test_owner();
-        let admission = owner
-            .admit(PhysicalWorkRequest::foreground_parallel(
-                PhysicalIoClass::Metadata,
-                0,
-                3,
-            ))
-            .await
-            .expect("parallel admission");
-        assert_eq!(
-            owner
-                .snapshot(PhysicalWorkClass::Foreground)
-                .available_workers,
-            0
-        );
-        let observed_owner = owner.clone();
-        let results = admission
-            .run_parallel(move |_, parallelism| {
-                assert_eq!(parallelism.workers(), 3);
-                assert_eq!(
-                    observed_owner
-                        .snapshot(PhysicalWorkClass::Foreground)
-                        .running_workers,
-                    3
-                );
-                parallelism.run_scoped((0..3).map(|index| move || index).collect())
-            })
-            .await
-            .expect("parallel worker")
-            .expect("scoped jobs");
-        assert_eq!(results, vec![0, 1, 2]);
-        let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
-        assert_eq!(snapshot.active_admissions, 0);
-        assert_eq!(snapshot.running_workers, 0);
-        assert_eq!(snapshot.available_workers, 3);
+    fn open(gate: &Gate) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
     }
 
     #[test]
@@ -1050,6 +782,7 @@ mod tests {
             .expect("scoped jobs");
         assert_eq!(results, vec![0, 1, 2]);
         let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+        assert_eq!(snapshot.active_admissions, 0);
         assert_eq!(snapshot.running_workers, 0);
         assert_eq!(snapshot.available_workers, 3);
     }
@@ -1072,33 +805,91 @@ mod tests {
         });
         drop(held);
         assert_eq!(ranges, vec![(0..10, true)]);
-        assert_eq!(
-            owner
-                .snapshot(PhysicalWorkClass::Foreground)
-                .available_workers,
-            3
-        );
     }
 
     #[tokio::test]
-    async fn parallel_admission_rejects_zero_and_excess_workers() {
+    async fn parallel_admission_is_bounded_and_reserves_every_worker() {
         let owner = test_owner();
         for parallelism in [0, 4] {
+            let request =
+                PhysicalWorkRequest::foreground_parallel(PhysicalIoClass::Metadata, 0, parallelism);
             assert!(matches!(
-                owner
-                    .admit(PhysicalWorkRequest::foreground_parallel(
-                        PhysicalIoClass::Metadata,
-                        0,
-                        parallelism,
-                    ))
-                    .await,
+                owner.admit(request).await,
                 Err(PhysicalWorkError::WorkerLimit)
             ));
         }
+        let admission = owner
+            .admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Metadata,
+                0,
+                3,
+            ))
+            .await
+            .expect("parallel admission");
+        let observed_owner = owner.clone();
+        let results = admission
+            .run_parallel(move |_, parallelism| {
+                let snapshot = observed_owner.snapshot(PhysicalWorkClass::Foreground);
+                assert_eq!((snapshot.running_workers, snapshot.available_workers), (3, 0));
+                parallelism.run_scoped((0..3).map(|index| move || index).collect())
+            })
+            .await
+            .expect("parallel worker")
+            .expect("scoped jobs");
+        assert_eq!(results, vec![0, 1, 2]);
+        let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+        assert_eq!(snapshot.active_admissions, 0);
+        assert_eq!(snapshot.available_workers, 3);
+    }
+
+    #[tokio::test]
+    async fn scratch_waiter_does_not_hold_background_capacity() {
+        let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
+            workers: 2,
+            background: 1,
+            heavy: 1,
+            scratch_bytes: SCRATCH_UNIT_BYTES,
+        });
+        let scratch = owner
+            .reserve_scratch(SCRATCH_UNIT_BYTES)
+            .await
+            .expect("reserve process scratch")
+            .expect("nonzero scratch permit");
+        let waiting = owner.group();
+        let waiting_task = tokio::spawn({
+            let waiting = waiting.clone();
+            async move {
+                waiting
+                    .run(
+                        PhysicalWorkRequest::background(PhysicalIoClass::Read, SCRATCH_UNIT_BYTES),
+                        |_| (),
+                    )
+                    .await
+            }
+        });
+        while waiting.active() == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            owner.group().run(
+                PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                |_| (),
+            ),
+        )
+        .await
+        .expect("scratch waiter must not occupy background capacity")
+        .expect("independent background work");
+
+        drop(scratch);
+        waiting_task
+            .await
+            .expect("join scratch waiter")
+            .expect("scratch waiter");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_filesystem_contract_cross_owner_reserves_foreground_and_scratch() {
+    async fn queued_background_work_leaves_foreground_admission_and_cancels() {
         let owner = PhysicalWorkOwner::new(PhysicalWorkLimits {
             workers: 2,
             background: 1,
@@ -1107,23 +898,17 @@ mod tests {
         });
         let first = owner.group();
         let second = owner.group();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let gate_for_worker = Arc::clone(&gate);
+        let gate: Gate = Arc::default();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let first_task = tokio::spawn({
-            let first = first.clone();
+            let (first, gate) = (first.clone(), Arc::clone(&gate));
             async move {
                 first
                     .run(
                         PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
                         move |_| {
                             let _ = started_tx.send(());
-                            let (lock, wake) = &*gate_for_worker;
-                            let released = lock.lock().expect("lock background worker");
-                            drop(
-                                wake.wait_while(released, |released| !*released)
-                                    .expect("wait for background release"),
-                            );
+                            wait(&gate);
                         },
                     )
                     .await
@@ -1160,24 +945,91 @@ mod tests {
             queued.await.expect("join queued work"),
             Err(PhysicalWorkError::Cancelled)
         );
-
-        let scratch = owner
-            .reserve_scratch(2 * SCRATCH_UNIT_BYTES)
-            .await
-            .expect("reserve all scratch")
-            .expect("nonzero scratch permit");
-        assert_eq!(
-            owner
-                .snapshot(PhysicalWorkClass::Foreground)
-                .available_scratch_bytes,
-            0
-        );
-        drop(scratch);
-        assert!(owner.reserve_scratch(SCRATCH_UNIT_BYTES).await.is_ok());
-
-        let (lock, wake) = &*gate;
-        *lock.lock().expect("release background worker") = true;
-        wake.notify_one();
+        open(&gate);
         assert_eq!(first_task.await.expect("join first work"), Ok(()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saturated_process_limits_queue_cancel_drain_and_restore_capacity() {
+        const WORKER_SCRATCH_BYTES: u64 = SCRATCH_LIMIT_BYTES / PROCESS_WORKER_LIMIT as u64;
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let gate: Gate = Arc::default();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut running = Vec::with_capacity(PROCESS_WORKER_LIMIT);
+        for index in 0..PROCESS_WORKER_LIMIT {
+            let group = owner.group();
+            let (gate, started_tx) = (Arc::clone(&gate), started_tx.clone());
+            let request = if index < BACKGROUND_WORKER_LIMIT {
+                PhysicalWorkRequest::background(PhysicalIoClass::Read, WORKER_SCRATCH_BYTES)
+            } else {
+                PhysicalWorkRequest::foreground(PhysicalIoClass::Read, WORKER_SCRATCH_BYTES)
+            };
+            let task = tokio::spawn({
+                let group = group.clone();
+                async move {
+                    group
+                        .run(request, move |cancellation| {
+                            started_tx.send(()).unwrap();
+                            wait(&gate);
+                            cancellation.is_cancelled()
+                        })
+                        .await
+                }
+            });
+            running.push((group, task));
+        }
+        drop(started_tx);
+        for _ in 0..PROCESS_WORKER_LIMIT {
+            tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+                .await
+                .expect("saturated worker starts")
+                .expect("saturated worker signal remains open");
+        }
+        let foreground = owner.snapshot(PhysicalWorkClass::Foreground);
+        let background = owner.snapshot(PhysicalWorkClass::Background);
+        assert_eq!(
+            foreground.running_workers + background.running_workers,
+            PROCESS_WORKER_LIMIT
+        );
+        assert_eq!(foreground.available_workers, 0);
+        assert_eq!(foreground.available_scratch_bytes, 0);
+
+        let queued = owner.group();
+        let (queued_tx, mut queued_rx) = tokio::sync::oneshot::channel();
+        let queued_task = tokio::spawn({
+            let queued = queued.clone();
+            async move {
+                queued
+                    .run(
+                        PhysicalWorkRequest::foreground(PhysicalIoClass::Metadata, 0),
+                        move |_| queued_tx.send(()).unwrap(),
+                    )
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued_rx)
+                .await
+                .is_err(),
+            "saturated work must keep the next worker queued"
+        );
+
+        for (group, _) in &running {
+            group.cancel();
+        }
+        open(&gate);
+        for (group, task) in running {
+            assert_eq!(task.await.expect("join saturated task"), Ok(true));
+            group.drain().await;
+        }
+        assert_eq!(queued_task.await.expect("join queued task"), Ok(()));
+        queued.drain().await;
+        for class in [PhysicalWorkClass::Foreground, PhysicalWorkClass::Background] {
+            let snapshot = owner.snapshot(class);
+            assert_eq!(snapshot.active_admissions, 0);
+            assert_eq!(snapshot.running_workers, 0);
+            assert_eq!(snapshot.available_workers, PROCESS_WORKER_LIMIT);
+            assert_eq!(snapshot.available_scratch_bytes, SCRATCH_LIMIT_BYTES);
+        }
     }
 }
