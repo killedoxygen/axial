@@ -3917,15 +3917,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn download_failure_diagnostics_keep_status_without_request_url() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::testing::{Reply, Server};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            socket.read(&mut [0_u8; 2_048]).await.unwrap();
-            socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-        });
+        let server = Server::start(vec![Reply::status(503, Vec::new())]);
+        let origin = server.url("");
+        let address = origin.strip_prefix("http://").unwrap();
         let error = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -3936,7 +3932,8 @@ pub(crate) mod tests {
             .unwrap()
             .error_for_status()
             .unwrap_err();
-        server.await.unwrap();
+        let served = server.finish();
+        assert!(served.delivered);
         let diagnostic = download_failure_diagnostic(&DownloadError::Request(error));
         assert_eq!(diagnostic.category, "request");
         assert_eq!(diagnostic.http_status, Some(503));
