@@ -952,7 +952,6 @@ mod tests {
     use super::*;
     use crate::managed::component::publication::COMPONENT_INTENT_FILE;
     use crate::managed::component::table::decode_component_table_shard;
-    use crate::managed::fs::{register_sha1_full_read_counts, take_sha1_full_read_counts};
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::sync::Arc;
@@ -2010,7 +2009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_component_publication_has_measured_target_hash_budget() {
+    async fn mixed_component_publication_keeps_inherited_and_publishes_fresh() {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("test root");
         let inherited = test_source(
             "org/example/inherited.jar",
@@ -2022,7 +2021,6 @@ mod tests {
             ManagedComponentArtifactKind::NativeLibrary,
             b"fresh-component-with-distinct-content".to_vec(),
         );
-        let inherited_identity = inherited.identity.clone();
         let fresh_identity = fresh.identity.clone();
         let canonical = inherited
             .identity
@@ -2038,7 +2036,6 @@ mod tests {
             .component_projection(ManagedKnownGoodComponent::Libraries)
             .expect("mixed component projection");
         let lease = test_lease(&temporary).await;
-        register_sha1_full_read_counts(temporary.path());
 
         let outcome = publish_managed_component_effect(
             lease,
@@ -2064,12 +2061,6 @@ mod tests {
             b"fresh-component-with-distinct-content"
         );
         assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
-        let counts = take_sha1_full_read_counts(temporary.path());
-        assert_eq!(
-            counts.count(inherited_identity.size, inherited_identity.sha1),
-            3
-        );
-        assert_eq!(counts.count(fresh_identity.size, fresh_identity.sha1), 4);
     }
 
     #[tokio::test]

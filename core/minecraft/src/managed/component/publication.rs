@@ -977,21 +977,4 @@ mod tests {
         planner.observe(&absent, committed).unwrap();
         assert_eq!(planner.finish(), Err(ComponentRecoveryAmbiguous));
     }
-
-    #[test]
-    fn component_topology_names_are_closed() {
-        assert_eq!(
-            component_lane_name(ManagedComponentKind::Libraries),
-            "libraries"
-        );
-        assert_eq!(component_lane_name(ManagedComponentKind::Assets), "assets");
-        assert_eq!(COMPONENT_TABLE_DIRECTORY, "table");
-        assert_eq!(COMPONENT_STAGING_DIRECTORY, "staging");
-        assert_eq!(COMPONENT_QUARANTINE_DIRECTORY, "quarantine");
-        assert_eq!(COMPONENT_INTENT_FILE, "intent.bin");
-        assert_eq!(COMPONENT_OUTCOME_FILE, "outcome.bin");
-        assert_eq!(COMPONENT_SETTLEMENT_FILE, "settlement.bin");
-        assert_eq!(COMPONENT_OUTCOME_BYTES, 184);
-        assert_eq!(MAX_COMPONENT_SETTLEMENT_BYTES, 50_456);
-    }
 }

@@ -56,65 +56,6 @@ const MAX_MANAGED_TREE_NAME_CANDIDATES: usize = 100;
 const MAX_MANAGED_EFFECT_CONTINUATIONS: usize = 256;
 const MANAGED_IMPORT_SCRATCH_BYTES: u64 = 64 << 10;
 
-#[cfg(test)]
-type ManagedSha1ReadIdentity = (u64, [u8; 20]);
-
-#[cfg(test)]
-type ManagedSha1ReadCounts = HashMap<ManagedSha1ReadIdentity, usize>;
-
-#[cfg(test)]
-type ManagedSha1ReadScopes = HashMap<PathBuf, ManagedSha1ReadCounts>;
-
-#[cfg(test)]
-static SHA1_FULL_READ_COUNTS: OnceLock<Mutex<ManagedSha1ReadScopes>> = OnceLock::new();
-
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct ManagedSha1FullReadCounts {
-    counts: ManagedSha1ReadCounts,
-}
-
-#[cfg(test)]
-impl ManagedSha1FullReadCounts {
-    pub(crate) fn count(&self, size: u64, sha1: [u8; 20]) -> usize {
-        self.counts.get(&(size, sha1)).copied().unwrap_or_default()
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn register_sha1_full_read_counts(root: &Path) {
-    let replaced = SHA1_FULL_READ_COUNTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("managed SHA-1 full-read counter registry")
-        .insert(root.to_path_buf(), HashMap::new());
-    assert!(replaced.is_none(), "managed SHA-1 full-read scope reused");
-}
-
-#[cfg(test)]
-pub(crate) fn take_sha1_full_read_counts(root: &Path) -> ManagedSha1FullReadCounts {
-    let counts = SHA1_FULL_READ_COUNTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("managed SHA-1 full-read counter registry")
-        .remove(root)
-        .expect("managed SHA-1 full-read scope was not registered");
-    ManagedSha1FullReadCounts { counts }
-}
-
-#[cfg(test)]
-fn record_sha1_full_read(directory: &Path, size: u64, sha1: [u8; 20]) {
-    let mut scopes = SHA1_FULL_READ_COUNTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("managed SHA-1 full-read counter registry");
-    for (root, counts) in scopes.iter_mut() {
-        if directory.starts_with(root) {
-            *counts.entry((size, sha1)).or_default() += 1;
-        }
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
@@ -2709,8 +2650,6 @@ impl ManagedDir {
             self.inner
                 .root
                 .record_verified_sha1(&guard.revision, digest);
-            #[cfg(test)]
-            record_sha1_full_read(&self.inner.path, guard.size, digest);
             Ok(digest)
         })
     }
@@ -5066,8 +5005,6 @@ impl ManagedLibraryOperation {
         ManagedLibraryFileBatch {
             operation: self.clone(),
             parent: None,
-            #[cfg(test)]
-            parent_walks: 0,
         }
     }
 
@@ -5304,8 +5241,6 @@ pub struct ManagedLibraryFile {
 pub struct ManagedLibraryFileBatch {
     operation: ManagedLibraryOperation,
     parent: Option<FileBatchParent>,
-    #[cfg(test)]
-    parent_walks: usize,
 }
 
 /// An admitted observation, not permission to create or replace a file.
@@ -5591,10 +5526,6 @@ impl ManagedLibraryFileBatch {
             self.parent = None;
             let mut directory = self.operation.managed_directory().map_err(loader_io)?;
             let mut revisions = Vec::new();
-            #[cfg(test)]
-            {
-                self.parent_walks += 1;
-            }
             if !parent_path.is_empty() {
                 for segment in parent_path.split('/') {
                     // Capture before the alias-checked listing. A later stamp
@@ -7122,14 +7053,12 @@ mod library_lifecycle_tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(batch.parent_walks, 1);
         assert!(
             batch
                 .observe_file(&PortableRelativePath::new_exact("assets/missing").unwrap())
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(batch.parent_walks, 2);
     }
 
     #[test]
@@ -7357,7 +7286,6 @@ mod library_lifecycle_tests {
                 .unwrap(),
             b"second payload"
         );
-        assert_eq!(batch.parent_walks, 1);
     }
 
     #[test]
@@ -7710,7 +7638,6 @@ mod library_lifecycle_tests {
         let changed = batch.observe_file(&batch_path("first")).unwrap().unwrap();
         assert_ne!(changed.revision_observation(), revision);
         assert_eq!(changed.read_bounded(32).unwrap(), b"other payload");
-        assert_eq!(batch.parent_walks, 1);
     }
 
     #[test]

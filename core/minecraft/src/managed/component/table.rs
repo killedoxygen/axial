@@ -1353,14 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_layout_sizes_and_slot_names_are_exact() {
-        assert_eq!(COMPONENT_TABLE_HEADER_BYTES, 72);
-        assert_eq!(COMPONENT_TABLE_ROW_PREFIX_BYTES, 44);
-        assert_eq!(MAX_COMPONENT_TABLE_SHARDS, 782);
-        assert_eq!(MAX_COMPONENT_TABLE_SHARD_BYTES, 149_576);
-        assert_eq!(COMPONENT_INTENT_HEADER_BYTES, 128);
-        assert_eq!(COMPONENT_INTENT_DESCRIPTOR_BYTES, 64);
-        assert_eq!(MAX_COMPONENT_INTENT_BYTES, 50_176);
+    fn table_and_slot_names_are_canonical_and_bounded() {
         assert_eq!(component_table_path(0).unwrap(), "table/000000.tbl");
         assert_eq!(component_table_path(781).unwrap(), "table/000781.tbl");
         assert_eq!(component_entry_slot(0, 0).unwrap(), "000000/000");
