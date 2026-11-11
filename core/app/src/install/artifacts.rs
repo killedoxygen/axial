@@ -6,18 +6,13 @@
 
 use crate::library::GenerationPin;
 use axial_minecraft::known_good::{KnownGoodActivationSource, KnownGoodIntegrity, KnownGoodRoot};
-use axial_minecraft::loaders::{
-    LoaderInstallBaseCommit, LoaderInstallBaseCommitVerificationFailure,
-    VerifiedLoaderInstallBaseCommit,
-};
+use axial_minecraft::loaders::{LoaderInstallBaseCommit, VerifiedLoaderInstallBaseCommit};
 use axial_minecraft::managed_path::{
     FileAbsence, FileObservation, ManagedLibraryFile, ManagedLibraryOperation,
 };
 use axial_minecraft::portable_path::{PortableFileName, PortableRelativePath};
 use axial_minecraft::{
-    KnownGoodInstallReceipt, ManagedInstallCommittedEvidence, ManagedInstallDurableOutcome,
-    ManagedInstallDurableRecovery, ManagedInstallReceiptVerificationFailure,
-    ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence, VerifiedManagedInstallReceipt,
+    KnownGoodInstallReceipt, ManagedInstallDurableOutcome, VerifiedManagedInstallReceipt,
 };
 use axial_minecraft::{VersionJson, rules::Environment};
 use serde::{Deserialize, Serialize};
@@ -1113,6 +1108,53 @@ impl InstalledVersionReceipt {
     }
 }
 
+/// Verify a committed publication against its install receipt. Every other
+/// outcome, including committed evidence for another receipt, stays unsettled.
+pub async fn verify_install_receipt(
+    library: ManagedLibraryOperation,
+    receipt: KnownGoodInstallReceipt,
+) -> Result<
+    (
+        VerifiedManagedInstallReceipt<KnownGoodInstallReceipt>,
+        String,
+    ),
+    ManagedInstallDurableOutcome,
+> {
+    let outcome = axial_minecraft::classify_managed_install_publication(
+        library,
+        receipt.version_id().to_string(),
+    )
+    .await;
+    let ManagedInstallDurableOutcome::Committed(evidence) = outcome else {
+        return Err(outcome);
+    };
+    let id = evidence.id().as_str().to_owned();
+    evidence
+        .verify_install_receipt(receipt)
+        .map(|verified| (verified, id))
+        .map_err(|failure| ManagedInstallDurableOutcome::Committed(failure.into_parts().0))
+}
+
+/// The loader base is a checkpoint, not a completed loader installation.
+pub async fn verify_loader_base(
+    library: ManagedLibraryOperation,
+    commit: LoaderInstallBaseCommit,
+) -> Result<(VerifiedLoaderInstallBaseCommit, String), ManagedInstallDurableOutcome> {
+    let outcome = axial_minecraft::classify_managed_install_publication(
+        library,
+        commit.base_version_id().to_string(),
+    )
+    .await;
+    let ManagedInstallDurableOutcome::Committed(evidence) = outcome else {
+        return Err(outcome);
+    };
+    let id = evidence.id().as_str().to_owned();
+    evidence
+        .verify_loader_base_commit(commit)
+        .map(|verified| (verified, id))
+        .map_err(|failure| ManagedInstallDurableOutcome::Committed(failure.into_parts().0))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::queue::InstallError;
@@ -2110,134 +2152,5 @@ pub(crate) mod tests {
             activated.inspect(pin, Inspection::Integrity, true),
             Err(InstallError::NotReady)
         ));
-    }
-}
-
-#[must_use = "publication must be activated, acknowledged, or retained for settlement"]
-pub enum InstallReceiptState {
-    AwaitingActivation {
-        verified: VerifiedManagedInstallReceipt<KnownGoodInstallReceipt>,
-        evidence: String,
-    },
-    NoEffect(KnownGoodInstallReceipt),
-    Mismatch(KnownGoodInstallReceipt),
-    ReceiptMismatch(ManagedInstallReceiptVerificationFailure<KnownGoodInstallReceipt>),
-    RolledBack {
-        receipt: KnownGoodInstallReceipt,
-        evidence: ManagedInstallRolledBackEvidence,
-        effect: ManagedInstallRollbackEffect,
-    },
-    Indeterminate {
-        receipt: KnownGoodInstallReceipt,
-        recovery: ManagedInstallDurableRecovery,
-    },
-}
-
-pub async fn inspect_install_receipt(
-    library: ManagedLibraryOperation,
-    receipt: KnownGoodInstallReceipt,
-) -> InstallReceiptState {
-    let outcome = axial_minecraft::classify_managed_install_publication(
-        library,
-        receipt.version_id().to_string(),
-    )
-    .await;
-    classify_receipt(receipt, outcome)
-}
-
-fn classify_receipt(
-    receipt: KnownGoodInstallReceipt,
-    outcome: ManagedInstallDurableOutcome,
-) -> InstallReceiptState {
-    match outcome {
-        ManagedInstallDurableOutcome::Committed(evidence) => {
-            let id = evidence.id().as_str().to_owned();
-            match evidence.verify_install_receipt(receipt) {
-                Ok(verified) => InstallReceiptState::AwaitingActivation {
-                    verified,
-                    evidence: id,
-                },
-                Err(failure) => InstallReceiptState::ReceiptMismatch(failure),
-            }
-        }
-        ManagedInstallDurableOutcome::NoEffect => InstallReceiptState::NoEffect(receipt),
-        ManagedInstallDurableOutcome::Mismatch => InstallReceiptState::Mismatch(receipt),
-        ManagedInstallDurableOutcome::RolledBack { evidence, effect } => {
-            InstallReceiptState::RolledBack {
-                receipt,
-                evidence,
-                effect,
-            }
-        }
-        ManagedInstallDurableOutcome::Indeterminate(recovery) => {
-            InstallReceiptState::Indeterminate { receipt, recovery }
-        }
-    }
-}
-
-#[must_use = "loader base is a checkpoint, not a completed loader installation"]
-pub enum LoaderBaseState {
-    AwaitingActivation {
-        verified: VerifiedLoaderInstallBaseCommit,
-        evidence: String,
-    },
-    NoEffect(LoaderInstallBaseCommit),
-    Mismatch(LoaderInstallBaseCommit),
-    ReceiptMismatch(LoaderInstallBaseCommitVerificationFailure),
-    RolledBack {
-        commit: LoaderInstallBaseCommit,
-        evidence: ManagedInstallRolledBackEvidence,
-        effect: ManagedInstallRollbackEffect,
-    },
-    Indeterminate {
-        commit: LoaderInstallBaseCommit,
-        recovery: ManagedInstallDurableRecovery,
-    },
-}
-
-pub async fn inspect_loader_base_commit(
-    library: ManagedLibraryOperation,
-    commit: LoaderInstallBaseCommit,
-) -> LoaderBaseState {
-    let outcome = axial_minecraft::classify_managed_install_publication(
-        library,
-        commit.base_version_id().to_string(),
-    )
-    .await;
-    classify_base(commit, outcome)
-}
-
-fn classify_base(
-    commit: LoaderInstallBaseCommit,
-    outcome: ManagedInstallDurableOutcome,
-) -> LoaderBaseState {
-    match outcome {
-        ManagedInstallDurableOutcome::Committed(evidence) => verify_base(evidence, commit),
-        ManagedInstallDurableOutcome::NoEffect => LoaderBaseState::NoEffect(commit),
-        ManagedInstallDurableOutcome::Mismatch => LoaderBaseState::Mismatch(commit),
-        ManagedInstallDurableOutcome::RolledBack { evidence, effect } => {
-            LoaderBaseState::RolledBack {
-                commit,
-                evidence,
-                effect,
-            }
-        }
-        ManagedInstallDurableOutcome::Indeterminate(recovery) => {
-            LoaderBaseState::Indeterminate { commit, recovery }
-        }
-    }
-}
-
-fn verify_base(
-    evidence: ManagedInstallCommittedEvidence,
-    commit: LoaderInstallBaseCommit,
-) -> LoaderBaseState {
-    let id = evidence.id().as_str().to_owned();
-    match evidence.verify_loader_base_commit(commit) {
-        Ok(verified) => LoaderBaseState::AwaitingActivation {
-            verified,
-            evidence: id,
-        },
-        Err(failure) => LoaderBaseState::ReceiptMismatch(failure),
     }
 }

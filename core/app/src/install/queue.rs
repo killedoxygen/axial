@@ -4,7 +4,7 @@
 
 pub use super::artifacts::InstalledVersionReceipt;
 use super::{
-    artifacts::{self, ActivatedVersion, InstallReceiptState, LoaderBaseState, VersionInspection},
+    artifacts::{self, ActivatedVersion, VersionInspection},
     model::*,
 };
 use crate::{
@@ -2733,8 +2733,8 @@ impl InstallQueue {
         receipt: axial_minecraft::KnownGoodInstallReceipt,
     ) -> Result<(), WorkFailure> {
         let version_id = receipt.version_id().to_owned();
-        match artifacts::inspect_install_receipt(operation, receipt).await {
-            InstallReceiptState::AwaitingActivation { verified, evidence } => {
+        match artifacts::verify_install_receipt(operation, receipt).await {
+            Ok((verified, evidence)) => {
                 let checkpoint = PublicationCheckpoint {
                     kind: CheckpointKind::Final,
                     version_id,
@@ -2769,7 +2769,7 @@ impl InstallQueue {
                     }
                 }
             }
-            state => Err(unsettled_receipt(state)),
+            Err(outcome) => Err(WorkFailure::Unsettled(RetainedInstall::Outcome(outcome))),
         }
     }
 
@@ -2788,11 +2788,11 @@ impl InstallQueue {
             LoaderInstallPublicationOutcome::BaseCommitted(commit) => {
                 let base_version = commit.base_version_id().to_owned();
                 let (verified, evidence) =
-                    match artifacts::inspect_loader_base_commit(operation.clone(), commit).await {
-                        LoaderBaseState::AwaitingActivation { verified, evidence } => {
-                            (verified, evidence)
+                    match artifacts::verify_loader_base(operation.clone(), commit).await {
+                        Ok(verified) => verified,
+                        Err(outcome) => {
+                            return Err(WorkFailure::Unsettled(RetainedInstall::Outcome(outcome)));
                         }
-                        state => return Err(unsettled_base(state)),
                     };
                 let checkpoint = PublicationCheckpoint {
                     kind: CheckpointKind::Base,
@@ -3223,48 +3223,6 @@ impl PublicationCheckpoint {
         }
         Ok(())
     }
-}
-
-fn unsettled_receipt(state: InstallReceiptState) -> WorkFailure {
-    let outcome = match state {
-        InstallReceiptState::NoEffect(_) => ManagedInstallDurableOutcome::NoEffect,
-        InstallReceiptState::Mismatch(_) => ManagedInstallDurableOutcome::Mismatch,
-        InstallReceiptState::ReceiptMismatch(failure) => {
-            let (evidence, _) = failure.into_parts();
-            ManagedInstallDurableOutcome::Committed(evidence)
-        }
-        InstallReceiptState::RolledBack {
-            evidence, effect, ..
-        } => ManagedInstallDurableOutcome::RolledBack { evidence, effect },
-        InstallReceiptState::Indeterminate { recovery, .. } => {
-            ManagedInstallDurableOutcome::Indeterminate(recovery)
-        }
-        InstallReceiptState::AwaitingActivation { .. } => {
-            unreachable!("verified receipt is activated by the caller")
-        }
-    };
-    WorkFailure::Unsettled(RetainedInstall::Outcome(outcome))
-}
-
-fn unsettled_base(state: LoaderBaseState) -> WorkFailure {
-    let outcome = match state {
-        LoaderBaseState::NoEffect(_) => ManagedInstallDurableOutcome::NoEffect,
-        LoaderBaseState::Mismatch(_) => ManagedInstallDurableOutcome::Mismatch,
-        LoaderBaseState::ReceiptMismatch(failure) => {
-            let (evidence, _) = failure.into_parts();
-            ManagedInstallDurableOutcome::Committed(evidence)
-        }
-        LoaderBaseState::RolledBack {
-            evidence, effect, ..
-        } => ManagedInstallDurableOutcome::RolledBack { evidence, effect },
-        LoaderBaseState::Indeterminate { recovery, .. } => {
-            ManagedInstallDurableOutcome::Indeterminate(recovery)
-        }
-        LoaderBaseState::AwaitingActivation { .. } => {
-            unreachable!("verified loader base is activated by the caller")
-        }
-    };
-    WorkFailure::Unsettled(RetainedInstall::Outcome(outcome))
 }
 
 async fn persist_activation(
@@ -5880,8 +5838,7 @@ pub(crate) mod tests {
         if matches!(point, CrashPoint::BeforeActivation) {
             return;
         }
-        let InstallReceiptState::AwaitingActivation { verified, evidence } =
-            artifacts::inspect_install_receipt(operation, receipt).await
+        let Ok((verified, evidence)) = artifacts::verify_install_receipt(operation, receipt).await
         else {
             panic!("fixture must produce verified publication");
         };
@@ -6638,8 +6595,8 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        let InstallReceiptState::AwaitingActivation { evidence, verified } =
-            artifacts::inspect_install_receipt(foreign_operation, foreign_receipt).await
+        let Ok((verified, evidence)) =
+            artifacts::verify_install_receipt(foreign_operation, foreign_receipt).await
         else {
             panic!("foreign fixture publication");
         };
