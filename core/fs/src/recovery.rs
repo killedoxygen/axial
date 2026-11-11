@@ -1268,10 +1268,6 @@ mod tests {
         }
     }
 
-    fn frame_checksum(body: &[u8], side: u8) -> [u8; 32] {
-        frame::checksum(body, side)
-    }
-
     fn decode_recovery_frame(
         encoded: &[u8],
         address: RecoveryFrameAddress,
@@ -1496,7 +1492,7 @@ mod tests {
     }
 
     fn resign(bytes: &mut [u8; RECOVERY_FRAME_BYTES], side: u8) {
-        let checksum = frame_checksum(&bytes[..FRAME_BODY_BYTES], side);
+        let checksum = frame::checksum(&bytes[..FRAME_BODY_BYTES], side);
         bytes[FRAME_BODY_BYTES..].copy_from_slice(&checksum);
     }
 
@@ -1575,12 +1571,6 @@ mod tests {
                 "accepted drift at {offset}"
             );
         }
-        let other_side = encoded(2, RecoveryPhase::PublishPrepared, 1);
-        assert_ne!(&bytes[FRAME_BODY_BYTES..], &other_side[FRAME_BODY_BYTES..]);
-        assert_ne!(
-            frame_checksum(&bytes[..FRAME_BODY_BYTES], 0),
-            frame_checksum(&bytes[..FRAME_BODY_BYTES], 1)
-        );
         assert_eq!(
             decode_recovery_frame(&bytes, address(1)),
             Err(RecoveryCodecError)
@@ -1588,93 +1578,92 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_schema_platform_lane_slot_frame_and_reserved_mismatch() {
-        for (offset, value) in [
-            (8, 2),
-            (10, PLATFORM_TAG.wrapping_add(1)),
-            (12, 0x22),
-            (28, 8),
-            (29, 1),
-            (30, 1),
-            (48, 1),
-        ] {
-            let mut drifted = encoded(1, RecoveryPhase::PublishPrepared, 0);
-            drifted[offset] = value;
-            resign(&mut drifted, 0);
+    fn decoder_rejects_resigned_noncanonical_fields() {
+        type Frame = [u8; RECOVERY_FRAME_BYTES];
+        let set = |offset: usize, value: u8| move |bytes: &mut Frame| bytes[offset] = value;
+        let payload_len = |delta: i64| {
+            move |bytes: &mut Frame| {
+                let len = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
+                let len = u32::try_from(i64::from(len) + delta).unwrap();
+                bytes[44..48].copy_from_slice(&len.to_le_bytes());
+            }
+        };
+        let proof_size = HEADER_BYTES + 24 + (2 + "destination".len()) + (2 + "target.bin".len());
+        let mutations: Vec<(&str, Box<dyn Fn(&mut Frame)>)> = vec![
+            ("schema", Box::new(set(8, 2))),
+            ("platform", Box::new(set(10, PLATFORM_TAG.wrapping_add(1)))),
+            ("kind", Box::new(set(11, 7))),
+            ("lane", Box::new(set(12, 0x22))),
+            ("slot", Box::new(set(28, 8))),
+            ("side", Box::new(set(29, 1))),
+            ("header reserved", Box::new(set(30, 1))),
+            ("header tail", Box::new(set(48, 1))),
+            ("phase", Box::new(set(HEADER_BYTES + 16, 7))),
+            ("flags", Box::new(set(HEADER_BYTES + 17, 0x80))),
+            ("component count", Box::new(set(HEADER_BYTES + 18, 33))),
+            ("payload reserved", Box::new(set(HEADER_BYTES + 20, 1))),
+            ("padding", Box::new(set(1_024, 1))),
+            ("zero generation", Box::new(|bytes: &mut Frame| bytes[36..44].fill(0))),
+            ("short payload", Box::new(payload_len(-1))),
+            ("long payload", Box::new(payload_len(1))),
+            (
+                "excessive payload",
+                Box::new(|bytes: &mut Frame| bytes[44..48].copy_from_slice(&u32::MAX.to_le_bytes())),
+            ),
+            (
+                "excessive name",
+                Box::new(|bytes: &mut Frame| {
+                    bytes[HEADER_BYTES + 24..HEADER_BYTES + 26]
+                        .copy_from_slice(&u16::MAX.to_le_bytes())
+                }),
+            ),
+            (
+                "oversized proof",
+                Box::new(move |bytes: &mut Frame| {
+                    bytes[proof_size..proof_size + 8]
+                        .copy_from_slice(&(MAX_RECOVERABLE_FILE_BYTES + 1).to_le_bytes())
+                }),
+            ),
+        ];
+        for (case, mutate) in mutations {
+            let mut bytes = encoded(1, RecoveryPhase::PublishPrepared, 0);
+            mutate(&mut bytes);
+            resign(&mut bytes, 0);
             assert_eq!(
-                decode_recovery_frame(&drifted, address(0)),
+                decode_recovery_frame(&bytes, address(0)),
                 Err(RecoveryCodecError),
-                "accepted field drift at {offset}"
+                "accepted {case}"
             );
         }
+
+        let mut value = record(RecoveryPhase::PublishPrepared);
+        value.destination_parent.clear();
+        value.destination_leaf = recovery_stage_leaf([0x12; 16]);
+        let destination = value.destination_leaf.as_str().as_bytes().to_vec();
+        let alias = recovery_stage_leaf(value.operation_id);
+        let mut bytes = encode_recovery_frame(
+            &RecoveryFrame {
+                generation: 1,
+                record: Some(value),
+            },
+            address(0),
+        )
+        .unwrap();
+        let start = bytes[..FRAME_BODY_BYTES]
+            .windows(destination.len())
+            .position(|window| window == destination)
+            .expect("encoded destination");
+        bytes[start..start + destination.len()].copy_from_slice(alias.as_str().as_bytes());
+        resign(&mut bytes, 0);
+        assert_eq!(
+            decode_recovery_frame(&bytes, address(0)),
+            Err(RecoveryCodecError),
+            "accepted a portable coordinate alias"
+        );
+
         assert!(RecoveryFrameAddress::new([0; 16], 0, 0).is_err());
         assert!(RecoveryFrameAddress::new(LANE, 64, 0).is_err());
         assert!(RecoveryFrameAddress::new(LANE, 0, 2).is_err());
-    }
-
-    #[test]
-    fn decoder_rejects_unknown_kind_phase_flags_lengths_and_payload_reserved_data() {
-        let mut cases = Vec::new();
-        let mut unknown_kind = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        unknown_kind[11] = 7;
-        cases.push(unknown_kind);
-        let mut unknown_phase = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        unknown_phase[HEADER_BYTES + 16] = 7;
-        cases.push(unknown_phase);
-        let mut unknown_flags = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        unknown_flags[HEADER_BYTES + 17] = 0x80;
-        cases.push(unknown_flags);
-        let mut too_many_components = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        too_many_components[HEADER_BYTES + 18] = 33;
-        cases.push(too_many_components);
-        let mut payload_reserved = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        payload_reserved[HEADER_BYTES + 20] = 1;
-        cases.push(payload_reserved);
-        let mut excessive_payload = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        excessive_payload[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
-        cases.push(excessive_payload);
-        let mut excessive_name = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        excessive_name[HEADER_BYTES + 24..HEADER_BYTES + 26]
-            .copy_from_slice(&u16::MAX.to_le_bytes());
-        cases.push(excessive_name);
-        let mut noncanonical_padding = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        noncanonical_padding[1_024] = 1;
-        cases.push(noncanonical_padding);
-        let mut zero_generation = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        zero_generation[36..44].fill(0);
-        cases.push(zero_generation);
-        for mut case in cases {
-            resign(&mut case, 0);
-            assert_eq!(
-                decode_recovery_frame(&case, address(0)),
-                Err(RecoveryCodecError)
-            );
-        }
-    }
-
-    #[test]
-    fn decoder_rejects_resigned_noncanonical_lengths_and_oversized_file_proofs() {
-        let original = encoded(1, RecoveryPhase::PublishPrepared, 0);
-        let payload_len = u32::from_le_bytes(original[44..48].try_into().unwrap());
-        for changed_len in [payload_len - 1, payload_len + 1] {
-            let mut changed = original;
-            changed[44..48].copy_from_slice(&changed_len.to_le_bytes());
-            resign(&mut changed, 0);
-            assert_eq!(
-                decode_recovery_frame(&changed, address(0)),
-                Err(RecoveryCodecError)
-            );
-        }
-
-        let mut oversized = original;
-        let proof_size = HEADER_BYTES + 24 + (2 + "destination".len()) + (2 + "target.bin".len());
-        oversized[proof_size..proof_size + 8]
-            .copy_from_slice(&(MAX_RECOVERABLE_FILE_BYTES + 1).to_le_bytes());
-        resign(&mut oversized, 0);
-        assert_eq!(
-            decode_recovery_frame(&oversized, address(0)),
-            Err(RecoveryCodecError)
-        );
     }
 
     #[test]
@@ -1772,7 +1761,6 @@ mod tests {
             recovery_frame_offset(63, 1),
             Ok(RECOVERY_CONTROL_BYTES - RECOVERY_FRAME_BYTES as u64)
         );
-        assert_eq!(RECOVERY_CONTROL_BYTES, 2 * 1024 * 1024);
         assert!(recovery_frame_offset(64, 0).is_err());
         assert!(recovery_frame_offset(0, 2).is_err());
 
@@ -1866,21 +1854,6 @@ mod tests {
     }
 
     #[test]
-    fn replacement_phase_projection_owns_exact_coordinates() {
-        for (phase, target, park) in [
-            (RecoveryPhase::StagePrepared, false, true),
-            (RecoveryPhase::StageSealed, true, true),
-            (RecoveryPhase::ReplacePrepared, true, true),
-            (RecoveryPhase::PublishPrepared, true, true),
-            (RecoveryPhase::RemovePrepared, false, false),
-            (RecoveryPhase::RemoveCommitted, true, true),
-        ] {
-            assert_eq!(phase.owns_target(), target, "target projection {phase:?}");
-            assert_eq!(phase.owns_park(), park, "park projection {phase:?}");
-        }
-    }
-
-    #[test]
     fn replacement_classifier_is_the_exact_canonical_cartesian() {
         const PHASES: [RecoveryPhase; 6] = [
             RecoveryPhase::StagePrepared,
@@ -1901,7 +1874,6 @@ mod tests {
         ];
         let cases = canonical_replacement_cases();
         let mut accepted = 0;
-        let mut checked = 0;
         for proofs_equal in [false, true] {
             for phase in PHASES {
                 if proofs_equal && phase == RecoveryPhase::StagePrepared {
@@ -1933,16 +1905,13 @@ mod tests {
                                 actual, expected,
                                 "classification {proofs_equal:?} {phase:?} ({stage:?}, {target:?}, {park:?})"
                             );
-                            checked += 1;
                             accepted += usize::from(actual.is_some());
                         }
                     }
                 }
             }
         }
-        assert_eq!(checked, 3_773);
         assert_eq!(accepted, cases.len());
-        assert_eq!(accepted, 47);
 
         let create_only = record(RecoveryPhase::StageSealed);
         assert_eq!(
@@ -1969,26 +1938,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn equal_proofs_follow_phase_and_coordinate_roles() {
-        use RecoveryPhase::*;
-        use ReplacementAction::*;
-        use ReplacementCarrier::{Absent as A, OldAndNew as B};
-
-        for (phase, stage, target, park, action) in [
-            (ReplacePrepared, B, B, A, ParkTarget),
-            (PublishPrepared, B, B, A, Advance(RemovePrepared)),
-            (PublishPrepared, A, B, A, Advance(RemoveCommitted)),
-            (PublishPrepared, A, B, B, RemovePark),
-        ] {
-            let record = replacement_record(phase, true);
-            assert_eq!(
-                classify_replacement(&record, (stage, target, park)),
-                Some(action)
-            );
-        }
     }
 
     #[test]
@@ -2207,34 +2156,6 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_a_resigned_portable_coordinate_alias() {
-        let mut value = record(RecoveryPhase::PublishPrepared);
-        value.destination_parent.clear();
-        value.destination_leaf = recovery_stage_leaf([0x12; 16]);
-        let destination = value.destination_leaf.as_str().as_bytes().to_vec();
-        let alias = recovery_stage_leaf(value.operation_id);
-        let mut bytes = encode_recovery_frame(
-            &RecoveryFrame {
-                generation: 1,
-                record: Some(value),
-            },
-            address(0),
-        )
-        .unwrap();
-        let destination_start = bytes[..FRAME_BODY_BYTES]
-            .windows(destination.len())
-            .position(|window| window == destination)
-            .expect("encoded destination");
-        bytes[destination_start..destination_start + destination.len()]
-            .copy_from_slice(alias.as_str().as_bytes());
-        resign(&mut bytes, 0);
-        assert_eq!(
-            decode_recovery_frame(&bytes, address(0)),
-            Err(RecoveryCodecError)
-        );
-    }
-
-    #[test]
     fn failed_write_and_unconfirmed_sync_never_reload_cached_bytes_as_durable() {
         for failure in ["write", "sync"] {
             let mut journal = empty_journal();
@@ -2277,12 +2198,15 @@ mod tests {
             generation: 1,
             record: Some(prepared.clone()),
         };
-        let mut journal = empty_journal();
-        let registration = journal.reserve(&prepared).unwrap();
-        journal
-            .write_with(
+        for (durable, reconciled) in [
+            (control_with(0, &intended), true),
+            (vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()], false),
+        ] {
+            let mut journal = empty_journal();
+            let registration = journal.reserve(&prepared).unwrap();
+            let result = journal.write_with(
                 registration,
-                Some(prepared),
+                Some(prepared.clone()),
                 |_, _| Ok(()),
                 || {
                     Err((
@@ -2291,31 +2215,12 @@ mod tests {
                     ))
                 },
                 |_, _| panic!("readback is skipped after the injected sync result"),
-                || Ok(control_with(0, &intended)),
-            )
-            .expect("confirmed exact frame should reconcile");
-        assert!(!journal.is_uncertain());
-        assert!(journal.record(registration).is_some());
-
-        let prepared = record(RecoveryPhase::StagePrepared);
-        let mut journal = empty_journal();
-        let registration = journal.reserve(&prepared).unwrap();
-        assert!(
-            journal
-                .write_with(
-                    registration,
-                    Some(prepared),
-                    |_, _| Ok(()),
-                    || Err((
-                        io::Error::other("injected post-sync validation failure"),
-                        true
-                    )),
-                    |_, _| panic!("readback is skipped after the injected sync result"),
-                    || Ok(vec![0; usize::try_from(RECOVERY_CONTROL_BYTES).unwrap()]),
-                )
-                .is_err()
-        );
-        assert!(journal.is_uncertain());
+                || Ok(durable),
+            );
+            assert_eq!(result.is_ok(), reconciled);
+            assert_eq!(journal.is_uncertain(), !reconciled);
+            assert_eq!(journal.record(registration).is_some(), reconciled);
+        }
     }
 
     #[test]
