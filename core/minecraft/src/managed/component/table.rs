@@ -1,4 +1,5 @@
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
+use crate::managed::component::bytes::{ByteCursor, put_u16, put_u32, put_u64};
 use crate::managed::fs::MAX_MANAGED_DIRECTORY_ENTRIES;
 use crate::portable_path::{
     MAX_PORTABLE_RELATIVE_PATH_BYTES, PortablePathKey, PortableRelativePath,
@@ -689,7 +690,7 @@ fn decode_row(cursor: &mut ByteCursor<'_>) -> Result<ComponentTableRow, Componen
         || path_len > MAX_COMPONENT_PATH_BYTES
         || record_start
             .checked_add(record_len)
-            .is_none_or(|end| end > cursor.bytes.len())
+            .is_none_or(|end| end > cursor.total_len())
     {
         return Err(ComponentTableError);
     }
@@ -762,71 +763,6 @@ fn validate_shard_geometry(shard: &ComponentTableShard) -> Result<(), ComponentT
         return Err(ComponentTableError);
     }
     Ok(())
-}
-
-fn put_u16(output: &mut Vec<u8>, value: u16) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut Vec<u8>, value: u32) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(output: &mut Vec<u8>, value: u64) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-struct ByteCursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> ByteCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn position(&self) -> usize {
-        self.position
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], ComponentTableError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or(ComponentTableError)?;
-        let value = &self.bytes[self.position..end];
-        self.position = end;
-        Ok(value)
-    }
-
-    fn expect(&mut self, expected: &[u8]) -> Result<(), ComponentTableError> {
-        if self.take(expected.len())? != expected {
-            return Err(ComponentTableError);
-        }
-        Ok(())
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], ComponentTableError> {
-        self.take(N)?.try_into().map_err(|_| ComponentTableError)
-    }
-
-    fn u8(&mut self) -> Result<u8, ComponentTableError> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, ComponentTableError> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, ComponentTableError> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, ComponentTableError> {
-        Ok(u64::from_le_bytes(self.array()?))
-    }
 }
 
 pub(crate) fn encode_component_intent_manifest(

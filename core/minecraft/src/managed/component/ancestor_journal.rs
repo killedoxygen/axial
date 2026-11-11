@@ -1,3 +1,4 @@
+use crate::managed::component::bytes::{ByteCursor, put_u16, put_u32};
 use crate::managed::component::table::{
     ComponentCreatedAncestor, ComponentTableError, MAX_COMPONENT_PATH_BYTES,
     MAX_CREATED_ANCESTOR_PATH_BYTES, MAX_CREATED_ANCESTORS, ManagedComponentKind,
@@ -486,7 +487,7 @@ fn decode_record(
                 .ok_or(ComponentAncestorJournalError)?
         || start
             .checked_add(record_len)
-            .is_none_or(|end| end > cursor.bytes.len())
+            .is_none_or(|end| end > cursor.total_len())
     {
         return Err(ComponentAncestorJournalError);
     }
@@ -574,69 +575,6 @@ fn journal_checksum(body: &[u8]) -> [u8; 32] {
     hasher.update(CHECKSUM_DOMAIN);
     hasher.update(body);
     hasher.finalize().into()
-}
-
-fn put_u16(output: &mut Vec<u8>, value: u16) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut Vec<u8>, value: u32) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-struct ByteCursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> ByteCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn position(&self) -> usize {
-        self.position
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], ComponentAncestorJournalError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or(ComponentAncestorJournalError)?;
-        let value = &self.bytes[self.position..end];
-        self.position = end;
-        Ok(value)
-    }
-
-    fn expect(&mut self, expected: &[u8]) -> Result<(), ComponentAncestorJournalError> {
-        if self.take(expected.len())? != expected {
-            return Err(ComponentAncestorJournalError);
-        }
-        Ok(())
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], ComponentAncestorJournalError> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| ComponentAncestorJournalError)
-    }
-
-    fn u8(&mut self) -> Result<u8, ComponentAncestorJournalError> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, ComponentAncestorJournalError> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, ComponentAncestorJournalError> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn finished(&self) -> bool {
-        self.position == self.bytes.len()
-    }
 }
 
 #[cfg(test)]

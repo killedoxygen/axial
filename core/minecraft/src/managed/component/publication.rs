@@ -1,4 +1,5 @@
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
+use crate::managed::component::bytes::{ByteCursor, put_u16, put_u32, put_u64};
 use crate::managed::component::table::{
     ComponentIntentManifest, ComponentTableError, ComponentTableRow, MAX_COMPONENT_INTENT_BYTES,
     MAX_COMPONENT_TABLE_ROWS, ManagedComponentKind, decode_component_intent_manifest,
@@ -319,7 +320,7 @@ pub(crate) fn decode_component_settlement(
     let total_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentPublicationRecordError)?;
     if cursor.u32()? != 0
         || cursor.u32()? != 0
-        || cursor.position != COMPONENT_SETTLEMENT_HEADER_BYTES
+        || cursor.position() != COMPONENT_SETTLEMENT_HEADER_BYTES
         || outcome_len != COMPONENT_OUTCOME_BYTES
         || intent_len > MAX_COMPONENT_INTENT_BYTES
         || total_len != bytes.len()
@@ -550,78 +551,11 @@ fn classify_component_recovery_shape(
     }
 }
 
-fn put_u16(output: &mut Vec<u8>, value: u16) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u32(output: &mut Vec<u8>, value: u32) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(output: &mut Vec<u8>, value: u64) {
-    output.extend_from_slice(&value.to_le_bytes());
-}
-
 fn outcome_checksum(body: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(OUTCOME_CHECKSUM_DOMAIN);
     hasher.update(body);
     hasher.finalize().into()
-}
-
-struct ByteCursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> ByteCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], ComponentPublicationRecordError> {
-        let end = self
-            .position
-            .checked_add(length)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or(ComponentPublicationRecordError)?;
-        let value = &self.bytes[self.position..end];
-        self.position = end;
-        Ok(value)
-    }
-
-    fn expect(&mut self, expected: &[u8]) -> Result<(), ComponentPublicationRecordError> {
-        if self.take(expected.len())? != expected {
-            return Err(ComponentPublicationRecordError);
-        }
-        Ok(())
-    }
-
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], ComponentPublicationRecordError> {
-        self.take(N)?
-            .try_into()
-            .map_err(|_| ComponentPublicationRecordError)
-    }
-
-    fn u8(&mut self) -> Result<u8, ComponentPublicationRecordError> {
-        Ok(self.array::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, ComponentPublicationRecordError> {
-        Ok(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Result<u32, ComponentPublicationRecordError> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, ComponentPublicationRecordError> {
-        Ok(u64::from_le_bytes(self.array()?))
-    }
-
-    fn finished(&self) -> bool {
-        self.position == self.bytes.len()
-    }
 }
 
 #[cfg(test)]
