@@ -1539,3 +1539,82 @@ async fn pending_content_exit_helper() {
     // This loses the retained owner after the SQL refusal, not during native staging.
     std::process::exit(PENDING_CONTENT_EXIT);
 }
+
+async fn startup_failure(root: &Path) -> StartupError {
+    match start_in_profile(root.to_path_buf(), None).await {
+        Err(failure) => failure,
+        Ok(services) => {
+            services.server.shutdown().await.unwrap();
+            panic!("an unknown launch binding must block service startup");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_launch_binding_blocks_before_runtime_recovery_and_can_be_preserved() {
+    use axial_app::{launch::coordinator::INTENT_MIGRATION, storage::rusqlite::params};
+
+    for malformed in [false, true] {
+        let temporary = temporary();
+        let root = temporary.path().join("rewrite");
+        admit_profile(&root).unwrap();
+        let marker = fs::read(root.join(PROFILE_MARKER)).unwrap();
+        fs::write(root.join("keep.txt"), b"profile user data").unwrap();
+        fs::create_dir(root.join("worlds")).unwrap();
+        fs::write(root.join("worlds/world.dat"), b"nested user data").unwrap();
+        let key = uuid::Uuid::new_v4().to_string();
+        let payload = if malformed {
+            b"invalid launch record".to_vec()
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "request": {"instance_id": uuid::Uuid::new_v4().to_string(), "intent_key": key},
+                "context": null,
+                "session_id": uuid::Uuid::new_v4().to_string()
+            }))
+            .unwrap()
+        };
+        let storage = MetadataStore::open(root.join("metadata.sqlite")).unwrap();
+        storage.migrate(&[INTENT_MIGRATION]).unwrap();
+        storage
+            .transaction(|tx| -> Result<(), StorageError> {
+                tx.execute(
+                    "INSERT INTO launch_intents(intent_key,payload,state) VALUES(?1,?2,'accepted')",
+                    params![key, payload],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(storage);
+
+        let failure = startup_failure(&root).await;
+        assert!(!root.join("runtime").exists());
+        failure
+            .try_preserve()
+            .expect("unknown launch does not trap startup preservation");
+        assert_eq!(fs::read(root.join(PROFILE_MARKER)).unwrap(), marker);
+        assert_eq!(
+            fs::read(root.join("keep.txt")).unwrap(),
+            b"profile user data"
+        );
+        assert_eq!(
+            fs::read(root.join("worlds/world.dat")).unwrap(),
+            b"nested user data"
+        );
+        let storage = MetadataStore::open(root.join("metadata.sqlite")).unwrap();
+        let persisted: Vec<u8> = storage
+            .read(|db| -> Result<_, StorageError> {
+                Ok(db.query_row(
+                    "SELECT payload FROM launch_intents WHERE intent_key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(persisted, payload);
+        drop(storage);
+        startup_failure(&root)
+            .await
+            .try_preserve()
+            .expect("repeat startup remains preservable");
+    }
+}
