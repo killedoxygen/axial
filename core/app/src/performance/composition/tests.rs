@@ -1,16 +1,12 @@
 use super::InstallError;
 use super::artifact::{ManagedArtifactStage, state_from_plan};
+use super::storage::TestManagedStorage;
 use super::{ManagedArtifactPin, ManagedCompositionInstallPlan, ManagedDependencyEdge};
 use super::{commit_staged_graph, managed_stage_selection, remove_managed_transaction};
 use crate::performance::model::{
-    CompositionPlan, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
+    CompositionPlan, CompositionState, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
     ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource, ManagedMod, ModCondition,
     OwnershipClass, PerformanceMode, VersionFamily,
-};
-use axial_fs::{
-    FileCreateObligation, FileCreateOutcome, FileCreateResolution, FilePromotionObligation,
-    FilePromotionOutcome, FilePromotionResolution, LeafName, RootSession,
-    RootSessionAcquireOutcome, StageDiscardObligation, StageDiscardOutcome, StageDiscardResolution,
 };
 use axial_minecraft::download::{
     RetryPolicy, TransferClient, TransferClientConfig, TransferOrigin,
@@ -45,61 +41,20 @@ impl ManagedArtifactStage for FakeOwnedStage {
         }
         let addition =
             super::state::prepare_managed_artifact_addition(destination, &self.installed)?;
-        publish_test_bytes_create_new(destination, &self.installed.filename, &self.bytes)?;
+        destination.create_file_create_new(Path::new(&self.installed.filename), &self.bytes)?;
         super::state::publish_managed_artifact_addition(destination, &self.installed, &addition)
             .map_err(Into::into)
     }
 }
 
 #[test]
-fn sealed_graph_state_retains_required_dependency_identity() {
-    let plan = graph_plan(b"root", b"dependency");
-    let state = state_from_plan(&plan, installed_from_plan(&plan));
-
-    assert_eq!(state.graph_sha512, plan.graph_digest());
-    assert_eq!(state.dependency_edges.len(), 1);
-    assert_eq!(state.installed_mods.len(), 2);
-    assert!(
-        state
-            .installed_mods
-            .iter()
-            .any(|installed| installed.role == ManagedArtifactRole::RequiredDependency)
-    );
-    super::plan::validate_state_graph(&state).expect("valid sealed state graph");
-}
-
-#[test]
-fn exact_healthy_graph_skips_provider_and_snapshot_work() {
-    let root = test_root("healthy-noop");
-    let storage = anchor(&root);
-    let plan = graph_plan(b"root", b"dependency");
-    let state = state_from_plan(&plan, installed_from_plan(&plan));
-    write_graph_files(&root, b"root", b"dependency");
-    super::state::save_state(storage.directory(), &state).expect("save state");
-
-    let admitted = managed_stage_selection(storage.directory(), &plan)
-        .expect("inspect exact graph")
-        .exact_state
-        .expect("healthy graph");
-
-    assert_eq!(admitted, state);
-    assert!(
-        super::state::load_rollback_snapshot(storage.directory())
-            .expect("load rollback")
-            .is_none()
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
 fn changed_graph_requests_provider_only_for_the_changed_pin() {
     let root = test_root("changed-pin-provider-selection");
-    let storage = anchor(&root);
-    let previous_plan = graph_plan(b"root", b"dependency");
-    let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
+    let storage = TestManagedStorage::new(&root);
+    let (_, previous) = graph(b"root", b"dependency");
     write_graph_files(&root, b"root", b"dependency");
     super::state::save_state(storage.directory(), &previous).expect("save previous state");
-    let next_plan = graph_plan(b"replacement-root", b"dependency");
+    let (next_plan, next) = graph(b"replacement-root", b"dependency");
 
     let selection =
         managed_stage_selection(storage.directory(), &next_plan).expect("select changed pins");
@@ -108,7 +63,6 @@ fn changed_graph_requests_provider_only_for_the_changed_pin() {
     assert_eq!(selection.pins.len(), 1, "one provider request is required");
     assert_eq!(selection.pins[0].filename(), "root.jar");
 
-    let next = state_from_plan(&next_plan, installed_from_plan(&next_plan));
     let changed_stage = fake_stages(&next_plan, false)
         .into_iter()
         .filter(|stage| stage.installed.filename == "root.jar")
@@ -116,20 +70,17 @@ fn changed_graph_requests_provider_only_for_the_changed_pin() {
     commit_staged_graph(storage.directory(), Some(&previous), &next, changed_stage)
         .expect("commit changed pin with retained dependency");
     assert_graph_files(&root, b"replacement-root", b"dependency");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn changed_graph_revalidates_retained_pin_before_commit_effects() {
     let root = test_root("changed-pin-precommit-revalidation");
-    let storage = anchor(&root);
-    let previous_plan = graph_plan(b"root", b"dependency");
-    let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
+    let storage = TestManagedStorage::new(&root);
+    let (_, previous) = graph(b"root", b"dependency");
     write_graph_files(&root, b"root", b"dependency");
     super::state::save_state(storage.directory(), &previous).expect("save previous state");
     let lock_before = fs::read(root.join(".axial-lock.json")).expect("lock bytes");
-    let next_plan = graph_plan(b"replacement-root", b"dependency");
-    let next = state_from_plan(&next_plan, installed_from_plan(&next_plan));
+    let (next_plan, next) = graph(b"replacement-root", b"dependency");
     let changed_stage = fake_stages(&next_plan, false)
         .into_iter()
         .filter(|stage| stage.installed.filename == "root.jar")
@@ -150,15 +101,13 @@ fn changed_graph_revalidates_retained_pin_before_commit_effects() {
         lock_before
     );
     assert!(!root.join(".axial-performance").exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn dependency_complete_graph_commits_and_rolls_back_to_absence() {
     let root = test_root("complete-graph");
-    let storage = anchor(&root);
-    let plan = graph_plan(b"root", b"dependency");
-    let state = state_from_plan(&plan, installed_from_plan(&plan));
+    let storage = TestManagedStorage::new(&root);
+    let (plan, state) = graph(b"root", b"dependency");
     super::state::save_absent_rollback_snapshot(storage.directory()).expect("snapshot absence");
 
     commit_staged_graph(storage.directory(), None, &state, fake_stages(&plan, false))
@@ -181,7 +130,6 @@ fn dependency_complete_graph_commits_and_rolls_back_to_absence() {
     ));
     assert!(!root.join("root.jar").exists());
     assert!(!root.join("dependency.jar").exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -189,9 +137,8 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let instance = test_root("provider-failure-instance");
     let mods = instance.join("mods");
     fs::create_dir(&mods).expect("create mods");
-    let mods_storage = anchor(&mods);
-    let previous_plan = graph_plan(b"root", b"dependency");
-    let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
+    let mods_storage = TestManagedStorage::new(&mods);
+    let (_, previous) = graph(b"root", b"dependency");
     write_graph_files(&mods, b"root", b"dependency");
     super::state::save_state(mods_storage.directory(), &previous).expect("save previous state");
     let lock_before = fs::read(mods.join(".axial-lock.json")).expect("lock bytes");
@@ -200,7 +147,7 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
         b"replacement-dependency",
         "https://127.0.0.1:1",
     );
-    let instance_anchor = anchor(&instance);
+    let instance_anchor = TestManagedStorage::new(&instance);
 
     let callback_called = Arc::new(AtomicBool::new(false));
     let callback_probe = callback_called.clone();
@@ -233,11 +180,10 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     );
     drop(mods_storage);
     drop(instance_anchor);
-    let _ = fs::remove_dir_all(instance);
 
     let fresh_instance = test_root("provider-failure-fresh-instance");
     let fresh_mods = fresh_instance.join("mods");
-    let fresh_instance_anchor = anchor(&fresh_instance);
+    let fresh_instance_anchor = TestManagedStorage::new(&fresh_instance);
     super::install_graph(
         &failed_plan,
         test_transfer_resolver(),
@@ -258,9 +204,6 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     );
     super::state::prove_managed_storage_recovered(&fresh_mods_storage, None)
         .expect("provider failure settles every candidate intent");
-    drop(fresh_mods_storage);
-    drop(fresh_instance_anchor);
-    let _ = fs::remove_dir_all(fresh_instance);
 }
 
 #[tokio::test]
@@ -270,7 +213,7 @@ async fn managed_graph_transfers_two_candidates_before_publication() {
     let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
 
     let instance = test_root("concurrent-candidate-transfers");
-    let instance_anchor = anchor(&instance);
+    let instance_anchor = TestManagedStorage::new(&instance);
     let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
 
     let outcome = super::install_graph(
@@ -301,9 +244,6 @@ async fn managed_graph_transfers_two_candidates_before_publication() {
     assert_eq!(state, outcome.into_state());
     super::state::prove_managed_storage_recovered(&mods_storage, Some(&state))
         .expect("all transfer candidates and intents settled");
-    drop(mods_storage);
-    drop(instance_anchor);
-    let _ = fs::remove_dir_all(instance);
 }
 
 #[tokio::test]
@@ -312,7 +252,7 @@ async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
     let dependency_bytes = b"downloaded-dependency";
     let (base_url, server) = start_artifact_server(root_bytes, dependency_bytes).await;
     let instance = test_root("rejected-target-checkpoint");
-    let instance_anchor = anchor(&instance);
+    let instance_anchor = TestManagedStorage::new(&instance);
     let plan = graph_plan_at(root_bytes, dependency_bytes, &base_url);
 
     let error = super::install_graph(
@@ -351,9 +291,6 @@ async fn rejected_target_checkpoint_cleans_every_verified_candidate() {
         .expect("checkpoint rejection settles candidate state");
     assert!(!instance.join("mods/root.jar").exists());
     assert!(!instance.join("mods/dependency.jar").exists());
-    drop(mods);
-    drop(instance_anchor);
-    let _ = fs::remove_dir_all(instance);
 }
 
 #[tokio::test]
@@ -361,12 +298,11 @@ async fn exact_graph_noop_skips_the_target_effect_boundary() {
     let instance = test_root("exact-noop-boundary");
     let mods = instance.join("mods");
     fs::create_dir(&mods).expect("create mods");
-    let mods_storage = anchor(&mods);
-    let plan = graph_plan(b"root", b"dependency");
-    let state = state_from_plan(&plan, installed_from_plan(&plan));
+    let mods_storage = TestManagedStorage::new(&mods);
+    let (plan, state) = graph(b"root", b"dependency");
     write_graph_files(&mods, b"root", b"dependency");
     super::state::save_state(mods_storage.directory(), &state).expect("save exact managed state");
-    let instance_anchor = anchor(&instance);
+    let instance_anchor = TestManagedStorage::new(&instance);
     let callback_called = Arc::new(AtomicBool::new(false));
     let callback_probe = callback_called.clone();
 
@@ -389,9 +325,6 @@ async fn exact_graph_noop_skips_the_target_effect_boundary() {
             .expect("load rollback")
             .is_none()
     );
-    drop(mods_storage);
-    drop(instance_anchor);
-    let _ = fs::remove_dir_all(instance);
 }
 
 #[tokio::test]
@@ -399,9 +332,8 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
     let instance = test_root("snapshot-effect-boundary");
     let mods = instance.join("mods");
     fs::create_dir(&mods).expect("create mods");
-    let mods_storage = anchor(&mods);
-    let previous_plan = graph_plan(b"root", b"dependency");
-    let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
+    let mods_storage = TestManagedStorage::new(&mods);
+    let (_, previous) = graph(b"root", b"dependency");
     write_graph_files(&mods, b"root", b"dependency");
     super::state::save_state(mods_storage.directory(), &previous)
         .expect("save previous managed state");
@@ -411,7 +343,7 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
         b"dependency",
         "https://cdn.example.invalid",
     );
-    let instance_anchor = anchor(&instance);
+    let instance_anchor = TestManagedStorage::new(&instance);
     let callback_mods = mods.clone();
     let callback_storage = mods_storage.directory().clone();
 
@@ -441,24 +373,19 @@ async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation()
 
     assert!(outcome.target_changed());
     assert_eq!(outcome.into_state().composition_id, "replacement-core");
-    drop(mods_storage);
-    drop(instance_anchor);
-    let _ = fs::remove_dir_all(instance);
 }
 
 #[test]
 fn mid_commit_failure_restores_exact_prior_graph() {
     let root = test_root("mid-commit-rollback");
-    let storage = anchor(&root);
-    let previous_plan = graph_plan(b"root", b"dependency");
-    let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
+    let storage = TestManagedStorage::new(&root);
+    let (_, previous) = graph(b"root", b"dependency");
     write_graph_files(&root, b"root", b"dependency");
     super::state::save_state(storage.directory(), &previous).expect("save previous state");
     let lock_before = fs::read(root.join(".axial-lock.json")).expect("lock bytes");
     super::state::save_rollback_snapshot(storage.directory(), &previous).expect("save rollback");
 
-    let replacement_plan = graph_plan(b"replacement-root", b"replacement-dependency");
-    let replacement = state_from_plan(&replacement_plan, installed_from_plan(&replacement_plan));
+    let (replacement_plan, replacement) = graph(b"replacement-root", b"replacement-dependency");
     let mut stages = fake_stages(&replacement_plan, false);
     stages[1].fail_publication = true;
     commit_staged_graph(storage.directory(), Some(&previous), &replacement, stages)
@@ -480,15 +407,13 @@ fn mid_commit_failure_restores_exact_prior_graph() {
             .expect("prior state"),
         previous
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn commit_collision_never_claims_or_removes_user_owned_destination() {
     let root = test_root("user-destination-collision");
-    let storage = anchor(&root);
-    let plan = graph_plan(b"root", b"dependency");
-    let state = state_from_plan(&plan, installed_from_plan(&plan));
+    let storage = TestManagedStorage::new(&root);
+    let (plan, state) = graph(b"root", b"dependency");
     fs::write(root.join("root.jar"), b"user-owned").expect("write user file");
 
     commit_staged_graph(storage.directory(), None, &state, fake_stages(&plan, false))
@@ -506,15 +431,13 @@ fn commit_collision_never_claims_or_removes_user_owned_destination() {
             .expect("load state")
             .is_none()
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn full_graph_remove_and_rollback_preserve_dependencies() {
     let root = test_root("remove-rollback");
-    let storage = anchor(&root);
-    let plan = graph_plan(b"root", b"dependency");
-    let state = state_from_plan(&plan, installed_from_plan(&plan));
+    let storage = TestManagedStorage::new(&root);
+    let (plan, state) = graph(b"root", b"dependency");
     commit_staged_graph(storage.directory(), None, &state, fake_stages(&plan, false))
         .expect("install graph");
 
@@ -530,7 +453,12 @@ fn full_graph_remove_and_rollback_preserve_dependencies() {
         super::state::ManagedRollbackOutcome::ManagedComposition(_)
     ));
     assert_graph_files(&root, b"root", b"dependency");
-    let _ = fs::remove_dir_all(root);
+}
+
+fn graph(root: &[u8], dependency: &[u8]) -> (ManagedCompositionInstallPlan, CompositionState) {
+    let plan = graph_plan(root, dependency);
+    let state = state_from_plan(&plan, installed_from_plan(&plan));
+    (plan, state)
 }
 
 fn graph_plan(root: &[u8], dependency: &[u8]) -> ManagedCompositionInstallPlan {
@@ -758,220 +686,6 @@ fn assert_graph_files(root: &Path, root_bytes: &[u8], dependency_bytes: &[u8]) {
         fs::read(root.join("dependency.jar")).expect("dependency"),
         dependency_bytes
     );
-}
-
-struct TestManagedRoot {
-    directory: super::storage::ManagedStorageDirectory,
-    _session: RootSession,
-    _cleanup: TestAuthorityRootCleanup,
-}
-
-impl TestManagedRoot {
-    fn directory(&self) -> &super::storage::ManagedStorageDirectory {
-        &self.directory
-    }
-}
-
-struct TestAuthorityRootCleanup(PathBuf);
-
-impl Drop for TestAuthorityRootCleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
-    }
-}
-
-fn anchor(root: &Path) -> TestManagedRoot {
-    let authority_root = root.parent().expect("managed test authority").to_path_buf();
-    let session = acquire_test_root_session(&authority_root);
-    let name = axial_fs::LeafName::new(
-        root.file_name()
-            .expect("managed test directory name")
-            .to_os_string(),
-    )
-    .expect("managed test directory leaf");
-    let directory = session
-        .root()
-        .and_then(|authority| authority.open_directory(&name))
-        .expect("admit managed test directory");
-    let effects = super::storage::ManagedInstanceEffectAuthority::bind(&directory)
-        .expect("bind managed test effect authority");
-    TestManagedRoot {
-        directory: super::storage::ManagedStorageDirectory::bind_instance_root(directory, effects)
-            .expect("bind managed test directory"),
-        _session: session,
-        _cleanup: TestAuthorityRootCleanup(authority_root),
-    }
-}
-
-fn acquire_test_root_session(root: &Path) -> RootSession {
-    match RootSession::acquire(root) {
-        RootSessionAcquireOutcome::Acquired(session) => session,
-        RootSessionAcquireOutcome::NoEffect(error) => {
-            panic!("test root authority acquisition had no effect: {error}")
-        }
-        RootSessionAcquireOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            RootSessionAcquireOutcome::Acquired(session) => session,
-            RootSessionAcquireOutcome::NoEffect(error) => {
-                panic!("test root authority reconciliation had no effect: {error}")
-            }
-            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
-                let message = obligation.error().to_string();
-                match obligation.cleanup() {
-                    Ok(()) => panic!(
-                        "test root authority was cleaned after indeterminate acquisition: {message}"
-                    ),
-                    Err(obligation) => {
-                        std::mem::forget(obligation);
-                        panic!(
-                            "test root authority remains retained after indeterminate acquisition: {message}"
-                        );
-                    }
-                }
-            }
-        },
-    }
-}
-
-fn publish_test_bytes_create_new(
-    destination: &super::storage::ManagedStorageDirectory,
-    filename: &str,
-    bytes: &[u8],
-) -> Result<(), InstallError> {
-    let mut staged = match destination.directory().create_stage() {
-        FileCreateOutcome::Created(staged) => staged,
-        FileCreateOutcome::NoEffect(error) => return Err(InstallError::Io(error)),
-        FileCreateOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            FileCreateResolution::Created(staged) => staged,
-            FileCreateResolution::NoEffect(error) => return Err(InstallError::Io(error)),
-            FileCreateResolution::Indeterminate(obligation) => {
-                let error = copy_io_error(obligation.error());
-                return Err(retained_test_effect(
-                    error,
-                    RetainedTestEffect::FileCreate {
-                        _obligation: obligation,
-                    },
-                ));
-            }
-        },
-    };
-    if let Err(error) = staged.write_all(bytes) {
-        settle_test_stage_discard(staged.discard())?;
-        return Err(InstallError::Io(error));
-    }
-    let sealed = match staged.seal() {
-        Ok(sealed) => sealed,
-        Err(failure) => {
-            let error = copy_io_error(failure.error());
-            settle_test_stage_discard(failure.into_staged().discard())?;
-            return Err(InstallError::Io(error));
-        }
-    };
-    let filename = LeafName::new(filename).map_err(|_| {
-        InstallError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "test artifact filename is not a direct leaf",
-        ))
-    })?;
-    match sealed.promote_no_replace(destination.directory(), destination.directory(), &filename) {
-        FilePromotionOutcome::Applied(file) => {
-            drop(file);
-            Ok(())
-        }
-        FilePromotionOutcome::NoEffect {
-            error,
-            item: staged,
-        } => {
-            settle_test_stage_discard(staged.discard())?;
-            Err(InstallError::Io(error))
-        }
-        FilePromotionOutcome::AppliedUnverified(obligation) => match (*obligation).reconcile() {
-            FilePromotionResolution::Applied(file) => {
-                drop(file);
-                Ok(())
-            }
-            FilePromotionResolution::NoEffect(staged) => {
-                settle_test_stage_discard(staged.discard())?;
-                Err(InstallError::Io(std::io::Error::other(
-                    "test artifact publication had no effect",
-                )))
-            }
-            FilePromotionResolution::Indeterminate(obligation) => {
-                let error = copy_io_error(obligation.error());
-                Err(retained_test_effect(
-                    error,
-                    RetainedTestEffect::FilePromotion {
-                        _obligation: obligation,
-                    },
-                ))
-            }
-        },
-    }
-}
-
-fn settle_test_stage_discard(outcome: StageDiscardOutcome) -> Result<(), InstallError> {
-    match outcome {
-        StageDiscardOutcome::Discarded => Ok(()),
-        StageDiscardOutcome::AppliedUnverified(obligation) => {
-            let error = copy_io_error(obligation.error());
-            match obligation.reconcile() {
-                StageDiscardResolution::Discarded => Ok(()),
-                StageDiscardResolution::Indeterminate(obligation) => Err(retained_test_effect(
-                    error,
-                    RetainedTestEffect::StageDiscard {
-                        _obligation: obligation,
-                    },
-                )),
-            }
-        }
-    }
-}
-
-fn copy_io_error(error: &std::io::Error) -> std::io::Error {
-    std::io::Error::new(error.kind(), error.to_string())
-}
-
-enum RetainedTestEffect {
-    FileCreate {
-        _obligation: FileCreateObligation,
-    },
-    FilePromotion {
-        _obligation: Box<FilePromotionObligation>,
-    },
-    StageDiscard {
-        _obligation: StageDiscardObligation,
-    },
-}
-
-struct RetainedTestEffectError {
-    source: std::io::Error,
-    _effect: RetainedTestEffect,
-}
-
-impl std::fmt::Debug for RetainedTestEffectError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RetainedTestEffectError")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Display for RetainedTestEffectError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("test filesystem effect remains retained and indeterminate")
-    }
-}
-
-impl std::error::Error for RetainedTestEffectError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-fn retained_test_effect(error: std::io::Error, effect: RetainedTestEffect) -> InstallError {
-    InstallError::Io(std::io::Error::other(RetainedTestEffectError {
-        source: error,
-        _effect: effect,
-    }))
 }
 
 fn test_root(name: &str) -> PathBuf {

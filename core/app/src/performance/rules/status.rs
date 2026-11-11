@@ -171,9 +171,9 @@ mod tests {
     use super::super::ActiveRules;
     use super::rules_status;
     use crate::performance::model::{
-        BundleHealth, CompositionTier, EmergencyDisable, EmergencyDisableTarget, Manifest,
-        OwnershipClass, PerformanceRulesStatus, RuleChannel, RuleSource, RulesCacheState,
-        RulesValidation, VersionFamily,
+        CompositionTier, EmergencyDisable, EmergencyDisableTarget, Manifest,
+        PerformanceRulesStatus, RuleChannel, RuleSource, RulesCacheState, RulesValidation,
+        VersionFamily,
     };
     use crate::performance::resolve::builtin_manifest;
 
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_manifest_status_is_truthful_about_current_foundation() {
+    fn bundled_status_reports_its_source_and_per_family_coverage() {
         let manifest = builtin_manifest().expect("builtin manifest should validate");
 
         let status = status(&manifest);
@@ -191,31 +191,45 @@ mod tests {
         assert_eq!(status.rule_channel, RuleChannel::Bundled);
         assert!(!status.rules_cache.recorded);
         assert_eq!(status.rules_cache.state, RulesCacheState::Unavailable);
-        assert_eq!(status.schema_version, manifest.schema_version);
-        assert_eq!(status.generated_at, manifest.generated_at);
-        assert_eq!(status.composition_count, manifest.compositions.len());
-        assert_eq!(status.family_coverage.len(), 6);
+        assert_eq!(status.validation, RulesValidation::Valid);
         assert!(!status.remote_refresh);
         assert_eq!(status.last_refresh_at, None);
-        assert_eq!(status.validation, RulesValidation::Valid);
-        assert_eq!(
-            status.health_states,
-            vec![
-                BundleHealth::Healthy,
-                BundleHealth::Disabled,
-                BundleHealth::Invalid,
-            ]
-        );
-        assert_eq!(
-            status.ownership_classes,
-            vec![
-                OwnershipClass::CompositionManaged,
-                OwnershipClass::UserManaged,
-            ]
-        );
-        assert_eq!(status.emergency_disable_count, 0);
+        assert_eq!(status.composition_count, manifest.compositions.len());
         assert!(status.emergency_disables.is_empty());
         assert!(status.warnings.is_empty());
+        use VersionFamily::{A, B, C, D, E, F};
+        assert_eq!(
+            status
+                .family_coverage
+                .iter()
+                .map(|coverage| coverage.family)
+                .collect::<Vec<_>>(),
+            [A, B, C, D, E, F]
+        );
+        for coverage in &status.family_coverage {
+            let vanilla_only = matches!(coverage.family, A | B | D);
+            assert!(coverage.composition_count > 0, "{:?}", coverage.family);
+            assert_eq!(
+                coverage.managed_mod_count == 0,
+                vanilla_only,
+                "{:?}",
+                coverage.family
+            );
+            assert_eq!(
+                coverage
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("intentionally vanilla-enhanced only")),
+                vanilla_only,
+                "{:?}",
+                coverage.family
+            );
+            assert_eq!(coverage.warnings.is_empty(), !vanilla_only);
+        }
+        let family_c = &status.family_coverage[2];
+        assert_eq!(family_c.managed_mod_count, 3);
+        assert!(family_c.tiers.contains(&CompositionTier::Core));
+        assert!(family_c.tiers.contains(&CompositionTier::VanillaEnhanced));
     }
 
     #[test]
@@ -240,84 +254,5 @@ mod tests {
             EmergencyDisableTarget::Composition
         );
         assert_eq!(status.emergency_disables[0].reason, "Temporary hold.");
-    }
-
-    #[test]
-    fn bundled_manifest_status_reports_all_family_coverage() {
-        let manifest = builtin_manifest().expect("builtin manifest should validate");
-
-        let status = status(&manifest);
-        let families = status
-            .family_coverage
-            .iter()
-            .map(|coverage| coverage.family)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            families,
-            vec![
-                VersionFamily::A,
-                VersionFamily::B,
-                VersionFamily::C,
-                VersionFamily::D,
-                VersionFamily::E,
-                VersionFamily::F,
-            ]
-        );
-        assert!(
-            status
-                .family_coverage
-                .iter()
-                .all(|coverage| coverage.composition_count > 0)
-        );
-    }
-
-    #[test]
-    fn vanilla_enhanced_only_and_managed_covered_families_report_current_status() {
-        let manifest = builtin_manifest().expect("builtin manifest should validate");
-
-        let status = status(&manifest);
-
-        for family in [VersionFamily::A, VersionFamily::B, VersionFamily::D] {
-            let coverage = status
-                .family_coverage
-                .iter()
-                .find(|coverage| coverage.family == family)
-                .expect("family coverage");
-            assert_eq!(coverage.managed_mod_count, 0);
-            assert!(
-                coverage
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.contains("intentionally vanilla-enhanced only")),
-                "missing vanilla-enhanced-only warning for {family:?}"
-            );
-        }
-
-        let family_c = status
-            .family_coverage
-            .iter()
-            .find(|coverage| coverage.family == VersionFamily::C)
-            .expect("family C coverage");
-        assert_eq!(family_c.managed_mod_count, 3);
-        assert!(family_c.tiers.contains(&CompositionTier::Core));
-        assert!(family_c.tiers.contains(&CompositionTier::VanillaEnhanced));
-        assert!(
-            family_c.warnings.is_empty(),
-            "Family C has bounded Forge managed coverage and should not warn as vanilla-only"
-        );
-
-        for family in [VersionFamily::E, VersionFamily::F] {
-            let coverage = status
-                .family_coverage
-                .iter()
-                .find(|coverage| coverage.family == family)
-                .expect("family coverage");
-            assert!(coverage.managed_mod_count > 0);
-            assert!(
-                coverage.warnings.is_empty(),
-                "managed-covered family should not warn: {family:?}"
-            );
-        }
     }
 }

@@ -149,29 +149,20 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
-    fn verifies_current_schema_manifest_payload() {
+    fn signature_verifies_only_the_signed_manifest_payload() {
         let manifest = builtin_manifest().expect("builtin manifest");
         let (public_key, metadata) = signed_metadata(&manifest);
         let verifier = RemoteRulesVerifier::from_public_key_hex(Some(&public_key));
-
         verifier
             .verify_manifest(&manifest, &metadata)
             .expect("signature should verify");
-    }
 
-    #[test]
-    fn rejects_signature_for_different_payload() {
-        let manifest = builtin_manifest().expect("builtin manifest");
-        let (public_key, metadata) = signed_metadata(&manifest);
-        let mut changed = manifest.clone();
+        let mut changed = manifest;
         changed.generated_at = "2026-05-30T15:00:00Z".to_string();
-        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(&public_key));
-
-        let error = verifier
-            .verify_manifest(&changed, &metadata)
-            .expect_err("signature should reject changed manifest");
-
-        assert!(matches!(error, RulesSignatureError::VerificationFailed));
+        assert!(matches!(
+            verifier.verify_manifest(&changed, &metadata),
+            Err(RulesSignatureError::VerificationFailed)
+        ));
     }
 
     #[test]

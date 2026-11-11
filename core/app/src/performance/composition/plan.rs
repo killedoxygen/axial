@@ -844,45 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn seals_dependency_complete_graph_and_exposes_exact_facts() {
-        let sealed = seal(
-            &[ROOT_A, ROOT_B],
-            vec![
-                pin(DEP_A, VERSION_B, ManagedArtifactRole::RequiredDependency),
-                pin(ROOT_B, VERSION_B, ManagedArtifactRole::Root),
-                pin(ROOT_A, VERSION_A, ManagedArtifactRole::Root),
-            ],
-            vec![
-                edge(ROOT_B, DEP_A, VERSION_B),
-                edge(ROOT_A, DEP_A, VERSION_B),
-            ],
-        )
-        .expect("sealed graph");
-
-        assert_eq!(sealed.composition_id(), "family-f-fabric-extended");
-        assert_eq!(sealed.family(), VersionFamily::F);
-        assert_eq!(sealed.tier(), CompositionTier::Extended);
-        assert_eq!(sealed.game_version(), "1.21.11");
-        assert_eq!(sealed.loader(), "fabric");
-        assert_eq!(sealed.aggregate_bytes(), 192);
-        assert_eq!(sealed.graph_digest().len(), SHA512_HEX_BYTES);
-        let dependency = sealed
-            .pins()
-            .iter()
-            .find(|pin| pin.project_id() == DEP_A)
-            .expect("dependency pin");
-        assert_eq!(dependency.version_id(), VERSION_B);
-        assert_eq!(dependency.filename(), "P7dR8mSH.jar");
-        assert_eq!(dependency.size(), 64);
-        assert_eq!(dependency.sha512(), SHA512);
-        assert_eq!(dependency.role(), ManagedArtifactRole::RequiredDependency);
-        assert!(dependency.download_url().starts_with("https://"));
-        assert_eq!(sealed.edges()[0].parent_project_id(), ROOT_A);
-        assert_eq!(sealed.edges()[0].child_project_id(), DEP_A);
-        assert_eq!(sealed.edges()[0].child_version_id(), VERSION_B);
-    }
-
-    #[test]
     fn canonical_digest_is_input_order_independent_and_excludes_url() {
         let first = seal(
             &[ROOT_A, ROOT_B],

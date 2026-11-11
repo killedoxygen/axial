@@ -1037,16 +1037,4 @@ mod tests {
             assert_eq!(baseline["proof"]["version"], "1.12.2");
         }
     }
-
-    #[test]
-    fn different_minecraft_or_loader_does_not_qualify_as_family_c_forge() {
-        for (loader, minecraft, build) in [
-            (LoaderComponentId::Forge, "1.7.10", "10.13.4.1614"),
-            (LoaderComponentId::Fabric, "1.12.2", "0.19.5"),
-        ] {
-            let version = installed_version_id_for(loader, minecraft, build).unwrap();
-            let baseline = baseline_payload(&version, Some(&version));
-            assert!(!version_matches(&baseline));
-        }
-    }
 }

@@ -381,15 +381,8 @@ mod tests {
     #[test]
     fn managed_effective_plan_covers_contract_shape() {
         let plan = CompositionPlan {
-            composition_id: "family-f-fabric-extended".to_string(),
-            family: VersionFamily::F,
-            loader: "fabric".to_string(),
-            mode: PerformanceMode::Managed,
-            tier: CompositionTier::Extended,
-            mods: vec![managed_mod("sodium", "Sodium")],
-            jvm_preset: "performance".to_string(),
-            warnings: Vec::new(),
             fallback_reason: "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option.".to_string(),
+            ..managed_plan(vec![managed_mod("sodium", "Sodium")])
         };
 
         let effective = effective_performance_plan(&plan);
@@ -448,10 +441,8 @@ mod tests {
                 loader: "vanilla".to_string(),
                 mode,
                 tier: CompositionTier::VanillaEnhanced,
-                mods: Vec::new(),
                 jvm_preset: String::new(),
-                warnings: Vec::new(),
-                fallback_reason: String::new(),
+                ..managed_plan(Vec::new())
             };
 
             let effective = effective_performance_plan(&plan);
@@ -474,17 +465,12 @@ mod tests {
     fn effective_plan_bounds_public_explanations_and_artifact_labels() {
         let long_text = format!("{}\n{}", "unsafe detail ".repeat(40), "x".repeat(400));
         let plan = CompositionPlan {
-            composition_id: "family-f-fabric-extended".to_string(),
-            family: VersionFamily::F,
-            loader: "fabric".to_string(),
-            mode: PerformanceMode::Managed,
-            tier: CompositionTier::Extended,
-            mods: vec![managed_mod("bad id with spaces / path", &long_text)],
             jvm_preset: "performance with spaces".to_string(),
             warnings: std::iter::once(long_text.clone())
                 .chain((0..32).map(|index| format!("bounded warning {index}")))
                 .collect(),
-            fallback_reason: long_text,
+            fallback_reason: long_text.clone(),
+            ..managed_plan(vec![managed_mod("bad id with spaces / path", &long_text)])
         };
 
         let effective = effective_performance_plan(&plan);
@@ -512,17 +498,10 @@ mod tests {
     #[test]
     fn effective_plan_replaces_suspicious_public_text() {
         let plan = CompositionPlan {
-            composition_id: "family-f-fabric-extended".to_string(),
-            family: VersionFamily::F,
-            loader: "fabric".to_string(),
-            mode: PerformanceMode::Managed,
-            tier: CompositionTier::Extended,
-            mods: vec![managed_mod("sodium", "/home/alice/.minecraft --token secret")],
-            jvm_preset: "performance".to_string(),
-            warnings: Vec::new(),
             fallback_reason:
                 r#"C:\Users\Alice\AppData\Roaming\.minecraft --accessToken secret {"provider":"payload"}"#
                     .to_string(),
+            ..managed_plan(vec![managed_mod("sodium", "/home/alice/.minecraft --token secret")])
         };
 
         let effective = effective_performance_plan(&plan);
@@ -542,6 +521,20 @@ mod tests {
         assert!(!lower.contains("token"));
         assert!(!lower.contains("provider"));
         assert!(!lower.contains("minecraft"));
+    }
+
+    fn managed_plan(mods: Vec<ManagedMod>) -> CompositionPlan {
+        CompositionPlan {
+            composition_id: "family-f-fabric-extended".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Extended,
+            mods,
+            jvm_preset: "performance".to_string(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        }
     }
 
     fn managed_mod(id: &str, name: &str) -> ManagedMod {

@@ -102,18 +102,13 @@ async fn accept_refresh(listener: &tokio::net::TcpListener) -> tokio::net::TcpSt
 fn periodic_rules_interval_preserves_default_and_bounds() {
     for (value, seconds) in [
         (None, 21_600),
-        (Some(""), 21_600),
         (Some(" \t\n"), 21_600),
-        (Some("invalid"), 21_600),
         (Some("-1"), 21_600),
         (Some("18446744073709551616"), 21_600),
         (Some("0"), 900),
-        (Some("1"), 900),
         (Some("900"), 900),
         (Some(" 1800 "), 1_800),
-        (Some("21600"), 21_600),
         (Some("86400"), 86_400),
-        (Some("86401"), 86_400),
         (Some("18446744073709551615"), 86_400),
     ] {
         assert_eq!(

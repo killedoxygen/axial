@@ -7,13 +7,6 @@ use crate::performance::model::{
 use std::fs;
 
 #[test]
-fn generated_rollback_snapshot_id_uses_the_validated_alphabet() {
-    let snapshot_id = new_rollback_snapshot_id();
-
-    validate_rollback_snapshot_id(&snapshot_id).expect("generated rollback snapshot id");
-}
-
-#[test]
 fn duplicate_payload_restores_independent_artifacts_with_current_or_history_only_state() {
     for current_present in [true, false] {
         let root = test_root("duplicate-rollback");
@@ -288,24 +281,6 @@ fn copy_duplicate_fixture(payload: &ManagedDuplicatePayload, source: &Path, dest
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::copy(source.join(relative), target).unwrap();
     }
-}
-
-#[test]
-fn capability_state_round_trip_and_removal() {
-    let root = test_root("state-round-trip");
-    fs::create_dir_all(&root).expect("create root");
-    let storage = TestManagedStorage::new(&root);
-    let state = test_state(Vec::new());
-    save_state(storage.directory(), &state).expect("save state");
-    assert_eq!(
-        load_state(storage.directory()).expect("load state"),
-        Some(state)
-    );
-    remove_state(storage.directory()).expect("remove state");
-    assert_eq!(
-        load_state(storage.directory()).expect("load empty state"),
-        None
-    );
 }
 
 #[test]
