@@ -3006,6 +3006,22 @@ mod tests {
     }
 
     #[test]
+    fn reserved_token_unwind_is_root_cleanable_no_effect() {
+        let (_temporary, session, root) = fixture();
+        let authority = session.authority.clone();
+        let operation = authority.enter().unwrap();
+        drop(reserve_test_transient(&authority, &operation, &root, "unwound.bin").unwrap());
+        drop(operation);
+        {
+            let state = authority.operations.lock().unwrap();
+            let record = state.transients.values().next().unwrap();
+            assert!(record.phase == TransientEffectPhase::Abandoned);
+            assert!(record.disposition == TransientEffectDisposition::NoEffect);
+        }
+        revoke(session, root);
+    }
+
+    #[test]
     fn move_and_transient_reservations_reject_conflicts_in_either_order() {
         let (_temporary, session, root) = fixture();
         let authority = session.authority.clone();
@@ -3083,8 +3099,7 @@ mod tests {
                 let operation = authority.enter().unwrap();
                 barriers.0.wait();
                 let reservation = if transient {
-                    reserve_test_transient(&authority, &operation, &root, "race.BIN")
-                        .map(Ok)
+                    reserve_test_transient(&authority, &operation, &root, "race.BIN").map(Ok)
                 } else {
                     MoveEffectToken::reserve(
                         &authority,
@@ -3225,6 +3240,7 @@ mod tests {
             TransientPublicationBatch::new(vec![first.seal().unwrap(), second.seal().unwrap()])
                 .unwrap();
         let files = published(batch.publish_create_new());
+        assert_eq!(files.len(), 2);
         for (file, (name, bytes)) in files.iter().zip([
             ("group-first.bin", b"first".as_slice()),
             ("group-second.bin", b"second"),
