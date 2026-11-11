@@ -1,8 +1,7 @@
 //! Public health is derived from exact admitted leaf inspection.
 
 use super::composition::{
-    ManagedCompositionInspection, ManagedResolvedInspection, RollbackSnapshotSummary,
-    storage::ManagedStorageDirectory,
+    ManagedCompositionInspection, ManagedResolvedInspection, storage::ManagedStorageDirectory,
 };
 use super::{model::*, mutation::PerformanceOperationStatus};
 use serde::Serialize;
@@ -195,67 +194,6 @@ impl From<PerformanceOperationStatus> for PerformanceOperationView {
 #[derive(Clone, Debug, Serialize)]
 pub struct PerformanceInstanceOperationResponse {
     pub operation: Option<PerformanceOperationView>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PerformanceRollbackResponse {
-    pub snapshots: Vec<RollbackSnapshotSummary>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PerformanceInstallResponse {
-    pub active: bool,
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub install_id: Option<String>,
-    pub health: BundleHealth,
-    pub composition_id: String,
-    pub tier: &'static str,
-    pub installed_count: usize,
-    pub managed_artifacts: Vec<PerformanceManagedArtifactSummary>,
-    pub warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<PerformanceOperationView>,
-}
-
-impl PerformanceInstallResponse {
-    /// Accepted durable work; its operation reports progress.
-    pub fn queued(operation: PerformanceOperationStatus) -> Self {
-        Self {
-            active: true,
-            status: "queued",
-            install_id: Some(operation.id.clone()),
-            health: BundleHealth::Disabled,
-            composition_id: String::new(),
-            tier: "",
-            installed_count: 0,
-            managed_artifacts: Vec::new(),
-            warnings: Vec::new(),
-            operation: Some(operation.into()),
-        }
-    }
-
-    pub fn complete(inspection: ManagedCompositionInspection) -> Self {
-        let state = inspection.state.as_ref();
-        Self {
-            active: state.is_some(),
-            status: "complete",
-            install_id: None,
-            health: inspection.health,
-            composition_id: state
-                .map(|state| state.composition_id.clone())
-                .unwrap_or_default(),
-            tier: state.map_or("", |state| match state.tier {
-                CompositionTier::Core => "core",
-                CompositionTier::Extended => "extended",
-                CompositionTier::VanillaEnhanced => "vanilla_enhanced",
-            }),
-            installed_count: state.map_or(0, |state| state.installed_mods.len()),
-            warnings: inspection.warnings.clone(),
-            managed_artifacts: health_response(inspection).managed_artifacts,
-            operation: None,
-        }
-    }
 }
 
 pub(crate) fn derive_health(

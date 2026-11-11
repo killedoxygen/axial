@@ -1,6 +1,5 @@
 //! Performance wire data and canonical leaf models. Filesystem authorities stay private.
 
-use super::effective::EffectivePerformancePlan;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,21 +341,6 @@ pub struct EmergencyDisableDiagnostic {
     pub families: Vec<VersionFamily>,
     pub loaders: Vec<String>,
     pub tiers: Vec<CompositionTier>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PerformancePlanRequest {
-    pub game_version: Option<String>,
-    pub loader: Option<String>,
-    pub mode: Option<String>,
-    pub instance_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PerformancePlanResponse {
-    pub active: bool,
-    pub effective: EffectivePerformancePlan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

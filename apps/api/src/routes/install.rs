@@ -1,9 +1,7 @@
-use super::error::{ApiError, ApiResult, Extracted};
+use super::error::{ApiResult, Extracted};
 use axial_app::{
     install::{
-        model::{
-            InstallEvent, InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse,
-        },
+        model::{InstallEvent, InstallQueueRequest, InstallQueueStateResponse},
         queue::{InstallError, InstallQueue},
     },
     instances::setup::SetupService,
@@ -36,10 +34,6 @@ pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
             "/api/v1/install/queue/failures/{operation_id}",
             delete(dismiss_failure),
         )
-        .route("/api/v1/install/{id}/status", get(status))
-        .route("/api/v1/install/{id}/events", get(install_events))
-        .route("/api/v1/install/{id}/cancel", post(cancel))
-        .route("/api/v1/loaders/install/{id}/events", get(install_events))
         .with_state(queue.clone())
         .merge(
             Router::new()
@@ -91,19 +85,6 @@ async fn dismiss_failure(
         .map_err(|_| InstallError::InvalidRequest)?;
     Ok(Json(queue.dismiss_failure(&operation_id)))
 }
-async fn status(
-    State(queue): State<Arc<InstallQueue>>,
-    Path(id): Path<String>,
-) -> ApiResult<InstallStatusResponse> {
-    Ok(Json(queue.status(&id)?))
-}
-async fn cancel(
-    State(queue): State<Arc<InstallQueue>>,
-    Path(id): Path<String>,
-) -> ApiResult<InstallStatusResponse> {
-    Ok(Json(queue.cancel(&id)?))
-}
-
 async fn queue_events(
     State(queue): State<Arc<InstallQueue>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -135,40 +116,6 @@ async fn queue_events(
         },
     ))
     .keep_alive(KeepAlive::default())
-}
-async fn install_events(
-    State(queue): State<Arc<InstallQueue>>,
-    Path(id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // Subscribe before reading status so the current snapshot and later events
-    // cannot have a gap. Slow clients rebase to the queue's latest projection.
-    let (_, receiver) = queue.subscribe();
-    let initial = queue.status(&id)?;
-    Ok(Sse::new(stream::unfold(
-        (Some(initial), receiver, queue, id, false),
-        |(initial, mut receiver, queue, id, finished)| async move {
-            if finished || queue.events_closed() {
-                return None;
-            }
-            let value = match initial {
-                Some(value) => value,
-                None => {
-                    receiver.changed().await.ok()?;
-                    queue.status(&id).ok()?
-                }
-            };
-            let finished = value.done;
-            let event = Event::default()
-                .id(value.revision.to_string())
-                .json_data(InstallEvent {
-                    revision: value.revision,
-                    value,
-                })
-                .ok()?;
-            Some((Ok(event), (None, receiver, queue, id, finished)))
-        },
-    ))
-    .keep_alive(KeepAlive::default()))
 }
 #[cfg(test)]
 mod tests {

@@ -635,15 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_benchmark_descriptors_remain_allowed_without_arbitrary_modes() {
-        assert!(validate_descriptor("shader_pack_lab", "warm_cache_3", "development").is_ok());
-        assert!(validate_descriptor("managed_default", "repeat", "invented_mode").is_err());
-        assert!(validate_descriptor("../private", "repeat", "development").is_err());
-        assert!(validate_descriptor("managed_default", "", "development").is_err());
-        assert!(validate_descriptor(&"a".repeat(97), "repeat", "development").is_err());
-    }
-
-    #[test]
     fn benchmark_matrix_has_representative_target_for_each_version_family() {
         let families = benchmark_matrix()
             .representative_targets
@@ -1111,26 +1102,6 @@ impl BenchmarkService {
         };
         request.validate().map_err(|_| BenchmarkError::Invalid)?;
         Ok(request)
-    }
-
-    pub async fn launch(
-        &self,
-        input: BenchmarkLaunchRequest,
-    ) -> Result<SessionSnapshot, BenchmarkError> {
-        if input.suite_mode.is_some() || input.suite_id.is_some() || input.run_index.is_some() {
-            return Err(BenchmarkError::Invalid);
-        }
-        let request = self.launch_request(&input)?;
-        let profile = input.profile.as_deref().unwrap_or("managed_default").trim();
-        let run_type = input.run_type.as_deref().unwrap_or("coldish").trim();
-        let mode = input
-            .benchmark_mode
-            .as_deref()
-            .unwrap_or("development")
-            .trim();
-        validate_descriptor(profile, run_type, mode)?;
-        let id = format!("benchmark-{}", uuid::Uuid::new_v4().simple());
-        self.launch_run(request, profile, run_type, mode, &id).await
     }
 
     async fn launch_run(
@@ -1757,14 +1728,6 @@ fn benchmark_scenario(profile: &str, run_type: &str, mode: &str, id: &str) -> La
         benchmark_mode: Some(mode.into()),
         benchmark_id: Some(id.into()),
         ..LaunchProofScenario::default()
-    }
-}
-fn validate_descriptor(profile: &str, run_type: &str, mode: &str) -> Result<(), BenchmarkError> {
-    let matrix = benchmark_matrix();
-    if valid_token(profile) && valid_token(run_type) && matrix.modes.iter().any(|p| p.id == mode) {
-        Ok(())
-    } else {
-        Err(BenchmarkError::Invalid)
     }
 }
 fn validate_suite(suite: &BenchmarkSuiteManifest) -> Result<(), BenchmarkError> {

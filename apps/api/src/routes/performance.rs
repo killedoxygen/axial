@@ -6,26 +6,19 @@ use axial_app::{
     performance::{
         PerformanceService,
         health::{
-            PerformanceHealthResponse, PerformanceInstallResponse,
-            PerformanceInstanceOperationResponse, PerformanceOperationView,
-            PerformanceRollbackResponse, disabled_health_response, resolved_health_response,
+            PerformanceHealthResponse, PerformanceInstanceOperationResponse,
+            disabled_health_response, resolved_health_response,
         },
-        model::{
-            PerformanceMode, PerformancePlanRequest, PerformancePlanResponse,
-            PerformanceRulesStatusResponse, ResolutionRequest,
-        },
-        plan::{configured_mode, plan_response, resolve_mode, version_target},
+        model::{PerformanceMode, ResolutionRequest},
+        plan::{configured_mode, resolve_mode, version_target},
     },
     settings::SettingsStore,
 };
 use axum::{
     Json, Router,
-    extract::{
-        DefaultBodyLimit, Path, Query, State,
-        rejection::{JsonRejection, QueryRejection},
-    },
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::QueryRejection},
     http::StatusCode,
-    routing::{get, post},
+    routing::get,
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -38,42 +31,13 @@ struct PerformanceApi {
 
 pub fn router(service: Arc<PerformanceService>, settings: Arc<SettingsStore>) -> Router {
     Router::new()
-        .route("/api/v1/performance/status", get(status))
-        .route("/api/v1/performance/rules/refresh", post(refresh))
-        .route("/api/v1/performance/plan", get(plan))
         .route("/api/v1/performance/health", get(health))
-        .route("/api/v1/performance/rollback", get(rollback))
-        .route("/api/v1/performance/install", post(install))
         .route(
             "/api/v1/performance/instances/{id}/operation",
             get(instance_operation),
         )
-        .route("/api/v1/performance/operations/{id}", get(operation))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(PerformanceApi { service, settings })
-}
-
-async fn status(State(api): State<PerformanceApi>) -> Json<PerformanceRulesStatusResponse> {
-    Json(api.service.rules().status())
-}
-
-async fn refresh(State(api): State<PerformanceApi>) -> ApiResult<PerformanceRulesStatusResponse> {
-    Ok(Json(api.service.refresh_rules().await?))
-}
-
-async fn plan(
-    State(api): State<PerformanceApi>,
-    query: Result<Query<PerformancePlanRequest>, QueryRejection>,
-) -> ApiResult<PerformancePlanResponse> {
-    let input = query.or_refuse(invalid)?;
-    let request = resolution(&api, &input)?;
-    if let Some(id) = input.instance_id.as_deref() {
-        let id = id.parse::<InstanceId>().map_err(|_| invalid())?;
-        let resolved = api.service.resolve_and_inspect(&id, request).await?;
-        return Ok(Json(plan_response(&resolved.plan)));
-    }
-    let planned = api.service.rules().plan(request).await?;
-    Ok(Json(plan_response(planned.plan())))
 }
 
 #[derive(Deserialize)]
@@ -88,83 +52,12 @@ async fn health(
 ) -> ApiResult<PerformanceHealthResponse> {
     let query = query.or_refuse(invalid)?;
     let id = selected(&api, query.instance_id.as_deref())?;
-    let request = resolution(
-        &api,
-        &PerformancePlanRequest {
-            instance_id: Some(id.to_string()),
-            ..Default::default()
-        },
-    )?;
+    let request = resolution(&api, &id)?;
     if request.mode != PerformanceMode::Managed {
         return Ok(Json(disabled_health_response()));
     }
     let resolved = api.service.resolve_and_inspect(&id, request).await?;
     Ok(Json(resolved_health_response(resolved)))
-}
-
-async fn rollback(
-    State(api): State<PerformanceApi>,
-    query: Result<Query<InstanceQuery>, QueryRejection>,
-) -> ApiResult<PerformanceRollbackResponse> {
-    let query = query.or_refuse(invalid)?;
-    let id = selected(&api, query.instance_id.as_deref())?;
-    let inspected = api.service.inspect(&id).await?;
-    Ok(Json(PerformanceRollbackResponse {
-        snapshots: inspected.rollback_snapshots,
-    }))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstallRequest {
-    instance_id: Option<String>,
-    game_version: Option<String>,
-    loader: Option<String>,
-    mode: Option<String>,
-    action: Option<String>,
-    rollback_id: Option<String>,
-    queued: Option<bool>,
-}
-
-async fn install(
-    State(api): State<PerformanceApi>,
-    body: Result<Json<InstallRequest>, JsonRejection>,
-) -> ApiResult<PerformanceInstallResponse> {
-    let body = body.or_refuse(invalid)?;
-    let id = selected(&api, body.instance_id.as_deref())?;
-    let request = resolution(
-        &api,
-        &PerformancePlanRequest {
-            instance_id: Some(id.to_string()),
-            game_version: body.game_version,
-            loader: body.loader,
-            mode: body.mode,
-        },
-    )?;
-    let action = body.action.as_deref().unwrap_or("apply");
-    if body.queued == Some(true) {
-        let operation = api.service.submit(&id, request, action, body.rollback_id)?;
-        return Ok(Json(PerformanceInstallResponse::queued(operation)));
-    }
-    let inspected = match action {
-        "apply" => api.service.apply(&id, request).await,
-        "reapply" => api.service.reapply(&id, request).await,
-        "remove" => api.service.remove(&id).await,
-        "rollback" => api.service.rollback(&id, body.rollback_id).await,
-        _ => return Err(invalid()),
-    }?;
-    Ok(Json(PerformanceInstallResponse::complete(inspected)))
-}
-
-async fn operation(
-    State(api): State<PerformanceApi>,
-    Path(id): Path<String>,
-) -> ApiResult<PerformanceOperationView> {
-    let operation = api
-        .service
-        .operation(&id)?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "performance operation not found"))?;
-    Ok(Json(operation.into()))
 }
 
 async fn instance_operation(
@@ -177,38 +70,25 @@ async fn instance_operation(
     }))
 }
 
-fn resolution(
-    api: &PerformanceApi,
-    input: &PerformancePlanRequest,
-) -> Result<ResolutionRequest, ApiError> {
+fn resolution(api: &PerformanceApi, id: &InstanceId) -> Result<ResolutionRequest, ApiError> {
     let settings = api.settings.current().map_err(|_| unavailable())?;
-    let record = input
-        .instance_id
-        .as_deref()
-        .map(|raw| {
-            let id: InstanceId = raw.parse().map_err(|_| invalid())?;
-            api.service
-                .instances()
-                .registry()
-                .get_live(&id)
-                .map_err(|_| unavailable())
-        })
-        .transpose()?;
+    let record = api
+        .service
+        .instances()
+        .registry()
+        .get_live(id)
+        .map_err(|_| unavailable())?;
     let mode = resolve_mode(
         configured_mode(settings.performance_mode),
-        record
-            .as_ref()
-            .map(|r| r.instance.settings.performance_mode.as_str()),
-        input.mode.as_deref(),
+        Some(&record.instance.settings.performance_mode),
+        None,
     )
     .map_err(|_| invalid())?;
     let (game, loader) = version_target(
-        record
-            .as_ref()
-            .map(|r| r.instance.minecraft_version.as_str()),
-        record.as_ref().map(|r| r.instance.loader_key.as_str()),
-        input.game_version.as_deref(),
-        input.loader.as_deref(),
+        Some(&record.instance.minecraft_version),
+        Some(&record.instance.loader_key),
+        None,
+        None,
     )
     .map_err(|_| invalid())?;
     Ok(api.service.resolution_request(game, loader, mode.mode))
@@ -612,49 +492,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn performance_projection_instance_plan_uses_admitted_installed_mods() {
-        let fixture = ProjectionFixture::new().await;
-        let router = fixture.signed_rules_router();
-        let before = files(&fixture.mods);
-        let query = "/api/v1/performance/plan?game_version=1.20.1&loader=fabric&mode=managed";
-        let request_only = get_json(router.clone(), query).await;
-        let instance = get_json(
-            router.clone(),
-            &format!("{query}&instance_id={}", fixture.instance),
-        )
-        .await;
-        let after = files(&fixture.mods);
-        drop(router);
-        fixture.close().await;
-        assert_eq!(request_only.0, StatusCode::OK, "{}", request_only.1);
-        assert!(
-            request_only.1["effective"]["managed_artifacts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|artifact| artifact["slug"] == "nvidium")
-        );
-        assert_eq!(instance.0, StatusCode::OK, "{}", instance.1);
-        assert!(
-            instance.1["effective"]["managed_artifacts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|artifact| artifact["slug"] != "nvidium"),
-            "{}",
-            instance.1
-        );
-        assert!(
-            instance.1["effective"]["explanation"]["details"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|warning| warning == "nvidium skipped: incompatible with managed mod iris")
-        );
-        assert_eq!(before, after);
-    }
-
-    #[tokio::test]
     async fn performance_projection_managed_health_retains_plan_warnings() {
         let fixture = ProjectionFixture::new().await;
         let router = fixture.signed_rules_router();
@@ -789,7 +626,6 @@ mod tests {
     }
 
     const STARTUP_RULES: &str = "2001-01-01T00:00:00Z";
-    const EXPLICIT_RULES: &str = "2001-02-01T00:00:00Z";
 
     fn signed_rules_response(key: &SigningKey, generated_at: &str) -> String {
         let mut manifest = builtin_manifest().unwrap();
@@ -852,13 +688,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_rules_refresh_at_startup_and_explicit_refresh_outlives_its_caller() {
+    async fn configured_rules_refresh_at_startup() {
         let key = SigningKey::from_bytes(&[23; 32]);
-        let (release, held) = tokio::sync::oneshot::channel();
-        let (url, mut requests, provider) = rules_provider(vec![
-            (None, signed_rules_response(&key, STARTUP_RULES)),
-            (Some(held), signed_rules_response(&key, EXPLICIT_RULES)),
-        ]);
+        let (url, mut requests, provider) =
+            rules_provider(vec![(None, signed_rules_response(&key, STARTUP_RULES))]);
         let profile = configured_profile(&url, &key).await;
         let rules = profile.services.performance.rules().clone();
         let tasks = profile.services.tasks.clone();
@@ -871,88 +704,11 @@ mod tests {
         .await
         .expect("startup did not publish the configured provider's rules");
 
-        let caller = tokio::spawn(
-            profile
-                .api
-                .builder(reqwest::Method::POST, "/api/v1/performance/rules/refresh")
-                .send(),
-        );
-        requests.recv().await.unwrap();
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        assert!(
-            !tasks.status().is_idle(),
-            "caller loss released the accepted refresh"
-        );
-
-        let shutdown = profile.services.server.shutdown();
-        tokio::pin!(shutdown);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), shutdown.as_mut())
-                .await
-                .is_err(),
-            "shutdown completed before the accepted refresh settled"
-        );
-        release.send(()).unwrap();
-        shutdown.await.unwrap();
-        assert!(profile.services.server.is_shutdown_settled());
-        provider.await.unwrap();
-        let status = rules.status().status;
-        assert_eq!(status.generated_at, EXPLICIT_RULES);
-        assert_eq!(status.rule_source, RuleSource::Remote);
-        assert!(status.warnings.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rules_refresh_refusals_keep_their_public_errors() {
-        let unconfigured = Profile::start().await;
-        let refusal = unconfigured
-            .api
-            .response(
-                reqwest::Method::POST,
-                "/api/v1/performance/rules/refresh",
-                None,
-            )
-            .await;
-        unconfigured.close().await;
-        assert_eq!(
-            refusal,
-            (
-                StatusCode::BAD_REQUEST,
-                json!({"error":"performance remote rules url is not configured"})
-            )
-        );
-
-        let key = SigningKey::from_bytes(&[23; 32]);
-        let unavailable =
-            "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let (url, mut requests, provider) =
-            rules_provider(vec![(None, unavailable.into()), (None, unavailable.into())]);
-        let profile = configured_profile(&url, &key).await;
-        requests.recv().await.unwrap();
-        let refusal = profile
-            .api
-            .response(
-                reqwest::Method::POST,
-                "/api/v1/performance/rules/refresh",
-                None,
-            )
-            .await;
-        let status = profile.services.performance.rules().status();
         profile.close().await;
         provider.await.unwrap();
-        assert_eq!(
-            refusal,
-            (
-                StatusCode::BAD_GATEWAY,
-                json!({"error":"Performance rules provider response could not be verified. Try again later."})
-            )
-        );
-        assert_eq!(status.status.rule_source, RuleSource::BuiltIn);
-        assert_eq!(
-            status.status.warnings,
-            vec!["Remote rules refresh failed: remote rules returned HTTP 503".to_string()]
-        );
-        assert_eq!(status.view_model.warnings, status.status.warnings);
+        let status = rules.status().status;
+        assert_eq!(status.generated_at, STARTUP_RULES);
+        assert_eq!(status.rule_source, RuleSource::Remote);
+        assert!(status.warnings.is_empty());
     }
 }

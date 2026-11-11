@@ -1376,20 +1376,6 @@ impl InstallQueue {
         Ok(project(&state))
     }
 
-    /// Only cancellation before the retained materializer starts can be accepted.
-    /// Once it owns effects, completion is joined and publication is settled.
-    pub fn cancel(&self, id: &str) -> Result<InstallStatusResponse, InstallError> {
-        let state = self.inner.state.lock().expect("install queue lock");
-        let entry = state.entries.get(id).ok_or(InstallError::NotFound)?;
-        if matches!(entry.request, InstallQueueRequest::Content { .. })
-            || !matches!(entry.status.phase, Phase::Starting)
-        {
-            return Err(InstallError::Busy);
-        }
-        entry.cancel.cancel();
-        Ok(entry.view(id))
-    }
-
     /// Resume retained native proofs or reconstruct their exact activation
     /// contract after restart. An ambiguous witness keeps the library fenced.
     pub async fn recover_interrupted(&self) -> Result<(), InstallError> {

@@ -851,7 +851,7 @@ async fn install_terminal(api: &Api, start: &Value) -> Value {
     let id = start["started_install"]["install_id"]
         .as_str()
         .expect("accepted durable install identity");
-    let mut events = api.events(&format!("/api/v1/install/{id}/events")).await;
+    let mut events = api.events("/api/v1/install/queue/events").await;
     let terminal = tokio::time::timeout(Duration::from_secs(40), async {
         let mut previous = 0;
         loop {
@@ -859,18 +859,16 @@ async fn install_terminal(api: &Api, start: &Value) -> Value {
             let revision = event["revision"].as_u64().unwrap();
             assert!(revision >= previous);
             previous = revision;
-            if event["value"]["done"] == true {
-                break event["value"].clone();
+            let status = api.installs.upgrade().unwrap().status(id).unwrap();
+            if status.done {
+                break serde_json::to_value(status).unwrap();
             }
         }
     })
     .await
     .expect("install must reach a real settled terminal state");
     assert_eq!(terminal["view_model"]["terminal"], true, "{terminal}");
-    assert_eq!(
-        api.get(&format!("/api/v1/install/{id}/status")).await,
-        terminal
-    );
+    assert_eq!(api.install_status(id).await, terminal);
     terminal
 }
 
@@ -891,9 +889,7 @@ async fn assert_installed(api: &Api, expected: bool) {
 async fn wait_launchable(api: &Api, instance: &str) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let status = api
-                .get(&format!("/api/v1/launch/preflight/{instance}"))
-                .await;
+            let status = api.get(&format!("/api/v1/instances/{instance}")).await;
             if status["launchable"] == true {
                 break;
             }
@@ -1227,10 +1223,10 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
         started.expect("startup must return while resumed provider I/O is still held");
     let services = services.unwrap();
     let api = Api::new(&services);
-    let operation_path = format!("/api/v1/performance/operations/{command}");
+    let operation_path = format!("/api/v1/performance/instances/{instance}/operation");
     tokio::time::timeout(Duration::from_secs(3), async {
         api.get("/api/v1/config").await;
-        let operation = api.get(&operation_path).await;
+        let operation = api.get(&operation_path).await["operation"].clone();
         assert_eq!(operation["id"], command);
         assert_eq!(operation["instance_id"], instance);
         assert_eq!(operation["action"], action);
@@ -1274,7 +1270,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     provider.hold.send_replace(false);
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let operation = api.get(&operation_path).await;
+            let operation = api.get(&operation_path).await["operation"].clone();
             if operation["view_model"]["is_terminal"] == true && services.tasks.status().is_idle() {
                 break operation;
             }
@@ -1353,7 +1349,10 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     .await
     .unwrap();
     let api = Api::new(&services);
-    assert_eq!(api.get(&operation_path).await, completed);
+    assert_eq!(
+        api.get(&operation_path).await["operation"].clone(),
+        completed
+    );
     assert_eq!(
         api.get(&format!(
             "/api/v1/performance/health?instance_id={instance}"
@@ -1417,24 +1416,29 @@ async fn prepared_performance_crash_helper() {
     .await
     .unwrap();
     let api = Api::new(&services);
-    let accepted = api
-        .post(
-            "/api/v1/performance/install",
-            json!({
-                "instance_id":instance,"action":action,"mode":"managed","queued":queued
-            }),
-        )
-        .await;
-    assert!(
-        queued,
-        "synchronous Apply returned without reaching its Prepared crash: {accepted}"
+    let id = instance.parse().unwrap();
+    let record = services.instances.registry().get_live(&id).unwrap();
+    let request = services.performance.resolution_request(
+        record.instance.minecraft_version,
+        record.instance.loader_key,
+        axial_app::performance::model::PerformanceMode::Managed,
     );
-    let command = accepted["install_id"].as_str().unwrap();
+    let (_accepted, task) = services
+        .performance
+        .start_command_for_test(&id, Some(request), &action, None)
+        .unwrap();
+    if !queued {
+        task.join().await.unwrap().unwrap();
+        panic!("synchronous Apply returned without reaching its Prepared crash");
+    }
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let operation = api
-                .get(&format!("/api/v1/performance/operations/{command}"))
-                .await;
+                .get(&format!(
+                    "/api/v1/performance/instances/{instance}/operation"
+                ))
+                .await["operation"]
+                .clone();
             assert_ne!(
                 operation["view_model"]["is_terminal"], true,
                 "Apply did not reach Prepared: {operation}"
@@ -1676,7 +1680,7 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
             );
             let restored = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    let restored = api.get(&driver_path).await;
+                    let restored = api.driver(&driver_path).await;
                     if restored["driver"]["state"] == "interrupted" {
                         break restored;
                     }
@@ -1697,10 +1701,7 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
                 1
             );
             let retained = api
-                .get(&format!(
-                    "/api/v1/launch/benchmark/suites/{}",
-                    suite["suite_id"].as_str().unwrap()
-                ))
+                .suite(&format!("{}", suite["suite_id"].as_str().unwrap()))
                 .await;
             assert_eq!(retained["runs"][0]["state"], "interrupted");
             assert_eq!(retained["runs"][0]["session_id"], session);
@@ -1819,7 +1820,7 @@ async fn interrupted_launch_crash_helper() {
             driver["driver"]["id"].as_str().unwrap()
         );
         tokio::time::timeout(Duration::from_secs(5), async {
-            while api.get(&path).await["driver"]["state"] != "waiting" {
+            while api.driver(&path).await["driver"]["state"] != "waiting" {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -1854,9 +1855,7 @@ async fn interrupted_launch_crash_helper() {
 async fn wait_benchmark_run(api: &Api, suite: &str, index: usize) -> Value {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let suite = api
-                .get(&format!("/api/v1/launch/benchmark/suites/{suite}"))
-                .await;
+            let suite = api.suite(&format!("{suite}")).await;
             if suite["runs"][index]["state"] == "running" {
                 break suite["runs"][index].clone();
             }
@@ -1932,7 +1931,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
             .await;
         let driver_id = started["driver"]["id"].as_str().unwrap();
         let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{driver_id}");
-        let suite_path = format!("/api/v1/launch/benchmark/suites/{SUITE}");
+        let suite_path = format!("{SUITE}");
         let first = wait_benchmark_run(&api, SUITE, 0).await;
         let first_session = first["session_id"].as_str().unwrap();
         let (_, first_processes) = observe_running_session(&api, first_session).await;
@@ -1941,7 +1940,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
             .get(&format!("/api/v1/launch/{first_session}/status"))
             .await;
         assert!(first_processes.contains(&live["pid"].as_u64().unwrap()));
-        let original_suite = api.get(&suite_path).await;
+        let original_suite = api.suite(&suite_path).await;
         assert_eq!(original_suite["runs"].as_array().unwrap().len(), 2);
         let first_intent = first["launch_intent"].as_str().unwrap();
         let second_intent = original_suite["runs"][1]["launch_intent"]
@@ -1957,7 +1956,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let status = api.get(&driver_path).await;
+                let status = api.driver(&driver_path).await;
                 if status["driver"]["state"] == "waiting" {
                     break;
                 }
@@ -1980,7 +1979,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
                     Some(json!({})),
                 )
                 .await;
-            let checkpoint = api.get(&driver_path).await;
+            let checkpoint = api.driver(&driver_path).await;
             assert_eq!(
                 status,
                 StatusCode::OK,
@@ -1989,7 +1988,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
             if action == "resume" {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
-                        let status = api.get(&driver_path).await;
+                        let status = api.driver(&driver_path).await;
                         if status["driver"]["state"] == "waiting" {
                             assert_eq!(status["driver"]["active_session_id"], first_session);
                             break;
@@ -2001,7 +2000,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
                 .await
                 .expect("resumed scheduler must observe the original still-running session");
             }
-            let suite = api.get(&suite_path).await;
+            let suite = api.suite(&suite_path).await;
             let session = api
                 .get(&format!("/api/v1/launch/{first_session}/status"))
                 .await;
@@ -2054,7 +2053,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
         );
         let complete_driver = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                let status = api.get(&driver_path).await;
+                let status = api.driver(&driver_path).await;
                 if status["driver"]["state"] == "complete" {
                     break status;
                 }
@@ -2070,7 +2069,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
         assert!(complete_driver["driver"]["pending_run_index"].is_null());
         assert!(complete_driver["driver"]["active_session_id"].is_null());
         assert!(!complete_driver["view_model"]["can_resume"].as_bool().unwrap());
-        let complete_suite = api.get(&suite_path).await;
+        let complete_suite = api.suite(&suite_path).await;
         assert_eq!(complete_suite["runs"].as_array().unwrap().len(), 2);
         let mut reports = Vec::new();
         for (index, session, intent) in [
@@ -2140,8 +2139,8 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
     };
     let persisted = std::panic::AssertUnwindSafe(async {
         let api = Api::new(&reopened);
-        assert_eq!(api.get(&driver_path).await, driver);
-        assert_eq!(api.get(&suite_path).await, suite);
+        assert_eq!(api.driver(&driver_path).await, driver);
+        assert_eq!(api.suite(&suite_path).await, suite);
         assert_eq!(api.get("/api/v1/launch/sessions").await, json!({"sessions":[]}));
         for (session, report) in reports {
             assert_eq!(api.get(&format!("/api/v1/launch/reports/{session}")).await, report);
@@ -2180,7 +2179,7 @@ async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once
 #[test]
 fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
     let _process_work = PROCESS_WORK.blocking_lock();
-    let (runtime, _diagnostics) = benchmark_diagnostic_runtime();
+    let (runtime, _diagnostics) = diagnostic_runtime();
     runtime.block_on(benchmark_driver_automatically_resumes_remaining_run_once());
 }
 
@@ -2291,7 +2290,7 @@ async fn benchmark_driver_automatically_resumes_remaining_run_once() {
         assert_fixture_processes_gone(&processes).await;
         let complete_driver = tokio::time::timeout(Duration::from_secs(40), async {
             loop {
-                let status = api.get(&driver_path).await;
+                let status = api.driver(&driver_path).await;
                 if status["driver"]["state"] == "complete" {
                     break status;
                 }
@@ -2310,7 +2309,7 @@ async fn benchmark_driver_automatically_resumes_remaining_run_once() {
         assert_eq!(complete_driver["driver"]["launched_run_count"], 2);
         assert!(complete_driver["driver"]["pending_run_index"].is_null());
         let complete_suite = api
-            .get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}"))
+            .suite(&format!("{RESTART_SUITE}"))
             .await;
         assert_eq!(complete_suite["runs"][0]["session_id"], first);
         assert_eq!(complete_suite["runs"][0]["launch_intent"], first_intent);
@@ -2337,9 +2336,9 @@ async fn benchmark_driver_automatically_resumes_remaining_run_once() {
         services = Some(start_in_profile(profile.clone(), None).await.unwrap());
         let reopened = services.as_ref().unwrap();
         let api = Api::new(reopened);
-        assert_eq!(api.get(&driver_path).await, complete_driver);
+        assert_eq!(api.driver(&driver_path).await, complete_driver);
         assert_eq!(
-            api.get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}"))
+            api.suite(&format!("{RESTART_SUITE}"))
                 .await,
             complete_suite
         );
@@ -2445,10 +2444,10 @@ async fn benchmark_pending_boundary_crash_helper() {
             Ok(())
         }).unwrap();
         let path = format!("/api/v1/launch/benchmark/suite/drivers/{}", driver["driver"]["id"].as_str().unwrap());
-        let current = api.get(&path).await;
+        let current = api.driver(&path).await;
         assert_eq!(current["driver"]["state"], "waiting");
         assert_eq!(current["driver"]["pending_run_index"], 1);
-        let suite = api.get(&format!("/api/v1/launch/benchmark/suites/{RESTART_SUITE}")).await;
+        let suite = api.suite(&format!("{RESTART_SUITE}")).await;
         assert_eq!(suite["runs"][0]["session_id"], session);
         assert_eq!(suite["runs"][1]["state"], "pending");
         assert!(suite["runs"][1]["session_id"].is_null());
@@ -2710,10 +2709,10 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
         )
         .await;
     let instance = created["id"].as_str().unwrap();
-    let preflight = format!("/api/v1/launch/preflight/{instance}");
+    let preflight = instance.to_string();
     let reports_before = api.get("/api/v1/launch/reports").await;
     let queue_before = api.get("/api/v1/install/queue").await;
-    let inherited = api.get(&preflight).await;
+    let inherited = api.preflight(&preflight).await;
     let java = services
         .installs
         .runtime_cache()
@@ -2729,7 +2728,7 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
         })),
     )
     .await;
-    let global = api.get(&preflight).await;
+    let global = api.preflight(&preflight).await;
     let current = api.get(&format!("/api/v1/instances/{instance}")).await;
     let private_args = "-Dpreflight.private=preflight-secret-sentinel";
     api.request(
@@ -2741,7 +2740,7 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
         })),
     )
     .await;
-    let local = api.get(&preflight).await;
+    let local = api.preflight(&preflight).await;
     let sessions = api.get("/api/v1/launch/sessions").await;
     let reports_after = api.get("/api/v1/launch/reports").await;
     let queue_after = api.get("/api/v1/install/queue").await;
@@ -2891,10 +2890,7 @@ async fn publication_preflight(retain_runtime: &mut bool) {
                 json!({"name":"Publication preflight","selection_id":format!("vanilla|{VERSION}")}),
             )
             .await;
-        let preflight = format!(
-            "/api/v1/launch/preflight/{}",
-            created["id"].as_str().unwrap()
-        );
+        let preflight = created["id"].as_str().unwrap().to_string();
         let second = api
             .post(
                 "/api/v1/instances",
@@ -2904,7 +2900,7 @@ async fn publication_preflight(retain_runtime: &mut bool) {
         let instance = created["id"].as_str().unwrap().to_owned();
         let sibling = second["id"].as_str().unwrap().to_owned();
         let detail_path = format!("/api/v1/instances/{instance}");
-        assert_eq!(api.get(&preflight).await["launchable"], true);
+        assert_eq!(api.preflight(&preflight).await["launchable"], true);
         let ready_detail = api.read(&detail_path).await;
         let ready_list = api.read("/api/v1/instances").await;
         let pin = services.library.admit().unwrap();
@@ -2945,20 +2941,20 @@ async fn publication_preflight(retain_runtime: &mut bool) {
             .get_live(&instance.parse().unwrap())
             .unwrap()
             .instance;
-        let strict_corrupt = api.get(&preflight).await;
+        let strict_corrupt = api.preflight(&preflight).await;
         std::fs::write(client, original_client).unwrap();
-        let strict_restored = api.get(&preflight).await;
+        let strict_restored = api.preflight(&preflight).await;
         let queue_before = api.get("/api/v1/install/queue").await;
         let requests_before = provider.state.requests.lock().unwrap().clone();
         let publication =
             axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
         let started = std::time::Instant::now();
-        let busy = api.get(&preflight).await;
+        let busy = api.preflight(&preflight).await;
         let busy_detail = api.read(&detail_path).await;
         let busy_list = api.read("/api/v1/instances").await;
         let elapsed = started.elapsed();
         drop(publication);
-        let recovered = api.get(&preflight).await;
+        let recovered = api.preflight(&preflight).await;
         let recovered_detail = api.read(&detail_path).await;
         let recovered_list = api.read("/api/v1/instances").await;
         let target_busy_guard = services
@@ -2967,20 +2963,20 @@ async fn publication_preflight(retain_runtime: &mut bool) {
             .exclusions()
             .try_acquire([created["id"].as_str().unwrap()], [])
             .unwrap();
-        let target_busy = api.get(&preflight).await;
+        let target_busy = api.preflight(&preflight).await;
         drop(target_busy_guard);
         let lane = root.join(".axial-publication");
         let retained_lane = temporary.path().join("retained-publication");
         std::fs::rename(&lane, &retained_lane).unwrap();
         let conflict = b"non-directory publication lane";
         std::fs::write(&lane, conflict).unwrap();
-        let unsafe_lane = api.get(&preflight).await;
+        let unsafe_lane = api.preflight(&preflight).await;
         let unsafe_detail = api.read(&detail_path).await;
         let unsafe_list = api.read("/api/v1/instances").await;
         let conflict_after = std::fs::read(&lane).unwrap();
         std::fs::remove_file(&lane).unwrap();
         std::fs::rename(&retained_lane, &lane).unwrap();
-        let restored = api.get(&preflight).await;
+        let restored = api.preflight(&preflight).await;
         let restored_detail = api.read(&detail_path).await;
         let restored_list = api.read("/api/v1/instances").await;
         let publication =
@@ -3283,8 +3279,8 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
             .await;
         let instance = created["id"].as_str().unwrap().to_owned();
         let detail_path = format!("/api/v1/instances/{instance}");
-        let preflight_path = format!("/api/v1/launch/preflight/{instance}");
-        assert_eq!(api.get(&preflight_path).await["launchable"], true);
+        let preflight_path = instance.to_string();
+        assert_eq!(api.preflight(&preflight_path).await["launchable"], true);
         assert_eq!(
             api.get(&detail_path).await["launch_action"]["primary_action"],
             "launch"
@@ -3309,7 +3305,7 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
         let malformed = b"{not valid version metadata\n";
         std::fs::write(&metadata, malformed).unwrap();
         let degraded_versions = api.read("/api/v1/versions").await;
-        let degraded = api.read(&preflight_path).await;
+        let degraded = api.preflight_response(&preflight_path).await;
         let degraded_detail = api.read(&detail_path).await;
         let degraded_list = api.read("/api/v1/instances").await;
         let intact: Vec<_> = protected.iter()
@@ -3333,7 +3329,7 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
         let missing_before = std::fs::symlink_metadata(&client)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         let combined_versions = api.read("/api/v1/versions").await;
-        let combined = api.read(&preflight_path).await;
+        let combined = api.preflight_response(&preflight_path).await;
         let combined_detail = api.read(&detail_path).await;
         let combined_list = api.read("/api/v1/instances").await;
         let missing_after = std::fs::symlink_metadata(&client)
@@ -3345,7 +3341,7 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
         let unrelated_absent = std::fs::symlink_metadata(&unrelated)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         let restored_versions = api.read("/api/v1/versions").await;
-        let restored = api.read(&preflight_path).await;
+        let restored = api.preflight_response(&preflight_path).await;
         let restored_detail = api.read(&detail_path).await;
         let restored_list = api.read("/api/v1/instances").await;
         let restored_bytes: Vec<_> = protected.iter()
@@ -3511,7 +3507,6 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
         let empty_cached =
             axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap();
         let empty_versions = api.get("/api/v1/versions").await;
-        let empty_catalog = api.get("/api/v1/versions/catalog").await;
         let view_path = "/api/v1/instances/create-view?source=vanilla";
         let empty_view = api.get(view_path).await;
         let install = api
@@ -3527,7 +3522,6 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
         )
         .unwrap();
         let cached = axial_minecraft::manifest::read_cached_manifest_bytes(&operation).unwrap();
-        let installed_catalog = api.get("/api/v1/versions/catalog").await;
         let installed_versions = api.get("/api/v1/versions").await;
         let installed_view = api.get(view_path).await;
         let protected = installed_files(&root, &["cache/version_manifest_v2.json"]);
@@ -3614,11 +3608,6 @@ async fn degraded_versions_block_create_view_and_create_without_mutation() {
             assert_eq!(empty_versions["versions"], json!([]));
             for cache in [empty_cached, cached] {
                 assert_eq!(cache, (manifest.clone(), true));
-            }
-            for catalog in [empty_catalog, installed_catalog] {
-                assert_eq!(catalog["catalog_state"]["fresh"], true, "{catalog}");
-                assert_eq!(catalog["catalog_state"]["cache_hit"], true);
-                assert_eq!(catalog["catalog_state"]["stale"], false);
             }
             assert_eq!(terminal["outcome"], "succeeded");
             assert!(requests_before.contains(&"GET /artifacts/client.jar".to_owned()));
@@ -4260,8 +4249,8 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         Some(json!({"expected_revision":current["revision"],"extra_jvm_args":private_args})),
     )
     .await;
-    let preflight = format!("/api/v1/launch/preflight/{instance}");
-    let ready = api.get(&preflight).await;
+    let preflight = instance.to_string();
+    let ready = api.preflight(&preflight).await;
     assert_eq!(ready["status"], "ready", "{ready}");
     assert_eq!(ready["launchable"], true, "{ready}");
     assert_eq!(ready["readiness"], json!({"launchable":true,"reasons":[]}));
@@ -4280,7 +4269,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     );
     std::fs::remove_file(&client).unwrap();
     std::fs::remove_file(&required_library).unwrap();
-    let missing_files = api.get(&preflight).await;
+    let missing_files = api.preflight(&preflight).await;
     let files_absent = [&client, &required_library].map(|path| {
         std::fs::symlink_metadata(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -4295,7 +4284,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     changed_metadata[0] ^= 1;
     std::fs::remove_file(&required_library).unwrap();
     std::fs::write(&metadata, &changed_metadata).unwrap();
-    let invalid_metadata = api.get(&preflight).await;
+    let invalid_metadata = api.preflight(&preflight).await;
     let library_absent_with_invalid_metadata = std::fs::symlink_metadata(&required_library)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let metadata_after_preflight = std::fs::read(&metadata).unwrap();
@@ -4311,7 +4300,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     );
     std::fs::remove_file(&log_config).unwrap();
     std::fs::remove_file(&required_library).unwrap();
-    let missing_libraries = api.get(&preflight).await;
+    let missing_libraries = api.preflight(&preflight).await;
     let libraries_absent = [&log_config, &required_library].map(|path| {
         std::fs::symlink_metadata(path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -4323,11 +4312,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let mut changed_log_config = original_log_config.clone();
     changed_log_config[0] ^= 1;
     std::fs::write(&log_config, &changed_log_config).unwrap();
-    let corrupt_log_config = api.get(&preflight).await;
+    let corrupt_log_config = api.preflight(&preflight).await;
     let log_config_after_preflight = std::fs::read(&log_config).unwrap();
     std::fs::write(&log_config, &original_log_config).unwrap();
     std::fs::remove_file(&log_config).unwrap();
-    let missing_log_config = api.get(&preflight).await;
+    let missing_log_config = api.preflight(&preflight).await;
     let log_config_absent = std::fs::symlink_metadata(&log_config)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let log_canary = temporary.path().join("outside-log-canary.xml");
@@ -4335,7 +4324,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     std::fs::write(&log_canary, &original_log_config).unwrap();
     std::os::unix::fs::symlink(&log_canary, &log_config).unwrap();
     let log_link_before = std::fs::symlink_metadata(&log_config).unwrap();
-    let log_inadmissible = api.get(&preflight).await;
+    let log_inadmissible = api.preflight(&preflight).await;
     let log_link_after = std::fs::symlink_metadata(&log_config).unwrap();
     let log_link_target = std::fs::read_link(&log_config).unwrap();
     let log_canary_after = std::fs::read(&log_canary).unwrap();
@@ -4350,10 +4339,10 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let mut changed_index = original_index.clone();
     changed_index[0] ^= 1;
     std::fs::write(&asset_index, &changed_index).unwrap();
-    let corrupt_index = api.get(&preflight).await;
+    let corrupt_index = api.preflight(&preflight).await;
     let index_after_preflight = std::fs::read(&asset_index).unwrap();
     std::fs::remove_file(&asset_index).unwrap();
-    let missing_index = api.get(&preflight).await;
+    let missing_index = api.preflight(&preflight).await;
     let index_absent = std::fs::symlink_metadata(&asset_index)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let index_canary = temporary.path().join("outside-index-canary.json");
@@ -4361,7 +4350,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     std::fs::write(&index_canary, &original_index).unwrap();
     std::os::unix::fs::symlink(&index_canary, &asset_index).unwrap();
     let index_link_before = std::fs::symlink_metadata(&asset_index).unwrap();
-    let index_inadmissible = api.get(&preflight).await;
+    let index_inadmissible = api.preflight(&preflight).await;
     let index_link_after = std::fs::symlink_metadata(&asset_index).unwrap();
     let index_link_target = std::fs::read_link(&asset_index).unwrap();
     let index_canary_after = std::fs::read(&index_canary).unwrap();
@@ -4377,17 +4366,17 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         provider.state.routes[&format!("GET /{asset_path}")]
     );
     std::fs::remove_file(&asset).unwrap();
-    let missing_asset = api.get(&preflight).await;
+    let missing_asset = api.preflight(&preflight).await;
     let asset_absent = std::fs::symlink_metadata(&asset)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     std::fs::write(&asset, &original_asset).unwrap();
     let mut changed_library = original_library.clone();
     changed_library[0] ^= 1;
     std::fs::write(&required_library, &changed_library).unwrap();
-    let corrupt_library = api.get(&preflight).await;
+    let corrupt_library = api.preflight(&preflight).await;
     let library_after_preflight = std::fs::read(&required_library).unwrap();
     std::fs::remove_file(&required_library).unwrap();
-    let missing_library = api.get(&preflight).await;
+    let missing_library = api.preflight(&preflight).await;
     let library_absent = std::fs::symlink_metadata(&required_library)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let library_canary = temporary.path().join("outside-library-canary.jar");
@@ -4395,14 +4384,14 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     std::fs::write(&library_canary, &original_library).unwrap();
     std::os::unix::fs::symlink(&library_canary, &required_library).unwrap();
     let library_link_before = std::fs::symlink_metadata(&required_library).unwrap();
-    let library_inadmissible = api.get(&preflight).await;
+    let library_inadmissible = api.preflight(&preflight).await;
     let library_link_after = std::fs::symlink_metadata(&required_library).unwrap();
     let library_link_target = std::fs::read_link(&required_library).unwrap();
     let library_canary_after = std::fs::read(&library_canary).unwrap();
     std::fs::remove_file(&required_library).unwrap();
     std::fs::write(&required_library, &original_library).unwrap();
     std::fs::remove_file(&metadata).unwrap();
-    let missing_metadata = api.get(&preflight).await;
+    let missing_metadata = api.preflight(&preflight).await;
     let metadata_absent = std::fs::symlink_metadata(&metadata)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let metadata_canary = temporary.path().join("outside-metadata-canary.json");
@@ -4410,7 +4399,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     std::fs::write(&metadata_canary, &original_metadata).unwrap();
     std::os::unix::fs::symlink(&metadata_canary, &metadata).unwrap();
     let metadata_link_before = std::fs::symlink_metadata(&metadata).unwrap();
-    let metadata_inadmissible = api.get(&preflight).await;
+    let metadata_inadmissible = api.preflight(&preflight).await;
     let metadata_link_after = std::fs::symlink_metadata(&metadata).unwrap();
     let metadata_link_target = std::fs::read_link(&metadata).unwrap();
     let metadata_canary_after = std::fs::read(&metadata_canary).unwrap();
@@ -4420,7 +4409,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     let mut changed = original.clone();
     changed[0] ^= 1;
     std::fs::write(&client, &changed).unwrap();
-    let corrupt = api.get(&preflight).await;
+    let corrupt = api.preflight(&preflight).await;
     let bytes_after_preflight = std::fs::read(&client).unwrap();
     std::fs::remove_file(&client).unwrap();
     let canary = temporary.path().join("outside-client-canary.jar");
@@ -4428,11 +4417,11 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
     std::fs::write(&canary, &original).unwrap();
     std::os::unix::fs::symlink(&canary, &client).unwrap();
     let link_before = std::fs::symlink_metadata(&client).unwrap();
-    let inadmissible = api.get(&preflight).await;
+    let inadmissible = api.preflight(&preflight).await;
     let link_after = std::fs::symlink_metadata(&client).unwrap();
     let link_target = std::fs::read_link(&client).unwrap();
     std::fs::remove_file(&client).unwrap();
-    let missing = api.get(&preflight).await;
+    let missing = api.preflight(&preflight).await;
     let canary_after = std::fs::read(&canary).unwrap();
     let log_config_after = std::fs::read(&log_config).unwrap();
     let metadata_after = std::fs::read(&metadata).unwrap();
@@ -4777,8 +4766,8 @@ async fn preflight_reports_missing_java_override_without_launching() {
         .await;
     let instance = created["id"].as_str().unwrap();
     let instance_path = format!("/api/v1/instances/{instance}");
-    let preflight = format!("/api/v1/launch/preflight/{instance}");
-    let ready = api.get(&preflight).await;
+    let preflight = instance.to_string();
+    let ready = api.preflight(&preflight).await;
     assert_eq!(ready["status"], "ready", "{ready}");
     assert_eq!(ready["launchable"], true, "{ready}");
     assert_eq!(ready["readiness"], json!({"launchable":true,"reasons":[]}));
@@ -4869,7 +4858,7 @@ async fn preflight_reports_missing_java_override_without_launching() {
             Some(json!({"expected_revision":current["revision"],"java_path":COMPONENT})),
         )
         .await;
-    let selected_override = api.get(&preflight).await;
+    let selected_override = api.preflight(&preflight).await;
     let inherited = api
         .request(
             reqwest::Method::PUT,
@@ -4877,7 +4866,7 @@ async fn preflight_reports_missing_java_override_without_launching() {
             Some(json!({"expected_revision":selected["revision"],"java_path":""})),
         )
         .await;
-    let inherited_override = api.get(&preflight).await;
+    let inherited_override = api.preflight(&preflight).await;
     let inherited_detail = api.get(&instance_path).await;
     let inherited_list = api.get("/api/v1/instances").await;
     let private_args = "-Dpreflight.private=java-override-secret";
@@ -4893,7 +4882,7 @@ async fn preflight_reports_missing_java_override_without_launching() {
             })),
         )
         .await;
-        responses.push(api.get(&preflight).await);
+        responses.push(api.preflight(&preflight).await);
     }
     let script_after = std::fs::read(&broken_java).unwrap();
     let data_after = std::fs::read(&non_executable_java).unwrap();
@@ -5162,10 +5151,7 @@ async fn missing_default_runtime_after_reopen() {
             .await;
         let terminal = install_terminal(&api, &install).await;
         assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
-        let install_path = format!(
-            "/api/v1/install/{}/status",
-            install["started_install"]["install_id"].as_str().unwrap()
-        );
+        let install_path = install["started_install"]["install_id"].as_str().unwrap().to_owned();
         let created = api
             .post(
                 "/api/v1/instances",
@@ -5244,9 +5230,9 @@ async fn missing_default_runtime_after_reopen() {
         assert_eq!(queue_before["view_model"], queue_before_restart["view_model"]);
         assert_ne!(api.capability, restarted_api.capability);
         assert_eq!(restarted_api.get("/api/v1/config").await["java_path_override"], "");
-        let preflight = format!("/api/v1/launch/preflight/{instance}");
+        let preflight = instance.to_string();
         let readonly_requests_before = provider.state.requests.lock().unwrap().clone();
-        let preflight_before = restarted_api.get(&preflight).await;
+        let preflight_before = restarted_api.preflight(&preflight).await;
         let instance_path = format!("/api/v1/instances/{instance}");
         let instance_before = restarted_api.get(&instance_path).await;
         assert!(!runtime.try_exists().unwrap());
@@ -5256,7 +5242,7 @@ async fn missing_default_runtime_after_reopen() {
             "expected_revision":instance_before["revision"],
             "extra_jvm_args":"-javaagent:fixture-agent.jar"
         }))).await;
-        let invalid_plan = restarted_api.get(&preflight).await;
+        let invalid_plan = restarted_api.preflight(&preflight).await;
         let invalid_instance = restarted_api.get(&instance_path).await;
         let runtime_absent_after_invalid_plan = std::fs::symlink_metadata(&runtime)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
@@ -5300,7 +5286,7 @@ async fn missing_default_runtime_after_reopen() {
                     "Play must reacquire {expected}: {:?}", &requests[request_count..]);
             }
             drop(requests);
-            let ready = restarted_api.get(&preflight).await;
+            let ready = restarted_api.preflight(&preflight).await;
             assert_eq!(ready["status"], "ready", "{ready}");
             assert_eq!(ready["launchable"], true, "{ready}");
             assert_installed(&restarted_api, true).await;
@@ -5341,7 +5327,7 @@ async fn missing_default_runtime_after_reopen() {
             assert!(runtime_before.is_dir());
             assert_eq!(std::fs::canonicalize(&runtime).unwrap(), runtime);
             std::fs::rename(&runtime, &preserved_runtime).unwrap();
-            let override_preflight = restarted_api.get(&preflight).await;
+            let override_preflight = restarted_api.preflight(&preflight).await;
             let override_instance = restarted_api.get(&instance_path).await;
             let (override_status, override_body) = restarted_api
                 .response(
@@ -5418,7 +5404,7 @@ async fn missing_default_runtime_after_reopen() {
             });
         }
         assert_eq!(restarted_api.get("/api/v1/install/queue").await, queue_before);
-        assert_eq!(restarted_api.get(&install_path).await, terminal);
+        assert_eq!(restarted_api.install_status(&install_path).await, terminal);
         provider.assert_requests(false);
         (status, body, preflight_before, instance_before, protected, verify_guards,
             readonly_requests_before, readonly_requests_after)
@@ -5716,152 +5702,6 @@ async fn offline_vanilla_journey(existing: bool) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_clean_benchmarks_compare_configured_modes_after_reopen() {
-    let _process_work = PROCESS_WORK.lock().await;
-    let temporary =
-        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-    let profile = temporary.path().join("profile");
-    let provider = Provider::start_with_java_exit(false, true).await;
-    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
-        .await
-        .unwrap();
-    let api = Api::new(&services);
-    configure_offline(
-        &api,
-        json!({"expected_revision":0,"performance_mode":"managed","java_path_override":""}),
-    )
-    .await;
-    install_vanilla(&api).await;
-    let created = api
-        .post(
-            "/api/v1/instances",
-            json!({
-                "name":"Clean benchmark comparison","selection_id":format!("vanilla|{VERSION}"),
-                "max_memory_mb":2048,"min_memory_mb":512
-            }),
-        )
-        .await;
-    let instance = created["id"].as_str().unwrap();
-    let instance_path = format!("/api/v1/instances/{instance}");
-    let mut reports = Vec::new();
-    for (mode, benchmark_profile) in [
-        ("vanilla", "vanilla_baseline"),
-        ("managed", "managed_default"),
-    ] {
-        let current = api.get(&instance_path).await;
-        let configured = api
-            .request(
-                reqwest::Method::PUT,
-                &instance_path,
-                Some(json!({
-                    "expected_revision":current["revision"],"performance_mode":mode
-                })),
-            )
-            .await;
-        assert_eq!(configured["performance_mode"], mode);
-        wait_launchable(&api, instance).await;
-        let launched = api
-            .post(
-                "/api/v1/launch/benchmark",
-                json!({
-                    "instance_id":instance,"profile":benchmark_profile,
-                    "run_type":"coldish","benchmark_mode":"release_validation"
-                }),
-            )
-            .await;
-        let session = launched["session_id"].as_str().unwrap();
-        let terminal = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let status = api.get(&format!("/api/v1/launch/{session}/status")).await;
-                if status["phase"] == "exited" {
-                    break status;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("fixture Java must exit naturally and publish its settled report");
-        assert_eq!(terminal["instance_id"], instance);
-        assert_eq!(terminal["tree_settled"], true);
-        assert_eq!(terminal["output_drained"], true);
-        assert_eq!(terminal["process_alive"], false);
-        assert_eq!(terminal["boot_observed"], true);
-        assert_eq!(terminal["exit_code"], 0);
-        assert_eq!(terminal["outcome"]["kind"], "clean", "{terminal}");
-        assert_fixture_processes_gone(&BTreeSet::from([terminal["pid"].as_u64().unwrap()])).await;
-        let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
-        assert_eq!(report["session_id"], session);
-        assert_eq!(report["instance_id"], instance);
-        assert_eq!(report["outcome"], "exited");
-        assert_eq!(report["session_outcome"]["kind"], "clean");
-        assert_eq!(report["exit_code"], 0);
-        assert!(report["boot_duration_ms"].as_u64().unwrap() > 0);
-        let scenario = &report["scenario"];
-        assert_eq!(scenario["performance_mode"], mode);
-        assert_eq!(scenario["version_id"], VERSION);
-        assert_eq!(scenario["requested_memory_mb"], 2048);
-        assert_eq!(scenario["benchmark_profile"], benchmark_profile);
-        assert_eq!(scenario["benchmark_run_type"], "coldish");
-        assert_eq!(scenario["benchmark_mode"], "release_validation");
-        assert!(matches!(
-            report["device"]["tier"].as_str(),
-            Some("low" | "mid" | "high")
-        ));
-        let logs = report["logs"].as_array().unwrap();
-        assert!(
-            logs.iter()
-                .any(|line| line["text"] == "Fixture command validated")
-        );
-        assert!(
-            logs.iter()
-                .any(|line| line["text"] == "Fixture heap MiB 2048")
-        );
-        reports.push(report);
-    }
-    let baseline = &reports[0];
-    let managed = &reports[1];
-    assert_ne!(managed["session_id"], baseline["session_id"]);
-    assert!(baseline["comparison"].is_null());
-    assert_eq!(managed["device"]["tier"], baseline["device"]["tier"]);
-    let comparison = &managed["comparison"];
-    assert_eq!(comparison["baseline_session_id"], baseline["session_id"]);
-    assert_eq!(comparison["baseline_recorded_at"], baseline["recorded_at"]);
-    assert_eq!(comparison["matched_sample_count"], 1);
-    assert_eq!(comparison["metric_name"], "boot_duration_ms");
-    assert_eq!(
-        comparison["baseline_value_ms"],
-        baseline["boot_duration_ms"]
-    );
-    assert_eq!(comparison["current_value_ms"], managed["boot_duration_ms"]);
-    assert_eq!(
-        comparison["baseline"],
-        json!({
-            "performance_mode":"vanilla","version_id":VERSION,"requested_memory_mb":2048,
-            "device_tier":baseline["device"]["tier"],"benchmark_profile":"vanilla_baseline",
-            "benchmark_run_type":"coldish","benchmark_mode":"release_validation"
-        })
-    );
-    provider.assert_requests(true);
-    services.server.shutdown().await.unwrap();
-    assert!(services.server.is_shutdown_settled());
-    drop(services);
-    provider.shutdown().await;
-
-    let reopened = start_in_profile(profile, None).await.unwrap();
-    let api = Api::new(&reopened);
-    assert_eq!(api.get(&instance_path).await["performance_mode"], "managed");
-    for report in reports {
-        let session = report["session_id"].as_str().unwrap();
-        assert_eq!(
-            api.get(&format!("/api/v1/launch/reports/{session}")).await,
-            report
-        );
-    }
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
-}
-
 #[test]
 fn real_playing_instance_edits_preserve_active_command_and_next_launch_settings() {
     let _process_work = PROCESS_WORK.blocking_lock();
@@ -6135,12 +5975,8 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
 #[test]
 fn real_benchmark_mapping_survives_response_loss_and_restart() {
     let _process_work = PROCESS_WORK.blocking_lock();
-    let (runtime, _diagnostics) = benchmark_diagnostic_runtime();
+    let (runtime, _diagnostics) = diagnostic_runtime();
     runtime.block_on(benchmark_mapping_survives_response_loss_and_restart());
-}
-
-fn benchmark_diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
-    diagnostic_runtime()
 }
 
 fn diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
@@ -6235,17 +6071,16 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     let request =
         json!({"instance_id":instance,"suite_id":"recovery-suite","suite_mode":"development"});
     let response = api
-        .client
-        .post(format!("{}/api/v1/launch/benchmark/suite/tick", api.base))
-        .header(transport::CAPABILITY_HEADER, &api.capability)
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    let suite = api
-        .get("/api/v1/launch/benchmark/suites/recovery-suite")
+        .benchmarks
+        .upgrade()
+        .unwrap()
+        .tick(serde_json::from_value(request.clone()).unwrap())
         .await;
+    assert!(matches!(
+        response,
+        Err(axial_app::performance::benchmarks::BenchmarkError::Storage(_))
+    ), "{response:?}");
+    let suite = api.suite("recovery-suite").await;
     assert_eq!(suite["runs"][0]["state"], "launching", "{suite}");
     let first = suite["runs"][0]["session_id"]
         .as_str()
@@ -6258,9 +6093,7 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     assert_eq!(accepted["state"], "accepted");
     assert_eq!(accepted["session"]["session_id"], first);
     assert_eq!(accepted["session"]["instance_id"], instance);
-    let retried = api
-        .post("/api/v1/launch/benchmark/suite/tick", request.clone())
-        .await;
+    let retried = api.tick(request.clone()).await;
     assert_eq!(retried["state"], "active");
     assert_eq!(retried["active_session_id"], first);
     services
@@ -6361,21 +6194,9 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     assert_eq!(historical["session"]["phase"], "exited");
     assert_eq!(historical["session"]["outcome"]["kind"], "stopped");
     assert_eq!(historical["session"]["session_id"], first);
-    let pending_response = api.client.post(format!("{}/api/v1/launch/benchmark/suite/tick", api.base))
-        .header(transport::CAPABILITY_HEADER, &api.capability)
-        .json(&json!({
-            "suite_id":"pending-suite","username":"ChangedPlayer","max_memory_mb":2048,"min_memory_mb":512
-        })).send().await.unwrap();
-    let pending_status = pending_response.status();
-    let pending_body = pending_response.text().await.unwrap();
-    assert!(
-        pending_status.is_success(),
-        "pending recovery: {pending_status}: {pending_body}; intent: {:?}",
-        reopened
-            .launch
-            .intent(pending_suite.runs[0].launch_intent.as_deref().unwrap())
-    );
-    let pending: Value = serde_json::from_str(&pending_body).unwrap();
+    let pending = api.benchmarks.upgrade().unwrap().tick(serde_json::from_value(json!({
+        "suite_id":"pending-suite","username":"ChangedPlayer","max_memory_mb":2048,"min_memory_mb":512
+    })).unwrap()).await.unwrap();
     assert_eq!(pending["state"], "launched", "{pending}");
     assert_eq!(pending["session"]["session_id"], pending_session);
     assert_eq!(pending["session"]["instance_id"], instance);
@@ -6392,12 +6213,7 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
         .unwrap();
     assert_eq!(pending_proof.scenario.requested_memory_mb, Some(768));
     wait_launchable(&api, &instance).await;
-    let next = api
-        .post(
-            "/api/v1/launch/benchmark/suite/tick",
-            json!({"suite_id":"recovery-suite"}),
-        )
-        .await;
+    let next = api.tick(json!({"suite_id":"recovery-suite"})).await;
     assert_eq!(next["state"], "launched", "{next}");
     assert_eq!(next["run_index"], 1);
     assert_eq!(next["suite"]["runs"][0]["state"], "stopped");
@@ -6408,22 +6224,14 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     assert_eq!(next["suite"]["runs"][1]["session_id"], second);
     assert_eq!(next["session"]["instance_id"], instance);
     observe_and_stop_session(&api, second).await;
-    let complete = api
-        .post(
-            "/api/v1/launch/benchmark/suite/tick",
-            json!({"suite_id":"recovery-suite"}),
-        )
-        .await;
+    let complete = api.tick(json!({"suite_id":"recovery-suite"})).await;
     assert_eq!(complete["state"], "complete");
 
     wait_launchable(&api, &instance).await;
     let observed = api
-        .post(
-            "/api/v1/launch/benchmark/suite/tick",
-            json!({
-                "instance_id":instance,"suite_id":"report-loss-suite","suite_mode":"development"
-            }),
-        )
+        .tick(json!({
+            "instance_id":instance,"suite_id":"report-loss-suite","suite_mode":"development"
+        }))
         .await;
     let settled_session = observed["session"]["session_id"]
         .as_str()
@@ -6437,9 +6245,7 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
     let settled = api
         .get(&format!("/api/v1/launch/intents/{settled_intent}"))
         .await;
-    let saved_suite = api
-        .get("/api/v1/launch/benchmark/suites/report-loss-suite")
-        .await;
+    let saved_suite = api.suite("report-loss-suite").await;
     // Loss of a diagnostic report does not erase the owner's actual settlement
     // observation or grant permission to repeat the benchmark run.
     reopened
@@ -6476,23 +6282,22 @@ async fn benchmark_mapping_survives_response_loss_and_restart() {
         settled["session"]["exit_code"]
     );
     for run_index in [Value::Null, json!(0)] {
-        let (status, result) = api
-            .response(
-                reqwest::Method::POST,
-                "/api/v1/launch/benchmark/suite/tick",
-                Some(json!({"suite_id":"report-loss-suite","run_index":run_index})),
+        let result = api
+            .benchmarks
+            .upgrade()
+            .unwrap()
+            .tick(
+                serde_json::from_value(
+                    json!({"suite_id":"report-loss-suite","run_index":run_index}),
+                )
+                .unwrap(),
             )
             .await;
-        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
+        assert!(matches!(
             result,
-            json!({
-                "error":axial_app::performance::benchmarks::BenchmarkError::Unavailable.to_string()
-            })
-        );
-        let retained = api
-            .get("/api/v1/launch/benchmark/suites/report-loss-suite")
-            .await;
+            Err(axial_app::performance::benchmarks::BenchmarkError::Unavailable)
+        ));
+        let retained = api.suite("report-loss-suite").await;
         assert_eq!(retained, saved_suite);
         assert_eq!(retained["runs"][0]["session_id"], settled_session);
         assert_eq!(retained["runs"][1]["state"], "pending");
@@ -6549,27 +6354,20 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
             .as_str()
             .expect("accepted durable installation")
             .to_owned();
-        let status_path = format!("/api/v1/install/{id}/status");
+        let status_path = id.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
             provider.state.client_held.notified(),
         )
         .await
         .expect("real materialization must request the client body");
-        let before = api.get(&status_path).await;
-        let (cancel_status, cancel_body) = api
-            .response(
-                reqwest::Method::POST,
-                &format!("/api/v1/install/{id}/cancel"),
-                None,
-            )
-            .await;
+        let before = api.install_status(&status_path).await;
         let held_shutdown = initial.tasks.shutdown(Duration::from_secs(2)).await;
         let held_receipt = initial.tasks.shutdown_receipt().is_some();
         eprintln!(
             "Original held-materialization shutdown: {held_shutdown:?}; receipt={held_receipt}"
         );
-        let after = api.get(&status_path).await;
+        let after = api.install_status(&status_path).await;
         let held_pins = initial.library.snapshot().current.unwrap().pins;
         let exclusion = initial
             .instances
@@ -6696,7 +6494,7 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
         );
         let reopened = services.as_ref().unwrap();
         let reopened_api = Api::new(reopened);
-        let reopened_status = reopened_api.get(&status_path).await;
+        let reopened_status = reopened_api.install_status(&status_path).await;
         let reopened_queue = reopened_api.get("/api/v1/install/queue").await;
         let reopened_sessions = reopened_api.get("/api/v1/launch/sessions").await;
         let reopened_reports = reopened_api.get("/api/v1/launch/reports").await;
@@ -6755,11 +6553,6 @@ async fn shutdown_refuses_held_materialization_then_installation_survives_reopen
                 assert_ne!(held["view_model"]["phase_id"], "starting");
                 assert_eq!(held["allowed_actions"], json!([]));
             }
-            assert_eq!(cancel_status, StatusCode::CONFLICT);
-            assert_eq!(
-                cancel_body,
-                json!({"error":"The library is in use. Wait for its current operation to finish."})
-            );
             assert_eq!(terminal["install_id"], id);
             assert_eq!(terminal["done"], true);
             assert_eq!(terminal["outcome"], "succeeded");
@@ -6986,7 +6779,7 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
                     .await.unwrap());
                 let current = services.as_ref().unwrap();
                 let api = Api::new(current);
-                assert_eq!(api.get(&format!("/api/v1/install/{failed_id}/status")).await, terminal);
+                assert_eq!(api.install_status(&failed_id).await, terminal);
                 let observed = provider.state.requests.lock().unwrap().clone();
                 assert_eq!(observed, before_reopen,
                     "reopen must not reacquire or replay settled work");
@@ -7004,7 +6797,7 @@ fn queued_fabric_artifact_failure_preserves_safe_provider_diagnostic() {
                 } else {
                     let success = succeeded.as_ref().unwrap();
                     let id = success["install_id"].as_str().unwrap();
-                    assert_eq!(api.get(&format!("/api/v1/install/{id}/status")).await, *success);
+                    assert_eq!(api.install_status(id).await, *success);
                 }
                 let pin = current.library.admit().unwrap();
                 assert!(current.installs.ready_version(&pin, VERSION).await.is_ok());

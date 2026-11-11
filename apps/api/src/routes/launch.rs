@@ -2,11 +2,8 @@
 
 use super::error::{ApiError, ApiResult, Extracted};
 use axial_app::{
-    instances::model::InstanceId,
     launch::{
-        coordinator::{
-            LaunchCoordinator, LaunchError, LaunchIntentView, LaunchPreflight, LaunchRequest,
-        },
+        coordinator::{LaunchCoordinator, LaunchError, LaunchIntentView, LaunchRequest},
         logs::LogEntry,
         reports::{LaunchReportStore, LaunchReportsResponse, valid_report_id},
         session::{
@@ -35,7 +32,6 @@ pub fn router(coordinator: LaunchCoordinator, sessions: SessionManager) -> Route
         .route("/api/v1/launch", post(launch))
         .route("/api/v1/launch/sessions", get(list_sessions))
         .route("/api/v1/launch/intents/{key}", get(intent))
-        .route("/api/v1/launch/preflight/{id}", get(preflight))
         .route("/api/v1/launch/{id}/status", get(status))
         .route("/api/v1/launch/{id}/kill", post(kill))
         .route("/api/v1/launch/{id}/events", get(events))
@@ -72,14 +68,6 @@ async fn intent(
             .intent_view(&key)?
             .ok_or(LaunchError::InstanceNotFound)?,
     ))
-}
-
-async fn preflight(
-    State(state): State<LaunchState>,
-    Path(id): Path<String>,
-) -> ApiResult<LaunchPreflight> {
-    let id: InstanceId = id.parse().map_err(|_| LaunchError::InvalidRequest)?;
-    Ok(Json(state.coordinator.preflight(id).await))
 }
 
 fn session_id(id: &str) -> Result<(), LaunchError> {

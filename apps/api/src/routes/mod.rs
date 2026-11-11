@@ -7,7 +7,6 @@ pub mod install;
 pub mod instances;
 pub mod java;
 pub mod launch;
-pub mod loaders;
 pub mod music;
 pub mod performance;
 pub mod resources;

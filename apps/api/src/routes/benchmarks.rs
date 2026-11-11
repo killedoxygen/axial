@@ -1,12 +1,9 @@
 use super::error::{ApiResult, Extracted};
-use axial_app::{
-    launch::session::SessionSnapshot,
-    performance::{
-        PerformanceService,
-        benchmarks::{
-            BenchmarkDriversResponse, BenchmarkError, BenchmarkLaunchRequest, BenchmarkMatrix,
-            BenchmarkService, BenchmarkSuiteManifest, benchmark_matrix, qualification_preview,
-        },
+use axial_app::performance::{
+    PerformanceService,
+    benchmarks::{
+        BenchmarkDriversResponse, BenchmarkError, BenchmarkLaunchRequest, BenchmarkMatrix,
+        BenchmarkService, benchmark_matrix, qualification_preview,
     },
 };
 use axum::{
@@ -25,12 +22,8 @@ struct BenchmarkApi {
 
 pub fn router(benchmarks: Arc<BenchmarkService>, performance: Arc<PerformanceService>) -> Router {
     Router::new()
-        .route("/api/v1/launch/benchmark", post(launch))
-        .route("/api/v1/launch/benchmark/suite", post(tick))
-        .route("/api/v1/launch/benchmark/suite/tick", post(tick))
         .route("/api/v1/launch/benchmark/suite/driver", post(start))
         .route("/api/v1/launch/benchmark/suite/drivers", get(drivers))
-        .route("/api/v1/launch/benchmark/suite/drivers/{id}", get(driver))
         .route(
             "/api/v1/launch/benchmark/suite/drivers/{id}/stop",
             post(stop),
@@ -39,7 +32,6 @@ pub fn router(benchmarks: Arc<BenchmarkService>, performance: Arc<PerformanceSer
             "/api/v1/launch/benchmark/suite/drivers/{id}/resume",
             post(resume),
         )
-        .route("/api/v1/launch/benchmark/suites/{id}", get(suite))
         .route("/api/v1/launch/benchmark/matrix", get(matrix))
         .route(
             "/api/v1/launch/benchmark/qualification/family-c-1-12-2/preview",
@@ -64,14 +56,6 @@ async fn matrix() -> Json<BenchmarkMatrix> {
 async fn preview() -> Json<Value> {
     Json(qualification_preview())
 }
-async fn launch(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<SessionSnapshot> {
-    let input = request.or_refuse(|| BenchmarkError::Invalid)?;
-    Ok(Json(api.benchmarks.launch(input).await?))
-}
-async fn tick(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<Value> {
-    let input = request.or_refuse(|| BenchmarkError::Invalid)?;
-    Ok(Json(api.benchmarks.tick(input).await?))
-}
 async fn start(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<Value> {
     let input = request.or_refuse(|| BenchmarkError::Invalid)?;
     let driver = api.benchmarks.start_driver(input).await?;
@@ -84,11 +68,6 @@ async fn drivers(State(api): State<BenchmarkApi>) -> ApiResult<BenchmarkDriversR
         drivers,
     }))
 }
-async fn driver(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
-    Ok(Json(
-        api.benchmarks.driver_view(api.benchmarks.driver(&id)?)?,
-    ))
-}
 async fn stop(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
     Ok(Json(
         api.benchmarks
@@ -99,14 +78,6 @@ async fn resume(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiR
     Ok(Json(
         api.benchmarks
             .driver_view(api.benchmarks.resume_driver(&id)?)?,
-    ))
-}
-async fn suite(
-    State(api): State<BenchmarkApi>,
-    Path(id): Path<String>,
-) -> ApiResult<BenchmarkSuiteManifest> {
-    Ok(Json(
-        api.benchmarks.suite(&id)?.ok_or(BenchmarkError::NotFound)?,
     ))
 }
 async fn qualification(
@@ -306,14 +277,14 @@ mod tests {
         let bootstrap = services.server.bootstrap();
         assert_eq!(
             reqwest::Client::new()
-                .get(format!("{}{path}", bootstrap.base_url))
+                .get(format!("{}{DRIVERS}", bootstrap.base_url))
                 .send()
                 .await
                 .unwrap()
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        let stopped = profile.api.get(&path).await;
+        let stopped = profile.api.driver(&path).await;
         assert_eq!(stopped["driver"]["id"], accepted.id);
         assert_eq!(stopped["view_model"]["state_label"], "stopped");
         assert_eq!(stopped["view_model"]["state_tone"], "warn");

@@ -952,7 +952,6 @@ async fn start_profile_inner(
             sessions.clone(),
         ))
         .merge(routes::install::router(installs.clone(), setup.clone()))
-        .merge(routes::loaders::router(catalogs.clone()))
         .merge(routes::versions::router(catalogs))
         .merge(routes::java::router(runtimes))
         .merge(routes::launch::router(

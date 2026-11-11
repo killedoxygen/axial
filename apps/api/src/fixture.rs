@@ -7,7 +7,7 @@ use axial_app::instances::{
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Weak, time::Duration};
 
 pub(crate) struct Profile {
     pub(crate) services: DesktopServices,
@@ -81,6 +81,9 @@ pub(crate) struct Api {
     pub(crate) client: reqwest::Client,
     pub(crate) base: String,
     pub(crate) capability: String,
+    pub(crate) installs: Weak<axial_app::install::queue::InstallQueue>,
+    launch: Weak<axial_app::launch::coordinator::LaunchCoordinator>,
+    pub(crate) benchmarks: Weak<axial_app::performance::benchmarks::BenchmarkService>,
 }
 
 impl Api {
@@ -94,7 +97,61 @@ impl Api {
                 .unwrap(),
             base: bootstrap.base_url,
             capability: bootstrap.capability,
+            installs: std::sync::Arc::downgrade(&services.installs),
+            launch: std::sync::Arc::downgrade(&services.launch),
+            benchmarks: std::sync::Arc::downgrade(&services.benchmarks),
         }
+    }
+
+    pub(crate) async fn preflight(&self, id: &str) -> Value {
+        serde_json::to_value(
+            self.launch
+                .upgrade()
+                .unwrap()
+                .preflight(id.parse().unwrap())
+                .await,
+        )
+        .unwrap()
+    }
+
+    pub(crate) async fn preflight_response(&self, id: &str) -> (StatusCode, Value) {
+        (StatusCode::OK, self.preflight(id).await)
+    }
+
+    pub(crate) async fn driver(&self, path: &str) -> Value {
+        let id = path.rsplit('/').next().unwrap();
+        self.get("/api/v1/launch/benchmark/suite/drivers").await["drivers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["driver"]["id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    pub(crate) async fn tick(&self, input: Value) -> Value {
+        self.benchmarks
+            .upgrade()
+            .unwrap()
+            .tick(serde_json::from_value(input).unwrap())
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn suite(&self, path: &str) -> Value {
+        serde_json::to_value(
+            self.benchmarks
+                .upgrade()
+                .unwrap()
+                .suite(path.rsplit('/').next().unwrap())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    pub(crate) async fn install_status(&self, path: &str) -> Value {
+        serde_json::to_value(self.installs.upgrade().unwrap().status(path).unwrap()).unwrap()
     }
 
     pub(crate) fn builder(&self, method: Method, path: &str) -> reqwest::RequestBuilder {

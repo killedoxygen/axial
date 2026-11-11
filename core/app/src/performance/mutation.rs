@@ -2,14 +2,13 @@
 
 use super::composition::{
     ManagedArtifactTransferResolver, ManagedArtifactWitnessProof, ManagedCompositionAuthority,
-    ManagedCompositionInspection, ManagedCompositionInstallPlan, ManagedInstallExecutionError,
-    ManagedInstanceEffectAuthority, ManagedInstanceIdentity, ManagedMutationError,
-    ManagedResolvedInspection, ManagedRollbackOutcome, RollbackSnapshotSummary,
+    ManagedCompositionInspection, ManagedInstallExecutionError, ManagedInstanceEffectAuthority,
+    ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
+    ManagedRollbackOutcome, RollbackSnapshotSummary,
 };
 use super::effective::{EffectivePerformancePlan, effective_performance_plan};
 use super::model::{
-    BundleHealth, CompositionPlan, CompositionState, PerformanceMode,
-    PerformanceRulesStatusResponse, ResolutionRequest,
+    BundleHealth, CompositionPlan, CompositionState, PerformanceMode, ResolutionRequest,
 };
 use super::{
     plan::{PreparedManagedPlan, prepare_managed_install},
@@ -26,7 +25,7 @@ use crate::{
         MetadataStore, Migration, StorageError,
         rusqlite::{self, Connection, OptionalExtension, Transaction, params},
     },
-    tasks::{CancellationToken, TaskHandle, TaskOwner},
+    tasks::{CancellationToken, TaskOwner},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -508,18 +507,6 @@ impl PerformanceService {
         &self.rules
     }
 
-    pub async fn refresh_rules(
-        &self,
-    ) -> Result<PerformanceRulesStatusResponse, RulesWorkflowError> {
-        let rules = self.rules.clone();
-        self.tasks
-            .try_spawn(rules.clone(), move |_| async move { rules.refresh().await })
-            .map_err(|_| RulesWorkflowError::Unavailable)?
-            .join()
-            .await
-            .map_err(|_| RulesWorkflowError::Changed)?
-    }
-
     #[cfg(feature = "test-support")]
     pub fn with_rules_for_test(mut self, rules: PerformanceRules) -> Self {
         assert!(rules.uses_metadata(&self.storage));
@@ -531,7 +518,7 @@ impl PerformanceService {
     pub async fn install_plan_for_test(
         &self,
         id: &InstanceId,
-        plan: ManagedCompositionInstallPlan,
+        plan: super::composition::ManagedCompositionInstallPlan,
         transfers: ManagedArtifactTransferResolver,
     ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
         let instance = self
@@ -636,18 +623,8 @@ impl PerformanceService {
         })
     }
 
-    pub fn submit(
-        &self,
-        id: &InstanceId,
-        request: ResolutionRequest,
-        action: &str,
-        snapshot: Option<String>,
-    ) -> Result<PerformanceOperationStatus, PerformanceMutationError> {
-        self.start_command(id, Some(request), action, snapshot)
-            .map(|(status, _)| status)
-    }
-
-    fn start_command(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_command_for_test(
         &self,
         id: &InstanceId,
         request: Option<ResolutionRequest>,
@@ -656,7 +633,9 @@ impl PerformanceService {
     ) -> Result<
         (
             PerformanceOperationStatus,
-            TaskHandle<Result<ManagedCompositionInspection, PerformanceMutationError>>,
+            crate::tasks::TaskHandle<
+                Result<ManagedCompositionInspection, PerformanceMutationError>,
+            >,
         ),
         PerformanceMutationError,
     > {
@@ -910,30 +889,6 @@ impl PerformanceService {
             .map_err(|_| PerformanceMutationError::Unsettled)?
     }
 
-    pub async fn apply(
-        &self,
-        id: &InstanceId,
-        request: ResolutionRequest,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.start_command(id, Some(request), "apply", None)?
-            .1
-            .join()
-            .await
-            .map_err(|_| PerformanceMutationError::Unsettled)?
-    }
-
-    pub async fn reapply(
-        &self,
-        id: &InstanceId,
-        request: ResolutionRequest,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.start_command(id, Some(request), "reapply", None)?
-            .1
-            .join()
-            .await
-            .map_err(|_| PerformanceMutationError::Unsettled)?
-    }
-
     async fn prepare_apply(
         &self,
         instance: &RegisteredInstance,
@@ -952,29 +907,6 @@ impl PerformanceService {
         } else {
             Ok(Action::Remove)
         }
-    }
-
-    pub async fn remove(
-        &self,
-        id: &InstanceId,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.start_command(id, None, "remove", None)?
-            .1
-            .join()
-            .await
-            .map_err(|_| PerformanceMutationError::Unsettled)?
-    }
-
-    pub async fn rollback(
-        &self,
-        id: &InstanceId,
-        snapshot: Option<String>,
-    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
-        self.start_command(id, None, "rollback", snapshot)?
-            .1
-            .join()
-            .await
-            .map_err(|_| PerformanceMutationError::Unsettled)?
     }
 
     /// Settle existing obligations and pin the selected mode's launch plan under
@@ -1618,6 +1550,21 @@ fn validate_target(
 mod tests {
     use super::*;
 
+    async fn run_command(
+        service: &PerformanceService,
+        id: &InstanceId,
+        request: Option<ResolutionRequest>,
+        action: &str,
+        snapshot: Option<String>,
+    ) -> Result<ManagedCompositionInspection, PerformanceMutationError> {
+        service
+            .start_command_for_test(id, request, action, snapshot)?
+            .1
+            .join()
+            .await
+            .map_err(|_| PerformanceMutationError::Unsettled)?
+    }
+
     async fn budget_checkpoint(service: &PerformanceService) -> PendingOperation {
         use crate::instances::create::{CreateTarget, InstanceService, tests::request};
         let mut request = request(&format!("Pending budget {}", uuid::Uuid::new_v4()));
@@ -1887,7 +1834,7 @@ mod tests {
                 Ok::<_, StorageError>(())
             }).unwrap();
             assert!(matches!(
-                service.remove(&id).await,
+                run_command(&service, &id, None, "remove", None).await,
                 Err(PerformanceMutationError::Unsettled)
             ));
             wait_for_mutation_tasks(&service).await;
@@ -2312,7 +2259,7 @@ mod tests {
         );
         if std::env::var("AXIAL_PERFORMANCE_PREPARED_ENTRY").unwrap() == "queued" {
             service
-                .submit(&instance.id, request, &action, snapshot)
+                .start_command_for_test(&instance.id, Some(request), &action, snapshot)
                 .unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 while !service.tasks.status().is_idle() {
@@ -2323,10 +2270,10 @@ mod tests {
             .unwrap();
         } else {
             let _ = match action.as_str() {
-                "apply" => service.apply(&instance.id, request).await,
-                "reapply" => service.reapply(&instance.id, request).await,
-                "rollback" => service.rollback(&instance.id, snapshot).await,
-                _ => service.remove(&instance.id).await,
+                "apply" => run_command(&service, &instance.id, Some(request), "apply", None).await,
+                "reapply" => run_command(&service, &instance.id, Some(request), "reapply", None).await,
+                "rollback" => run_command(&service, &instance.id, None, "rollback", snapshot).await,
+                _ => run_command(&service, &instance.id, None, "remove", None).await,
             };
         }
         panic!("prepared remove did not reach its durable crash boundary");
@@ -2844,7 +2791,7 @@ mod tests {
                         Ok::<_, StorageError>(())
                     })
                     .unwrap();
-                assert!(service.remove(&id).await.is_err());
+                assert!(run_command(&service, &id, None, "remove", None).await.is_err());
                 wait_for_mutation_tasks(&service).await;
                 let command = service.instance_operation(&id).unwrap().unwrap();
                 assert_ne!(command.state, "complete");
@@ -2910,7 +2857,10 @@ mod tests {
                     Ok::<_, StorageError>(())
                 })
                 .unwrap();
-            assert!(service.remove(&id).await.is_err(), "{corruption}");
+            assert!(
+                run_command(&service, &id, None, "remove", None).await.is_err(),
+                "{corruption}"
+            );
             wait_for_mutation_tasks(&service).await;
             assert_eq!(payload_files(&path), files);
             let command = service.instance_operation(&id).unwrap().unwrap();
@@ -3180,7 +3130,7 @@ mod tests {
             .unwrap();
         let id = admitted.record().instance.id.clone();
         drop(admitted);
-        service.remove(&id).await.unwrap();
+        run_command(&service, &id, None, "remove", None).await.unwrap();
         let status = service.instance_operation(&id).unwrap().unwrap();
         assert_eq!(status.state, "complete");
         assert_eq!(status.action, "remove");
@@ -3249,7 +3199,7 @@ mod tests {
         let (_root, service, admitted) = launch_fixture().await;
         let id = admitted.record().instance.id.clone();
         drop(admitted);
-        service.remove(&id).await.unwrap();
+        run_command(&service, &id, None, "remove", None).await.unwrap();
         let status = service.instance_operation(&id).unwrap().unwrap();
         assert_eq!(status.state, "complete");
         let global = service.operation(&status.id).unwrap();

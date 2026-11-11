@@ -889,11 +889,8 @@ async fn preflight_projection_release_resumes_a_queued_install() {
         .view_model
         .phase_id
         == "starting";
-    // This current-thread test cancels before the accepted worker can poll
-    // any provider work; the red path removes its still-queued request.
-    if started {
-        coordinator.installs.cancel(&queued.install_id).unwrap();
-    } else {
+    // Shutdown cancels accepted work before this current-thread worker can poll providers.
+    if !started {
         coordinator
             .installs
             .remove(&queued.install_id)

@@ -3,10 +3,9 @@
 use super::composition::{
     ManagedArtifactPin, ManagedCompositionInstallPlan, ManagedDependencyEdge,
 };
-use super::effective::effective_performance_plan;
 use super::model::{
-    CompositionPlan, ManagedArtifactRole, ModeSource, PerformanceMode, PerformancePlanResponse,
-    PlanInputError, ResolvedPerformanceMode,
+    CompositionPlan, ManagedArtifactRole, ModeSource, PerformanceMode, PlanInputError,
+    ResolvedPerformanceMode,
 };
 use super::resolve::parse_mode;
 use crate::content::catalog::ContentService;
@@ -51,13 +50,6 @@ pub fn configured_mode(mode: crate::settings::ConfigPerformanceMode) -> Performa
         crate::settings::ConfigPerformanceMode::Managed => PerformanceMode::Managed,
         crate::settings::ConfigPerformanceMode::Vanilla => PerformanceMode::Vanilla,
         crate::settings::ConfigPerformanceMode::Custom => PerformanceMode::Custom,
-    }
-}
-
-pub fn plan_response(plan: &CompositionPlan) -> PerformancePlanResponse {
-    PerformancePlanResponse {
-        active: plan.mode == PerformanceMode::Managed,
-        effective: effective_performance_plan(plan),
     }
 }
 
