@@ -1479,15 +1479,6 @@ impl ManagedDir {
         Self::from_directory_with_session_and_path(directory, effects, None, path)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    fn from_directory_with_session(
-        directory: Directory,
-        effects: EffectOwner,
-        session: Option<ManagedRootSession>,
-    ) -> Result<Self, LoaderError> {
-        Self::from_directory_with_session_and_path(directory, effects, session, PathBuf::new())
-    }
-
     fn from_directory_with_session_and_path(
         directory: Directory,
         effects: EffectOwner,
@@ -4837,10 +4828,11 @@ impl ManagedLibraryRoot {
             ));
         }
         let effects = directory.create_effect_owner()?;
-        let root = ManagedDir::from_directory_with_session(
+        let root = ManagedDir::from_directory_with_session_and_path(
             directory,
             effects,
             Some(ManagedRootSession::Direct(session)),
+            configured_path,
         )
         .map_err(loader_io)?;
         root.settle().map_err(loader_io)?;

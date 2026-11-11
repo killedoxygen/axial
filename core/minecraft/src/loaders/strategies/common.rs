@@ -4591,7 +4591,10 @@ printf '%s' 'processor-terminal' > "$last"
         let task = tokio::spawn(async move {
             super::publish_loader_managed_install(&task_root, prepared).await
         });
-        reached.await.expect("loader publication reached effect");
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached)
+            .await
+            .expect("loader publication must reach its paused effect")
+            .expect("loader publication reached effect");
         task.abort();
         assert!(
             task.await
