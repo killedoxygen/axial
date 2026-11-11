@@ -1,18 +1,11 @@
 use super::common::{
     FORGE_MAVEN_META, FORGE_PROMOTIONS_URL, apply_forge_promotion_selection,
     extract_forge_loader_version, extract_forge_minecraft_version, fetch_text,
-    forge_install_source, infer_loader_build_metadata, is_prerelease_loader_version,
-    parse_maven_versions, provider_installed_version_id,
+    forge_install_source, infer_loader_build_metadata, maven_build_record, maven_game_versions,
+    parse_maven_versions,
 };
-use crate::lifecycle::LifecycleMeta;
-use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_json;
-use crate::loaders::types::{
-    LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId, LoaderGameVersion,
-    LoaderInstallability, LoaderVersionIndex,
-};
-use crate::types::VersionSubjectKind;
-use crate::version_meta::MinecraftVersionMeta;
+use crate::loaders::types::{LoaderComponentId, LoaderGameVersion, LoaderVersionIndex};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -29,32 +22,12 @@ pub async fn fetch_game_versions()
 }
 
 fn parse_game_versions_from_maven_metadata(xml: &str) -> Vec<LoaderGameVersion> {
-    let mut versions_by_stability = std::collections::HashMap::<String, bool>::new();
-    for entry in parse_maven_versions(xml) {
-        let minecraft_version = extract_forge_minecraft_version(&entry);
-        let loader_version = extract_forge_loader_version(&entry);
-        if minecraft_version.is_empty() || loader_version.is_empty() {
-            continue;
-        }
-        let has_stable_build = !is_prerelease_loader_version(&loader_version);
-        versions_by_stability
-            .entry(minecraft_version)
-            .and_modify(|stable| *stable |= has_stable_build)
-            .or_insert(has_stable_build);
-    }
-
-    let mut versions = Vec::new();
-    for (minecraft_version, has_stable_build) in versions_by_stability {
-        versions.push(LoaderGameVersion {
-            subject_kind: VersionSubjectKind::MinecraftVersion,
-            id: minecraft_version,
-            release_time: String::new(),
-            minecraft_meta: MinecraftVersionMeta::default(),
-            lifecycle: LifecycleMeta::default(),
-            stable_hint: Some(has_stable_build),
-        });
-    }
-    versions
+    maven_game_versions(xml, |entry| {
+        let minecraft_version = extract_forge_minecraft_version(entry);
+        let loader_version = extract_forge_loader_version(entry);
+        (!minecraft_version.is_empty() && !loader_version.is_empty())
+            .then_some((minecraft_version, loader_version))
+    })
 }
 
 pub async fn fetch_builds(
@@ -91,8 +64,7 @@ pub async fn fetch_builds(
         let is_latest = latest
             .as_ref()
             .is_some_and(|value| value == &loader_version);
-        let (strategy, artifact_kind, install_source) =
-            forge_install_source(minecraft_version, &loader_version)?;
+        let install = forge_install_source(minecraft_version, &loader_version)?;
         let mut build_meta =
             infer_loader_build_metadata(&loader_version, &[], is_recommended, is_latest, None);
         apply_forge_promotion_selection(
@@ -101,25 +73,13 @@ pub async fn fetch_builds(
             is_recommended,
             is_latest,
         );
-
-        builds.push(LoaderBuildRecord {
-            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+        builds.push(maven_build_record(
             component_id,
-            component_name: component_id.display_name().to_string(),
-            build_id: build_id_for(component_id, minecraft_version, &loader_version),
-            minecraft_version: minecraft_version.to_string(),
-            loader_version: loader_version.clone(),
-            version_id: provider_installed_version_id(
-                component_id,
-                minecraft_version,
-                &loader_version,
-            )?,
+            minecraft_version,
+            loader_version,
             build_meta,
-            strategy,
-            artifact_kind,
-            installability: LoaderInstallability::Installable,
-            install_source,
-        });
+            install,
+        )?);
     }
 
     builds.reverse();

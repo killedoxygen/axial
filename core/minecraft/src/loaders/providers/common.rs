@@ -1,10 +1,15 @@
+use crate::lifecycle::LifecycleMeta;
+use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_bytes;
 use crate::loaders::installed_version_id_for;
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildMetadata, LoaderComponentId, LoaderError, LoaderInstallSource,
-    LoaderInstallStrategy, LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason,
+    LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderBuildSubjectKind,
+    LoaderComponentId, LoaderError, LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy,
+    LoaderInstallability, LoaderProviderFailureKind, LoaderSelectionMeta, LoaderSelectionReason,
     LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
 };
+use crate::types::VersionSubjectKind;
+use crate::version_meta::MinecraftVersionMeta;
 
 pub const FABRIC_META_BASE: &str = "https://meta.fabricmc.net/v2/versions";
 pub const QUILT_META_BASE: &str = "https://meta.quiltmc.org/v3/versions";
@@ -235,6 +240,69 @@ pub fn parse_maven_versions(xml: &str) -> Vec<String> {
     }
 
     versions
+}
+
+/// Minecraft versions named by Maven metadata entries. `split` maps an entry
+/// to its Minecraft and loader versions; a version is stable when any of its
+/// loader builds is.
+pub(crate) fn maven_game_versions(
+    xml: &str,
+    split: impl Fn(&str) -> Option<(String, String)>,
+) -> Vec<LoaderGameVersion> {
+    let mut versions_by_stability = std::collections::HashMap::<String, bool>::new();
+    for entry in parse_maven_versions(xml) {
+        let Some((minecraft_version, loader_version)) = split(&entry) else {
+            continue;
+        };
+        let has_stable_build = !is_prerelease_loader_version(&loader_version);
+        versions_by_stability
+            .entry(minecraft_version)
+            .and_modify(|stable| *stable |= has_stable_build)
+            .or_insert(has_stable_build);
+    }
+    versions_by_stability
+        .into_iter()
+        .map(|(minecraft_version, has_stable_build)| LoaderGameVersion {
+            subject_kind: VersionSubjectKind::MinecraftVersion,
+            id: minecraft_version,
+            release_time: String::new(),
+            minecraft_meta: MinecraftVersionMeta::default(),
+            lifecycle: LifecycleMeta::default(),
+            stable_hint: Some(has_stable_build),
+        })
+        .collect()
+}
+
+/// An installable Forge-family build of `loader_version` for `minecraft_version`.
+pub(crate) fn maven_build_record(
+    component_id: LoaderComponentId,
+    minecraft_version: &str,
+    loader_version: String,
+    build_meta: LoaderBuildMetadata,
+    (strategy, artifact_kind, install_source): (
+        LoaderInstallStrategy,
+        LoaderArtifactKind,
+        LoaderInstallSource,
+    ),
+) -> Result<LoaderBuildRecord, LoaderError> {
+    Ok(LoaderBuildRecord {
+        subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+        component_id,
+        component_name: component_id.display_name().to_string(),
+        build_id: build_id_for(component_id, minecraft_version, &loader_version),
+        minecraft_version: minecraft_version.to_string(),
+        version_id: provider_installed_version_id(
+            component_id,
+            minecraft_version,
+            &loader_version,
+        )?,
+        loader_version,
+        build_meta,
+        strategy,
+        artifact_kind,
+        installability: LoaderInstallability::Installable,
+        install_source,
+    })
 }
 
 pub fn extract_forge_minecraft_version(entry: &str) -> String {
