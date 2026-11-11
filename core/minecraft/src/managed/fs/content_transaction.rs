@@ -13,6 +13,7 @@ use crate::download::{
     fail_create_only_transfer, start_create_only_transfer,
 };
 use crate::loaders::LoaderError;
+use crate::managed::fault::{self, Fault};
 use crate::portable_path::{
     PortableFileName, PortablePathKey, PortableRelativePath, managed_content_name_is_reserved,
     managed_content_name_key,
@@ -49,20 +50,6 @@ const MAX_CONTENT_PRIVATE_DIRECTORIES: usize = 16;
 const PRIVATE_STAGE_NAME: &str = "stage";
 const PRIVATE_BACKUP_NAME: &str = "backup";
 const MAX_STAGING_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
-
-#[cfg(any(test, feature = "test-support"))]
-type BeforeManifestRevalidation = Box<dyn FnOnce() + Send>;
-
-#[cfg(any(test, feature = "test-support"))]
-static BEFORE_MANIFEST_REVALIDATION: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<std::path::PathBuf, BeforeManifestRevalidation>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-thread_local! {
-    static AFTER_STAGING_PARENT_REMOVAL: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
-    static AFTER_PUBLISHED_FILE_REMOVAL: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedContentPathPolicy {
@@ -778,17 +765,17 @@ impl ManagedContentTransactionRoot {
                 "noncanonical test root",
             ));
         }
-        let mut hooks = BEFORE_MANIFEST_REVALIDATION
-            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-            .lock()
-            .expect("content test hook lock");
-        if hooks.contains_key(root) {
+        if fault::is_armed(root, Fault::BeforeManifestRevalidation) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "content test hook already armed",
             ));
         }
-        hooks.insert(root.to_path_buf(), Box::new(callback));
+        fault::arm(
+            root,
+            Fault::BeforeManifestRevalidation,
+            Some(Box::new(callback)),
+        );
         Ok(())
     }
 
@@ -1899,8 +1886,6 @@ struct TransactionState {
     backup_cleanup: CleanupDirectoryState,
     private_cleanup: CleanupDirectoryState,
     created_parents: Vec<CreatedTransactionParent>,
-    #[cfg(any(test, feature = "test-support"))]
-    before_manifest_revalidation: Option<BeforeManifestRevalidation>,
 }
 
 enum CleanupDirectoryState {
@@ -2106,15 +2091,6 @@ fn prepare_transaction(
     let stage_cleanup = CleanupDirectoryState::Known(stage.clone());
     let backup_cleanup = CleanupDirectoryState::Known(backup.clone());
     let private_cleanup = CleanupDirectoryState::Known(private.clone());
-    #[cfg(any(test, feature = "test-support"))]
-    let before_manifest_revalidation = BEFORE_MANIFEST_REVALIDATION.get().and_then(|hooks| {
-        let mut hooks = hooks.lock().expect("content test hook lock");
-        let root = hooks
-            .keys()
-            .find(|path| session.root.validate_absolute_projection(path).is_ok())
-            .cloned()?;
-        hooks.remove(&root)
-    });
     ManagedContentPreparationOutcome::Prepared(ManagedContentPreparedTransaction {
         state: TransactionState {
             root: session.root,
@@ -2142,8 +2118,6 @@ fn prepare_transaction(
             backup_cleanup,
             private_cleanup,
             created_parents: Vec::new(),
-            #[cfg(any(test, feature = "test-support"))]
-            before_manifest_revalidation,
         },
         slots,
     })
@@ -4422,11 +4396,8 @@ fn cleanup_staging_checkpoint(
             .remove_guarded_file(&published.name, guard)
             .map_err(|_| changed)?;
         published.guard = None;
-        #[cfg(test)]
-        AFTER_PUBLISHED_FILE_REMOVAL.with(|hook| {
-            if let Some(callback) = hook.take() {
-                callback();
-            }
+        fault::take(Fault::AfterPublishedFileRemoval, |armed| {
+            root.validate_absolute_projection(armed).is_ok()
         });
     }
     if let CleanupDirectoryState::Known(private) = &cleanup.private {
@@ -4458,11 +4429,8 @@ fn cleanup_staging_checkpoint(
             return Err(changed);
         }
         cleanup.created_parents.pop();
-        #[cfg(test)]
-        AFTER_STAGING_PARENT_REMOVAL.with(|hook| {
-            if let Some(callback) = hook.take() {
-                callback();
-            }
+        fault::take(Fault::AfterStagingParentRemoval, |armed| {
+            root.validate_absolute_projection(armed).is_ok()
         });
     }
     let remaining = staging_public_bindings(root, checkpoint, false)?;
@@ -4752,10 +4720,9 @@ fn drive_commit(
         state.terminal_failure = ManagedContentTransactionFailure::ObservationDrift;
         return drive_rollback(state, false);
     }
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(hook) = state.before_manifest_revalidation.take() {
-        hook();
-    }
+    fault::take(Fault::BeforeManifestRevalidation, |root| {
+        state.root.validate_absolute_projection(root).is_ok()
+    });
     if !created_transaction_parent_bindings_match(&state)
         || !revalidate_transaction_logical_names(&state)
         || !revalidate_read_preconditions(&state)
@@ -6718,15 +6685,18 @@ mod tests {
     #[test]
     fn refused_recovery_keeps_installed_guard_until_exact_payload_returns() {
         let temporary = test_tempdir().unwrap();
-        let (tree, mut ready) = checkpoint_fixture(&temporary, true);
+        let (tree, ready) = checkpoint_fixture(&temporary, true);
         let destination = temporary.path().join("mods/first.jar");
         let retained = temporary.path().join("retained-payload");
         let moved_destination = destination.clone();
         let moved_retained = retained.clone();
-        ready.state.before_manifest_revalidation = Some(Box::new(move || {
-            std::fs::rename(&moved_destination, moved_retained).unwrap();
-            std::fs::write(moved_destination, b"staged replacement").unwrap();
-        }));
+        fault::arm_here(
+            Fault::BeforeManifestRevalidation,
+            Some(Box::new(move || {
+                std::fs::rename(&moved_destination, moved_retained).unwrap();
+                std::fs::write(moved_destination, b"staged replacement").unwrap();
+            })),
+        );
         let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = ready.commit() else {
             panic!("foreign replacement must retain rollback");
         };
@@ -7130,7 +7100,10 @@ mod tests {
                 .for_pack()
                 .restore_staging_checkpoint(checkpoint, [15; 32])
                 .unwrap();
-            AFTER_STAGING_PARENT_REMOVAL.with(|hook| hook.set(Some(|| std::process::exit(43))));
+            fault::arm_here(
+                Fault::AfterStagingParentRemoval,
+                Some(Box::new(|| std::process::exit(43))),
+            );
             let _outcome = recovery.reconcile();
             panic!("cleanup must exit after an actual recorded parent removal");
         }
@@ -7335,10 +7308,10 @@ mod tests {
                 .unwrap();
                 std::process::exit(42);
             };
-            let mut witness_and_exit: Option<BeforeManifestRevalidation> =
+            let mut witness_and_exit: Option<Box<dyn FnOnce() + Send>> =
                 Some(Box::new(witness_and_exit));
             if !before_save {
-                ready.state.before_manifest_revalidation = witness_and_exit.take();
+                fault::arm_here(Fault::BeforeManifestRevalidation, witness_and_exit.take());
             }
             let _outcome =
                 ready.commit_with_checkpoint([18; 32], MAX_STAGING_CHECKPOINT_BYTES, |offered| {
@@ -7441,9 +7414,10 @@ mod tests {
                     .for_pack()
                     .restore_staging_checkpoint(checkpoint, BINDING)
                     .unwrap();
-                AFTER_PUBLISHED_FILE_REMOVAL.with(|hook| {
-                    hook.set(Some(|| std::process::exit(43)));
-                });
+                fault::arm_here(
+                    Fault::AfterPublishedFileRemoval,
+                    Some(Box::new(|| std::process::exit(43))),
+                );
                 let _outcome = recovery.reconcile();
                 panic!("cleanup must exit after an actual guarded public file removal");
             }
@@ -7487,27 +7461,30 @@ mod tests {
             .unwrap();
             let root = temporary.path().to_path_buf();
             std::fs::write(container.join("root-path"), root.to_str().unwrap()).unwrap();
-            ready.state.before_manifest_revalidation = Some(Box::new(move || {
-                for path in [
-                    "mods/first.jar",
-                    "mods/second.jar",
-                    "config/nested/options.txt",
-                ] {
-                    if remove_first && path == "mods/first.jar" {
-                        assert!(!root.join(path).exists());
-                        continue;
+            fault::arm_here(
+                Fault::BeforeManifestRevalidation,
+                Some(Box::new(move || {
+                    for path in [
+                        "mods/first.jar",
+                        "mods/second.jar",
+                        "config/nested/options.txt",
+                    ] {
+                        if remove_first && path == "mods/first.jar" {
+                            assert!(!root.join(path).exists());
+                            continue;
+                        }
+                        assert_eq!(
+                            std::fs::read(root.join(path)).unwrap(),
+                            b"staged replacement"
+                        );
                     }
                     assert_eq!(
-                        std::fs::read(root.join(path)).unwrap(),
-                        b"staged replacement"
+                        std::fs::read(root.join(MANIFEST_NAME)).unwrap(),
+                        b"original manifest"
                     );
-                }
-                assert_eq!(
-                    std::fs::read(root.join(MANIFEST_NAME)).unwrap(),
-                    b"original manifest"
-                );
-                std::process::exit(42);
-            }));
+                    std::process::exit(42);
+                })),
+            );
             let _outcome =
                 ready.commit_with_checkpoint(BINDING, MAX_STAGING_CHECKPOINT_BYTES, |checkpoint| {
                     std::fs::write(
@@ -7725,7 +7702,10 @@ mod tests {
                 .restore_staging_checkpoint(checkpoint, [19; 32])
                 .unwrap();
             let recovery = if interrupted_restore {
-                super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.set(true));
+                crate::managed::fault::arm_here(
+                    crate::managed::fault::Fault::GuardedMoveUnsettled,
+                    None,
+                );
                 let outcome =
                     recovery.reconcile_with_checkpoint(MAX_STAGING_CHECKPOINT_BYTES, |_| {
                         panic!("interrupted restoration cannot offer a complete proof");
@@ -7733,7 +7713,9 @@ mod tests {
                 let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = outcome else {
                     panic!("applied restoration must retain its exact owner");
                 };
-                assert!(!super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.get()));
+                assert!(!crate::managed::fault::armed_here(
+                    crate::managed::fault::Fault::GuardedMoveUnsettled
+                ));
                 recovery
             } else {
                 recovery
@@ -7947,14 +7929,19 @@ mod tests {
             .for_pack()
             .restore_staging_checkpoint(checkpoint, [19; 32])
             .unwrap();
-        super::super::FAIL_NEXT_GUARDED_REMOVAL_AFTER_APPLY.with(|fail| fail.set(true));
+        crate::managed::fault::arm_here(
+            crate::managed::fault::Fault::GuardedRemovalUnsettled,
+            None,
+        );
         let outcome = recovery.reconcile_with_checkpoint(MAX_STAGING_CHECKPOINT_BYTES, |_| {
             panic!("interrupted restoration cannot offer a complete proof");
         });
         let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = outcome else {
             panic!("applied removal failure must retain recovery");
         };
-        assert!(!super::super::FAIL_NEXT_GUARDED_REMOVAL_AFTER_APPLY.with(|fail| fail.get()));
+        assert!(!crate::managed::fault::armed_here(
+            crate::managed::fault::Fault::GuardedRemovalUnsettled
+        ));
         assert_eq!(
             [
                 "mods/first.jar",
@@ -8006,14 +7993,16 @@ mod tests {
             .for_pack()
             .restore_staging_checkpoint(checkpoint, [19; 32])
             .unwrap();
-        super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.set(true));
+        crate::managed::fault::arm_here(crate::managed::fault::Fault::GuardedMoveUnsettled, None);
         let outcome = recovery.reconcile_with_checkpoint(MAX_STAGING_CHECKPOINT_BYTES, |_| {
             panic!("interrupted restoration cannot offer a complete proof");
         });
         let ManagedContentTransactionOutcome::RecoveryRequired(recovery) = outcome else {
             panic!("applied original restoration failure must retain recovery");
         };
-        assert!(!super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.get()));
+        assert!(!crate::managed::fault::armed_here(
+            crate::managed::fault::Fault::GuardedMoveUnsettled
+        ));
         assert_eq!(
             std::fs::read(root.join("mods/first.jar")).unwrap(),
             b"original",
@@ -8090,14 +8079,16 @@ mod tests {
             .for_pack()
             .restore_staging_checkpoint(checkpoint, [19; 32])
             .unwrap();
-        super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.set(true));
+        crate::managed::fault::arm_here(crate::managed::fault::Fault::GuardedMoveUnsettled, None);
         let outcome = recovery.reconcile_with_checkpoint(MAX_STAGING_CHECKPOINT_BYTES, |_| {
             panic!("interrupted restoration cannot offer a complete proof");
         });
         let ManagedContentTransactionOutcome::RecoveryRequired(mut recovery) = outcome else {
             panic!("applied original restoration failure must retain recovery");
         };
-        assert!(!super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.get()));
+        assert!(!crate::managed::fault::armed_here(
+            crate::managed::fault::Fault::GuardedMoveUnsettled
+        ));
         let path = root.join("mods/first.jar");
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
         let file = probe
@@ -8147,13 +8138,18 @@ mod tests {
                     proof.encode(MAX_STAGING_CHECKPOINT_BYTES).unwrap(),
                 )
                 .unwrap();
-                super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.set(true));
+                crate::managed::fault::arm_here(
+                    crate::managed::fault::Fault::GuardedMoveUnsettled,
+                    None,
+                );
                 Err(())
             });
         let ManagedContentTransactionOutcome::RecoveryRequired(mut recovery) = outcome else {
             panic!("live applied restoration failure must retain recovery");
         };
-        assert!(!super::super::FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.get()));
+        assert!(!crate::managed::fault::armed_here(
+            crate::managed::fault::Fault::GuardedMoveUnsettled
+        ));
         let publication = std::fs::read_to_string(&receipt_path).unwrap();
         let record: serde_json::Value = serde_json::from_str(&publication).unwrap();
         let private = record["private_name"].as_str().unwrap();
@@ -9667,13 +9663,16 @@ mod tests {
             ManagedContentTransferStep::Complete(complete) => complete,
             ManagedContentTransferStep::Issued(_) => panic!("batch must be complete"),
         };
-        let mut ready = match complete.stage() {
+        let ready = match complete.stage() {
             ManagedContentStageOutcome::Ready(ready) => ready,
             ManagedContentStageOutcome::Unwind(_) => panic!("payload must stage"),
         };
-        ready.state.before_manifest_revalidation = Some(Box::new(move || {
-            std::fs::write(dependency_path, b"drifted").expect("drift dependency");
-        }));
+        fault::arm_here(
+            Fault::BeforeManifestRevalidation,
+            Some(Box::new(move || {
+                std::fs::write(dependency_path, b"drifted").expect("drift dependency");
+            })),
+        );
         assert!(matches!(
             ready.commit(),
             ManagedContentTransactionOutcome::Failed(
@@ -10246,10 +10245,13 @@ mod tests {
             manifest,
         )
         .expect("removal plan");
-        let mut ready = ready_without_transfers(prepared(session, plan));
-        ready.state.before_manifest_revalidation = Some(Box::new(move || {
-            std::fs::write(dependency_path, b"drifted").expect("drift dependency");
-        }));
+        let ready = ready_without_transfers(prepared(session, plan));
+        fault::arm_here(
+            Fault::BeforeManifestRevalidation,
+            Some(Box::new(move || {
+                std::fs::write(dependency_path, b"drifted").expect("drift dependency");
+            })),
+        );
         assert!(matches!(
             ready.commit(),
             ManagedContentTransactionOutcome::Failed(
@@ -10291,11 +10293,14 @@ mod tests {
             manifest,
         )
         .expect("removal plan");
-        let mut ready = ready_without_transfers(prepared(session, plan));
+        let ready = ready_without_transfers(prepared(session, plan));
         let effect_drift_path = effect_path.clone();
-        ready.state.before_manifest_revalidation = Some(Box::new(move || {
-            std::fs::write(effect_drift_path, b"foreign").expect("drift final effect");
-        }));
+        fault::arm_here(
+            Fault::BeforeManifestRevalidation,
+            Some(Box::new(move || {
+                std::fs::write(effect_drift_path, b"foreign").expect("drift final effect");
+            })),
+        );
         let recovery = match ready.commit() {
             ManagedContentTransactionOutcome::RecoveryRequired(recovery) => recovery,
             _ => panic!("foreign final effect must retain rollback recovery"),

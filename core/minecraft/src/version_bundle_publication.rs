@@ -9,8 +9,7 @@ use crate::known_good::{
     ManagedComponentProjection, ManagedKnownGoodComponent,
 };
 use crate::loaders::LoaderError;
-#[cfg(test)]
-use crate::managed::fs::ManagedCreateOnlyWriteFault;
+use crate::managed::fault::{self, Fault};
 use crate::managed::fs::{
     ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard,
     ManagedFileIdentity, ManagedGuardedFileMoveFailure,
@@ -183,15 +182,11 @@ enum PublicationTestHook {
     #[cfg(test)]
     ReportFirstMoveUnsettled,
     #[cfg(test)]
-    IntentWriteFault(ManagedCreateOnlyWriteFault),
-    #[cfg(test)]
     FailAfterIntent,
     #[cfg(test)]
     FailSettlementOnce,
     #[cfg(test)]
     FailSettlementPermanently,
-    #[cfg(test)]
-    SettlementWriteFault(ManagedCreateOnlyWriteFault),
     #[cfg(test)]
     FailAfterSettlementMarkerOnce,
     #[cfg(test)]
@@ -986,8 +981,6 @@ fn prepare_transaction(
     fingerprints: Vec<EntryFingerprint>,
     #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<PreparationOutcome, VersionBundleTransactionError> {
-    #[cfg(test)]
-    let mut test_hook = test_hook;
     let mut planned = bind_sources(source, fingerprints)?;
     let lane = open_lane(&lease)?;
     refuse_unacknowledged_settlement(&lane)?;
@@ -1097,22 +1090,10 @@ fn prepare_transaction(
     )?;
     let intent_bytes = bounded_marker_bytes(&intent, MAX_MARKER_BYTES)
         .map_err(|_| VersionBundleTransactionError::Preparation)?;
-    #[cfg(test)]
-    let intent_write_fault = match test_hook.as_ref() {
-        Some(PublicationTestHook::IntentWriteFault(fault)) => Some(*fault),
-        _ => None,
-    };
-    #[cfg(test)]
-    if intent_write_fault.is_some() {
-        test_hook = None;
-    }
-    #[cfg(test)]
-    let intent_write = match intent_write_fault {
-        Some(fault) => lane.write_new_exact_retained_with_fault(INTENT_NAME, &intent_bytes, fault),
-        None => lane.write_new_exact_retained(INTENT_NAME, &intent_bytes),
-    };
-    #[cfg(not(test))]
-    let intent_write = lane.write_new_exact_retained(INTENT_NAME, &intent_bytes);
+    let intent_write = ManagedCreateOnlyWriteFailure::unacknowledged_if(
+        fault::hit(lane.path(), Fault::VersionIntentUnacknowledged),
+        lane.write_new_exact_retained(INTENT_NAME, &intent_bytes),
+    );
     let intent_guard = match intent_write {
         Ok(guard) => guard,
         Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_)) => {
@@ -2489,31 +2470,15 @@ fn write_settlement(
     lane: &ManagedDir,
     settlement: &PersistedSettlement,
 ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
-    write_settlement_inner(
-        lane,
-        settlement,
-        #[cfg(test)]
-        None,
-    )
-}
-
-fn write_settlement_inner(
-    lane: &ManagedDir,
-    settlement: &PersistedSettlement,
-    #[cfg(test)] fault: Option<ManagedCreateOnlyWriteFault>,
-) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
     let bytes = bounded_marker_bytes(settlement, MAX_MARKER_BYTES).map_err(|_| {
         ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Verify(
             "version bundle settlement marker is invalid".to_string(),
         ))
     })?;
-    #[cfg(test)]
-    let write = match fault {
-        Some(fault) => lane.write_new_exact_retained_with_fault(SETTLEMENT_NAME, &bytes, fault),
-        None => lane.write_new_exact_retained(SETTLEMENT_NAME, &bytes),
-    };
-    #[cfg(not(test))]
-    let write = lane.write_new_exact_retained(SETTLEMENT_NAME, &bytes);
+    let write = ManagedCreateOnlyWriteFailure::unacknowledged_if(
+        fault::hit(lane.path(), Fault::VersionSettlementUnacknowledged),
+        lane.write_new_exact_retained(SETTLEMENT_NAME, &bytes),
+    );
     match write {
         Ok(guard) => Ok(guard),
         Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
@@ -3399,11 +3364,9 @@ fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool 
             PublicationTestHook::PauseAfter { .. }
             | PublicationTestHook::CrashAfterPromotion { .. }
             | PublicationTestHook::ReportFirstMoveUnsettled
-            | PublicationTestHook::IntentWriteFault(_)
             | PublicationTestHook::FailAfterIntent
             | PublicationTestHook::FailSettlementOnce
             | PublicationTestHook::FailSettlementPermanently
-            | PublicationTestHook::SettlementWriteFault(_)
             | PublicationTestHook::FailAfterSettlementMarkerOnce
             | PublicationTestHook::FailAfterCommittedOutcomeOnce,
         ) => false,
@@ -3429,18 +3392,6 @@ pub fn fail_after_promotions_for_test(version_id: &str, promotions: usize) {
         .insert(
             version_id.to_string(),
             PublicationTestHook::FailAfter { promotions },
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn fail_intent_write_after_promotion_for_test(version_id: &str) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::IntentWriteFault(ManagedCreateOnlyWriteFault::Promotion),
         );
 }
 
@@ -3815,21 +3766,7 @@ fn settle_context(
         intent: context.intent.clone(),
         outcome,
     };
-    #[cfg(test)]
-    let settlement_write_fault = match context.test_hook.take() {
-        Some(PublicationTestHook::SettlementWriteFault(fault)) => Some(fault),
-        retained => {
-            context.test_hook = retained;
-            None
-        }
-    };
-    let settlement_guard = write_settlement_inner(
-        &context.lane,
-        &settlement,
-        #[cfg(test)]
-        settlement_write_fault,
-    )
-    .map_err(|_| {
+    let settlement_guard = write_settlement(&context.lane, &settlement).map_err(|_| {
         LoaderError::Verify("version bundle settlement remains indeterminate".to_string())
     })?;
     context.lease.revalidate().map_err(publication_as_loader)?;
@@ -4673,10 +4610,13 @@ mod settlement_tests {
         )
     }
 
-    async fn assert_intent_retry_commits(version_id: &str, inject: impl FnOnce(&str)) {
+    async fn assert_intent_retry_commits(
+        version_id: &str,
+        inject: impl FnOnce(&std::path::Path, &str),
+    ) {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).expect("intent retry root");
         let root = ManagedDir::open_root(temporary.path()).expect("open intent retry root");
-        inject(version_id);
+        inject(temporary.path(), version_id);
         let (authority, settled) = publish_fixture(version_id, root).await;
         let lease = match settled.expect("intent-boundary retry should settle") {
             VersionBundleTransactionSettledOutcome::Committed { lease } => lease,
@@ -4721,19 +4661,17 @@ mod settlement_tests {
 
     #[tokio::test]
     async fn attempted_intent_write_reenters_owned_publication_recovery() {
-        assert_intent_retry_commits(
-            "version-bundle-intent-write-retry",
-            fail_intent_write_after_promotion_for_test,
-        )
+        assert_intent_retry_commits("version-bundle-intent-write-retry", |root, _| {
+            fault::arm(root, Fault::VersionIntentUnacknowledged, None)
+        })
         .await;
     }
 
     #[tokio::test]
     async fn post_intent_failure_reenters_owned_publication_recovery() {
-        assert_intent_retry_commits(
-            "version-bundle-post-intent-retry",
-            fail_after_intent_for_test,
-        )
+        assert_intent_retry_commits("version-bundle-post-intent-retry", |_, version_id| {
+            fail_after_intent_for_test(version_id)
+        })
         .await;
     }
 
@@ -5050,10 +4988,15 @@ mod settlement_tests {
             quarantine,
             version_id,
             ..
-        } = pending_settlement_fixture(PublicationTestHook::SettlementWriteFault(
-            ManagedCreateOnlyWriteFault::Promotion,
-        ))
+        } = pending_settlement_fixture(PublicationTestHook::FailAfter {
+            promotions: usize::MAX,
+        })
         .await;
+        fault::arm(
+            temporary.path(),
+            Fault::VersionSettlementUnacknowledged,
+            None,
+        );
         let lease = match settle_owned_context(
             context,
             SettlementExpectation::PendingFailure {

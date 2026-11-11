@@ -1,5 +1,6 @@
 use crate::download::LocalTransferReader;
 use crate::loaders::types::LoaderError;
+use crate::managed::fault::{self, Fault};
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_fs::{
     Directory, DirectoryCreateOutcome, DirectoryEntry, DirectoryIdentity, DirectoryListingState,
@@ -54,14 +55,6 @@ const MAX_MANAGED_TREE_OPERATION_DEPTH: usize = 64;
 const MAX_MANAGED_TREE_NAME_CANDIDATES: usize = 100;
 const MAX_MANAGED_EFFECT_CONTINUATIONS: usize = 256;
 const MANAGED_IMPORT_SCRATCH_BYTES: u64 = 64 << 10;
-
-#[cfg(test)]
-thread_local! {
-    pub(crate) static FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY: std::cell::Cell<bool>
-        = const { std::cell::Cell::new(false) };
-    pub(crate) static FAIL_NEXT_GUARDED_REMOVAL_AFTER_APPLY: std::cell::Cell<bool>
-        = const { std::cell::Cell::new(false) };
-}
 
 #[cfg(test)]
 type ManagedSha1ReadIdentity = (u64, [u8; 20]);
@@ -789,12 +782,19 @@ pub(crate) enum ManagedCreateOnlyWriteFailure {
     },
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManagedCreateOnlyWriteFault {
-    TempCreated,
-    TempVerified,
-    Promotion,
+impl ManagedCreateOnlyWriteFailure {
+    /// Report a completed write as an unacknowledged promotion when a test fault `fired`.
+    pub(crate) fn unacknowledged_if(
+        fired: bool,
+        write: Result<ManagedFileGuard, Self>,
+    ) -> Result<ManagedFileGuard, Self> {
+        match write {
+            Ok(guard) if fired => Err(Self::PromotionAttempted {
+                final_guard: Some(guard),
+            }),
+            write => write,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1538,6 +1538,7 @@ impl ManagedDir {
         Self::from_directory_with_session_and_path(directory, effects, None, path)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn from_directory_with_session(
         directory: Directory,
         effects: EffectOwner,
@@ -2988,30 +2989,6 @@ impl ManagedDir {
         name: &str,
         bytes: &[u8],
     ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
-        self.write_new_exact_retained_inner(
-            name,
-            bytes,
-            #[cfg(test)]
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn write_new_exact_retained_with_fault(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        fault: ManagedCreateOnlyWriteFault,
-    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
-        self.write_new_exact_retained_inner(name, bytes, Some(fault))
-    }
-
-    fn write_new_exact_retained_inner(
-        &self,
-        name: &str,
-        bytes: &[u8],
-        #[cfg(test)] fault: Option<ManagedCreateOnlyWriteFault>,
-    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
         let name_leaf = leaf(name).map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
         let size = u64::try_from(bytes.len()).map_err(|_| {
             ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Verify(
@@ -3026,37 +3003,15 @@ impl ManagedDir {
         let mut staged = self
             .create_stage()
             .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::TempCreated) {
-            self.discard_stage(staged)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                injected_create_only_write_failure(),
-            ));
-        }
         if let Err(error) = staged.write_all(bytes) {
             self.discard_stage(staged)
                 .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
             return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error.into()));
         }
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::TempVerified) {
-            self.discard_stage(staged)
-                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
-            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
-                injected_create_only_write_failure(),
-            ));
-        }
         let sealed = self
             .seal_stage(staged)
             .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
         let guard = self.promote_create_new(name_leaf, sealed, true)?;
-        #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::Promotion) {
-            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
-                final_guard: Some(guard),
-            });
-        }
         let verified = self
             .read_guarded_file_bounded(name, &guard, size)
             .is_ok_and(|written| written == bytes);
@@ -3441,8 +3396,7 @@ impl ManagedDir {
         destination
             .revalidate_locked(&transition)
             .map_err(|_| ManagedGuardedFileMoveFailure::AppliedUnsettled)?;
-        #[cfg(test)]
-        if FAIL_NEXT_GUARDED_MOVE_AFTER_APPLY.with(|fail| fail.replace(false)) {
+        if fault::hit(self.path(), Fault::GuardedMoveUnsettled) {
             return Err(ManagedGuardedFileMoveFailure::AppliedUnsettled);
         }
         Ok(())
@@ -3645,8 +3599,7 @@ impl ManagedDir {
                 )));
             }
         }
-        #[cfg(test)]
-        if FAIL_NEXT_GUARDED_REMOVAL_AFTER_APPLY.with(|fail| fail.replace(false)) {
+        if fault::hit(self.path(), Fault::GuardedRemovalUnsettled) {
             return Err(AppliedUnsettled(LoaderError::Io(io::Error::other(
                 "injected guarded removal post-effect failure",
             ))));
@@ -4789,13 +4742,6 @@ impl Drop for ManagedPersistentFile {
     }
 }
 
-#[cfg(test)]
-fn injected_create_only_write_failure() -> LoaderError {
-    LoaderError::Io(io::Error::other(
-        "injected managed create-only write failure",
-    ))
-}
-
 fn sha256_file_revision(
     file: &FileCapability,
     revision: &axial_fs::FileRevision,
@@ -5129,20 +5075,7 @@ impl ManagedLibraryOperation {
     /// post-creation failure returns its exact partial cleanup receipt.
     pub async fn publish_native_directory(
         &self,
-        files: Vec<(PortableFileName, Vec<u8>)>,
-    ) -> Result<ManagedNativeDirectory, ManagedNativePublicationFailure> {
-        self.publish_native_directory_inner(
-            files,
-            #[cfg(test)]
-            None,
-        )
-        .await
-    }
-
-    async fn publish_native_directory_inner(
-        &self,
         mut files: Vec<(PortableFileName, Vec<u8>)>,
-        #[cfg(test)] fail_after_promotion: Option<usize>,
     ) -> Result<ManagedNativeDirectory, ManagedNativePublicationFailure> {
         const MANIFEST: &str = ".axial-native-manifest.json";
         if files.is_empty() || files.len() > 4096 {
@@ -5206,25 +5139,15 @@ impl ManagedLibraryOperation {
                 .map_err(|_| io::Error::other("native cleanup lock was poisoned"))?;
             for (index, (name, bytes)) in files.into_iter().enumerate() {
                 self.revalidate()?;
-                #[cfg(test)]
-                let result = if fail_after_promotion == Some(index) {
-                    cleanup.directory.write_new_exact_retained_with_fault(
-                        name.as_str(),
-                        &bytes,
-                        ManagedCreateOnlyWriteFault::Promotion,
-                    )
-                } else {
+                let result = ManagedCreateOnlyWriteFailure::unacknowledged_if(
+                    fault::hit(
+                        cleanup.directory.path(),
+                        Fault::NativeFileUnacknowledged { index },
+                    ),
                     cleanup
                         .directory
-                        .write_new_exact_retained(name.as_str(), &bytes)
-                };
-                #[cfg(not(test))]
-                let result = {
-                    let _ = index;
-                    cleanup
-                        .directory
-                        .write_new_exact_retained(name.as_str(), &bytes)
-                };
+                        .write_new_exact_retained(name.as_str(), &bytes),
+                );
                 match result {
                     Ok(guard) => cleanup.guards.push((name, guard)),
                     Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
@@ -7828,24 +7751,22 @@ mod library_lifecycle_tests {
             tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
         let operation = root.try_acquire().unwrap();
+        fault::arm_here(Fault::NativeFileUnacknowledged { index: 1 }, None);
         let failure = match operation
-            .publish_native_directory_inner(
-                vec![
-                    (
-                        PortableFileName::new_exact("first.bin").unwrap(),
-                        b"first native".to_vec(),
-                    ),
-                    (
-                        PortableFileName::new_exact("second.bin").unwrap(),
-                        b"second native".to_vec(),
-                    ),
-                    (
-                        PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
-                        b"{}".to_vec(),
-                    ),
-                ],
-                Some(1),
-            )
+            .publish_native_directory(vec![
+                (
+                    PortableFileName::new_exact("first.bin").unwrap(),
+                    b"first native".to_vec(),
+                ),
+                (
+                    PortableFileName::new_exact("second.bin").unwrap(),
+                    b"second native".to_vec(),
+                ),
+                (
+                    PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
+                    b"{}".to_vec(),
+                ),
+            ])
             .await
         {
             Err(failure) => failure,

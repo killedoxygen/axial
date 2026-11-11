@@ -12,6 +12,7 @@ use crate::managed::component::table::{
     MAX_COMPONENT_TABLE_SHARDS, MAX_CREATED_ANCESTORS, ManagedComponentKind, component_table_path,
     decode_component_table_shard, encode_component_intent_manifest,
 };
+use crate::managed::fault::{self, Fault};
 use crate::managed::fs::{
     MAX_MANAGED_TEMP_ENTRIES, ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity,
     ManagedEmptyChildRemoval, ManagedFileGuard, ManagedFileIdentity, ManagedPassiveFileRevision,
@@ -23,22 +24,14 @@ use std::collections::BTreeSet;
 
 mod transaction;
 
-#[cfg(test)]
-pub(crate) use transaction::{
-    ComponentExecutionFault, ComponentSettlementFault, execute_component_intent_with_fault,
-    settle_component_transaction_with_fault,
-};
 pub(crate) use transaction::{
     ComponentExecutionResult, ComponentIntentPublicationRecovery,
     ComponentPriorRecoveryRetryResult, ComponentRecoveryRequired, ComponentRecoveryRetryResult,
     ComponentSettledOutcome, ComponentSettlementResult, ComponentStartupRecoveryResult,
-    ComponentTransactionReceipt, execute_component_intent, recover_component_intent_publication,
-    recover_component_transaction, retry_component_recovery, retry_component_settlement,
-    retry_prior_component_recovery, settle_component_transaction,
+    execute_component_intent, recover_component_intent_publication, recover_component_transaction,
+    retry_component_recovery, retry_component_settlement, retry_prior_component_recovery,
+    settle_component_transaction,
 };
-
-#[cfg(test)]
-use crate::managed::fs::ManagedCreateOnlyWriteFault;
 
 const MAX_COMPONENT_LANE_ENTRIES: usize = 7;
 const COMPONENT_ANCESTORS_DIRECTORY: &str = "ancestors";
@@ -140,15 +133,6 @@ pub(crate) enum ComponentIntentPublishFailure {
         candidate: Box<ComponentIntentCandidate>,
         intent_guard: Option<ManagedFileGuard>,
     },
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ComponentIntentPublishFault {
-    BeforeMarkerPromotion,
-    PromotionAttemptedWithoutMarker,
-    AfterMarkerPromotion,
-    AfterLeaseRevalidated,
 }
 
 #[derive(Eq, PartialEq)]
@@ -513,24 +497,6 @@ impl ComponentIntentCandidate {
     pub(crate) fn publish_intent(
         self,
     ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
-        self.publish_intent_inner(
-            #[cfg(test)]
-            None,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn publish_intent_with_fault(
-        self,
-        fault: ComponentIntentPublishFault,
-    ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
-        self.publish_intent_inner(Some(fault))
-    }
-
-    fn publish_intent_inner(
-        self,
-        #[cfg(test)] fault: Option<ComponentIntentPublishFault>,
-    ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
         let (current_summary, current_authority) =
             match admit_component_preintent(&self.lane, &self.lease, &self.manifest) {
                 Ok(admitted) => admitted,
@@ -557,39 +523,25 @@ impl ComponentIntentCandidate {
                     });
                 }
             };
-        #[cfg(test)]
-        if fault == Some(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker) {
+        let lane = self.lane.lane.path();
+        if fault::hit(lane, Fault::IntentWithoutMarker) {
             return Err(ComponentIntentPublishFailure::PromotionAttempted {
                 candidate: Box::new(self),
                 intent_guard: None,
             });
         }
-        #[cfg(test)]
-        let marker_result = match fault {
-            Some(ComponentIntentPublishFault::BeforeMarkerPromotion) => {
-                self.lane.lane.write_new_exact_retained_with_fault(
-                    COMPONENT_INTENT_FILE,
-                    &self.encoded_intent,
-                    ManagedCreateOnlyWriteFault::TempVerified,
-                )
-            }
-            Some(ComponentIntentPublishFault::AfterMarkerPromotion) => {
-                self.lane.lane.write_new_exact_retained_with_fault(
-                    COMPONENT_INTENT_FILE,
-                    &self.encoded_intent,
-                    ManagedCreateOnlyWriteFault::Promotion,
-                )
-            }
-            _ => self
-                .lane
-                .lane
-                .write_new_exact_retained(COMPONENT_INTENT_FILE, &self.encoded_intent),
+        let marker_result = if fault::hit(lane, Fault::IntentBeforePromotion) {
+            Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                LoaderError::Io(std::io::Error::other("injected intent marker failure")),
+            ))
+        } else {
+            ManagedCreateOnlyWriteFailure::unacknowledged_if(
+                fault::hit(lane, Fault::IntentUnacknowledged),
+                self.lane
+                    .lane
+                    .write_new_exact_retained(COMPONENT_INTENT_FILE, &self.encoded_intent),
+            )
         };
-        #[cfg(not(test))]
-        let marker_result = self
-            .lane
-            .lane
-            .write_new_exact_retained(COMPONENT_INTENT_FILE, &self.encoded_intent);
         let intent_guard = match marker_result {
             Ok(guard) => guard,
             Err(ManagedCreateOnlyWriteFailure::BeforePromotion(cause)) => {
@@ -605,14 +557,7 @@ impl ComponentIntentCandidate {
                 });
             }
         };
-        if finish_component_intent_publication(
-            &self,
-            &intent_guard,
-            #[cfg(test)]
-            fault,
-        )
-        .is_err()
-        {
+        if finish_component_intent_publication(&self, &intent_guard).is_err() {
             return Err(ComponentIntentPublishFailure::PromotionAttempted {
                 candidate: Box::new(self),
                 intent_guard: Some(intent_guard),
@@ -1109,7 +1054,6 @@ fn validate_indexed_names(
 fn finish_component_intent_publication(
     candidate: &ComponentIntentCandidate,
     intent_guard: &ManagedFileGuard,
-    #[cfg(test)] fault: Option<ComponentIntentPublishFault>,
 ) -> Result<(), ComponentEffectsError> {
     if intent_guard.size()
         != u64::try_from(candidate.encoded_intent.len())
@@ -1134,8 +1078,10 @@ fn finish_component_intent_publication(
     }
     validate_empty_ancestor_topology(&candidate.lane)?;
     candidate.lease.revalidate()?;
-    #[cfg(test)]
-    if fault == Some(ComponentIntentPublishFault::AfterLeaseRevalidated) {
+    if fault::hit(
+        candidate.lane.lane.path(),
+        Fault::IntentAfterLeaseRevalidated,
+    ) {
         return Err(ComponentEffectsError::Topology);
     }
     if !candidate
@@ -1962,8 +1908,35 @@ mod tests {
         ComponentShardDescriptor, ComponentTableBuilder, ComponentTableRow,
         ManagedComponentArtifactKind,
     };
+    use crate::managed::fault::{self, Fault};
     use sha2::{Digest as _, Sha256};
     use std::fs;
+
+    async fn execute_faulted(
+        temporary: &tempfile::TempDir,
+        fault: Fault,
+        published: ComponentIntentPublished,
+    ) -> ComponentExecutionResult {
+        fault::arm(temporary.path(), fault, None);
+        execute_component_intent(published).await
+    }
+
+    async fn settle_faulted(
+        temporary: &tempfile::TempDir,
+        fault: Fault,
+        receipt: transaction::ComponentTransactionReceipt,
+    ) -> ComponentSettlementResult {
+        fault::arm(temporary.path(), fault, None);
+        settle_component_transaction(receipt).await
+    }
+
+    fn publish_faulted(
+        candidate: ComponentIntentCandidate,
+        fault: Fault,
+    ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
+        fault::arm(candidate.lane.lane.path(), fault, None);
+        candidate.publish_intent()
+    }
 
     #[cfg(target_os = "linux")]
     fn open_fds_beneath(root: &std::path::Path) -> usize {
@@ -2817,11 +2790,7 @@ mod tests {
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
 
-        let result = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::AfterFirstRow,
-        )
-        .await;
+        let result = execute_faulted(&temporary, Fault::RowFailure, published).await;
 
         assert!(matches!(result, ComponentExecutionResult::RolledBack(_)));
         assert!(!temporary.path().join("libraries").exists());
@@ -2850,11 +2819,7 @@ mod tests {
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
 
-        let result = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::UnsettledAfterFirstRow,
-        )
-        .await;
+        let result = execute_faulted(&temporary, Fault::RowUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = result else {
             panic!("unsettled row move must retain recovery authority")
         };
@@ -2902,11 +2867,7 @@ mod tests {
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
         let ComponentExecutionResult::RolledBack(receipt) =
-            transaction::execute_component_intent_with_fault(
-                published,
-                transaction::ComponentExecutionFault::AfterFirstRow,
-            )
-            .await
+            execute_faulted(&temporary, Fault::RowFailure, published).await
         else {
             panic!("injected execution failure must roll back")
         };
@@ -2924,16 +2885,14 @@ mod tests {
 
     #[tokio::test]
     async fn component_settlement_retries_every_durable_frontier() {
-        use transaction::ComponentSettlementFault;
-
         for fault in [
-            ComponentSettlementFault::AfterSettlementPromotion,
-            ComponentSettlementFault::AfterStagingBucket,
-            ComponentSettlementFault::AfterQuarantineBucket,
-            ComponentSettlementFault::AfterTableShard,
-            ComponentSettlementFault::AfterOutcomeRemoval,
-            ComponentSettlementFault::AfterIntentRemoval,
-            ComponentSettlementFault::AfterSettlementRemoval,
+            Fault::AfterSettlementPromotion,
+            Fault::AfterStagingBucket,
+            Fault::AfterQuarantineBucket,
+            Fault::AfterTableShard,
+            Fault::AfterOutcomeRemoval,
+            Fault::AfterIntentRemoval,
+            Fault::AfterSettlementRemoval,
         ] {
             let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_replacement_row_candidate(&temporary)
@@ -2946,7 +2905,7 @@ mod tests {
                 panic!("frontier fixture must commit")
             };
             let ComponentSettlementResult::Retry(retry) =
-                transaction::settle_component_transaction_with_fault(receipt, fault).await
+                settle_faulted(&temporary, fault, receipt).await
             else {
                 panic!("fault must retain settlement retry authority")
             };
@@ -2962,12 +2921,7 @@ mod tests {
 
     #[tokio::test]
     async fn component_settlement_retries_committed_and_rolled_back_ancestor_frontiers() {
-        use transaction::ComponentSettlementFault;
-
-        for fault in [
-            ComponentSettlementFault::AfterAncestorBucket,
-            ComponentSettlementFault::AfterAncestorRecord,
-        ] {
+        for fault in [Fault::AfterAncestorBucket, Fault::AfterAncestorRecord] {
             let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_absent_row_candidate(&temporary)
                 .await
@@ -2979,7 +2933,7 @@ mod tests {
                 panic!("committed ancestor fixture must commit")
             };
             let ComponentSettlementResult::Retry(retry) =
-                transaction::settle_component_transaction_with_fault(receipt, fault).await
+                settle_faulted(&temporary, fault, receipt).await
             else {
                 panic!("committed ancestor frontier must be retryable")
             };
@@ -2994,16 +2948,12 @@ mod tests {
                 .publish_intent()
                 .unwrap_or_else(|_| panic!("publish component intent"));
             let ComponentExecutionResult::RolledBack(receipt) =
-                transaction::execute_component_intent_with_fault(
-                    published,
-                    transaction::ComponentExecutionFault::AfterFirstRow,
-                )
-                .await
+                execute_faulted(&temporary, Fault::RowFailure, published).await
             else {
                 panic!("rolled-back ancestor fixture must roll back")
             };
             let ComponentSettlementResult::Retry(retry) =
-                transaction::settle_component_transaction_with_fault(receipt, fault).await
+                settle_faulted(&temporary, fault, receipt).await
             else {
                 panic!("rolled-back ancestor frontier must be retryable")
             };
@@ -3017,12 +2967,10 @@ mod tests {
 
     #[tokio::test]
     async fn startup_resumes_each_settlement_marker_suffix() {
-        use transaction::ComponentSettlementFault;
-
         for fault in [
-            ComponentSettlementFault::AfterSettlementPromotion,
-            ComponentSettlementFault::AfterOutcomeRemoval,
-            ComponentSettlementFault::AfterIntentRemoval,
+            Fault::AfterSettlementPromotion,
+            Fault::AfterOutcomeRemoval,
+            Fault::AfterIntentRemoval,
         ] {
             let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let published = single_absent_row_candidate(&temporary)
@@ -3035,7 +2983,7 @@ mod tests {
                 panic!("startup settlement fixture must commit")
             };
             let ComponentSettlementResult::Retry(retry) =
-                transaction::settle_component_transaction_with_fault(receipt, fault).await
+                settle_faulted(&temporary, fault, receipt).await
             else {
                 panic!("fault must retain settlement retry authority")
             };
@@ -3068,11 +3016,7 @@ mod tests {
             panic!("invalid suffix fixture must commit")
         };
         let ComponentSettlementResult::Retry(retry) =
-            transaction::settle_component_transaction_with_fault(
-                receipt,
-                transaction::ComponentSettlementFault::AfterSettlementPromotion,
-            )
-            .await
+            settle_faulted(&temporary, Fault::AfterSettlementPromotion, receipt).await
         else {
             panic!("settlement marker fault must be retryable")
         };
@@ -3108,11 +3052,7 @@ mod tests {
             panic!("foreign obstruction fixture must commit")
         };
         let ComponentSettlementResult::Retry(retry) =
-            transaction::settle_component_transaction_with_fault(
-                receipt,
-                transaction::ComponentSettlementFault::AfterSettlementPromotion,
-            )
-            .await
+            settle_faulted(&temporary, Fault::AfterSettlementPromotion, receipt).await
         else {
             panic!("settlement marker fault must be retryable")
         };
@@ -3151,11 +3091,7 @@ mod tests {
             panic!("marker replacement fixture must commit")
         };
         let ComponentSettlementResult::Retry(retry) =
-            transaction::settle_component_transaction_with_fault(
-                receipt,
-                transaction::ComponentSettlementFault::AfterSettlementPromotion,
-            )
-            .await
+            settle_faulted(&temporary, Fault::AfterSettlementPromotion, receipt).await
         else {
             panic!("settlement marker fault must be retryable")
         };
@@ -3178,20 +3114,12 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let rolled_back = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::AfterFirstRow,
-        )
-        .await;
+        let rolled_back = execute_faulted(&temporary, Fault::RowFailure, published).await;
         let ComponentExecutionResult::RolledBack(receipt) = rolled_back else {
             panic!("park replacement fixture must roll back")
         };
         let ComponentSettlementResult::Retry(retry) =
-            transaction::settle_component_transaction_with_fault(
-                receipt,
-                transaction::ComponentSettlementFault::AfterSettlementPromotion,
-            )
-            .await
+            settle_faulted(&temporary, Fault::AfterSettlementPromotion, receipt).await
         else {
             panic!("settlement marker fault must be retryable")
         };
@@ -3224,11 +3152,7 @@ mod tests {
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
 
-        let result = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::OutcomePromotionAttempted,
-        )
-        .await;
+        let result = execute_faulted(&temporary, Fault::OutcomeUnacknowledged, published).await;
 
         let ComponentExecutionResult::RecoveryRequired(recovery) = result else {
             panic!("attempted outcome must retain recovery authority");
@@ -3396,11 +3320,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstRow,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::RowUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("injected row crash must retain recovery authority")
         };
@@ -3434,11 +3354,8 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstReplacementQuarantine,
-        )
-        .await;
+        let crashed =
+            execute_faulted(&temporary, Fault::ReplacementQuarantineUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("injected replacement crash must retain recovery authority")
         };
@@ -3459,11 +3376,8 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstReplacementQuarantine,
-        )
-        .await;
+        let crashed =
+            execute_faulted(&temporary, Fault::ReplacementQuarantineUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("injected replacement crash must retain recovery authority")
         };
@@ -3498,11 +3412,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashBeforeOutcome,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::OutcomeUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("pre-outcome crash must retain recovery authority")
         };
@@ -3525,11 +3435,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let rolled_back = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::AfterFirstRow,
-        )
-        .await;
+        let rolled_back = execute_faulted(&temporary, Fault::RowFailure, published).await;
         let ComponentExecutionResult::RolledBack(receipt) = rolled_back else {
             panic!("live failure must publish rolled-back outcome")
         };
@@ -3547,11 +3453,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::AncestorUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("ancestor crash must retain recovery authority")
         };
@@ -3566,11 +3468,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::AncestorUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("ancestor crash must retain recovery authority")
         };
@@ -3601,11 +3499,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::AncestorUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("ancestor crash must retain recovery authority")
         };
@@ -3636,11 +3530,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::AncestorUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("ancestor crash must retain recovery authority")
         };
@@ -3665,11 +3555,7 @@ mod tests {
             .await
             .publish_intent()
             .unwrap_or_else(|_| panic!("publish component intent"));
-        let crashed = transaction::execute_component_intent_with_fault(
-            published,
-            transaction::ComponentExecutionFault::CrashBeforeFirstAncestorJournal,
-        )
-        .await;
+        let crashed = execute_faulted(&temporary, Fault::AncestorJournalUnsettled, published).await;
         let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
             panic!("unjournaled ancestor crash must retain recovery authority")
         };
@@ -3797,9 +3683,7 @@ mod tests {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let lane_path = candidate.lane.lane.path().to_path_buf();
-        let before = match candidate
-            .publish_intent_with_fault(ComponentIntentPublishFault::BeforeMarkerPromotion)
-        {
+        let before = match publish_faulted(candidate, Fault::IntentBeforePromotion) {
             Err(failure) => failure,
             Ok(_) => panic!("injected pre-promotion failure was ignored"),
         };
@@ -3813,9 +3697,7 @@ mod tests {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
         let lane_path = candidate.lane.lane.path().to_path_buf();
-        let attempted = match candidate
-            .publish_intent_with_fault(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker)
-        {
+        let attempted = match publish_faulted(candidate, Fault::IntentWithoutMarker) {
             Err(failure) => failure,
             Ok(_) => panic!("injected attempted promotion without a marker was ignored"),
         };
@@ -3829,13 +3711,13 @@ mod tests {
         assert!((*candidate).publish_intent().is_ok());
 
         for fault in [
-            ComponentIntentPublishFault::AfterMarkerPromotion,
-            ComponentIntentPublishFault::AfterLeaseRevalidated,
+            Fault::IntentUnacknowledged,
+            Fault::IntentAfterLeaseRevalidated,
         ] {
             let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
             let candidate = single_absent_row_candidate(&temporary).await;
             let lane_path = candidate.lane.lane.path().to_path_buf();
-            let attempted = match candidate.publish_intent_with_fault(fault) {
+            let attempted = match publish_faulted(candidate, fault) {
                 Err(failure) => failure,
                 Ok(_) => panic!("injected post-promotion failure was ignored"),
             };
@@ -3860,9 +3742,7 @@ mod tests {
         let candidate = single_absent_row_candidate(&temporary).await;
         let intent = candidate.lane.lane.path().join(COMPONENT_INTENT_FILE);
         let saved = temporary.path().join("saved-attempted-intent");
-        let attempted = match candidate
-            .publish_intent_with_fault(ComponentIntentPublishFault::AfterMarkerPromotion)
-        {
+        let attempted = match publish_faulted(candidate, Fault::IntentUnacknowledged) {
             Err(failure) => failure,
             Ok(_) => panic!("injected attempted marker promotion was ignored"),
         };

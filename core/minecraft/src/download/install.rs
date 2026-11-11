@@ -63,8 +63,6 @@ use crate::loaders::{
     VerifiedLoaderInstallBaseCommit,
 };
 use crate::managed::blocking::ManagedBlockingWorkers;
-#[cfg(test)]
-use crate::managed::component::lifecycle::publish_managed_component_effect_rolling_back_after_first_row_for_test;
 use crate::managed::component::lifecycle::{
     ManagedComponentLifecycleOutcome, publish_managed_component_effect,
 };
@@ -3551,8 +3549,17 @@ async fn publish_managed_install_publication_seed_owned(
     #[cfg(test)]
     maybe_panic_managed_install_owner_after_lease_for_test(&observer_key);
     #[cfg(test)]
-    let rollback_component =
-        take_managed_install_component_rollback_after_first_row_for_test(&observer_key);
+    if let Some(component) =
+        take_managed_install_component_rollback_after_first_row_for_test(&observer_key)
+    {
+        crate::managed::fault::arm(
+            &lease.publication_directory().path().join(
+                crate::managed::component::publication::component_lane_name(component),
+            ),
+            crate::managed::fault::Fault::RowFailure,
+            None,
+        );
+    }
     let outcome = {
         let seed = guard.seed();
         publish_managed_projection_sequence(
@@ -3564,8 +3571,6 @@ async fn publish_managed_install_publication_seed_owned(
                 .map(RetainedLibraryComponentSource::retained_replay)
                 .collect(),
             seed.version_bundle_source.clone(),
-            #[cfg(test)]
-            rollback_component,
         )
         .await
     };
@@ -3616,27 +3621,12 @@ async fn publish_managed_projection_sequence(
     asset_sources: Vec<RetainedAssetComponentSource>,
     library_sources: Vec<RetainedLibraryComponentSource>,
     version_bundle_source: AuthenticatedVersionBundleSource,
-    #[cfg(test)] rollback_component: Option<ManagedComponentKind>,
 ) -> Result<ManagedProjectionSequenceOutcome, ManagedProjectionSequenceError> {
     let assets = authority
         .component_projection(ManagedKnownGoodComponent::Assets)
         .map_err(|_| {
             ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::Assets)
         })?;
-    #[cfg(test)]
-    let assets = if rollback_component == Some(ManagedComponentKind::Assets) {
-        publish_managed_component_effect_rolling_back_after_first_row_for_test(
-            lease,
-            assets,
-            ManagedComponentKind::Assets,
-            asset_sources,
-        )
-        .await
-    } else {
-        publish_managed_component_effect(lease, assets, ManagedComponentKind::Assets, asset_sources)
-            .await
-    };
-    #[cfg(not(test))]
     let assets = publish_managed_component_effect(
         lease,
         assets,
@@ -3659,25 +3649,6 @@ async fn publish_managed_projection_sequence(
         .map_err(|_| {
             ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::Libraries)
         })?;
-    #[cfg(test)]
-    let libraries = if rollback_component == Some(ManagedComponentKind::Libraries) {
-        publish_managed_component_effect_rolling_back_after_first_row_for_test(
-            lease,
-            libraries,
-            ManagedComponentKind::Libraries,
-            library_sources,
-        )
-        .await
-    } else {
-        publish_managed_component_effect(
-            lease,
-            libraries,
-            ManagedComponentKind::Libraries,
-            library_sources,
-        )
-        .await
-    };
-    #[cfg(not(test))]
     let libraries = publish_managed_component_effect(
         lease,
         libraries,

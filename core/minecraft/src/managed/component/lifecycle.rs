@@ -5,6 +5,8 @@ use crate::known_good::{
     ManagedKnownGoodComponent,
 };
 use crate::loaders::types::LoaderError;
+#[cfg(test)]
+use crate::managed::component::effects::plan_component_canonical_path;
 use crate::managed::component::effects::{
     ComponentCanonicalObservation, ComponentCanonicalParents, ComponentEffectsError,
     ComponentExecutionResult, ComponentIntentCandidate, ComponentIntentPublicationRecovery,
@@ -15,18 +17,13 @@ use crate::managed::component::effects::{
     retry_component_recovery, retry_component_settlement, retry_prior_component_recovery,
     settle_component_transaction,
 };
-#[cfg(test)]
-use crate::managed::component::effects::{
-    ComponentExecutionFault, ComponentIntentPublishFault, ComponentSettlementFault,
-    execute_component_intent_with_fault, plan_component_canonical_path,
-    settle_component_transaction_with_fault,
-};
 use crate::managed::component::spool::{ComponentTableSpool, ComponentTableSpoolError};
 use crate::managed::component::table::{
     COMPONENT_TABLE_ROWS_PER_SHARD, ComponentIntentManifest, ComponentPriorFile,
     ComponentTableBuilder, ComponentTableError, ComponentTableRow, ComponentTableSummary,
     ManagedComponentArtifactKind, ManagedComponentKind,
 };
+use crate::managed::fault::{self, Fault};
 use crate::managed::fs::{ManagedDir, ManagedFileIdentity, ManagedPassiveFileRevision};
 use crate::managed::publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
@@ -199,15 +196,6 @@ enum ComponentProgress {
     Settlement(ComponentSettlementResult),
 }
 
-#[cfg(test)]
-#[derive(Default)]
-struct ComponentLifecycleTestFaults {
-    intent: Option<ComponentIntentPublishFault>,
-    execution: Option<ComponentExecutionFault>,
-    settlement: Option<ComponentSettlementFault>,
-    no_effect_before_final_validation: Option<Box<dyn FnOnce() + Send>>,
-}
-
 impl ComponentRetryBackoff {
     fn new() -> Self {
         Self {
@@ -225,12 +213,11 @@ impl ComponentRetryBackoff {
 }
 
 #[cfg(test)]
-async fn publish_managed_component_with_faults<S>(
+async fn publish_managed_component<S>(
     lease: ManagedRootPublicationLease,
     authority: &PendingKnownGoodInstallAuthority,
     component: ManagedComponentKind,
     sources: Vec<S>,
-    faults: &mut ComponentLifecycleTestFaults,
 ) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
 where
     S: RetainedComponentPublicationSource + 'static,
@@ -239,8 +226,7 @@ where
     let projection = authority
         .component_projection(known_good_component)
         .map_err(|_| PrepareComponentIntentError::Projection)?;
-    publish_managed_component_effect_inner(lease, projection, component, sources, Some(faults))
-        .await
+    publish_managed_component_effect(lease, projection, component, sources).await
 }
 
 pub(crate) async fn publish_managed_component_effect<S>(
@@ -248,45 +234,6 @@ pub(crate) async fn publish_managed_component_effect<S>(
     projection: ManagedComponentProjection<'_>,
     component: ManagedComponentKind,
     sources: Vec<S>,
-) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
-where
-    S: RetainedComponentPublicationSource + 'static,
-{
-    publish_managed_component_effect_inner(
-        lease,
-        projection,
-        component,
-        sources,
-        #[cfg(test)]
-        None,
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(crate) async fn publish_managed_component_effect_rolling_back_after_first_row_for_test<S>(
-    lease: ManagedRootPublicationLease,
-    projection: ManagedComponentProjection<'_>,
-    component: ManagedComponentKind,
-    sources: Vec<S>,
-) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
-where
-    S: RetainedComponentPublicationSource + 'static,
-{
-    let mut faults = ComponentLifecycleTestFaults {
-        execution: Some(ComponentExecutionFault::AfterFirstRow),
-        ..ComponentLifecycleTestFaults::default()
-    };
-    publish_managed_component_effect_inner(lease, projection, component, sources, Some(&mut faults))
-        .await
-}
-
-async fn publish_managed_component_effect_inner<S>(
-    lease: ManagedRootPublicationLease,
-    projection: ManagedComponentProjection<'_>,
-    component: ManagedComponentKind,
-    sources: Vec<S>,
-    #[cfg(test)] mut faults: Option<&mut ComponentLifecycleTestFaults>,
 ) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
 where
     S: RetainedComponentPublicationSource + 'static,
@@ -299,13 +246,7 @@ where
             return Err(PrepareComponentIntentError::SourceSet.into());
         }
         drop(sources);
-        #[cfg(test)]
-        if let Some(hook) = faults
-            .as_deref_mut()
-            .and_then(|faults| faults.no_effect_before_final_validation.take())
-        {
-            hook();
-        }
+        fault::hit(lease.root().path(), Fault::ExactBeforeFinalValidation);
         let lease =
             revalidate_exact_component_projection(lease, component, planned.table_rows).await?;
         return Ok(ManagedComponentLifecycleOutcome::Committed(
@@ -322,20 +263,8 @@ where
     )
     .await?;
     let mut backoff = ComponentRetryBackoff::new();
-    let execution = publish_current_component_intent(
-        candidate,
-        &mut backoff,
-        #[cfg(test)]
-        faults.as_deref_mut(),
-    )
-    .await?;
-    let settled = normalize_current_component_transaction(
-        execution,
-        &mut backoff,
-        #[cfg(test)]
-        faults,
-    )
-    .await?;
+    let execution = publish_current_component_intent(candidate, &mut backoff).await?;
+    let settled = normalize_current_component_transaction(execution, &mut backoff).await?;
     match settled {
         ComponentSettledOutcome::Committed(lease) => Ok(
             ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt { lease }),
@@ -368,28 +297,10 @@ async fn settle_prior_component_transaction(
 async fn publish_current_component_intent(
     mut candidate: ComponentIntentCandidate,
     backoff: &mut ComponentRetryBackoff,
-    #[cfg(test)] mut faults: Option<&mut ComponentLifecycleTestFaults>,
 ) -> Result<ComponentExecutionResult, ComponentLifecycleError> {
     loop {
-        #[cfg(test)]
-        let publication = match faults
-            .as_deref_mut()
-            .and_then(|faults| faults.intent.take())
-        {
-            Some(fault) => candidate.publish_intent_with_fault(fault),
-            None => candidate.publish_intent(),
-        };
-        #[cfg(not(test))]
-        let publication = candidate.publish_intent();
-        match publication {
-            Ok(published) => {
-                return Ok(execute_current_component_intent(
-                    published,
-                    #[cfg(test)]
-                    faults.as_deref_mut(),
-                )
-                .await);
-            }
+        match candidate.publish_intent() {
+            Ok(published) => return Ok(execute_component_intent(published).await),
             Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
                 drop(candidate);
                 return Err(ComponentLifecycleError::BeforeEffects(cause));
@@ -427,21 +338,13 @@ async fn publish_current_component_intent(
 async fn normalize_current_component_transaction(
     execution: ComponentExecutionResult,
     backoff: &mut ComponentRetryBackoff,
-    #[cfg(test)] mut faults: Option<&mut ComponentLifecycleTestFaults>,
 ) -> Result<ComponentSettledOutcome, ComponentLifecycleError> {
     let mut progress = ComponentProgress::Execution(execution);
     loop {
         progress = match progress {
             ComponentProgress::Execution(ComponentExecutionResult::Committed(receipt))
             | ComponentProgress::Execution(ComponentExecutionResult::RolledBack(receipt)) => {
-                ComponentProgress::Settlement(
-                    settle_current_component_transaction(
-                        receipt,
-                        #[cfg(test)]
-                        faults.as_deref_mut(),
-                    )
-                    .await,
-                )
+                ComponentProgress::Settlement(settle_component_transaction(receipt).await)
             }
             ComponentProgress::Execution(ComponentExecutionResult::RecoveryRequired(recovery)) => {
                 ComponentProgress::Recovery(recovery)
@@ -454,13 +357,7 @@ async fn normalize_current_component_transaction(
                     }
                     ComponentRecoveryRetryResult::RetryIntent(candidate) => {
                         ComponentProgress::Execution(
-                            publish_current_component_intent(
-                                *candidate,
-                                backoff,
-                                #[cfg(test)]
-                                faults.as_deref_mut(),
-                            )
-                            .await?,
+                            publish_current_component_intent(*candidate, backoff).await?,
                         )
                     }
                     ComponentRecoveryRetryResult::Transaction(execution) => {
@@ -505,13 +402,7 @@ async fn normalize_prior_component_transaction(
                     }
                     ComponentPriorRecoveryRetryResult::RetryIntent(candidate) => {
                         ComponentProgress::Execution(
-                            publish_current_component_intent(
-                                *candidate,
-                                backoff,
-                                #[cfg(test)]
-                                None,
-                            )
-                            .await?,
+                            publish_current_component_intent(*candidate, backoff).await?,
                         )
                     }
                     ComponentPriorRecoveryRetryResult::Transaction(execution) => {
@@ -535,28 +426,6 @@ fn settled_component_lease(outcome: ComponentSettledOutcome) -> ManagedRootPubli
         ComponentSettledOutcome::Committed(lease)
         | ComponentSettledOutcome::RolledBack { lease, .. } => lease,
     }
-}
-
-async fn execute_current_component_intent(
-    published: crate::managed::component::effects::ComponentIntentPublished,
-    #[cfg(test)] faults: Option<&mut ComponentLifecycleTestFaults>,
-) -> ComponentExecutionResult {
-    #[cfg(test)]
-    if let Some(fault) = faults.and_then(|faults| faults.execution.take()) {
-        return execute_component_intent_with_fault(published, fault).await;
-    }
-    execute_component_intent(published).await
-}
-
-async fn settle_current_component_transaction(
-    receipt: crate::managed::component::effects::ComponentTransactionReceipt,
-    #[cfg(test)] faults: Option<&mut ComponentLifecycleTestFaults>,
-) -> ComponentSettlementResult {
-    #[cfg(test)]
-    if let Some(fault) = faults.and_then(|faults| faults.settlement.take()) {
-        return settle_component_transaction_with_fault(receipt, fault).await;
-    }
-    settle_component_transaction(receipt).await
 }
 
 #[cfg(test)]
@@ -1370,14 +1239,12 @@ mod tests {
                 .join_under(&temporary.path().join(component_root_name(component)));
             fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
             fs::write(&canonical, &bytes).unwrap();
-            let mut faults = ComponentLifecycleTestFaults::default();
 
-            let outcome = publish_managed_component_with_faults(
+            let outcome = publish_managed_component(
                 test_lease(&temporary).await,
                 &authority,
                 component,
                 vec![source],
-                &mut faults,
             )
             .await
             .expect("exact component no-effect publication");
@@ -1416,14 +1283,12 @@ mod tests {
             fs::write(canonical, &source.bytes).unwrap();
         }
         let authority = test_authority(ManagedComponentKind::Libraries, &sources);
-        let mut faults = ComponentLifecycleTestFaults::default();
 
-        let outcome = publish_managed_component_with_faults::<TestSource>(
+        let outcome = publish_managed_component::<TestSource>(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
             Vec::new(),
-            &mut faults,
         )
         .await
         .expect("large exact projection must stream file guards");
@@ -1456,14 +1321,12 @@ mod tests {
                 b"other-component".to_vec(),
             );
             let authority = test_authority(other_component, &[other_source]);
-            let mut faults = ComponentLifecycleTestFaults::default();
 
-            let outcome = publish_managed_component_with_faults::<TestSource>(
+            let outcome = publish_managed_component::<TestSource>(
                 test_lease(&temporary).await,
                 &authority,
                 component,
                 Vec::new(),
-                &mut faults,
             )
             .await
             .expect("empty projection no-effect publication");
@@ -1495,19 +1358,19 @@ mod tests {
         fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
         fs::write(&canonical, b"expected").unwrap();
         let mutation_path = canonical.clone();
-        let mut faults = ComponentLifecycleTestFaults {
-            no_effect_before_final_validation: Some(Box::new(move || {
+        fault::arm(
+            temporary.path(),
+            Fault::ExactBeforeFinalValidation,
+            Some(Box::new(move || {
                 fs::write(mutation_path, b"mutated!").expect("same-size mutation");
             })),
-            ..ComponentLifecycleTestFaults::default()
-        };
+        );
 
-        let error = match publish_managed_component_with_faults::<TestSource>(
+        let error = match publish_managed_component::<TestSource>(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
             Vec::new(),
-            &mut faults,
         )
         .await
         {
@@ -1558,21 +1421,21 @@ mod tests {
         let reached_no_effect = Arc::new(AtomicUsize::new(0));
         let hook_counter = Arc::clone(&reached_no_effect);
         let hook_lane = lane.clone();
-        let mut faults = ComponentLifecycleTestFaults {
-            no_effect_before_final_validation: Some(Box::new(move || {
+        fault::arm(
+            temporary.path(),
+            Fault::ExactBeforeFinalValidation,
+            Some(Box::new(move || {
                 assert!(!hook_lane.join("outcome.bin").exists());
                 assert!(!hook_lane.join("settlement.bin").exists());
                 hook_counter.fetch_add(1, Ordering::SeqCst);
             })),
-            ..ComponentLifecycleTestFaults::default()
-        };
+        );
 
-        let outcome = publish_managed_component_with_faults::<TestSource>(
+        let outcome = publish_managed_component::<TestSource>(
             lease,
             &authority,
             ManagedComponentKind::Libraries,
             Vec::new(),
-            &mut faults,
         )
         .await
         .expect("settle prior transaction before exact no-effect return");
@@ -1600,18 +1463,14 @@ mod tests {
             let bytes = format!("current-{}", component_root_name(component)).into_bytes();
             let source = test_source(path, kind, bytes.clone());
             let authority = test_authority(component, std::slice::from_ref(&source));
-            let mut faults = ComponentLifecycleTestFaults {
-                intent: Some(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker),
-                settlement: Some(ComponentSettlementFault::AfterSettlementPromotion),
-                ..ComponentLifecycleTestFaults::default()
-            };
+            fault::arm(temporary.path(), Fault::IntentWithoutMarker, None);
+            fault::arm(temporary.path(), Fault::AfterSettlementPromotion, None);
 
-            let outcome = publish_managed_component_with_faults(
+            let outcome = publish_managed_component(
                 test_lease(&temporary).await,
                 &authority,
                 component,
                 vec![source],
-                &mut faults,
             )
             .await
             .expect("recover and settle current component transaction");
@@ -1631,8 +1490,7 @@ mod tests {
                 .unwrap(),
                 bytes
             );
-            assert!(faults.intent.is_none());
-            assert!(faults.settlement.is_none());
+            assert!(!fault::pending(temporary.path()));
             assert_component_lane_settled(&temporary, component);
             let other = match component {
                 ManagedComponentKind::Libraries => "assets",
@@ -1654,17 +1512,13 @@ mod tests {
             ManagedComponentKind::Libraries,
             std::slice::from_ref(&source),
         );
-        let mut faults = ComponentLifecycleTestFaults {
-            execution: Some(ComponentExecutionFault::AfterFirstRow),
-            ..ComponentLifecycleTestFaults::default()
-        };
+        fault::arm(temporary.path(), Fault::RowFailure, None);
 
-        let outcome = publish_managed_component_with_faults(
+        let outcome = publish_managed_component(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
             vec![source],
-            &mut faults,
         )
         .await
         .expect("current rollback must settle");
@@ -1674,7 +1528,7 @@ mod tests {
             ManagedComponentLifecycleOutcome::RolledBack
         ));
         assert!(!temporary.path().join("libraries").exists());
-        assert!(faults.execution.is_none());
+        assert!(!fault::pending(temporary.path()));
         assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
     }
 
@@ -1694,18 +1548,14 @@ mod tests {
             ),
         ];
         let authority = test_authority(ManagedComponentKind::Libraries, &sources);
-        let mut faults = ComponentLifecycleTestFaults {
-            execution: Some(ComponentExecutionFault::CrashAfterFirstRow),
-            settlement: Some(ComponentSettlementFault::AfterSettlementPromotion),
-            ..ComponentLifecycleTestFaults::default()
-        };
+        fault::arm(temporary.path(), Fault::RowUnsettled, None);
+        fault::arm(temporary.path(), Fault::AfterSettlementPromotion, None);
 
-        let outcome = publish_managed_component_with_faults(
+        let outcome = publish_managed_component(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
             sources,
-            &mut faults,
         )
         .await
         .expect("reconciled current rollback must settle");
@@ -1715,8 +1565,7 @@ mod tests {
             ManagedComponentLifecycleOutcome::RolledBack
         ));
         assert!(!temporary.path().join("libraries").exists());
-        assert!(faults.execution.is_none());
-        assert!(faults.settlement.is_none());
+        assert!(!fault::pending(temporary.path()));
         assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
     }
 
@@ -1732,17 +1581,13 @@ mod tests {
             ManagedComponentKind::Libraries,
             std::slice::from_ref(&source),
         );
-        let mut faults = ComponentLifecycleTestFaults {
-            intent: Some(ComponentIntentPublishFault::BeforeMarkerPromotion),
-            ..ComponentLifecycleTestFaults::default()
-        };
+        fault::arm(temporary.path(), Fault::IntentBeforePromotion, None);
 
-        let error = match publish_managed_component_with_faults(
+        let error = match publish_managed_component(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
             vec![source],
-            &mut faults,
         )
         .await
         {
