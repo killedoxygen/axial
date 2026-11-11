@@ -210,21 +210,7 @@ impl SettingsStore {
     }
 
     pub fn update(&self, patch: ConfigPatch) -> Result<ConfigView, SettingsError> {
-        self.update_with_transaction(patch, |_, _| Ok(()))
-    }
-
-    /// The account owner uses this transaction seam to commit selected offline
-    /// username changes together with the settings revision. Owner errors roll
-    /// back both records; callers must not perform nested storage calls here.
-    pub fn update_with_transaction(
-        &self,
-        patch: ConfigPatch,
-        owner_update: impl FnOnce(
-            &rusqlite::Transaction<'_>,
-            &mut ConfigView,
-        ) -> Result<(), SettingsError>,
-    ) -> Result<ConfigView, SettingsError> {
-        self.commit_with_transaction(patch, owner_update)
+        self.commit_with_transaction(patch, |_, _| Ok(()))
             .map(|commit| commit.config)
     }
 

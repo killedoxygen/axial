@@ -189,10 +189,7 @@ impl ProfileMedia {
         };
         let account_id = crate::accounts::model::microsoft_account_id(profile_id)
             .map_err(|_| ProfileMediaError::InvalidTexture)?;
-        let capture = self
-            .accounts
-            .capture_account(&account_id)
-            .map_err(account_error)?;
+        let capture = self.accounts.capture(&account_id).map_err(account_error)?;
         let profile = capture
             .profile()
             .ok_or(ProfileMediaError::AccountRequired)?;
@@ -832,7 +829,7 @@ impl ProfileMedia {
     async fn apply(&self, pending: &PendingSkin) -> Result<(), ProfileMediaError> {
         let capture = self
             .accounts
-            .capture_account(&pending.account_id)
+            .capture(&pending.account_id)
             .map_err(account_error)?;
         if !pending.matches_account(&capture) {
             return Err(ProfileMediaError::StaleIdentity);
@@ -1827,12 +1824,7 @@ mod tests {
         service.auth.logout().await.unwrap();
         resume.send(()).unwrap();
         assert!(waiter.await.unwrap().is_err());
-        assert!(
-            service
-                .accounts
-                .capture_account(capture.account_id())
-                .is_err()
-        );
+        assert!(service.accounts.capture(capture.account_id()).is_err());
         assert!(
             service
                 .library

@@ -915,15 +915,6 @@ impl LibraryLifecycle {
         }
     }
 
-    pub fn from_root_session_at(
-        session: RootSession,
-        managed_library_id: LibraryId,
-        path: PathBuf,
-    ) -> io::Result<Self> {
-        session.root()?.validate_absolute_projection(&path)?;
-        Ok(Self::construct(session, managed_library_id, Some(path)))
-    }
-
     fn construct(
         session: RootSession,
         managed_library_id: LibraryId,

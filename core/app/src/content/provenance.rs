@@ -618,18 +618,6 @@ impl ContentManifest {
         Ok(Some(true))
     }
 
-    pub fn validate_provider_entry(&self, entry: &ManifestEntry) -> ContentResult<()> {
-        entry.validate().map_err(|_| {
-            ContentError::ProviderMetadataInvalid("invalid provider content entry".into())
-        })
-    }
-
-    pub fn validate_provider_projection(&self) -> ContentResult<()> {
-        self.encode_managed().map(|_| ()).map_err(|_| {
-            ContentError::ProviderMetadataInvalid("provider content exceeds manifest bounds".into())
-        })
-    }
-
     fn validate(&self) -> ContentResult<()> {
         if self.schema_version != 3 || self.entries.len() > MAX_MANIFEST_ENTRIES {
             return Err(invalid("unsupported or oversized content manifest"));

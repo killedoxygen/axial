@@ -101,10 +101,6 @@ impl AccountDirectory {
         CapturedAccount::new(&self.snapshot()?, account_id)
     }
 
-    pub fn capture_account(&self, account_id: &str) -> Result<CapturedAccount, AccountError> {
-        self.capture(account_id)
-    }
-
     pub fn validate_capture(&self, capture: &CapturedAccount) -> Result<(), AccountError> {
         capture.validate(&self.snapshot()?)
     }
