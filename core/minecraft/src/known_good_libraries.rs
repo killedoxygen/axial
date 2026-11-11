@@ -76,45 +76,59 @@ struct InstallerTerminalOutputContract {
     size: Option<u64>,
 }
 
-pub(crate) struct BoundInstallerLibraryDeclarations {
+/// Installer library declarations at one stage. Each stage exposes only its own
+/// transitions, so stages cannot be skipped or repeated.
+pub(crate) struct InstallerDeclarations<Stage> {
     selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
     entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
     embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
+    stage: Stage,
 }
 
-pub(crate) struct PendingInstallerNetworkDeclarations {
-    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
-    workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    structure: InstallerLibraryStructure,
+pub(crate) mod installer_stage {
+    pub(crate) struct Bound;
+    pub(crate) struct NetworkPending;
+    pub(crate) struct ReconstructionPending;
+    pub(crate) struct ReconstructionTerminal;
+    pub(crate) struct TerminalPending {
+        pub(super) network_sources: Vec<super::RetainedLibraryComponentSource>,
+    }
 }
 
-pub(crate) struct PendingInstallerReconstructionDeclarations {
-    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
-    workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    structure: InstallerLibraryStructure,
-}
+pub(crate) type BoundInstallerLibraryDeclarations = InstallerDeclarations<installer_stage::Bound>;
+pub(crate) type PendingInstallerNetworkDeclarations =
+    InstallerDeclarations<installer_stage::NetworkPending>;
+pub(crate) type PendingInstallerReconstructionDeclarations =
+    InstallerDeclarations<installer_stage::ReconstructionPending>;
+pub(crate) type PendingInstallerReconstructionTerminalDeclarations =
+    InstallerDeclarations<installer_stage::ReconstructionTerminal>;
+pub(crate) type PendingInstallerTerminalDeclarations =
+    InstallerDeclarations<installer_stage::TerminalPending>;
 
-pub(crate) struct PendingInstallerReconstructionTerminalDeclarations {
-    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
-    workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    structure: InstallerLibraryStructure,
-}
+impl<Stage> InstallerDeclarations<Stage> {
+    fn advance<Next>(self, stage: Next) -> InstallerDeclarations<Next> {
+        InstallerDeclarations {
+            selected: self.selected,
+            entries: self.entries,
+            embedded: self.embedded,
+            workspace_embedded: self.workspace_embedded,
+            structure: self.structure,
+            stage,
+        }
+    }
 
-pub(crate) struct PendingInstallerTerminalDeclarations {
-    selected: BTreeMap<PortableRelativePath, InstallerSelectedLibrary>,
-    entries: BTreeMap<PortableRelativePath, SealedExactLibraryDeclaration>,
-    embedded: BTreeMap<PortableRelativePath, AuthenticatedEmbeddedMavenArtifact>,
-    workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
-    structure: InstallerLibraryStructure,
-    network_sources: Vec<RetainedLibraryComponentSource>,
+    pub(crate) fn embedded_maven_artifact(
+        &self,
+        path: &PortableRelativePath,
+    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
+        self.embedded.get(path).or_else(|| {
+            self.workspace_embedded
+                .iter()
+                .find(|artifact| artifact.relative_path() == path)
+        })
+    }
 }
 
 pub(crate) struct SealedInstallerLibrarySources {
@@ -349,6 +363,7 @@ pub(crate) fn bind_installer_library_declarations(
             libraries,
             environment,
         },
+        stage: installer_stage::Bound,
     })
 }
 
@@ -432,16 +447,7 @@ impl BoundInstallerLibraryDeclarations {
                 },
             });
         }
-        Ok((
-            PendingInstallerNetworkDeclarations {
-                selected: self.selected,
-                entries: self.entries,
-                embedded: self.embedded,
-                workspace_embedded: self.workspace_embedded,
-                structure: self.structure,
-            },
-            jobs,
-        ))
+        Ok((self.advance(installer_stage::NetworkPending), jobs))
     }
 
     pub(crate) fn into_reconstruction_jobs(
@@ -467,33 +473,13 @@ impl BoundInstallerLibraryDeclarations {
                 })
             })
             .collect();
-        (
-            PendingInstallerReconstructionDeclarations {
-                selected: self.selected,
-                entries: self.entries,
-                embedded: self.embedded,
-                workspace_embedded: self.workspace_embedded,
-                structure: self.structure,
-            },
-            jobs,
-        )
+        (self.advance(installer_stage::ReconstructionPending), jobs)
     }
 }
 
 impl PendingInstallerNetworkDeclarations {
-    pub(crate) fn embedded_maven_artifact(
-        &self,
-        path: &PortableRelativePath,
-    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
-        self.embedded.get(path).or_else(|| {
-            self.workspace_embedded
-                .iter()
-                .find(|artifact| artifact.relative_path() == path)
-        })
-    }
-
     pub(crate) fn complete_network(
-        self,
+        mut self,
         sources: Vec<RetainedLibraryComponentSource>,
     ) -> Result<PendingInstallerTerminalDeclarations, SealedLibraryDeclarationError> {
         let mut sources =
@@ -506,7 +492,7 @@ impl PendingInstallerNetworkDeclarations {
                     }
                     Ok(sources)
                 })?;
-        let mut entries = self.entries;
+        let mut entries = std::mem::take(&mut self.entries);
         let mut network_sources = Vec::new();
         for (path, selected) in &self.selected {
             let exact = matches!(selected.producer, InstallerLibraryProducer::ExactNetwork);
@@ -556,31 +542,14 @@ impl PendingInstallerNetworkDeclarations {
         if !sources.is_empty() {
             return Err(SealedLibraryDeclarationError::ExtraDeclaration);
         }
-        Ok(PendingInstallerTerminalDeclarations {
-            selected: self.selected,
-            entries,
-            embedded: self.embedded,
-            workspace_embedded: self.workspace_embedded,
-            structure: self.structure,
-            network_sources,
-        })
+        self.entries = entries;
+        Ok(self.advance(installer_stage::TerminalPending { network_sources }))
     }
 }
 
 impl PendingInstallerReconstructionDeclarations {
-    pub(crate) fn embedded_maven_artifact(
-        &self,
-        path: &PortableRelativePath,
-    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
-        self.embedded.get(path).or_else(|| {
-            self.workspace_embedded
-                .iter()
-                .find(|artifact| artifact.relative_path() == path)
-        })
-    }
-
     pub(crate) fn complete_network(
-        self,
+        mut self,
         streamed: Vec<ExactLibraryDownloadProof>,
     ) -> Result<PendingInstallerReconstructionTerminalDeclarations, SealedLibraryDeclarationError>
     {
@@ -606,7 +575,7 @@ impl PendingInstallerReconstructionDeclarations {
                     }
                     Ok(streamed)
                 })?;
-        let mut entries = self.entries;
+        let mut entries = std::mem::take(&mut self.entries);
         for (path, selected) in &self.selected {
             if !matches!(selected.producer, InstallerLibraryProducer::FreshNetwork) {
                 continue;
@@ -627,28 +596,12 @@ impl PendingInstallerReconstructionDeclarations {
         if !streamed.is_empty() {
             return Err(SealedLibraryDeclarationError::ExtraDeclaration);
         }
-        Ok(PendingInstallerReconstructionTerminalDeclarations {
-            selected: self.selected,
-            entries,
-            embedded: self.embedded,
-            workspace_embedded: self.workspace_embedded,
-            structure: self.structure,
-        })
+        self.entries = entries;
+        Ok(self.advance(installer_stage::ReconstructionTerminal))
     }
 }
 
 impl PendingInstallerReconstructionTerminalDeclarations {
-    pub(crate) fn embedded_maven_artifact(
-        &self,
-        path: &PortableRelativePath,
-    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
-        self.embedded.get(path).or_else(|| {
-            self.workspace_embedded
-                .iter()
-                .find(|artifact| artifact.relative_path() == path)
-        })
-    }
-
     pub(crate) fn seal_declared_terminal_outputs(
         self,
     ) -> Result<SealedExactLibraryDeclarations, SealedLibraryDeclarationError> {
@@ -715,22 +668,12 @@ impl PendingInstallerReconstructionTerminalDeclarations {
 }
 
 impl PendingInstallerTerminalDeclarations {
-    pub(crate) fn embedded_maven_artifact(
-        &self,
-        path: &PortableRelativePath,
-    ) -> Option<&AuthenticatedEmbeddedMavenArtifact> {
-        self.embedded.get(path).or_else(|| {
-            self.workspace_embedded
-                .iter()
-                .find(|artifact| artifact.relative_path() == path)
-        })
-    }
-
     pub(crate) fn replay_network_source(
         &self,
         path: &PortableRelativePath,
     ) -> Result<Option<RetainedLibrarySourceReplay>, crate::loaders::types::LoaderError> {
         let Some(source) = self
+            .stage
             .network_sources
             .iter()
             .find(|source| source.relative_path() == path)
@@ -762,7 +705,7 @@ impl PendingInstallerTerminalDeclarations {
             entries: self.entries,
             structure: LibraryStructure::Installer(Box::new(self.structure)),
         };
-        let mut sources = self.network_sources;
+        let mut sources = self.stage.network_sources;
         for (path, artifact) in self.embedded {
             if !matches!(
                 self.selected.get(&path).map(|selected| &selected.producer),
@@ -794,7 +737,7 @@ impl PendingInstallerTerminalDeclarations {
     ) -> Result<SealedInstallerLibrarySources, SealedLibraryDeclarationError> {
         let mut outputs = outputs.into_entries();
         let mut entries = self.entries;
-        let mut sources = self.network_sources;
+        let mut sources = self.stage.network_sources;
         for (path, selected) in &self.selected {
             let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
                 continue;
