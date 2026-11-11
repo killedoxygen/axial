@@ -70,19 +70,17 @@ fn preferences_survive_real_database_reopen_without_reinitializing() {
         .canonicalize()
         .unwrap()
         .join("settings.sqlite");
-    {
+    let saved = {
         let metadata = Arc::new(MetadataStore::open(&database).unwrap());
         metadata.migrate(&[SETTINGS_MIGRATION]).unwrap();
         let settings = SettingsStore::new(metadata).unwrap();
-        settings
-            .update(patch(
-                json!({"expected_revision":0,"theme":"nether",
+        let saved = settings
+            .update(patch(json!({"expected_revision":0,"theme":"nether",
             "min_memory_mb":1024,"max_memory_mb":6144,"window_width":1280,"window_height":720,
             "onboarding_done":true,"jvm_preset":"smooth","performance_mode":"vanilla",
             "custom_hue":123,"custom_vibrancy":77,"lightness":55,"music_enabled":true,
             "music_volume":31,"music_track":7,"discord_rpc_enabled":false,
-            "discord_rpc_onboarding_seen":true}),
-            ))
+            "discord_rpc_onboarding_seen":true})))
             .unwrap();
         settings
             .update_flag(
@@ -93,39 +91,22 @@ fn preferences_survive_real_database_reopen_without_reinitializing() {
                 },
             )
             .unwrap();
-    }
+        saved
+    };
+    assert_eq!(
+        (saved.theme, saved.music_track, saved.performance_mode),
+        (ConfigTheme::Nether, 7, ConfigPerformanceMode::Vanilla)
+    );
     let metadata = Arc::new(MetadataStore::open(&database).unwrap());
     metadata.migrate(&[SETTINGS_MIGRATION]).unwrap();
     let settings = SettingsStore::new(metadata).unwrap();
-    let restored = settings.current().unwrap();
-    assert_eq!(restored.revision, 2);
-    assert_eq!(restored.theme, ConfigTheme::Nether);
     assert_eq!(
-        (restored.min_memory_mb, restored.max_memory_mb),
-        (1024, 6144)
+        settings.current().unwrap(),
+        ConfigView {
+            revision: 2,
+            ..saved
+        }
     );
-    assert_eq!((restored.window_width, restored.window_height), (1280, 720));
-    assert!(restored.onboarding_done);
-    assert_eq!(
-        (
-            restored.custom_hue,
-            restored.custom_vibrancy,
-            restored.lightness
-        ),
-        (Some(123), Some(77), Some(55))
-    );
-    assert_eq!(
-        (
-            restored.music_enabled,
-            restored.music_volume,
-            restored.music_track
-        ),
-        (Some(true), Some(31), 7)
-    );
-    assert!(!restored.discord_rpc_enabled);
-    assert!(restored.discord_rpc_onboarding_seen);
-    assert_eq!(restored.jvm_preset, ConfigJvmPreset::Smooth);
-    assert_eq!(restored.performance_mode, ConfigPerformanceMode::Vanilla);
     assert!(settings.list_flags().unwrap().flags[0].enabled);
 }
 

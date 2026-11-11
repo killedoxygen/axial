@@ -890,34 +890,4 @@ mod tests {
         assert_eq!(settings.current().unwrap().max_memory_mb, 8192);
         assert_eq!(settings.interface_preferences().unwrap(), snapshot);
     }
-
-    #[test]
-    #[ignore = "bounded settings cost diagnostic; run explicitly with --nocapture"]
-    fn maximum_envelope_read_and_route_write_cost() {
-        for (label, value) in [("small", envelope()), ("maximum", maximum_envelope())] {
-            let (_, settings) = store();
-            replace(&settings, 0, Some(value)).unwrap();
-            let read_started = std::time::Instant::now();
-            for _ in 0..10 {
-                settings.current().unwrap();
-            }
-            let read_time = read_started.elapsed();
-            let write_started = std::time::Instant::now();
-            for revision in 1..11 {
-                settings
-                    .update_interface_preferences(InterfacePreferencesUpdate {
-                        expected_revision: revision,
-                        change: InterfacePreferencesChange::Route {
-                            route: Some(InterfaceRoute::Home {}),
-                        },
-                    })
-                    .unwrap();
-            }
-            eprintln!(
-                "{label}: 10 config reads {read_time:?}; 10 route writes {:?}",
-                write_started.elapsed()
-            );
-            assert_eq!(settings.current().unwrap().revision, 0);
-        }
-    }
 }
