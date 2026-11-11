@@ -20,20 +20,20 @@
     "format:check": "prettier --check ."
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.4",
+    "@biomejs/biome": "2.6.6",
     "@types/node": "26.6.6",
-    "@types/react": "19.2.14",
+    "@types/react": "19.3.0",
     "@types/three": "^0.184.1",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.25.12",
     "mime-types": "3.0.2",
-    "prettier": "^3.8.4",
-    "typescript": "^5.7.0",
-    "yaml": "2.9.0"
+    "prettier": "^3.9.10",
+    "typescript": "^5.9.3",
+    "yaml": "2.9.1"
   },
   "dependencies": {
-    "@preact/signals": "^2.0.0",
+    "@preact/signals": "^2.11.4",
     "lucide-preact": "1.25.0",
-    "preact": "^10.25.0",
+    "preact": "^10.29.8",
     "react-markdown": "^9.1.0",
     "remark-gfm": "^4.0.1",
     "three": "^0.184.0"

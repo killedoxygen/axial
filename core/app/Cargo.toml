@@ -28,7 +28,6 @@ base64.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
-lzma-rs.workspace = true
 md5.workspace = true
 regex.workspace = true
 png.workspace = true

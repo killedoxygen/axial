@@ -239,12 +239,12 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             .instances
             .registry()
             .storage()
-            .transaction(|db| -> Result<(), StorageError> {
+            .with_connection(|db| {
                 db.update_hook(
                     None::<fn(crate::storage::rusqlite::hooks::Action, &str, &str, i64)>,
-                );
-                db.commit_hook(None::<fn() -> bool>);
-                Ok(())
+                )
+                .unwrap();
+                db.commit_hook(None::<fn() -> bool>).unwrap();
             })
     };
     let outcome = runtime.block_on(
@@ -412,7 +412,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                     .instances
                     .registry()
                     .storage()
-                    .transaction(|db| -> Result<(), StorageError> {
+                    .with_connection(|db| {
                         db.update_hook(Some({
                             let row = row.clone();
                             let armed = armed.clone();
@@ -429,7 +429,8 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                                     }
                                 }
                             }
-                        }));
+                        }))
+                        .unwrap();
                         db.commit_hook(Some({
                             let pressure = pressure.clone();
                             let work = work.clone();
@@ -454,8 +455,8 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                                 }
                                 false
                             }
-                        }));
-                        Ok(())
+                        }))
+                        .unwrap();
                     })
                     .unwrap();
                 let name = if worker_pressure {
@@ -2666,7 +2667,8 @@ async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
             FABRIC_BUILDS.to_vec(),
             true,
         );
-        service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
+        service.loader_build_url =
+            Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
         let service = Arc::new(service);
         let mut release = Some(release);
         let mut caller = None;

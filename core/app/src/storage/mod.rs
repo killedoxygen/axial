@@ -161,15 +161,23 @@ impl MetadataStore {
     }
 
     fn initialize(
-        connection: Connection,
+        mut connection: Connection,
         limits: StorageLimits,
         memory: bool,
     ) -> StorageResult<Self> {
         connection.busy_timeout(limits.busy_timeout)?;
-        let budget = ExecutionBudget::new(&connection, limits);
+        Self::configure(&ExecutionBudget::new(&mut connection, limits), memory)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            mutation_closed: AtomicBool::new(false),
+            limits,
+        })
+    }
+
+    fn configure(connection: &Connection, memory: bool) -> StorageResult<()> {
         // Validate before any pragma that could persistently alter an existing
         // database. Corruption is an error, never a cue to rename/delete/rebuild.
-        verify_integrity(&connection)?;
+        verify_integrity(connection)?;
         let application_id: i64 =
             connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
         if application_id != 0 && application_id != APPLICATION_ID {
@@ -201,12 +209,17 @@ impl MetadataStore {
         }
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "application_id", APPLICATION_ID)?;
-        drop(budget);
-        Ok(Self {
-            connection: Mutex::new(connection),
-            mutation_closed: AtomicBool::new(false),
-            limits,
-        })
+        Ok(())
+    }
+
+    /// Test access for connection-level hooks, which need exclusive borrows.
+    #[cfg(test)]
+    pub(crate) fn with_connection<T>(
+        &self,
+        use_connection: impl FnOnce(&mut Connection) -> T,
+    ) -> StorageResult<T> {
+        self.lock()
+            .map(|mut connection| use_connection(&mut connection))
     }
 
     pub fn is_mutation_closed(&self) -> bool {
@@ -227,13 +240,13 @@ impl MetadataStore {
     where
         E: From<StorageError>,
     {
-        let connection = self.lock().map_err(E::from)?;
-        let budget = ExecutionBudget::new(&connection, self.limits);
-        connection
+        let mut connection = self.lock().map_err(E::from)?;
+        let budget = ExecutionBudget::new(&mut connection, self.limits);
+        budget
             .pragma_update(None, "query_only", true)
             .map_err(StorageError::from)
             .map_err(E::from)?;
-        let result = read(&connection);
+        let result = read(&budget);
         drop(budget);
         if !connection.is_autocommit() {
             let _ = connection.execute_batch("ROLLBACK");
@@ -246,7 +259,7 @@ impl MetadataStore {
             return Err(StorageError::from(error).into());
         }
         if result.is_err() {
-            self.check_after_failed_callback(&connection);
+            self.check_after_failed_callback(&mut connection);
         }
         result
     }
@@ -261,25 +274,24 @@ impl MetadataStore {
     where
         E: From<StorageError>,
     {
-        let connection = self.lock().map_err(E::from)?;
+        let mut connection = self.lock().map_err(E::from)?;
         if self.is_mutation_closed() {
             return Err(StorageError::Closed.into());
         }
-        let budget = ExecutionBudget::new(&connection, self.limits);
-        // The budget only borrows the connection for its Drop cleanup; use an
-        // unchecked_transaction with explicit IMMEDIATE behavior under our
-        // exclusive connection mutex to avoid overlapping mutable borrows.
-        let transaction =
-            match Transaction::new_unchecked(&connection, TransactionBehavior::Immediate) {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    let error = StorageError::from(error);
-                    if matches!(error, StorageError::Corrupt) {
-                        self.mutation_closed.store(true, Ordering::Release);
-                    }
-                    return Err(error.into());
+        let budget = ExecutionBudget::new(&mut connection, self.limits);
+        // The budget holds the connection's mutable borrow; use an unchecked
+        // IMMEDIATE transaction through it under our exclusive connection mutex.
+        let transaction = match Transaction::new_unchecked(&budget, TransactionBehavior::Immediate)
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let error = StorageError::from(error);
+                if matches!(error, StorageError::Corrupt) {
+                    self.mutation_closed.store(true, Ordering::Release);
                 }
-            };
+                return Err(error.into());
+            }
+        };
         let result = match write(&transaction) {
             Ok(value) => transaction
                 .commit()
@@ -295,7 +307,7 @@ impl MetadataStore {
         };
         drop(budget);
         if result.is_err() {
-            self.check_after_failed_callback(&connection);
+            self.check_after_failed_callback(&mut connection);
         }
         // Make accidental transaction ownership changes a closed-mutation
         // state even when SQLite's transaction destructor has settled them.
@@ -350,11 +362,10 @@ impl MetadataStore {
         })
     }
 
-    fn check_after_failed_callback(&self, connection: &Connection) {
+    fn check_after_failed_callback(&self, connection: &mut Connection) {
         // A feature error may wrap SQLite's corruption error. Checking here
         // permits typed feature errors without losing storage's fail-closed rule.
-        let _budget = ExecutionBudget::new(connection, self.limits);
-        if verify_integrity(connection).is_err() {
+        if verify_integrity(&ExecutionBudget::new(connection, self.limits)).is_err() {
             self.mutation_closed.store(true, Ordering::Release);
         }
     }
@@ -368,10 +379,19 @@ fn verify_integrity(connection: &Connection) -> StorageResult<()> {
     Ok(())
 }
 
-struct ExecutionBudget<'a>(&'a Connection);
+/// Bounds SQLite execution while it holds the connection; access goes through it.
+struct ExecutionBudget<'a>(&'a mut Connection);
+
+impl std::ops::Deref for ExecutionBudget<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.0
+    }
+}
 
 impl<'a> ExecutionBudget<'a> {
-    fn new(connection: &'a Connection, limits: StorageLimits) -> Self {
+    fn new(connection: &'a mut Connection, limits: StorageLimits) -> Self {
         let started = Instant::now();
         let mut instructions = 0_u64;
         let _ = connection.progress_handler(
