@@ -1,11 +1,13 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { Icon, type IconName } from '../ui/Icons';
-import { IconButton } from '../ui/Atoms';
+import { Icon } from '../ui/Icons';
+import { Chip, IconButton, Kbd, Ring } from '../ui/Atoms';
+import { Face } from '../ui/Face';
 import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { UpdateWidget } from './UpdateWidget';
-import { goBack, goForward, navigate, route } from '../ui-state';
+import { commandPaletteOpen, goBack, goForward, navigate, route } from '../ui-state';
+import { shortcutHint } from '../shortcuts';
 import { launchSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailures, downloadQueue } from '../machines/downloads';
 import { hasVisibleUpdate, updateFlow, updateFlowActive } from '../updater';
@@ -74,25 +76,14 @@ function versionTag(versionId: string | undefined): string | null {
   return minecraftVersionLabel(versionById(versionId), '') || null;
 }
 
-type GlyphState = 'idle' | 'preparing' | 'monitoring' | 'playing' | 'stopping' | 'downloading' | 'queued' | 'failed';
+type GlyphState = 'preparing' | 'monitoring' | 'playing' | 'stopping' | 'downloading' | 'queued' | 'failed';
 
-const STATUS_ICON_BY_STATE = {
-  idle: 'circle-dashed',
-  preparing: 'refresh',
-  monitoring: 'activity',
-  playing: 'play',
-  stopping: 'stop',
-  downloading: 'download',
-  queued: 'clock',
-  failed: 'alert',
-} as const satisfies Record<GlyphState, IconName>;
-
-function StatusGlyph({ state }: { state: GlyphState }): JSX.Element {
-  return (
-    <span class="cp-status-mark cp-status-icon" data-state={state} aria-hidden="true">
-      <Icon name={STATUS_ICON_BY_STATE[state]} size={14} stroke={2} />
-    </span>
-  );
+/** The face for how it stands, the ring while it is still going. */
+function StatusGlyph({ state, progress }: { state: GlyphState; progress?: number }): JSX.Element {
+  if (state === 'failed') return <Face eyes="x" />;
+  if (state === 'queued') return <Face eyes="closed" />;
+  if (state === 'playing') return <Face />;
+  return <Ring progress={progress} />;
 }
 
 function sessionGlyph(session: Pick<LaunchSession, 'stopping' | 'viewModel'>): GlyphState {
@@ -125,7 +116,7 @@ function useSettledLabel(label: string | null, holdMs = 600): string | null {
   return shown;
 }
 
-function StatusPill(): JSX.Element {
+function StatusPill(): JSX.Element | null {
   const sessions = launchSessions.value;
   const install = activeDownload.value;
 
@@ -133,13 +124,13 @@ function StatusPill(): JSX.Element {
   const inst = runIds.length > 0 ? instances.value.find((i) => i.id === runIds[0]) : null;
   const session = runIds.length > 0 ? sessions[runIds[0]] : null;
 
-  let glyph: GlyphState = 'idle';
-  let mod = '';
+  let glyph: GlyphState | null = null;
+  let tone: 'accent' | 'err' | undefined = 'accent';
+  let progress: number | undefined;
   let onClick: (() => void) | undefined;
-  let title = 'Idle';
+  let title: string | undefined;
   let ariaLabel: string | undefined;
-  let style: JSX.CSSProperties | undefined;
-  let content: JSX.Element | null = <span class="cp-status-pill-label">Idle</span>;
+  let content: JSX.Element | null = null;
 
   const launch = launchState.value;
   const queueState = downloadQueue.value;
@@ -160,62 +151,58 @@ function StatusPill(): JSX.Element {
     const label = flowLabel || (session.stopping ? 'Stopping' : launchSessionActivityLabel(session));
     const tag = versionTag(inst.version_id);
     glyph = sessionGlyph(session);
-    mod = ' cp-status-pill--running';
     onClick = () => navigate({ name: 'instance', id: inst.id });
     title = `${label}: ${inst.name}`;
     ariaLabel = `Open active instance. ${label}: ${inst.name}`;
     content = (
       <>
         <span class="cp-status-pill-label">{label}</span>
-        {tag && <span class="cp-status-pill-meta">{tag}</span>}
+        {tag && <Chip mono>{tag}</Chip>}
       </>
     );
   } else if (install) {
     const queueView = downloadQueue.value.view_model;
     const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
     const installName = install.displayName || install.item.versionId;
-    const installTag = install.item.loader?.minecraftVersion || versionTag(install.item.versionId);
     glyph = 'downloading';
-    mod = ' cp-status-pill--installing';
+    progress = installPct;
     onClick = () => navigate({ name: 'downloads' });
     title = `${installName}: ${install.label}, ${installPct}%${queueView.active_queued_count_label || ''}`;
     ariaLabel = `Open downloads. ${title}`;
-    style = { '--cp-install-ratio': String(installPct / 100) } as JSX.CSSProperties;
     content = (
       <>
-        {installTag && <span class="cp-status-pill-meta">{installTag}</span>}
+        <span class="cp-status-pill-label">{installName}</span>
         <span class="cp-status-pill-pct">{installPct}%</span>
-        {queueView.queued_count > 0 && <span class="cp-status-pill-chip">+{queueView.queued_count}</span>}
+        {queueView.queued_count > 0 && <Chip>+{queueView.queued_count}</Chip>}
       </>
     );
   } else if (launch.status === 'preparing') {
     const li = instances.value.find((i) => i.id === launch.instanceId);
     const prepTag = versionTag(li?.version_id);
     glyph = 'preparing';
-    mod = ' cp-status-pill--preparing';
     title = `${launch.label}: ${li?.name || 'launch'}`;
     content = (
       <>
         <span class="cp-status-pill-label">{flowLabel || launch.label}</span>
-        {prepTag && <span class="cp-status-pill-meta">{prepTag}</span>}
+        {prepTag && <Chip mono>{prepTag}</Chip>}
       </>
     );
   } else if (queueState.items.length > 0) {
     const queueView = queueState.view_model;
     glyph = 'queued';
-    mod = ' cp-status-pill--queued';
+    tone = undefined;
     onClick = () => navigate({ name: 'downloads' });
     title = `${queueView.queued_count_label}. ${queueView.next_label ? `Next: ${queueView.next_label}` : queueView.summary}`;
     ariaLabel = `Open downloads. ${title}`;
     content = (
       <>
         <span class="cp-status-pill-label">{queueView.status_label}</span>
-        {queueView.queued_count > 1 && <span class="cp-status-pill-chip">{queueView.queued_count}</span>}
+        {queueView.queued_count > 1 && <Chip>{queueView.queued_count}</Chip>}
       </>
     );
   } else if (failure) {
     glyph = 'failed';
-    mod = ' cp-status-pill--failed';
+    tone = 'err';
     onClick = () => navigate({ name: 'downloads' });
     title = `${failure.displayName}: ${failure.viewModel.summary}`;
     ariaLabel = `Open downloads. ${failures.length} failed: ${title}`;
@@ -234,16 +221,18 @@ function StatusPill(): JSX.Element {
     return () => ro.disconnect();
   }, [glyph]);
 
+  if (!glyph) return null;
   return (
     <button
-      class={`cp-status-pill${mod} cp-nodrag`}
+      class="cp-status-pill cp-nodrag"
+      data-state={glyph}
+      data-tone={tone}
       disabled={!onClick}
       onClick={onClick}
       title={title}
       aria-label={ariaLabel}
-      style={style}
     >
-      <StatusGlyph state={glyph} />
+      <StatusGlyph state={glyph} progress={progress} />
       <span class="cp-status-pill-body" style={bodyWidth != null ? { width: bodyWidth } : undefined}>
         <span class="cp-status-pill-swap" key={glyph} ref={swapRef}>
           {content}
@@ -303,50 +292,49 @@ export function Topbar(): JSX.Element {
       onMouseDown={onDragAreaMouseDown}
       onDblClick={onDragAreaDoubleClick}
     >
-      <div class="cp-nodrag" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+      <div class="cp-topbar-nav cp-nodrag">
         <IconButton icon="arrow-left" size={28} tooltip="Back" onClick={goBack} />
         <IconButton icon="arrow-right" size={28} tooltip="Forward" onClick={goForward} />
       </div>
       <div class="cp-topbar-crumbs cp-nodrag">
         {crumbs.map((c, i) => (
-          <div key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            {i > 0 && <Icon name="chevron-right" size={12} color="var(--text-mute)" />}
-            <button
-              class={`cp-topbar-crumb${i === crumbs.length - 1 ? ' cp-topbar-crumb--last' : ''}`}
-              onClick={c.onClick}
-              disabled={!c.onClick}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: 'inherit',
-                font: 'inherit',
-                padding: 0,
-                cursor: c.onClick ? 'pointer' : 'default',
-              }}
-            >
+          <>
+            {i > 0 && <Icon name="chevron-right" size={12} />}
+            <button class="cp-topbar-crumb" onClick={c.onClick} disabled={!c.onClick}>
               {c.label}
             </button>
-          </div>
+          </>
         ))}
       </div>
+      <button
+        type="button"
+        class="cp-topbar-search cp-nodrag"
+        data-sound-silent="true"
+        aria-label="Search and jump to"
+        onClick={() => {
+          commandPaletteOpen.value = true;
+        }}
+      >
+        <Icon name="search" size={13} stroke={2} />
+        <span>Search or jump to</span>
+        <Kbd>{shortcutHint('command-palette')}</Kbd>
+      </button>
       <div class="cp-topbar-spacer" />
-      <div class="cp-topbar-actions cp-nodrag">
+      <div
+        class="cp-topbar-actions cp-nodrag"
+        style={
+          updateBusy && !updateIndeterminate
+            ? ({ '--cp-update-ratio': String(updateRatio) } as JSX.CSSProperties)
+            : undefined
+        }
+      >
         <MusicWidget />
-        <div
-          class="cp-status-slot"
-          data-update={hasUpdate}
-          data-session={sessionActive}
-          data-busy={updateBusy}
-          data-indeterminate={updateIndeterminate}
-          style={updateBusy ? ({ '--cp-update-ratio': String(updateRatio) } as JSX.CSSProperties) : undefined}
-        >
-          <StatusPill />
-          {hasUpdate && (
-            <div class="cp-update-collapse" data-collapsed={sessionActive}>
-              <UpdateWidget />
-            </div>
-          )}
-        </div>
+        <StatusPill />
+        {hasUpdate && (
+          <div class="cp-update-collapse" data-collapsed={sessionActive}>
+            <UpdateWidget />
+          </div>
+        )}
       </div>
       <WindowControls />
     </div>

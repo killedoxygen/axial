@@ -268,8 +268,10 @@ function detailHarness(inst: EnrichedInstance) {
     },
     'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
     '../../ui/Icons': { Icon: 'Icon' },
-    '../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Pill: 'Pill' },
-    '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile', guardedInstanceHue: () => 140 },
+    '../../vista/Vista': { Vista: () => null },
+    '../../ui/Face': { Face: 'Face' },
+    '../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Chip: 'Chip', Empty: 'Empty', Status: 'Status' },
+    '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile', guardedInstanceHue: () => 140, artSeedFor: () => 0 },
     '../../ui/ContextMenu': {},
     '../../store': store,
     '../../ui-state': {},
@@ -282,6 +284,8 @@ function detailHarness(inst: EnrichedInstance) {
     '../../instance-setup': {},
     '../../instance-readiness': readinessExports,
     '../../launch-presenters': launchPresenters,
+    './mod-provenance-cache': { cachedModProvenance: () => null },
+    './components/pack-origin': { PackChips: 'PackChips' },
     './resources': {
       fetchInstanceResources: async () => {
         resourceReads += 1;
@@ -325,6 +329,41 @@ function detailHarness(inst: EnrichedInstance) {
     },
     { filename },
   );
+  const launchFile = resolve(frontend, 'src/views/instance/components/launch.tsx');
+  const launchExports = {};
+  const launchImports: Record<string, unknown> = {
+    'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
+    '../../../ui/Icons': { Icon: 'Icon' },
+    '../../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Meter: 'Meter', Ring: 'Ring' },
+    '../../../ui/Face': { Face: 'Face' },
+    '../../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
+    '../../../ui/ContextMenu': {},
+    '../../../ui-state': {},
+    '../../../actions': {},
+    '../../../toast': {},
+    '../../../launch-presenters': launchPresenters,
+    '../instance-actions': {},
+  };
+  vm.runInNewContext(
+    ts.transpileModule(readFileSync(launchFile, 'utf8'), {
+      fileName: launchFile,
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2020,
+        module: ts.ModuleKind.CommonJS,
+        jsx: ts.JsxEmit.ReactJSX,
+        jsxImportSource: 'preact',
+      },
+    }).outputText,
+    {
+      exports: launchExports,
+      require(id: string): unknown {
+        if (Object.prototype.hasOwnProperty.call(launchImports, id)) return launchImports[id];
+        throw new Error(`Unreviewed launch control dependency: ${id}`);
+      },
+    },
+    { filename: launchFile },
+  );
+  const { LaunchSplitButton } = launchExports as typeof import('../../src/views/instance/components/launch');
   const { InstanceDetailView } = exports as typeof import('../../src/views/instance/InstanceDetailView');
   type Node = { type: unknown; props: Record<string, unknown> };
   function nodes(value: unknown): Node[] {
@@ -341,15 +380,25 @@ function detailHarness(inst: EnrichedInstance) {
     const render = root.type as (props: { id: string }) => unknown;
     return nodes(render({ id: inst.id }));
   }
+  function primaryLabel(): unknown {
+    const control = render().find((node) => node.type === 'LaunchSplitButton');
+    assert.ok(control);
+    const tree = LaunchSplitButton(control.props as Parameters<typeof LaunchSplitButton>[0]);
+    const button = nodes(tree).find((node) => node.type === 'button');
+    assert.ok(button);
+    return nodes(button).find((node) => node.type === 'span')?.props.children;
+  }
   function status(): unknown {
     const result = render();
-    const header = result.find((node) => node.props.class === 'cp-instance-status');
-    assert.ok(header);
-    return header.props.children;
+    const header = result.find((node) => node.type === 'Status');
+    const children = header?.props.children;
+    return Array.isArray(children) ? children[0] : children;
   }
   return {
     ...h, store, reads, render, status,
-    respond(next: typeof read) { read = next; },
+    primaryLabel,
+    respond(next: typeof read) { read = next;
+    },
     resourceReads: () => resourceReads,
     mount() {
       render();
@@ -375,7 +424,8 @@ test('the real instance header follows installation and backend readiness instea
   const inst = enrichedInstanceResponse(instance(installTarget));
   const h = detailHarness(inst);
   const { status, store } = h;
-  assert.equal(status(), 'Install');
+  assert.equal(status(), undefined);
+  assert.equal(h.primaryLabel(), 'Install');
   h.downloads.activeDownload.value = {
     queueId: 'queue-1',
     kind: 'loader',
@@ -405,7 +455,8 @@ test('the real instance header follows installation and backend readiness instea
       launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' },
     },
   ];
-  assert.equal(status(), 'Ready'); // Historical failure is not current readiness authority.
+  assert.equal(status(), undefined);
+  assert.equal(h.primaryLabel(), 'Launch');
   store.launchState.value = { status: 'preparing', instanceId: inst.id, pct: 10, label: 'Preparing launch' };
   assert.equal(status(), 'Preparing launch');
   store.launchSessions.value = {
@@ -435,17 +486,21 @@ test('entering instance details and refreshing Mods recover stale availability w
   h.respond(async () => ready);
   h.mount();
   await new Promise((done) => setImmediate(done));
-  assert.equal(h.status(), 'Ready');
+  assert.equal(h.status(), undefined);
+  assert.equal(h.primaryLabel(), 'Launch');
   assert.deepEqual(h.reads, [`/instances/${busy.id}`]);
   h.store.instances.value = [busy];
   const mods = h.render().find((node) => node.type === 'ModsPane');
   assert.ok(mods);
   (mods.props.onRefresh as () => void)();
   await new Promise((done) => setImmediate(done));
-  assert.equal(h.status(), 'Ready');
+  assert.equal(h.status(), undefined);
+  assert.equal(h.primaryLabel(), 'Launch');
   assert.deepEqual(h.reads, [`/instances/${busy.id}`, `/instances/${busy.id}`]);
-  const resources = h.render().find((node) => node.type === 'ModsPane')?.props.resources as
-    { status: string; data: unknown; error: string };
+  const resources = h.render().find((node) => node.type === 'ModsPane')?.props.resources as { status: string;
+    data: unknown;
+    error: string;
+  };
   assert.equal(resources.status, 'error');
   assert.equal(resources.data, null);
   assert.equal(resources.error, 'Resources unavailable');

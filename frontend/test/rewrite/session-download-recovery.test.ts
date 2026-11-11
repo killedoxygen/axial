@@ -1281,7 +1281,8 @@ test('an older downloads projection cannot overwrite readiness published after s
   assert.equal(launch.errors.length + downloads.errors.length, 0);
   assert.equal(launch.store.launchSessions.value['instance-1'], undefined);
   assert.equal(launch.store.instances.value[0].launch_action.label, 'Launch',
-    'the delayed registry response must not restore the ended session\'s Unavailable readiness');
+    "the delayed registry response must not restore the ended session's Unavailable readiness",
+  );
   assert.equal(launch.store.instances.value[0].launchable, true);
   assert.equal(downloads.calls.filter((path) => path === '/instances').length, 3);
   assert.equal(downloads.clock.timeouts.size, 0);
@@ -1591,9 +1592,15 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
   const removed: string[] = [];
   const imports: Record<string, unknown> = {
     'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
-    '../../ui/Atoms': { IconButton: 'IconButton', Meter: 'Meter' },
+    '../../ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', Meter: 'Meter', Ring: 'Ring' },
     '../../ui/Icons': { Icon: 'Icon' },
-    '../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
+    '../../ui/Face': { Face: 'Face' },
+    '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile' },
+    '../../ui-state': { navigate() {}, openCreate() {} },
+    '../discover/shared': { KIND_ICON: {} },
+    '../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
+    '../create/loader-logos': { LoaderLogo: 'LoaderLogo' },
+    '../../install-item': source<typeof import('../../src/install-item')>('install-item.ts'),
     '../../hooks/use-now': { useNowTicker: () => 0 },
     '../../machines/downloads': { ...h.machine, removeQueuedInstall: (id: string) => removed.push(id) },
     '../../api': { api: async () => assert.fail('rendering issues no requests') },
@@ -1618,14 +1625,16 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
     if (Array.isArray(value)) return value.flatMap(nodes);
     if (!value || typeof value !== 'object' || !('props' in value)) return [];
     const node = value as Node;
+    if (typeof node.type === 'function' && ['Row', 'FailureRow', 'Lead', 'Target'].includes(node.type.name))
+      return nodes(node.type(node.props));
     return [node, ...nodes(node.props.children)];
   }
   const rendered = nodes(DownloadsView());
-  assert.equal(rendered.find((node) => node.type === 'h2')?.props.children, label);
-  assert.equal(rendered.find((node) => node.props.class === 'cp-dl-queue-label')?.props.children, label);
-  assert.equal(rendered.find((node) => node.props.class === 'cp-dl-queue-version')?.props.children, '1.20.1');
+  assert.equal(rendered.find((node) => node.type === 'strong')?.props.children, label);
+  assert.equal(rendered.filter((node) => node.type === 'strong' && node.props.children === label).length, 2);
+  assert.equal(rendered.find((node) => node.type === 'Chip')?.props.children, '1.20.1');
   assert.equal(rendered.some((node) => node.props.children === item.version_id), false);
-  const remove = rendered.find((node) => node.type === 'IconButton');
+  const remove = rendered.find((node) => node.type === 'button' && node.props['aria-label'] === 'Remove from queue');
   assert.ok(remove);
   (remove.props.onClick as () => void)();
   assert.deepEqual(removed, ['next-queue']);

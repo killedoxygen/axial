@@ -1,49 +1,30 @@
+/* An instance's tile: its loader's mark on a wash of its own hue. Callers give it a size and a corner. */
 .cp-tile {
   position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
   overflow: hidden;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   container-type: size;
-  isolation: isolate;
   background: linear-gradient(
     170deg,
-    color-mix(in oklab, var(--surface-3) 74%, oklch(0.58 0.16 var(--cp-tile-h))),
-    color-mix(in oklab, var(--surface) 84%, oklch(0.45 0.14 var(--cp-tile-h)))
+    color-mix(in oklab, var(--fill-3) 74%, oklch(0.58 0.16 var(--cp-tile-h))),
+    color-mix(in oklab, var(--fill) 84%, oklch(0.45 0.14 var(--cp-tile-h)))
   );
 }
-
-.cp-tile-identity {
-  display: flex;
-  align-items: center;
-}
-
 .cp-tile-glyph {
   width: clamp(20px, 42cqmin, 80px);
   height: clamp(20px, 42cqmin, 80px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
   color: color-mix(in oklab, var(--text-mute) 52%, oklch(0.62 0.13 var(--cp-tile-h)));
 }
-
 .cp-tile-glyph--mask {
   background-color: currentColor;
-  -webkit-mask-image: var(--cp-loader-src);
-  mask-image: var(--cp-loader-src);
-  -webkit-mask-position: center;
-  mask-position: center;
-  -webkit-mask-repeat: no-repeat;
-  mask-repeat: no-repeat;
-  -webkit-mask-size: contain;
-  mask-size: contain;
+  -webkit-mask: var(--cp-loader-src) center / contain no-repeat;
+  mask: var(--cp-loader-src) center / contain no-repeat;
 }
-
 .cp-tile-glyph--mask[data-loader='quilt'] {
   translate: 2.1cqmin 2.1cqmin;
 }
-
 .cp-tile-glyph--mask[data-loader='forge'] {
   translate: 0 2.1cqmin;
 }

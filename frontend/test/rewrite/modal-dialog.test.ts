@@ -248,6 +248,7 @@ function harness(
     {
       'preact/hooks': dialogHooks,
       './Atoms': { Button: 'Button', Input: 'Input' },
+      './Face': { Face: 'Face' },
     },
     globals,
   );
@@ -309,7 +310,11 @@ function harness(
     },
     globals,
   );
-  const atoms = source<typeof import('../../src/ui/Atoms')>('ui/Atoms.tsx', { './Icons': { Icon: 'Icon' } }, globals);
+  const atoms = source<typeof import('../../src/ui/Atoms')>(
+    'ui/Atoms.tsx',
+    { './Icons': { Icon: 'Icon' }, './Face': { Face: 'Face' } },
+    globals,
+  );
   const lightboxHooks = hooks();
   let mutation: Promise<void> | undefined;
   let shot = { name: 'before.png', size: 512, modified_at: '2026-10-04T12:00:00Z' };
@@ -341,6 +346,7 @@ function harness(
       'preact/hooks': paneHooks,
       '../../../ui/Icons': { Icon: 'Icon' },
       '../../../ui/Atoms': atoms,
+      '../../../ui/Segmented': { Segmented: 'Segmented' },
       '../../../ui/ContextMenu': {},
       '../../../ui/SelectionActionTray': {
         SelectionActionTray: 'SelectionActionTray',

@@ -96,31 +96,24 @@ export function PerformanceLabCard(): JSX.Element | null {
 
   if (!isDev) return null;
 
-  if (!labOpen) {
-    return (
-      <SettingRow
-        title="Performance lab"
-        description="Developer-only launch proof and benchmark tools."
-        control={
-          <Button variant="secondary" size="sm" icon="chevron-down" onClick={() => setLabOpen(true)}>
-            Open
-          </Button>
-        }
-      />
-    );
-  }
-
   return (
-    <SettingRow title="Performance lab" description="Developer-only launch proof and benchmark tools.">
-      <div class="cp-settings-lab-action">
-        <Button variant="secondary" size="sm" icon="chevron-up" onClick={() => setLabOpen(false)}>
-          Close
+    <SettingRow
+      title="Performance lab"
+      description="Developer-only launch proof and benchmark tools."
+      control={
+        <Button variant="secondary" onClick={() => setLabOpen(!labOpen)}>
+          {labOpen ? 'Close' : 'Open'}
         </Button>
-      </div>
-      <LaunchProofHistoryBlock state={launchReports} />
-      <BenchmarkMatrixBlock state={benchmarkMatrix} />
-      <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
-      <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
+      }
+    >
+      {labOpen && (
+        <>
+          <LaunchProofHistoryBlock state={launchReports} />
+          <BenchmarkMatrixBlock state={benchmarkMatrix} />
+          <BenchmarkQualificationPreviewBlock state={qualificationPreview} />
+          <BenchmarkSuiteDriversBlock matrixState={benchmarkMatrix} />
+        </>
+      )}
     </SettingRow>
   );
 }

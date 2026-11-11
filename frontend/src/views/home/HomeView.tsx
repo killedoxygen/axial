@@ -1,16 +1,23 @@
 import type { JSX } from 'preact';
-import { useMemo } from 'preact/hooks';
-import { Button, SectionHeading, Card, Pill } from '../../ui/Atoms';
+import { InstanceFacts, SessionChip } from '../../ui/InstanceFacts';
+import { useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { Button, Chip } from '../../ui/Atoms';
+import { Face } from '../../ui/Face';
 import { Icon } from '../../ui/Icons';
-import { InstanceCard } from '../../ui/InstanceCard';
-import { InstanceGlyph, guardedInstanceHue } from '../../ui/InstanceVisual';
+import { InstanceTile, artSeedFor } from '../../ui/InstanceVisual';
+import { Vista } from '../../vista/Vista';
+import { selectInstance } from '../../actions';
+import { fmtRelative } from '../../format';
+import { launchGame } from '../../launch';
 import { navigate, openCreate } from '../../ui-state';
-import { config, instances, launchSessions, versionById } from '../../store';
+import { config, instances, launchSessions, launchState, versionById } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
-import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
 import { openInstanceContextMenu } from '../instance/instance-menu';
-import { useTheme } from '../../hooks/use-theme';
 import type { EnrichedInstance } from '../../types-instance';
+
+const COVER = 120;
+const GAP = 28;
+const SHELF_LIMIT = 6;
 
 function greetingFor(date: Date): string {
   const h = date.getHours();
@@ -20,192 +27,160 @@ function greetingFor(date: Date): string {
   return 'Good evening';
 }
 
-function relativeTime(iso?: string): string {
-  if (!iso) return 'never played';
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return 'never played';
-  const diff = Date.now() - then;
-  const m = Math.floor(diff / 60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d < 7) return `${d}d ago`;
-  const w = Math.floor(d / 7);
-  if (w < 5) return `${w}w ago`;
-  return new Date(iso).toLocaleDateString();
-}
-
-const HOME_LIBRARY_CARD_LIMIT = 14;
-
-function FeatureBanner({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  const theme = useTheme();
-  const version = versionById(inst.version_id);
+/** The last-played instance: its name as display type, its facts, and the way in. */
+function Lead({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const session = launchSessions.value[inst.id];
-  const playing = launchSessionIsPlaying(session);
-  const sessionLabel = launchSessionActivityLabel(session);
-  const install = instanceInstallStatus(inst, version);
-  const installing = install.installing;
-  const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
-  const launchAction = inst.launch_action;
-  const actionIcon =
-    launchAction.primary_action === 'launch'
-      ? 'play'
-      : launchAction.primary_action === 'install'
-        ? 'download'
-        : 'alert';
-  const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
-  const mods = inst.mods_count ?? 0;
-  const showModsCount = inst.version_display.supports_mods && inst.counts_available === true;
+  const install = instanceInstallStatus(inst, versionById(inst.version_id));
+  const action = inst.launch_action;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
-  const onKeyDown = (e: KeyboardEvent): void => {
-    if (e.target !== e.currentTarget) return;
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    open();
+  const canPlay = action.launchable && !session && !install.installing;
+  const play = (): void => {
+    selectInstance(inst.id);
+    void launchGame();
   };
   return (
-    <div
-      class="cp-feature"
-      role="button"
-      tabIndex={0}
-      aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
-      data-installing={installing}
-      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme) }}
-      onClick={open}
-      onKeyDown={onKeyDown}
-      onContextMenu={(e) => openInstanceContextMenu(e, inst)}
-    >
-      <div class="cp-feature-glow" aria-hidden="true" />
-      <InstanceGlyph inst={inst} className="cp-feature-glyph" />
-      <div class="cp-feature-content">
-        <div class="cp-feature-id">
-          <div class="cp-feature-kicker">{session ? sessionLabel : installing ? installBadge : 'Jump back in'}</div>
-          <h2 title={inst.name}>{inst.name}</h2>
-          <div class="cp-meta">
-            <span>{inst.version_display.loader_label}</span>
-            <span class="cp-dot" />
-            <span>MC {inst.version_display.minecraft_label}</span>
-            {showModsCount && (
-              <>
-                <span class="cp-dot" />
-                <span>{mods} mods</span>
-              </>
-            )}
-            <span class="cp-dot" />
-            <span>{relativeTime(inst.last_played_at)}</span>
-          </div>
-        </div>
-        <div class="cp-feature-actions">
-          {session && (
-            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
-              {sessionLabel}
-            </Pill>
-          )}
-          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installBadge}</Pill>}
+    <section class="cp-home-lead" aria-label={inst.name} onContextMenu={(e) => openInstanceContextMenu(e, inst)}>
+      <h2 class="cp-home-name" title={inst.name}>
+        {inst.name}
+      </h2>
+      <div class="cp-chips">
+        <InstanceFacts inst={inst} />
+        {session ? (
+          <SessionChip session={session} />
+        ) : install.installing ? (
+          <Chip tone="accent" icon={install.state === 'queued' ? 'clock' : 'download'}>
+            {install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing'}
+          </Chip>
+        ) : (
+          <Chip icon="clock">{inst.last_played_at ? fmtRelative(inst.last_played_at) : 'Not played yet'}</Chip>
+        )}
+      </div>
+      <div class="cp-home-actions">
+        {canPlay ? (
+          <>
+            <Button
+              size="lg"
+              icon="play"
+              sound="launchPress"
+              busy={launchState.value.status === 'preparing'}
+              onClick={play}
+            >
+              Play
+            </Button>
+            <Button size="lg" variant="secondary" onClick={open}>
+              Open
+            </Button>
+          </>
+        ) : (
           <Button
             size="lg"
             icon={
-              installing ? (install.state === 'queued' ? 'clock' : 'download') : session ? 'chevron-right' : actionIcon
+              session || install.installing ? undefined : action.primary_action === 'install' ? 'download' : 'alert'
             }
-            title={
-              installing
-                ? installBadge
-                : session
-                  ? `Open ${inst.name}`
-                  : launchAction.primary_action === 'blocked'
-                    ? launchAction.disabled_reason
-                    : `${actionLabel} ${inst.name}`
-            }
-            disabled={installing}
-            onClick={(e) => {
-              e.stopPropagation();
-              open();
-            }}
-            sound="launchPress"
+            title={action.primary_action === 'blocked' ? action.disabled_reason : undefined}
+            onClick={open}
           >
-            {installing ? installBadge : session ? 'Open' : actionLabel}
+            {session || install.installing ? 'Open' : action.label}
           </Button>
-        </div>
+        )}
       </div>
-    </div>
+    </section>
   );
 }
 
-function EmptyHome(): JSX.Element {
+/** One shelf of covers, as many as fit, then the way to add one. */
+function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JSX.Element {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [fit, setFit] = useState(SHELF_LIMIT);
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!row) return undefined;
+    const measure = (): void =>
+      setFit(Math.max(1, Math.min(SHELF_LIMIT, Math.floor((row.clientWidth + GAP) / (COVER + GAP)) - 1)));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, []);
+  const shown = list.slice(0, fit);
   return (
-    <Card padding={32}>
-      <div class="cp-empty">
-        <Icon name="stack" size={36} color="var(--text-mute)" />
-        <h2>Create your first instance</h2>
-        <p>
-          Instances are isolated Minecraft setups. Pick a version, bundle mods, and launch without touching your other
-          worlds.
-        </p>
-        <Button icon="plus" onClick={openCreate}>
-          New instance
+    <section class="cp-home-shelf">
+      <div class="cp-head">
+        <h2>Library</h2>
+        <Button
+          variant="ghost"
+          size="sm"
+          trailing={<Icon name="chevron-right" size={13} />}
+          onClick={() => navigate({ name: 'instances' })}
+        >
+          {total > shown.length + 1 ? `See all ${total}` : 'See all'}
         </Button>
       </div>
-    </Card>
+      <div class="cp-home-row" ref={rowRef}>
+        {shown.map((inst) => (
+          <button
+            key={inst.id}
+            type="button"
+            class="cp-home-item"
+            aria-label={`Open ${inst.name}`}
+            onClick={() => navigate({ name: 'instance', id: inst.id })}
+            onContextMenu={(e) => openInstanceContextMenu(e, inst)}
+          >
+            <InstanceTile inst={inst} className="cp-home-cover" />
+            <span class="cp-home-title" title={inst.name}>
+              {inst.name}
+            </span>
+          </button>
+        ))}
+        <button type="button" class="cp-home-item cp-home-new" onClick={openCreate}>
+          <span class="cp-home-cover">
+            <Icon name="plus" size={22} />
+          </span>
+          <span class="cp-home-title">New instance</span>
+        </button>
+      </div>
+    </section>
   );
 }
 
 export function HomeView(): JSX.Element {
-  const cfg = config.value;
   const all = instances.value;
-  const now = new Date();
-  const recent = useMemo(() => {
-    return [...all]
-      .sort((a, b) => {
+  const username = config.value?.username;
+  const recent = useMemo(
+    () =>
+      [...all].sort((a, b) => {
         const ta = a.last_played_at ? new Date(a.last_played_at).getTime() : 0;
         const tb = b.last_played_at ? new Date(b.last_played_at).getTime() : 0;
         return tb - ta;
-      })
-      .slice(0, HOME_LIBRARY_CARD_LIMIT + 1);
-  }, [all]);
-  const rest = recent.slice(1);
+      }),
+    [all],
+  );
+  const lead = recent[0];
 
-  return (
-    <div class="cp-view-page">
-      <div class="cp-page-header">
-        <div>
-          <h1>
-            {greetingFor(now)}
-            {cfg?.username ? `, ${cfg.username}` : ''}.
-          </h1>
-          <div class="cp-page-sub">
-            {all.length === 0
-              ? 'Set up your first instance to start playing.'
-              : `${all.length} instance${all.length === 1 ? '' : 's'} in your library`}
-          </div>
-        </div>
-        <div style={{ flex: 1 }} />
-        <Button variant="secondary" icon="plus" onClick={openCreate}>
+  if (!lead) {
+    return (
+      <div class="cp-view-page cp-home cp-home--empty">
+        <Face size={96} />
+        <h1>No instances yet</h1>
+        <Button size="lg" icon="plus" onClick={openCreate}>
           New instance
         </Button>
       </div>
-
-      {all.length === 0 ? (
-        <EmptyHome />
-      ) : (
-        <>
-          <FeatureBanner inst={recent[0]} />
-          {rest.length > 0 && (
-            <div>
-              <SectionHeading
-                title="Library"
-                action={{ label: 'See all', onClick: () => navigate({ name: 'instances' }) }}
-              />
-              <div class="cp-cover-grid">
-                {rest.map((inst) => (
-                  <InstanceCard key={inst.id} inst={inst} onContextMenu={(e) => openInstanceContextMenu(e, inst)} />
-                ))}
-              </div>
-            </div>
-          )}
-        </>
-      )}
+    );
+  }
+  return (
+    <div class="cp-view-page cp-home">
+      <Vista
+        seed={artSeedFor(lead)}
+        version={lead.version_id}
+        installing={instanceInstallStatus(lead, versionById(lead.version_id)).installing}
+      />
+      <h1 class="cp-home-hello">
+        {greetingFor(new Date())}
+        {username ? `, ${username}` : ''}.
+      </h1>
+      <Lead inst={lead} />
+      <Shelf list={recent.slice(1)} total={all.length} />
     </div>
   );
 }

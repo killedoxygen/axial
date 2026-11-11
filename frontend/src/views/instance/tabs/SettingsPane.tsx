@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Icon } from '../../../ui/Icons';
+import { Chip, Notice } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { ChoicePills, type ChoicePillOption } from '../../../ui/ChoicePills';
 import { OverrideChip, SettingRow, SettingsSection } from '../../../ui/SettingsSheet';
@@ -183,42 +183,76 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   };
 
   return (
-    <div class="cp-instance-body cp-settings-pane">
-      <div class="cp-resource-toolbar cp-settings-toolbar">
-        <strong>Instance settings</strong>
-        {saving && (
-          <span class="cp-settings-saving" aria-live="polite">
-            Saving…
-          </span>
-        )}
-      </div>
+    <div class="cp-pane cp-settings-pane">
+      {saving && (
+        <span class="cp-instance-saving" aria-live="polite">
+          Saving…
+        </span>
+      )}
 
       {healthNotice && (
-        <section class="cp-notice" data-tone={healthNotice.tone} aria-live="polite">
-          <span class="cp-notice-mark" aria-hidden="true">
-            <Icon name="alert" size={15} stroke={2.2} />
-          </span>
-          <div class="cp-notice-copy">
-            <strong>{healthNotice.title}</strong>
-            {healthNotice.detail && <p>{healthNotice.detail}</p>}
-          </div>
-        </section>
+        <Notice tone={healthNotice.tone} title={healthNotice.title}>
+          {healthNotice.detail && <p>{healthNotice.detail}</p>}
+        </Notice>
       )}
 
       <SettingsSection>
         <SettingRow
-          title="Launch profile"
-          description={modeOptions.find((option) => option.value === mode)?.note}
-          aside={mode !== '' && <OverrideChip onReset={() => changeMode('')} />}
-          control={
-            <ChoicePills<InstancePerformanceMode>
-              value={mode}
-              options={modeOptions}
-              ariaLabel="Instance performance mode"
-              onChange={changeMode}
-            />
+          title="Memory"
+          description={`Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)} for this system.`}
+          aside={
+            memoryOverridden ? (
+              <OverrideChip onReset={() => commit({ min_memory_mb: 0, max_memory_mb: 0 }, { label: 'memory' })} />
+            ) : (
+              <Chip>Global</Chip>
+            )
           }
-        />
+        >
+          <MemoryField
+            minGb={minGb}
+            maxGb={maxGb}
+            totalGb={totalGb}
+            onChange={(low, high) => {
+              setMinGb(low);
+              setMaxGb(high);
+            }}
+            onCommit={(low, high) =>
+              commit(
+                {
+                  min_memory_mb: Math.round(Math.min(low, high) * 1024),
+                  max_memory_mb: Math.round(high * 1024),
+                },
+                {
+                  label: 'memory',
+                  revert: () => {
+                    const current = instances.value.find((instance) => instance.id === inst.id);
+                    setMinGb(memoryGb(current?.min_memory_mb, config.value?.min_memory_mb ?? 1024));
+                    setMaxGb(memoryGb(current?.max_memory_mb, config.value?.max_memory_mb ?? 4096));
+                  },
+                },
+              )
+            }
+          />
+        </SettingRow>
+
+        <SettingRow
+          title="Game window"
+          description="Game window size when this instance launches."
+          aside={
+            windowOverridden && (
+              <OverrideChip onReset={() => commit({ window_width: 0, window_height: 0 }, { label: 'window size' })} />
+            )
+          }
+        >
+          <WindowField
+            width={effectiveWidth}
+            height={effectiveHeight}
+            inherit={
+              windowOverridden ? undefined : { active: true, label: `Global size\n${globalWidth} × ${globalHeight}` }
+            }
+            onCommit={(w, h) => commit({ window_width: w, window_height: h }, { label: 'window size' })}
+          />
+        </SettingRow>
 
         <SettingRow
           title="Runtime"
@@ -264,61 +298,18 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
         </SettingRow>
 
         <SettingRow
-          title="Memory"
-          description={`${memoryOverridden ? '' : 'Inherits the global default. '}Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)} for this system.`}
-          aside={
-            memoryOverridden && (
-              <OverrideChip onReset={() => commit({ min_memory_mb: 0, max_memory_mb: 0 }, { label: 'memory' })} />
-            )
+          title="Launch profile"
+          description={modeOptions.find((option) => option.value === mode)?.note}
+          aside={mode !== '' && <OverrideChip onReset={() => changeMode('')} />}
+          control={
+            <ChoicePills<InstancePerformanceMode>
+              value={mode}
+              options={modeOptions}
+              ariaLabel="Instance performance mode"
+              onChange={changeMode}
+            />
           }
-        >
-          <MemoryField
-            minGb={minGb}
-            maxGb={maxGb}
-            totalGb={totalGb}
-            onChange={(low, high) => {
-              setMinGb(low);
-              setMaxGb(high);
-            }}
-            onCommit={(low, high) =>
-              commit(
-                {
-                  min_memory_mb: Math.round(Math.min(low, high) * 1024),
-                  max_memory_mb: Math.round(high * 1024),
-                },
-                {
-                  label: 'memory',
-                  revert: () => {
-                    const current = instances.value.find((instance) => instance.id === inst.id);
-                    setMinGb(memoryGb(current?.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-                    setMaxGb(memoryGb(current?.max_memory_mb, config.value?.max_memory_mb ?? 4096));
-                  },
-                },
-              )
-            }
-          />
-        </SettingRow>
-
-        <SettingRow
-          title="Window"
-          description="Game window size when this instance launches."
-          aside={
-            windowOverridden && (
-              <OverrideChip onReset={() => commit({ window_width: 0, window_height: 0 }, { label: 'window size' })} />
-            )
-          }
-        >
-          <WindowField
-            width={effectiveWidth}
-            height={effectiveHeight}
-            inherit={
-              windowOverridden
-                ? undefined
-                : { active: true, label: `Global size\n${globalWidth} × ${globalHeight}` }
-            }
-            onCommit={(w, h) => commit({ window_width: w, window_height: h }, { label: 'window size' })}
-          />
-        </SettingRow>
+        />
       </SettingsSection>
     </div>
   );

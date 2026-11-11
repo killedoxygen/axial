@@ -1,26 +1,82 @@
-import type { JSX } from 'preact';
-import { useState } from 'preact/hooks';
+import type { ComponentChildren, JSX } from 'preact';
 import { Icon, type IconName } from '../../../ui/Icons';
-import { IconButton, Pill } from '../../../ui/Atoms';
+import { Chip, IconButton } from '../../../ui/Atoms';
+import { Art } from '../../../ui/Art';
 import { SelectionCheckbox } from '../../../ui/SelectionActionTray';
 import { selectionToggleLabel } from '../../../ui/selection';
-import { formatBytes } from '../../../format';
 
 /** One installed file in the Mods, Resource packs or Shaders list. */
 export interface ContentRowView {
   key: string;
   title: string;
   fileName: string;
-  /** Version and author details, shown on the second line. */
+  /** Mods: the file's own version. */
+  version?: string;
+  /** Mods: the authors. Packs: the pack's description. */
   details: string[];
   iconUrl?: string;
   fallbackIcon: IconName;
-  managed: boolean;
   /** The modpack that placed this file. */
   pack?: string;
   enabled: boolean;
-  size?: number;
+  /** An unpacked folder rather than an archive. */
+  folder?: boolean;
   update?: { version: string; disabled: boolean; onClick: () => void };
+}
+
+/** A list row: art (its selection mark on hover), name and a quiet second line, a number, an action, a menu. */
+export function Entry({
+  art,
+  title,
+  titleTip,
+  chips,
+  byline,
+  num,
+  action,
+  selected,
+  disabled,
+  onToggle,
+  onMenu,
+  menuLabel = 'More',
+}: {
+  art: JSX.Element;
+  title: string;
+  titleTip?: string;
+  chips?: ComponentChildren;
+  byline?: string;
+  num?: string;
+  action?: JSX.Element;
+  selected: boolean;
+  disabled?: boolean;
+  onToggle: () => void;
+  onMenu: (e: MouseEvent) => void;
+  menuLabel?: string;
+}): JSX.Element {
+  return (
+    <div class="cp-entry" data-disabled={disabled === true} data-selected={selected} onContextMenu={onMenu}>
+      <span class="cp-lead">
+        {art}
+        <SelectionCheckbox
+          selected={selected}
+          label={selectionToggleLabel(selected, title)}
+          onToggle={(e) => {
+            e.stopPropagation();
+            onToggle();
+          }}
+        />
+      </span>
+      <span class="cp-entry-id">
+        <span class="cp-entry-title">
+          <strong title={titleTip}>{title}</strong>
+          {chips}
+        </span>
+        {byline && <span class="cp-entry-by">{byline}</span>}
+      </span>
+      <span class="cp-entry-num">{num}</span>
+      {action ?? <span />}
+      <IconButton icon="dots" size={28} tooltip={menuLabel} onClick={onMenu} />
+    </div>
+  );
 }
 
 export function ContentRow({
@@ -34,70 +90,73 @@ export function ContentRow({
   onToggle: () => void;
   onMenu: (e: MouseEvent) => void;
 }): JSX.Element {
-  const details = [
-    ...(view.size === undefined ? ['Unpacked folder'] : []),
-    ...(view.pack ? [`From ${view.pack}`] : []),
-    ...view.details,
-  ];
+  const update = view.update;
   return (
-    <div
-      class="cp-content-row cp-selection-row"
-      data-disabled={!view.enabled}
-      data-selected={selected}
-      onContextMenu={onMenu}
-    >
-      <SelectionCheckbox
-        selected={selected}
-        label={selectionToggleLabel(selected, view.title)}
-        onToggle={(e) => {
-          e.stopPropagation();
-          onToggle();
-        }}
-      />
-      <ContentFileIcon url={view.iconUrl} fallback={view.fallbackIcon} />
-      <span class="cp-content-row-main">
-        <span class="cp-content-row-title">
-          <span class="cp-resource-name" title={view.fileName}>
-            {view.title}
-          </span>
-          {!view.enabled && <Pill>Disabled</Pill>}
-          {view.update && (
-            <button
-              type="button"
-              class="cp-mod-update"
-              title={`Update to ${view.update.version}`}
-              disabled={view.update.disabled}
-              onClick={(e) => {
-                e.stopPropagation();
-                view.update?.onClick();
-              }}
-            >
-              <Icon name="arrow-up" size={11} stroke={2.4} />
-              Update
-            </button>
-          )}
-        </span>
-        {details.length > 0 && <span class="cp-content-row-details">{details.join(' · ')}</span>}
-      </span>
-      <span class="cp-mod-source" data-provider={view.managed ? 'modrinth' : 'local'}>
-        {view.managed ? 'Modrinth' : 'Local'}
-      </span>
-      <span class="cp-resource-meta">{view.size === undefined ? '' : formatBytes(view.size)}</span>
-      <IconButton icon="dots" size={24} tooltip="More" onClick={onMenu} />
-    </div>
+    <Entry
+      art={<Art url={view.iconUrl} icon={view.fallbackIcon} />}
+      title={view.title}
+      titleTip={view.fileName}
+      chips={
+        <>
+          {!view.enabled && <Chip>Disabled</Chip>}
+          {view.folder && <Chip icon="folder">Folder</Chip>}
+        </>
+      }
+      byline={view.details.join(', ')}
+      num={view.version}
+      action={
+        update && (
+          <button
+            type="button"
+            class="cp-btn cp-btn--sm cp-btn--soft cp-entry-update"
+            title={`Update to ${update.version}`}
+            aria-label={`Update ${view.title} to ${update.version}`}
+            disabled={update.disabled}
+            onClick={(e) => {
+              e.stopPropagation();
+              update.onClick();
+            }}
+          >
+            <Icon name="arrow-up" size={12} />
+            <span>{update.version}</span>
+          </button>
+        )
+      }
+      selected={selected}
+      disabled={!view.enabled}
+      onToggle={onToggle}
+      onMenu={onMenu}
+    />
   );
 }
 
-export function ContentFileIcon({ url, fallback }: { url?: string; fallback: IconName }): JSX.Element {
-  const [failed, setFailed] = useState<string | null>(null);
+/** The one action for every pending update, carrying how many. */
+export function UpdateAll({
+  count,
+  noun,
+  note,
+  disabled,
+  onClick,
+}: {
+  count: number;
+  noun: string;
+  note?: string;
+  disabled: boolean;
+  onClick: () => void;
+}): JSX.Element {
   return (
-    <span class="cp-content-row-icon">
-      {url && failed !== url ? (
-        <img src={url} alt="" loading="lazy" decoding="async" onError={() => setFailed(url)} />
-      ) : (
-        <Icon name={fallback} size={16} color="var(--text-mute)" />
-      )}
-    </span>
+    <button
+      type="button"
+      class="cp-btn cp-btn--soft cp-update-all"
+      title={note}
+      aria-label={`Update ${count} ${noun}${count === 1 ? '' : 's'}`}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <Icon name="arrow-up" size={13} />
+      <span>Update all</span>
+      <span class="cp-update-all-n">{count}</span>
+    </button>
   );
 }
 
@@ -113,7 +172,7 @@ export function compareContentRows(left: ContentRowView, right: ContentRowView):
 export function contentRowMatches(view: ContentRowView, query: string): boolean {
   const needle = query.trim().toLowerCase();
   if (!needle) return true;
-  return [view.title, view.fileName, view.pack ?? '', ...view.details].some((text) =>
+  return [view.title, view.fileName, view.version ?? '', view.pack ?? '', ...view.details].some((text) =>
     text.toLowerCase().includes(needle),
   );
 }

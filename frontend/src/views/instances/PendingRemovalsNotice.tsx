@@ -1,15 +1,28 @@
 import type { JSX } from 'preact';
 import { useEffect } from 'preact/hooks';
-import { Button } from '../../ui/Atoms';
-import { Icon } from '../../ui/Icons';
+import { Button, Notice } from '../../ui/Atoms';
 import { instances } from '../../store';
 import { checkInstanceDeletionFlow, recoverInstanceDeletionFlow } from '../instance/instance-actions';
 import {
   deletionDiscoveryError,
+  type DeletionObservation,
   instanceDeletions,
   refreshPendingInstanceDeletions,
 } from '../instance/deletions';
 
+function statusLine(row: DeletionObservation): string {
+  const outcome =
+    row.status === 'pending_restore'
+      ? 'Removal did not commit. The instance can be restored.'
+      : row.status === 'cleanup_pending'
+        ? 'Removal committed. File cleanup is unfinished.'
+        : row.status === 'aborted'
+          ? 'Removal aborted. The instance and its files were preserved.'
+          : 'The removal result is unconfirmed. Check its status before trying again.';
+  return `${outcome} ${row.intent === 'keep_files' ? 'Original choice: keep files.' : 'Original choice: delete files.'}`;
+}
+
+/** Unfinished instance removals: what happened to each, and the way to settle it, on one line. */
 export function PendingRemovalsNotice(): JSX.Element | null {
   useEffect(() => {
     void refreshPendingInstanceDeletions().catch(() => undefined);
@@ -18,61 +31,50 @@ export function PendingRemovalsNotice(): JSX.Element | null {
   const error = deletionDiscoveryError.value;
   if (pending.length === 0 && !error) return null;
   return (
-    <div class="cp-notice" data-tone={error ? 'error' : 'warned'} aria-live="polite">
-      <div class="cp-notice-mark">
-        <Icon name="alert" size={16} />
-      </div>
-      <div class="cp-notice-copy">
-        <strong>Unfinished instance removals</strong>
-        {error && <p>{error}</p>}
-        {pending.map((row) => {
-          const name = instances.value.find((instance) => instance.id === row.instance_id)?.name ?? row.instance_id;
-          const canContinue = row.status === 'pending_restore' || row.status === 'cleanup_pending';
-          return (
-            <div key={row.operation_id} class="cp-notice-details">
-              <p>
-                {name}:{' '}
-                {row.status === 'pending_restore'
-                  ? 'Removal did not commit. The instance can be restored.'
-                  : row.status === 'cleanup_pending'
-                    ? 'Removal committed. File cleanup is unfinished.'
-                    : row.status === 'aborted'
-                      ? 'Removal aborted. The instance and its files were preserved.'
-                      : 'The removal result is unconfirmed. Check its status before trying again.'}{' '}
-                {row.intent === 'keep_files' ? 'Original choice: keep files.' : 'Original choice: delete files.'}
-              </p>
-              {row.error && <p>{row.error}</p>}
-              <Button
-                size="sm"
-                variant="secondary"
-                disabled={row.busy}
-                onClick={() => void checkInstanceDeletionFlow(row)}
-              >
-                {row.busy ? 'Checking removal…' : 'Check status'}
-              </Button>
-              {canContinue && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={row.busy}
-                  onClick={() => void recoverInstanceDeletionFlow(row)}
-                >
-                  {row.status === 'pending_restore' ? 'Restore instance' : 'Finish cleanup'}
-                </Button>
-              )}
-            </div>
-          );
-        })}
-        {error && (
+    <section class="cp-removals" aria-label="Unfinished instance removals">
+      {error && (
+        <Notice tone="warned" class="cp-removal">
+          <p>{error}</p>
           <Button
             size="sm"
             variant="secondary"
             onClick={() => void refreshPendingInstanceDeletions().catch(() => undefined)}
           >
-            Check unfinished removals
+            Check again
           </Button>
-        )}
-      </div>
-    </div>
+        </Notice>
+      )}
+      {pending.map((row) => {
+        const name = instances.value.find((instance) => instance.id === row.instance_id)?.name ?? row.instance_id;
+        const canContinue = row.status === 'pending_restore' || row.status === 'cleanup_pending';
+        return (
+          <Notice key={row.operation_id} tone="warned" class="cp-removal">
+            <p>
+              <strong>{name}</strong> {statusLine(row)}
+              {row.error && <span class="cp-removal-error">{row.error}</span>}
+            </p>
+            <Button
+              size="sm"
+              variant="secondary"
+              busy={row.busy}
+              disabled={row.busy}
+              onClick={() => void checkInstanceDeletionFlow(row)}
+            >
+              Check status
+            </Button>
+            {canContinue && (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={row.busy}
+                onClick={() => void recoverInstanceDeletionFlow(row)}
+              >
+                {row.status === 'pending_restore' ? 'Restore instance' : 'Finish cleanup'}
+              </Button>
+            )}
+          </Notice>
+        );
+      })}
+    </section>
   );
 }

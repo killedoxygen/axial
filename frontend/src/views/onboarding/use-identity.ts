@@ -12,7 +12,7 @@ import {
   lookupSkinFileUrl,
 } from '../accounts/api';
 import type { MinecraftSkinLookup, SkinVariant } from '../accounts/types';
-import { SIGN_IN_UNAVAILABLE } from '../accounts/AccountSwitcher';
+import { SIGN_IN_UNAVAILABLE } from '../accounts/account-rows';
 import { useMicrosoftSignIn } from '../accounts/useMicrosoftSignIn';
 
 const LOOKUP_DELAY_MS = 450;

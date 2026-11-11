@@ -1,15 +1,23 @@
 import type { JSX } from 'preact';
-import { guardedInstanceHue, InstanceTile } from './InstanceVisual';
-import { useTheme } from '../hooks/use-theme';
+import { InstanceFacts, SessionChip } from './InstanceFacts';
+import { InstanceTile } from './InstanceVisual';
+import { Chip } from './Atoms';
 import { Icon } from './Icons';
 import { SelectionCheckbox } from './SelectionActionTray';
 import { selectionToggleLabel } from './selection';
 import { navigate } from '../ui-state';
 import { launchSessions, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
-import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
 import type { EnrichedInstance } from '../types-instance';
 
+/** Opens the instance on Enter or Space when the row or cover itself has focus, not a control inside it. */
+export function openOnKey(e: KeyboardEvent, open: () => void): void {
+  if (e.target !== e.currentTarget || (e.key !== 'Enter' && e.key !== ' ')) return;
+  e.preventDefault();
+  open();
+}
+
+/** A library cover: the instance's tile, its name, and its facts as chips. */
 export function InstanceCard({
   inst,
   onContextMenu,
@@ -21,48 +29,27 @@ export function InstanceCard({
   selected?: boolean;
   onToggleSelect?: (e: MouseEvent) => void;
 }): JSX.Element {
-  const theme = useTheme();
   const session = launchSessions.value[inst.id];
-  const playing = launchSessionIsPlaying(session);
-  const sessionLabel = launchSessionActivityLabel(session);
-  const version = versionById(inst.version_id);
-  const install = instanceInstallStatus(inst, version);
-  const installing = install.installing;
-  const installBadge = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
-  const launchAction = inst.launch_action;
-  const actionIcon =
-    launchAction.primary_action === 'launch'
-      ? 'play'
-      : launchAction.primary_action === 'install'
-        ? 'download'
-        : 'alert';
+  const install = instanceInstallStatus(inst, versionById(inst.version_id));
+  const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+  const action = inst.launch_action.primary_action;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
-  const onKeyDown = (e: KeyboardEvent): void => {
-    if (e.target !== e.currentTarget) return;
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    open();
-  };
   return (
     <div
-      class="cp-icard"
-      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme) }}
+      class="cp-cover"
       role="button"
       tabIndex={0}
-      aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
-      data-running={playing}
-      data-session-active={Boolean(session)}
-      data-installing={installing}
+      aria-label={install.installing ? `Open ${inst.name}. ${installLabel}` : `Open ${inst.name}`}
+      data-installing={install.installing}
       data-selected={selected === true}
       onClick={open}
-      onKeyDown={onKeyDown}
+      onKeyDown={(e) => openOnKey(e, open)}
       onContextMenu={onContextMenu}
     >
-      <div class="cp-icard-art">
-        <InstanceTile inst={inst} radius={0} className="cp-icard-canvas" />
+      <div class="cp-cover-art">
+        <InstanceTile inst={inst} />
         {onToggleSelect && (
           <SelectionCheckbox
-            className="cp-icard-select"
             selected={selected === true}
             label={selectionToggleLabel(selected === true, inst.name)}
             onToggle={(e) => {
@@ -71,32 +58,25 @@ export function InstanceCard({
             }}
           />
         )}
-        {session && (
-          <span class="cp-icard-live" aria-label={sessionLabel}>
-            <span class="cp-icard-live-dot" />
-            <span class="cp-icard-live-label">{sessionLabel}</span>
-          </span>
-        )}
-        {installing && (
-          <span class="cp-icard-install" aria-label={installBadge}>
-            <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={13} stroke={2} />
-            {installBadge}
-          </span>
-        )}
-        {!installing && (
-          <span class="cp-icard-play" aria-hidden="true">
-            <Icon name={actionIcon} size={20} stroke={2} />
+        {!install.installing && !session && (
+          <span class="cp-cover-play" aria-hidden="true">
+            <Icon name={action === 'launch' ? 'play' : action === 'install' ? 'download' : 'alert'} size={14} />
           </span>
         )}
       </div>
-      <div class="cp-icard-body">
-        <div class="cp-icard-name" title={inst.name}>
-          {inst.name}
-        </div>
-        <div class="cp-icard-sub">
-          {installing ? `${installBadge}, ` : ''}
-          {inst.version_display.summary_label}
-        </div>
+      <strong class="cp-cover-name" title={inst.name}>
+        {inst.name}
+      </strong>
+      <div class="cp-chips">
+        {session ? (
+          <SessionChip session={session} />
+        ) : install.installing ? (
+          <Chip tone="accent" icon={install.state === 'queued' ? 'clock' : 'download'}>
+            {installLabel}
+          </Chip>
+        ) : (
+          <InstanceFacts inst={inst} />
+        )}
       </div>
     </div>
   );

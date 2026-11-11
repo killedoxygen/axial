@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { Pill } from '../../ui/Atoms';
+import { Chip } from '../../ui/Atoms';
 import { errMessage } from '../../utils';
 import type { BenchmarkQualificationResponse } from '../../types-performance';
 import { compactId } from './PerformanceLabFormat';
@@ -37,21 +37,21 @@ export function BenchmarkQualificationPreviewBlock({
   const rows = preview?.targets ?? [];
 
   return (
-    <div class="cp-settings-qualification-preview" aria-live="polite">
-      <div class="cp-settings-qualification-head">
-        <div class="cp-settings-rule-status-copy">
+    <div class="cp-lab-block" aria-live="polite">
+      <div class="cp-lab-head">
+        <div class="cp-lab-title">
           <strong>Family C qualification</strong>
           <span>No-launch evidence preview. Incomplete is expected until suite and proof evidence exists.</span>
         </div>
-        <div class="cp-settings-qualification-status">
-          {state.status === 'loading' && <span class="cp-settings-proof-muted">Loading</span>}
-          {state.status === 'error' && <span class="cp-settings-proof-error">Unavailable</span>}
-          {preview && <Pill tone={preview.view_model.status_tone}>{preview.view_model.status_label}</Pill>}
+        <div class="cp-lab-status">
+          {state.status === 'loading' && <Chip>Loading</Chip>}
+          {state.status === 'error' && <Chip tone="err">Unavailable</Chip>}
+          {preview && <Chip tone={preview.view_model.status_tone}>{preview.view_model.status_label}</Chip>}
         </div>
       </div>
 
       {!preview && (
-        <div class="cp-settings-proof-empty">
+        <div class="cp-lab-note">
           {state.status === 'loading'
             ? 'Checking Family C qualification evidence.'
             : `Family C qualification preview is unavailable. ${state.error}`}
@@ -60,7 +60,7 @@ export function BenchmarkQualificationPreviewBlock({
 
       {preview && (
         <>
-          <div class="cp-settings-qualification-summary">
+          <div class="cp-lab-qualification-summary">
             <div>
               <span>Target</span>
               <strong>{preview.view_model.target_label}</strong>
@@ -75,11 +75,11 @@ export function BenchmarkQualificationPreviewBlock({
             </div>
           </div>
 
-          {rows.length === 0 && <div class="cp-settings-proof-empty">No qualification targets are described yet.</div>}
+          {rows.length === 0 && <div class="cp-lab-note">No qualification targets are described yet.</div>}
 
           {rows.length > 0 && (
-            <div class="cp-settings-qualification-table">
-              <div class="cp-settings-qualification-table-head">
+            <div class="cp-lab-qualification-table">
+              <div class="cp-lab-qualification-table-head">
                 <span>Role</span>
                 <span>Target ID</span>
                 <span>Required evidence</span>
@@ -88,7 +88,7 @@ export function BenchmarkQualificationPreviewBlock({
                 <span>Missing</span>
               </div>
               {rows.map((row) => (
-                <div class="cp-settings-qualification-row" key={`${row.role}:${row.target_id}`}>
+                <div class="cp-lab-qualification-row" key={`${row.role}:${row.target_id}`}>
                   <span data-label="Role">{row.view_model.role_label}</span>
                   <strong data-label="Target ID" title={row.target_id}>
                     {compactId(row.target_id || 'Unknown target')}
@@ -109,7 +109,7 @@ export function BenchmarkQualificationPreviewBlock({
           )}
 
           {state.status === 'error' && (
-            <div class="cp-settings-proof-note">
+            <div class="cp-lab-note">
               Could not refresh qualification preview. Showing the last loaded evidence state.
             </div>
           )}

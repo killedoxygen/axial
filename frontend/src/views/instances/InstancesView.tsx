@@ -1,25 +1,22 @@
 import type { JSX } from 'preact';
+import { SessionChip } from '../../ui/InstanceFacts';
 import { useCallback, useState } from 'preact/hooks';
 import { InstanceTile } from '../../ui/InstanceVisual';
-import { Button, IconButton, Input, Pill } from '../../ui/Atoms';
+import { Button, Empty, IconButton, Input } from '../../ui/Atoms';
 import { Segmented } from '../../ui/Segmented';
 import { Icon } from '../../ui/Icons';
-import { InstanceCard } from '../../ui/InstanceCard';
+import { InstanceCard, openOnKey } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { SelectionActionTray, SelectionCheckbox } from '../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
-import { useTheme } from '../../hooks/use-theme';
 import { instances, versionById, launchSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
-import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
 import { navigate, openCreate } from '../../ui-state';
 import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
-import { fmtRelativeCompact } from '../../format';
+import { fmtRelative } from '../../format';
 import type { EnrichedInstance } from '../../types-instance';
 import { PendingRemovalsNotice } from './PendingRemovalsNotice';
-
-const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
 
 function ListRow({
   inst,
@@ -32,11 +29,8 @@ function ListRow({
   onToggleSelect: (e: MouseEvent) => void;
   onContextMenu: (e: MouseEvent) => void;
 }): JSX.Element {
-  const theme = useTheme();
-  const v = versionById(inst.version_id);
   const session = launchSessions.value[inst.id];
-  const playing = launchSessionIsPlaying(session);
-  const install = instanceInstallStatus(inst, v);
+  const install = instanceInstallStatus(inst, versionById(inst.version_id));
   const installing = install.installing;
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const launchAction = inst.launch_action;
@@ -46,55 +40,48 @@ function ListRow({
       : launchAction.primary_action === 'install'
         ? 'download'
         : 'alert';
-  const actionLabel = launchAction.primary_action === 'launch' ? 'Play' : launchAction.label;
-  const showModsCount = inst.version_display.supports_mods && inst.counts_available === true;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
-  const onKeyDown = (e: KeyboardEvent): void => {
-    if (e.target !== e.currentTarget) return;
-    if (e.key !== 'Enter' && e.key !== ' ') return;
-    e.preventDefault();
-    open();
-  };
   return (
     <div
-      class="cp-table-row cp-selection-row"
-      style={{ gridTemplateColumns: LIST_COLS }}
+      class="cp-tr"
       role="button"
       tabIndex={0}
       aria-label={installing ? `Open ${inst.name}. ${installLabel}` : `Open ${inst.name}`}
       data-selected={selected}
       onClick={open}
-      onKeyDown={onKeyDown}
+      onKeyDown={(e) => openOnKey(e, open)}
       onContextMenu={onContextMenu}
     >
-      <SelectionCheckbox
-        selected={selected}
-        label={selectionToggleLabel(selected, inst.name)}
-        onToggle={(e) => {
-          e.stopPropagation();
-          onToggleSelect(e);
-        }}
-      />
-      <InstanceTile inst={inst} radius={theme.r.sm} style={{ width: 36, height: 36 }} />
-      <div>
-        <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {inst.name}
-          {session && (
-            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
-              {launchSessionActivityLabel(session)}
-            </Pill>
-          )}
-          {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}
-        </div>
-        <div class="cp-table-row-sub">{inst.version_display.loader_detail_label}</div>
-      </div>
-      <div class="cp-table-cell">{inst.version_display.minecraft_label}</div>
-      <div class="cp-table-cell">{showModsCount ? `${inst.mods_count ?? 0} mods` : null}</div>
-      <div class="cp-table-cell">{fmtRelativeCompact(inst.last_played_at)}</div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 4 }}>
+      <span class="cp-library-name">
+        <span class="cp-lead">
+          <InstanceTile inst={inst} />
+          <SelectionCheckbox
+            selected={selected}
+            label={selectionToggleLabel(selected, inst.name)}
+            onToggle={(e) => {
+              e.stopPropagation();
+              onToggleSelect(e);
+            }}
+          />
+        </span>
+        <strong>{inst.name}</strong>
+        {session && (
+          <SessionChip session={session} />
+        )}
+      </span>
+      <span class="cp-library-cell">
+        {inst.version_display.loader_label}
+        {inst.version_display.loader_version_label ? ` ${inst.version_display.loader_version_label}` : ''}
+      </span>
+      <span class="cp-library-num">{inst.version_display.minecraft_label}</span>
+      <span class="cp-library-cell">
+        {inst.version_display.supports_mods && inst.counts_available === true ? inst.mods_count : null}
+      </span>
+      <span class="cp-library-cell">{inst.last_played_at ? fmtRelative(inst.last_played_at) : null}</span>
+      <span class="cp-library-acts">
         <Button
           size="sm"
-          variant="secondary"
+          variant="ghost"
           icon={installing ? (install.state === 'queued' ? 'clock' : 'download') : actionIcon}
           disabled={installing}
           title={launchAction.primary_action === 'blocked' ? launchAction.disabled_reason : undefined}
@@ -103,18 +90,18 @@ function ListRow({
             open();
           }}
         >
-          {installing ? installLabel : actionLabel}
+          {installing ? installLabel : launchAction.primary_action === 'launch' ? 'Play' : launchAction.label}
         </Button>
         <IconButton
           icon="dots"
           size={28}
           tooltip={`Actions for ${inst.name}`}
-          onClick={(e: any) => {
+          onClick={(e) => {
             e.stopPropagation();
             onContextMenu(e);
           }}
         />
-      </div>
+      </span>
     </div>
   );
 }
@@ -130,34 +117,20 @@ export function InstancesView(): JSX.Element {
     useCallback((inst: EnrichedInstance) => inst.id, []),
   );
 
-  const menuItems = (inst: EnrichedInstance) => [
-    selectionMenuItem(selection, inst.id),
-    { divider: true, label: '', onSelect: () => undefined },
-    ...instanceMenuItems(inst),
-  ];
-
   const openMenu = (e: MouseEvent, inst: EnrichedInstance): void => {
-    openContextMenu(e, menuItems(inst));
-  };
-
-  const deleteSelected = async (): Promise<void> => {
-    await deleteInstancesFlow(selection.selectedItems, selection.clear);
+    openContextMenu(e, [
+      selectionMenuItem(selection, inst.id),
+      { divider: true, label: '', onSelect: () => undefined },
+      ...instanceMenuItems(inst),
+    ]);
   };
 
   return (
-    <div class="cp-view-page" style={{ gap: 18 }}>
-      <div class="cp-page-header">
-        <div>
-          <h1>Instances</h1>
-          <div class="cp-page-sub">
-            {all.length} total
-            {all.every((inst) => inst.counts_available === true)
-              ? `, ${all.reduce((sum, inst) => sum + inst.mods_count, 0)} mods across all`
-              : null}
-          </div>
-        </div>
-        <div style={{ flex: 1 }} />
-        <Input value={q} onChange={setQ} placeholder="Filter instances…" icon="search" style={{ width: 260 }} />
+    <div class="cp-view-page cp-library">
+      <header class="cp-library-head">
+        <h1 class="cp-h1">Instances</h1>
+        <span class="cp-head-fill" />
+        <Input value={q} onChange={setQ} placeholder="Search instances" icon="search" />
         <Segmented<'grid' | 'list'>
           value={view}
           onChange={setView}
@@ -167,25 +140,27 @@ export function InstancesView(): JSX.Element {
             { value: 'list', label: 'List' },
           ]}
         />
-        <Button icon="plus" onClick={openCreate}>
-          New
+        <Button size="lg" icon="plus" onClick={openCreate}>
+          New instance
         </Button>
-      </div>
+      </header>
 
       <PendingRemovalsNotice />
       {filtered.length === 0 ? (
-        <div class="cp-empty">
-          <Icon name="stack" size={36} color="var(--text-mute)" />
-          <h2>{q ? 'No matches' : 'No instances yet'}</h2>
-          <p>{q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}</p>
-          {!q && (
-            <Button icon="plus" onClick={openCreate}>
-              New instance
-            </Button>
-          )}
-        </div>
+        <Empty
+          title={q ? 'No matches' : 'No instances yet'}
+          actions={
+            !q && (
+              <Button icon="plus" onClick={openCreate}>
+                New instance
+              </Button>
+            )
+          }
+        >
+          {q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}
+        </Empty>
       ) : view === 'grid' ? (
-        <div class="cp-cover-grid" data-selecting={selection.selectedCount > 0}>
+        <div class="cp-covers">
           {filtered.map((i) => (
             <InstanceCard
               key={i.id}
@@ -195,14 +170,19 @@ export function InstancesView(): JSX.Element {
               onContextMenu={(e) => openMenu(e, i)}
             />
           ))}
+          <button type="button" class="cp-cover cp-cover--new" onClick={openCreate}>
+            <span class="cp-cover-art">
+              <Icon name="plus" size={24} />
+            </span>
+            <strong class="cp-cover-name">New instance</strong>
+          </button>
         </div>
       ) : (
-        <div class="cp-card cp-table">
-          <div class="cp-table-head" style={{ gridTemplateColumns: LIST_COLS }}>
-            <span />
-            <span />
-            <span>Instance</span>
-            <span>Version</span>
+        <div class="cp-table cp-library-table">
+          <div class="cp-tr cp-th">
+            <span>Name</span>
+            <span>Loader</span>
+            <span>Minecraft</span>
             <span>Mods</span>
             <span>Last played</span>
             <span />
@@ -221,7 +201,14 @@ export function InstancesView(): JSX.Element {
       <SelectionActionTray
         selection={selection}
         itemLabel="instance"
-        actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}
+        actions={[
+          {
+            label: 'Delete',
+            icon: 'trash',
+            danger: true,
+            onClick: () => void deleteInstancesFlow(selection.selectedItems, selection.clear),
+          },
+        ]}
       />
     </div>
   );

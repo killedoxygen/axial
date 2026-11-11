@@ -1,8 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Icon, type IconName } from '../../ui/Icons';
-import { Button, IconButton, Pill } from '../../ui/Atoms';
-import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
+import { Button, Chip, Empty, IconButton, Status, Tabs, type TabItem } from '../../ui/Atoms';
+import { artSeedFor } from '../../ui/InstanceVisual';
+import { Vista } from '../../vista/Vista';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { instances, launchNotices, launchSessions, launchState, versionById } from '../../store';
 import { navigate, resetViewScroll } from '../../ui-state';
@@ -10,7 +10,7 @@ import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../machines/downloads';
 import { errMessage } from '../../utils';
-import { formatDate, fmtRelative } from '../../format';
+import { fmtRelative } from '../../format';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { refreshInstanceReadiness } from '../../instance-readiness';
 import { resumeInstanceSetup } from '../../instance-setup';
@@ -32,12 +32,13 @@ import { ScreenshotsPane } from './tabs/ScreenshotsPane';
 import { LogsPane } from './tabs/LogsPane';
 import { SettingsPane } from './tabs/SettingsPane';
 import { InstallBarrierPane, LaunchOutcomeNotice, LaunchSplitButton } from './components/launch';
-import { useTheme } from '../../hooks/use-theme';
+import { PackChips } from './components/pack-origin';
+import { cachedModProvenance } from './mod-provenance-cache';
 
 type Tab = 'mods' | 'resourcepacks' | 'shaderpacks' | 'worlds' | 'screenshots' | 'logs' | 'settings';
 type TabSelection = { instanceId: string; tab: Tab } | null;
 
-const TABS: Array<{ id: Tab; icon: IconName; label: string }> = [
+const TABS: TabItem<Tab>[] = [
   { id: 'mods', icon: 'puzzle', label: 'Mods' },
   { id: 'resourcepacks', icon: 'image', label: 'Resource packs' },
   { id: 'shaderpacks', icon: 'palette', label: 'Shaders' },
@@ -66,7 +67,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
 }
 
 function InstanceDetailContent({ id }: { id: string }): JSX.Element {
-  const theme = useTheme();
   const inst = instances.value.find((i) => i.id === id);
   const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
@@ -131,14 +131,16 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   if (!inst) {
     return (
       <div class="cp-view-page">
-        <div class="cp-empty">
-          <Icon name="stack" size={36} color="var(--text-mute)" />
-          <h2>Instance not found</h2>
-          <p>That instance might have been deleted.</p>
-          <Button icon="chevron-left" onClick={() => navigate({ name: 'instances' })}>
-            Back to instances
-          </Button>
-        </div>
+        <Empty
+          title="Instance not found"
+          actions={
+            <Button variant="secondary" icon="chevron-left" onClick={() => navigate({ name: 'instances' })}>
+              Back to instances
+            </Button>
+          }
+        >
+          That instance might have been deleted.
+        </Empty>
       </div>
     );
   }
@@ -150,7 +152,6 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const modTabs: Tab[] = ['mods', 'shaderpacks'];
   const activeTab: Tab = !showModsTab && modTabs.includes(currentTab) ? 'worlds' : currentTab;
   const visibleTabs = showModsTab ? TABS : TABS.filter((t) => !modTabs.includes(t.id));
-  const auroraHue = guardedInstanceHue(inst, theme);
   const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
   const installTarget = installStatus.target;
@@ -168,13 +169,28 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
     installProgress,
     preparing,
   });
-  const statusLabel = session
-    ? sessionLabel
-    : launchPresentation.progress || installQueued
-      ? launchPresentation.label
-      : launchAction.launchable
-        ? 'Ready'
-        : (launchAction.primary_action === 'install' && matchingInstallFailure?.viewModel.title) || launchAction.label;
+  // Status only when it says something the Launch button does not: ready and install are the button itself.
+  const failureTitle = launchAction.primary_action === 'install' ? matchingInstallFailure?.viewModel.title : undefined;
+  const quiet = launchAction.launchable || (launchAction.primary_action === 'install' && !failureTitle);
+  const status = session ? (
+    playing ? (
+      <Status eyes="open" tone="accent">
+        {sessionLabel} <span class="cp-instance-clock">{fmtElapsed(session.launchedAt, now)}</span>
+      </Status>
+    ) : (
+      <Status busy>{sessionLabel}</Status>
+    )
+  ) : launchPresentation.progress || installQueued ? (
+    <Status busy>{launchPresentation.label}</Status>
+  ) : quiet ? null : failureTitle ? (
+    <Status eyes="x" tone="err">
+      {failureTitle}
+    </Status>
+  ) : (
+    <Status eyes="wide" tone="warn">
+      {launchAction.label}
+    </Status>
+  );
 
   const onPlay = (): void => {
     selectInstance(inst.id);
@@ -216,159 +232,120 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   };
 
   const launchNotice = launchNotices.value[inst.id];
+  const packs = cachedModProvenance(inst.id)?.packs ?? [];
+  const loader = inst.version_display;
 
   return (
-    <div class="cp-instance-view" data-running={playing} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
-      <div class="cp-instance-stage" aria-hidden="true">
-        <div class="cp-instance-aurora-sheet">
-          <div class="cp-instance-aurora cp-instance-aurora--b1" />
-          <div class="cp-instance-aurora cp-instance-aurora--b2" />
-          <div class="cp-instance-aurora cp-instance-aurora--b3" />
-          <div class="cp-instance-aurora cp-instance-aurora--b4" />
+    <div class="cp-view-page cp-instance" data-running={playing}>
+      <Vista seed={artSeedFor(inst)} version={inst.version_id} installing={installStatus.installing} />
+      <header class="cp-instance-head">
+        <h1 class="cp-instance-name" title={inst.name}>
+          {inst.name}
+        </h1>
+        <div class="cp-chips">
+          {status}
+          <Chip>
+            {loader.loader_label}
+            {loader.loader_version_label ? ` ${loader.loader_version_label}` : ''}
+          </Chip>
+          <Chip mono>{loader.minecraft_label}</Chip>
+          {inst.last_played_at && (
+            <Chip icon="clock" title={`Last played ${fmtRelative(inst.last_played_at)}`}>
+              {fmtRelative(inst.last_played_at)}
+            </Chip>
+          )}
+          <PackChips packs={packs} instanceId={inst.id} />
         </div>
-      </div>
-
-      <div class="cp-view-page cp-instance-page">
-        <header class="cp-instance-hero">
-          <div class="cp-instance-hero-tile">
-            <InstanceTile inst={inst} radius={18} />
-          </div>
-          <div class="cp-instance-hero-id">
-            <div class="cp-instance-hero-kicker">
-              <Pill>
-                {inst.version_display.loader_label}
-                {inst.version_display.loader_version_label ? ` ${inst.version_display.loader_version_label}` : ''}
-              </Pill>
-              <span class="cp-instance-hero-mc">Minecraft {inst.version_display.minecraft_label}</span>
-            </div>
-            <h1 class="cp-instance-hero-title">{inst.name}</h1>
-            <div class="cp-instance-hero-meta">
-              <span class="cp-instance-status" data-running={playing}>
-                {statusLabel}
-              </span>
-              <span>
-                Last played <b>{fmtRelative(inst.last_played_at)}</b>
-              </span>
-              <span>
-                Created <b>{formatDate(inst.created_at, 'unknown')}</b>
-              </span>
-            </div>
-          </div>
-          <div class="cp-instance-hero-actions">
-            <div class="cp-instance-launch">
-              {sessionActive ? (
-                <div class="cp-session">
-                  <span class="cp-session-time">
-                    <span>{playing ? `${sessionLabel} - ${fmtElapsed(session?.launchedAt, now)}` : sessionLabel}</span>
-                  </span>
-                  {canStop && (
-                    <button class="cp-session-stop" type="button" disabled={session?.stopping} onClick={onStop}>
-                      <Icon name="stop" size={13} />
-                      Stop
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <LaunchSplitButton
-                  inst={inst}
-                  launchAction={launchAction}
-                  installQueued={installQueued}
-                  installQueuedView={installQueuedView}
-                  installProgress={installProgress}
-                  onLaunch={onPlay}
-                  onInstall={onInstall}
-                  onOpenLogs={() => selectTab('logs')}
-                  onOpenSettings={() => selectTab('settings')}
-                  preparing={preparing}
-                />
-              )}
-            </div>
-            <IconButton
-              icon="dots"
-              tooltip="More"
-              onClick={(e) =>
-                openContextMenu(e, [
-                  { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
-                  {
-                    icon: 'folder',
-                    label: 'Open resource packs folder',
-                    onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks'),
-                  },
-                  {
-                    icon: 'folder',
-                    label: 'Open shader packs folder',
-                    onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks'),
-                  },
-                  { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
-                  { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
-                  { label: '', onSelect: () => {}, divider: true },
-                  {
-                    icon: 'trash',
-                    label: 'Delete',
-                    onSelect: () => void deleteInstanceFlow(inst, () => navigate({ name: 'instances' })),
-                    danger: true,
-                  },
-                ])
-              }
+        <div class="cp-instance-actions">
+          {!sessionActive ? (
+            <LaunchSplitButton
+              inst={inst}
+              launchAction={launchAction}
+              installQueued={installQueued}
+              installQueuedView={installQueuedView}
+              installProgress={installProgress}
+              onLaunch={onPlay}
+              onInstall={onInstall}
+              onOpenLogs={() => selectTab('logs')}
+              onOpenSettings={() => selectTab('settings')}
+              preparing={preparing}
             />
-          </div>
-        </header>
-
-        {!installLocked && (
-          <div class="cp-tabs" role="tablist">
-            {visibleTabs.map((t) => {
-              const count = tabCount(t.id);
-              return (
-                <button
-                  key={t.id}
-                  role="tab"
-                  aria-selected={activeTab === t.id}
-                  data-active={activeTab === t.id}
-                  aria-label={t.label}
-                  title={t.label}
-                  onClick={() => selectTab(t.id)}
-                >
-                  <span class="cp-tab-icon">
-                    <Icon name={t.icon} size={15} />
-                  </span>
-                  <span class="cp-tab-label">{t.label}</span>
-                  {count != null && <span class="cp-tab-count">{count}</span>}
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
-
-        {installLocked && (
-          <InstallBarrierPane
-            installTarget={installTarget}
-            installLabel={installLabel}
-            installQueued={installQueued}
-            installQueuedView={installQueuedView}
-            installProgress={installProgress}
-            installFailure={matchingInstallFailure}
-            onRetryInstall={() => matchingInstallFailure && retryFailedInstall(matchingInstallFailure)}
+          ) : (
+            canStop && (
+              <Button size="lg" variant="secondary" icon="stop" disabled={session?.stopping} onClick={onStop}>
+                Stop
+              </Button>
+            )
+          )}
+          <IconButton
+            icon="dots"
+            size={36}
+            tooltip="More"
+            onClick={(e) =>
+              openContextMenu(e, [
+                { icon: 'folder', label: 'Open folder', onSelect: () => void openInstanceFolder(inst.id) },
+                {
+                  icon: 'folder',
+                  label: 'Open resource packs folder',
+                  onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks'),
+                },
+                {
+                  icon: 'folder',
+                  label: 'Open shader packs folder',
+                  onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks'),
+                },
+                { icon: 'copy', label: 'Duplicate', onSelect: () => void duplicateInstance(inst) },
+                { icon: 'edit', label: 'Rename', onSelect: () => void renameInstance(inst) },
+                { label: '', onSelect: () => {}, divider: true },
+                {
+                  icon: 'trash',
+                  label: 'Delete',
+                  onSelect: () => void deleteInstanceFlow(inst, () => navigate({ name: 'instances' })),
+                  danger: true,
+                },
+              ])
+            }
           />
-        )}
-        {!installLocked && activeTab === 'mods' && (
-          <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-        )}
-        {!installLocked && (activeTab === 'resourcepacks' || activeTab === 'shaderpacks') && (
-          <PacksPane key={activeTab} inst={inst} folder={activeTab} />
-        )}
-        {!installLocked && activeTab === 'worlds' && (
-          <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-        )}
-        {!installLocked && activeTab === 'screenshots' && (
-          <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-        )}
-        {!installLocked && activeTab === 'logs' && (
-          <LogsPane inst={inst} resources={resources} processLive={processLive} onRefresh={reloadResources} />
-        )}
-        {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
-      </div>
+        </div>
+      </header>
+
+      {!installLocked && (
+        <Tabs
+          tabs={visibleTabs.map((tab) => ({ ...tab, count: tabCount(tab.id) }))}
+          active={activeTab}
+          onSelect={selectTab}
+        />
+      )}
+
+      {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
+
+      {installLocked && (
+        <InstallBarrierPane
+          installTarget={installTarget}
+          installLabel={installLabel}
+          installQueued={installQueued}
+          installQueuedView={installQueuedView}
+          installProgress={installProgress}
+          installFailure={matchingInstallFailure}
+          onRetryInstall={() => matchingInstallFailure && retryFailedInstall(matchingInstallFailure)}
+        />
+      )}
+      {!installLocked && activeTab === 'mods' && (
+        <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+      )}
+      {!installLocked && (activeTab === 'resourcepacks' || activeTab === 'shaderpacks') && (
+        <PacksPane key={activeTab} inst={inst} folder={activeTab} />
+      )}
+      {!installLocked && activeTab === 'worlds' && (
+        <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+      )}
+      {!installLocked && activeTab === 'screenshots' && (
+        <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
+      )}
+      {!installLocked && activeTab === 'logs' && (
+        <LogsPane inst={inst} resources={resources} processLive={processLive} onRefresh={reloadResources} />
+      )}
+      {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );
 }

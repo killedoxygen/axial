@@ -1,12 +1,19 @@
-import type { JSX } from 'preact';
-import { Button, IconButton, Meter } from '../../ui/Atoms';
+import type { ComponentChildren, JSX } from 'preact';
+import { Button, Chip, Empty, Meter, Ring } from '../../ui/Atoms';
+import { Face } from '../../ui/Face';
 import { Icon } from '../../ui/Icons';
-import { DownloadFailureNotice } from '../../ui/DownloadFailureNotice';
+import { InstanceTile } from '../../ui/InstanceVisual';
 import { api } from '../../api';
 import { installQueueStateResponse } from '../../dto-install';
 import { instances } from '../../store';
+import { navigate, openCreate } from '../../ui-state';
 import { errMessage, showError } from '../../utils';
 import { useNowTicker } from '../../hooks/use-now';
+import { KIND_ICON } from '../discover/shared';
+import { loaderKeyFromComponentId } from '../create/defaults';
+import { LoaderLogo } from '../create/loader-logos';
+import { installItemFromQueuedViewModel } from '../../install-item';
+import type { InstallItem } from '../../types-install';
 import {
   activeDownload,
   activeInstallRetryPending,
@@ -44,9 +51,116 @@ function formatElapsedTime(startedAt: number, now: number): string {
   return `${hours}h ${remainingMinutes.toString().padStart(2, '0')}m elapsed`;
 }
 
+function formatFailureTime(timestamp: number): string {
+  return new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
 function stepRatio(current: number | undefined, total: number | undefined): string {
   if (typeof current !== 'number' || typeof total !== 'number' || total <= 0) return '';
   return `${current}/${total}`;
+}
+
+/** What is being installed: the loader's mark for a game install, the content kind for content. */
+function Lead({ item }: { item: InstallItem }): JSX.Element {
+  const content = item.content?.action;
+  let mark: JSX.Element;
+  if (!content) {
+    mark = <LoaderLogo loader={loaderKeyFromComponentId(item.loader?.componentId)} size={18} class="cp-dl-logo" />;
+  } else if (content.kind === 'uninstall') {
+    mark = <Icon name="trash" size={16} />;
+  } else {
+    const kinds = content.kind === 'modpack' ? ['modpack' as const] : content.selections.map((pick) => pick.kind);
+    mark = (
+      <Icon name={kinds.every((kind) => kind === kinds[0]) && kinds[0] ? KIND_ICON[kinds[0]] : 'download'} size={16} />
+    );
+  }
+  return (
+    <span class="cp-dl-lead" aria-hidden="true">
+      {mark}
+    </span>
+  );
+}
+
+/** Where it goes: the target instance for content, the Minecraft version for a loader. */
+function Target({ item }: { item: InstallItem }): JSX.Element | null {
+  const instanceId = item.content?.instance_id;
+  if (instanceId) {
+    const instance = instances.value.find((entry) => entry.id === instanceId);
+    return (
+      <span class="cp-chip cp-dl-into">
+        {instance && <InstanceTile inst={instance} />}
+        {instance?.name ?? 'A removed instance'}
+      </span>
+    );
+  }
+  return item.loader ? <Chip mono>{item.loader.minecraftVersion}</Chip> : null;
+}
+
+function Row({
+  item,
+  title,
+  children,
+  end,
+}: {
+  item: InstallItem;
+  title: string;
+  children?: ComponentChildren;
+  end: ComponentChildren;
+}): JSX.Element {
+  return (
+    <div class="cp-row cp-dl-row">
+      <Lead item={item} />
+      <div class="cp-dl-id">
+        <div class="cp-dl-top">
+          <strong>{title}</strong>
+          <Target item={item} />
+        </div>
+        {children}
+      </div>
+      <div class="cp-dl-end">{end}</div>
+    </div>
+  );
+}
+
+function FailureRow({ failure }: { failure: DownloadFailure }): JSX.Element {
+  const view = failure.viewModel;
+  const reasons = [view.summary || 'Install failed.', view.detail, ...view.details.slice(1)].filter(Boolean);
+  const retry = view.retry_action;
+  const dismiss = view.dismiss_action;
+  return (
+    <Row
+      item={failure.item}
+      title={failure.displayName || view.title || 'Install failed'}
+      end={
+        <>
+          <span class="cp-dl-time">{formatFailureTime(failure.failedAt)}</span>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => retryFailedInstall(failure)}
+            disabled={retry?.enabled !== true}
+            title={retry?.disabled_reason || undefined}
+          >
+            {retry?.label || 'Retry install'}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void dismissFailure(failure)}
+            disabled={dismiss?.enabled !== true}
+            title={dismiss?.disabled_reason || undefined}
+          >
+            {dismiss?.label || 'Dismiss'}
+          </Button>
+        </>
+      }
+    >
+      <div class="cp-dl-why" title={reasons.join(' ')}>
+        <Face eyes="x" tone="err" size={24} />
+        <span>{reasons.join(' ')}</span>
+      </div>
+    </Row>
+  );
 }
 
 export function DownloadsView(): JSX.Element {
@@ -56,62 +170,49 @@ export function DownloadsView(): JSX.Element {
   const now = useNowTicker(Boolean(active));
 
   const title = active ? active.displayName || active.item.versionId : '';
-  const pct = active ? Math.round(Math.max(0, Math.min(100, active.pct))) : 0;
+  const pct = active ? Math.round(active.pct) : 0;
   const step = active?.activeStep ?? null;
-  const stepPct = step ? Math.round(Math.max(0, Math.min(100, step.progress_pct))) : 0;
   const ratio = step ? stepRatio(step.current, step.total) : '';
-  const headerSub = active
-    ? `${queueView.status_label}${queueView.active_queued_count_label || ''}`
-    : queueView.queued_count > 0
-      ? queueView.queued_count_label
-      : failures.length > 0
-        ? `${failures.length} ${failures.length === 1 ? 'failure' : 'failures'}`
-        : queueView.status_label;
+
+  if (!active && failures.length === 0 && queue.length === 0) {
+    return (
+      <div class="cp-view-page cp-downloads cp-downloads--empty">
+        <Empty
+          title={queueView.empty_title}
+          actions={
+            <>
+              <Button variant="secondary" icon="compass" onClick={() => navigate({ name: 'discover' })}>
+                Browse Discover
+              </Button>
+              <Button variant="secondary" icon="plus" onClick={openCreate}>
+                New instance
+              </Button>
+            </>
+          }
+        />
+      </div>
+    );
+  }
 
   return (
-    <div class="cp-view-page cp-downloads-page">
-      <div class="cp-page-header">
-        <div>
-          <h1>Downloads</h1>
-          <div class="cp-page-sub">{headerSub}</div>
-        </div>
-      </div>
-
-      {failures.length > 0 && (
-        <div class="cp-dlfail-list">
-          {failures.map((failure) => (
-            <DownloadFailureNotice
-              key={failure.operationId}
-              failure={failure}
-              instanceName={
-                failure.instanceId &&
-                (instances.value.find((instance) => instance.id === failure.instanceId)?.name ?? 'a removed instance')
-              }
-              onRetry={() => retryFailedInstall(failure)}
-              onDismiss={() => void dismissFailure(failure)}
-            />
-          ))}
-        </div>
-      )}
-
-      {active ? (
-        <section class="cp-dl-live" aria-live="polite">
-          <div class="cp-dl-live-head">
-            <span class="cp-dl-live-icon" aria-hidden="true">
-              <Icon name="download" size={18} stroke={2} />
-            </span>
-            <div class="cp-dl-live-id">
-              <h2>{title}</h2>
-              <p>{active.label}</p>
-            </div>
-            <div class="cp-dl-live-readout">
-              <span class="cp-dl-live-pct cp-dl-num">
-                {pct}
-                <em>%</em>
-              </span>
-              {active.startedAt !== null && (
-                <span class="cp-dl-live-elapsed">{formatElapsedTime(active.startedAt, now)}</span>
-              )}
+    <div class="cp-view-page cp-downloads">
+      {active && (
+        <section class="cp-dl-now" aria-label="Installing now" aria-live="polite">
+          <div class="cp-dl-now-row">
+            <Lead item={active.item} />
+            <div class="cp-dl-id">
+              <div class="cp-dl-top">
+                <strong>{title}</strong>
+                <Target item={active.item} />
+              </div>
+              <div class="cp-dl-step">
+                <Ring progress={step ? step.progress_pct : null} size={14} />
+                <span>{step?.label ?? active.label}</span>
+                {ratio && <Chip mono>{ratio}</Chip>}
+                {active.startedAt !== null && (
+                  <span class="cp-dl-elapsed">{formatElapsedTime(active.startedAt, now)}</span>
+                )}
+              </div>
             </div>
             {active.installId && active.retryAction?.action === 'retry' && (
               <Button
@@ -124,71 +225,46 @@ export function DownloadsView(): JSX.Element {
                 {active.retryAction.label}
               </Button>
             )}
+            <span class="cp-dl-pct">
+              {pct}
+              <small>%</small>
+            </span>
           </div>
           <Meter value={pct} height={6} ariaLabel={`Install progress for ${title}`} />
-          {step && (
-            <div class="cp-dl-live-step">
-              <span class="cp-dl-live-step-label">{step.label}</span>
-              <span class="cp-dl-live-step-count cp-dl-num">
-                {ratio ? `${ratio}, ` : ''}
-                {stepPct}%
-              </span>
-              <div class="cp-dl-live-step-meter">
-                <Meter value={stepPct} height={3} ariaLabel={`${step.label} progress for ${title}`} />
-              </div>
-            </div>
-          )}
-          {queueView.next_label && (
-            <div class="cp-dl-live-foot">
-              <Icon name="clock" size={13} stroke={2} />
-              <span>Next: {queueView.next_label}</span>
-            </div>
-          )}
         </section>
-      ) : (
-        failures.length === 0 && (
-          <div class="cp-empty">
-            <Icon name="download" size={36} color="var(--text-mute)" />
-            {queue.length > 0 ? (
-              <>
-                <h2>{queueView.title}</h2>
-                <p>{queueView.summary}</p>
-              </>
-            ) : (
-              <>
-                <h2>{queueView.empty_title}</h2>
-                <p>{queueView.empty_summary}</p>
-              </>
-            )}
-          </div>
-        )
+      )}
+
+      {failures.length > 0 && (
+        <section class="cp-dl-group">
+          <h2>Needs attention</h2>
+          {failures.map((failure) => (
+            <FailureRow key={failure.operationId} failure={failure} />
+          ))}
+        </section>
       )}
 
       {queue.length > 0 && (
-        <section class="cp-dl-queue">
-          <div class="cp-dl-queue-head">
-            <span>{queueView.section_title}</span>
-            <span class="cp-dl-queue-count cp-dl-num">{queueView.queued_count}</span>
-          </div>
-          <div class="cp-dl-queue-rows">
-            {queue.map((item) => (
-              <div key={item.queue_id} class="cp-dl-queue-row">
-                <span class="cp-dl-queue-pos cp-dl-num">{item.position}</span>
-                <div class="cp-dl-queue-main">
-                  <span class="cp-dl-queue-label">{item.label}</span>
-                  {item.install_item.loader && <span class="cp-dl-queue-version">{item.install_item.loader.minecraft_version}</span>}
-                </div>
-                <IconButton
-                  icon="trash"
-                  size={28}
-                  danger
-                  tooltip={item.remove_action.disabled_reason || item.remove_action.label}
-                  onClick={() => void removeQueuedInstall(item.queue_id)}
+        <section class="cp-dl-group">
+          <h2>{queueView.section_title}</h2>
+          {queue.map((item) => (
+            <Row
+              key={item.queue_id}
+              item={installItemFromQueuedViewModel(item)}
+              title={item.label}
+              end={
+                <button
+                  type="button"
+                  class="cp-btn cp-btn--sm cp-btn--ghost"
+                  aria-label={item.remove_action.label}
+                  title={item.remove_action.disabled_reason || undefined}
                   disabled={!item.remove_action.enabled}
-                />
-              </div>
-            ))}
-          </div>
+                  onClick={() => void removeQueuedInstall(item.queue_id)}
+                >
+                  <span>Remove</span>
+                </button>
+              }
+            />
+          ))}
         </section>
       )}
     </div>

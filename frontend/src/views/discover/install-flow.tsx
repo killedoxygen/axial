@@ -1,8 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Button } from '../../ui/Atoms';
-import { Icon } from '../../ui/Icons';
-import { Modal, ModalContent } from '../../ui/Modal';
+import { Button, Notice } from '../../ui/Atoms';
+import { Modal, ModalContent, ModalTitle } from '../../ui/Modal';
 import { formatBytes, plural } from '../../format';
 import type { ContentSelection, ResolutionPlan } from '../../types-content';
 import { addToInstance, commitInstall, type AddOutcome } from './actions';
@@ -93,23 +92,24 @@ function ConflictSheet({
   }.`;
   return (
     <Modal open onOpenChange={(next) => !next && onCancel()}>
-      <ModalContent className="cp-discover-dialog" aria-label="Resolve conflicts">
-        <h2 class="cp-discover-dialog-title">
-          {overridable ? 'This needs a decision' : partial ? 'Some of this cannot be added here' : 'This cannot be added here'}
-        </h2>
+      <ModalContent
+        className="cp-dialog cp-dialog--choice cp-pop"
+        aria-label="Resolve conflicts"
+        showCloseButton={false}
+      >
+        <ModalTitle>
+          {overridable
+            ? 'This needs a decision'
+            : partial
+              ? 'Some of this cannot be added here'
+              : 'This cannot be added here'}
+        </ModalTitle>
         {plan.conflicts.map((conflict, index) => (
-          <div key={index} class="cp-discover-conflict">
-            <Icon name="alert" size={13} />{' '}
-            {conflict.title ? (
-              <span>
-                <strong>{conflict.title}</strong>: {conflict.detail}
-              </span>
-            ) : (
-              conflict.detail
-            )}
-          </div>
+          <Notice key={index} tone="warned" title={conflict.title}>
+            <p>{conflict.detail}</p>
+          </Notice>
         ))}
-        <p class="cp-discover-dialog-sub">
+        <p class="cp-dialog-body">
           {overridable
             ? onlyReplacing
               ? `Replacing overwrites ${plural(replacing, 'file', 'files')} in this instance.`
@@ -120,7 +120,7 @@ function ConflictSheet({
               ? `${skipped} of ${staged} will be skipped. The rest can still be installed.`
               : 'Nothing can be installed until this is resolved.'}
         </p>
-        <div class="cp-discover-dialog-actions">
+        <div class="cp-dialog-actions">
           <Button variant={overridable || partial ? 'ghost' : 'primary'} onClick={onCancel} disabled={busy}>
             {overridable || partial ? 'Cancel' : 'Close'}
           </Button>
@@ -130,14 +130,8 @@ function ConflictSheet({
             </Button>
           )}
           {overridable && (
-            <Button variant={onlyReplacing ? 'danger' : 'primary'} onClick={onConfirm} disabled={busy}>
-              {busy
-                ? 'Installing…'
-                : onlyReplacing
-                  ? replacing === 1
-                    ? 'Replace file'
-                    : 'Replace files'
-                  : 'Install anyway'}
+            <Button variant={onlyReplacing ? 'danger' : 'primary'} busy={busy} onClick={onConfirm} disabled={busy}>
+              {onlyReplacing ? (replacing === 1 ? 'Replace file' : 'Replace files') : 'Install anyway'}
             </Button>
           )}
         </div>

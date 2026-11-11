@@ -1,8 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
 import { contentRevision } from '../../../content-activity';
-import { Icon } from '../../../ui/Icons';
-import { Button, Input } from '../../../ui/Atoms';
+import { Button, Empty, IconButton, Input } from '../../../ui/Atoms';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionTray } from '../../../ui/SelectionActionTray';
 import { selectionMenuItem, useSelection } from '../../../ui/selection';
@@ -15,6 +14,7 @@ import { openInstanceFolder } from '../instance-actions';
 import { ResourceMutationStatus } from '../components/resource-bits';
 import {
   ContentRow,
+  UpdateAll,
   compareContentRows,
   contentRowMatches,
   fileDisplayName,
@@ -91,10 +91,9 @@ export function PacksPane({ inst, folder }: { inst: EnrichedInstance; folder: Pa
           iconUrl:
             folder === 'resourcepacks' && pack.metadata.icon ? resourcePackIconUrl(inst.id, pack.name) : undefined,
           fallbackIcon: folder === 'resourcepacks' ? 'image' : 'palette',
-          managed: Boolean(entry),
           pack: membership.get(`${folder}/${base}`),
           enabled: pack.enabled,
-          size: pack.size,
+          folder: pack.directory,
           update: update && {
             version: update.latest_version_number,
             disabled: busy,
@@ -103,7 +102,11 @@ export function PacksPane({ inst, folder }: { inst: EnrichedInstance; folder: Pa
         },
       };
     })
-    .sort((left, right) => compareContentRows(left.view, right.view));
+    .sort(
+      (left, right) =>
+        Number(Boolean(right.view.update)) - Number(Boolean(left.view.update)) ||
+        compareContentRows(left.view, right.view),
+    );
   const shown = rows.filter(({ view }) => contentRowMatches(view, q));
   const selection = useSelection(
     shown.map(({ row }) => row),
@@ -115,50 +118,28 @@ export function PacksPane({ inst, folder }: { inst: EnrichedInstance; folder: Pa
     refresh();
   };
 
+  const empty = state.status === 'ready' && rows.length === 0;
+  const openFolder = (): void => void openInstanceFolder(inst.id, folder);
+
   return (
-    <div class="cp-instance-body">
-      <div class="cp-resource-toolbar">
-        <div>
-          <strong>
-            {rows.length} {noun}
-            {rows.length === 1 ? '' : 's'}
-          </strong>
-          <Input
-            value={q}
-            onChange={setQ}
-            placeholder={`Filter ${noun}s…`}
-            icon="search"
-            style={{ width: 200, height: 30 }}
-          />
-        </div>
-        <div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={refresh}>
-            Refresh
+    <div class="cp-pane">
+      {!empty && (
+        <div class="cp-pane-bar">
+          <Input value={q} onChange={setQ} placeholder={`Search ${noun}s`} icon="search" />
+          {updates.length > 0 && (
+            <UpdateAll
+              count={updates.length}
+              noun={noun}
+              disabled={busy}
+              onClick={() => void applyModUpdates(inst, updates)}
+            />
+          )}
+          <span class="cp-head-fill" />
+          <IconButton icon="refresh" tooltip="Refresh" onClick={refresh} />
+          <IconButton icon="folder" tooltip="Open folder" onClick={openFolder} />
+          <Button variant="soft" icon="plus" onClick={() => navigate({ name: 'discover', target: inst.id })}>
+            Add {noun}s
           </Button>
-          <Button variant="secondary" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, folder)}>
-            Open folder
-          </Button>
-          <Button
-            variant="soft"
-            size="sm"
-            icon="compass"
-            onClick={() => navigate({ name: 'discover', target: inst.id })}
-          >
-            Add content
-          </Button>
-        </div>
-      </div>
-      {updates.length > 0 && (
-        <div class="cp-mods-updates" role="status">
-          <Icon name="arrow-up" size={14} color="var(--accent)" />
-          <span>
-            {updates.length} update{updates.length === 1 ? '' : 's'} available
-          </span>
-          <span class="cp-mods-updates-action">
-            <Button size="sm" disabled={busy} onClick={() => void applyModUpdates(inst, updates)}>
-              Update all
-            </Button>
-          </span>
         </div>
       )}
       {state.status === 'error' && (
@@ -170,16 +151,33 @@ export function PacksPane({ inst, folder }: { inst: EnrichedInstance; folder: Pa
         </div>
       )}
       <ResourceMutationStatus instanceId={inst.id} />
-      <div class="cp-content-list">
-        {state.status === 'loading' && rows.length === 0 ? (
-          <div class="cp-mods-empty-row">Loading {noun}s…</div>
-        ) : shown.length === 0 ? (
-          <div class="cp-mods-empty-row">
-            <strong>{rows.length === 0 ? `No ${noun}s in this instance` : `No ${noun}s match this filter`}</strong>
-            {rows.length === 0 ? EMPTY_HINT[folder] : 'Try a different filter.'}
-          </div>
-        ) : (
-          shown.map(({ row, view }) => (
+      {state.status === 'loading' && rows.length === 0 ? (
+        <div class="cp-resource-note">Loading {noun}s…</div>
+      ) : empty ? (
+        <Empty
+          title={`No ${noun}s in this instance`}
+          actions={
+            <>
+              <Button
+                variant="secondary"
+                icon="compass"
+                onClick={() => navigate({ name: 'discover', target: inst.id })}
+              >
+                Browse Discover
+              </Button>
+              <Button variant="secondary" icon="folder" onClick={openFolder}>
+                Open folder
+              </Button>
+            </>
+          }
+        >
+          {EMPTY_HINT[folder]}
+        </Empty>
+      ) : shown.length === 0 ? (
+        <Empty title={`No ${noun}s match this filter`}>Try a different filter.</Empty>
+      ) : (
+        <div class="cp-entries">
+          {shown.map(({ row, view }) => (
             <ContentRow
               key={view.key}
               view={view}
@@ -192,9 +190,9 @@ export function PacksPane({ inst, folder }: { inst: EnrichedInstance; folder: Pa
                 )
               }
             />
-          ))
-        )}
-      </div>
+          ))}
+        </div>
+      )}
       <SelectionActionTray
         selection={selection}
         itemLabel={noun}

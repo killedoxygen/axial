@@ -119,3 +119,27 @@ export function nativeDragPositionHitsElement(
   const rect = element.getBoundingClientRect();
   return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
 }
+
+/** The nearest element matching `selector` under a native drag, wherever the pointer events went. */
+export function nativeDragTargetElement<T extends HTMLElement>(
+  position: NativeDragDropPayload['position'],
+  selector: string,
+): T | null {
+  const point = cssPointFromNativeDrag(position);
+  if (!point) return null;
+
+  for (const element of document.elementsFromPoint(point.x, point.y)) {
+    if (!(element instanceof HTMLElement)) continue;
+    const match = element.closest(selector);
+    if (match instanceof HTMLElement) return match as T;
+  }
+
+  for (const element of Array.from(document.querySelectorAll<HTMLElement>(selector))) {
+    const rect = element.getBoundingClientRect();
+    if (point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom) {
+      return element as T;
+    }
+  }
+
+  return null;
+}

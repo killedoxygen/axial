@@ -1,24 +1,23 @@
 import type { JSX } from 'preact';
 import { Button } from '../../ui/Atoms';
-import { Icon } from '../../ui/Icons';
-import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from '../../ui/FloatingTray';
+import { Art } from '../../ui/Art';
+import { FloatingTray, FloatingTrayLabel } from '../../ui/FloatingTray';
 import { plural } from '../../format';
 import { navigate, openCreateDraft } from '../../ui-state';
 import { InstallConflictSheet, useInstallFlow } from './install-flow';
-import { clearTray, targetInstance, tray, traySelections, unstage } from './state';
 import { InstanceTargetPicker, KIND_ICON } from './shared';
+import { clearTray, targetInstance, tray, traySelections, unstage } from './state';
 
-const TRAY_PREVIEW_LIMIT = 5;
+const PREVIEW_LIMIT = 5;
 
+/** What has been staged, and where it can go: the target instance, an existing one, or a new one. */
 export function Tray(): JSX.Element | null {
   const items = tray.value;
-  const visibleItems = items.slice(0, TRAY_PREVIEW_LIMIT);
-  const hiddenItems = items.slice(TRAY_PREVIEW_LIMIT);
   const instance = targetInstance.value;
   const flow = useInstallFlow(instance?.id);
-
   if (items.length === 0) return null;
 
+  const hidden = items.slice(PREVIEW_LIMIT);
   const addAll = async (): Promise<void> => {
     const outcome = await flow.add(traySelections(), plural(items.length, 'item', 'items'));
     if (outcome.status === 'queued') clearTray();
@@ -26,55 +25,44 @@ export function Tray(): JSX.Element | null {
 
   return (
     <>
-      <FloatingTray ariaLabel={`${items.length} staged`} reserveSpace>
+      <FloatingTray class="cp-tray" ariaLabel={`${items.length} staged`} reserveSpace>
         <div class="cp-tray-items" role="list" aria-label="Staged content">
-          {visibleItems.map((item) => (
+          {items.slice(0, PREVIEW_LIMIT).map((item) => (
             <button
               key={item.canonical_id}
               type="button"
-              class="cp-tray-item"
               role="listitem"
               title={`${item.title}${item.version_label ? ` ${item.version_label}` : ''}. Click to unstage.`}
               aria-label={`Unstage ${item.title}`}
               disabled={flow.busy}
               onClick={() => unstage(item.canonical_id)}
             >
-              {item.icon_url ? (
-                <img src={item.icon_url} alt="" loading="lazy" />
-              ) : (
-                <Icon name={KIND_ICON[item.kind]} size={13} />
-              )}
-              <span class="cp-tray-item-x" aria-hidden="true">
-                <Icon name="x" size={11} stroke={2.4} />
-              </span>
+              <Art url={item.icon_url} icon={KIND_ICON[item.kind]} size={24} />
             </button>
           ))}
-          {hiddenItems.length > 0 && (
+          {hidden.length > 0 && (
             <span
-              class="cp-tray-overflow"
+              class="cp-unit"
               role="listitem"
-              title={hiddenItems.map((item) => item.title).join(', ')}
-              aria-label={`${hiddenItems.length} more staged items`}
+              title={hidden.map((item) => item.title).join(', ')}
+              aria-label={`${hidden.length} more staged`}
             >
-              +{hiddenItems.length}
+              +{hidden.length}
             </span>
           )}
         </div>
-        <FloatingTrayLabel>{plural(items.length, 'item', 'items')} staged</FloatingTrayLabel>
-        <FloatingTrayDivider />
+        <FloatingTrayLabel>{items.length} staged</FloatingTrayLabel>
         <Button variant="ghost" size="sm" onClick={clearTray} disabled={flow.busy}>
           Clear
         </Button>
-        <FloatingTrayDivider />
         {instance ? (
-          <Button size="sm" icon="download" onClick={() => void addAll()} disabled={flow.busy}>
-            {flow.busy ? 'Adding…' : `Add to ${instance.name}`}
+          <Button size="sm" icon="download" busy={flow.busy} disabled={flow.busy} onClick={() => void addAll()}>
+            Add to {instance.name}
           </Button>
         ) : (
           <>
             <InstanceTargetPicker
               placeholder="Add to existing…"
-              width={180}
               onPick={(id) => navigate({ name: 'discover', target: id })}
             />
             <Button size="sm" icon="plus" onClick={() => openCreateDraft(tray.value)} disabled={flow.busy}>
@@ -83,7 +71,6 @@ export function Tray(): JSX.Element | null {
           </>
         )}
       </FloatingTray>
-
       <InstallConflictSheet flow={flow} onQueued={clearTray} />
     </>
   );

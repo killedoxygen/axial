@@ -9,11 +9,13 @@ export function FloatingTray({
   role = 'toolbar',
   ariaLabel,
   reserveSpace = false,
+  class: cls,
 }: {
   children: ComponentChildren;
   role?: JSX.AriaRole;
   ariaLabel?: string;
   reserveSpace?: boolean;
+  class?: string;
 }): JSX.Element {
   const trayRef = useRef<HTMLDivElement>(null);
   const [reservedHeight, setReservedHeight] = useState(0);
@@ -47,7 +49,12 @@ export function FloatingTray({
       {reserveSpace && <div class="cp-floating-tray-reserve" style={{ height: reservedHeight }} aria-hidden="true" />}
       {createPortal(
         <div class="cp-floating-tray-position" aria-live="polite">
-          <div ref={trayRef} class="cp-floating-tray" role={role} aria-label={ariaLabel}>
+          <div
+            ref={trayRef}
+            class={cls ? `cp-floating-tray cp-pop ${cls}` : 'cp-floating-tray cp-pop'}
+            role={role}
+            aria-label={ariaLabel}
+          >
             {children}
           </div>
         </div>,
@@ -59,8 +66,4 @@ export function FloatingTray({
 
 export function FloatingTrayLabel({ children }: { children: ComponentChildren }): JSX.Element {
   return <span class="cp-floating-tray-label">{children}</span>;
-}
-
-export function FloatingTrayDivider(): JSX.Element {
-  return <span class="cp-floating-tray-divider" aria-hidden="true" />;
 }

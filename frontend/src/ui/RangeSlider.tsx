@@ -1,28 +1,7 @@
 import type { JSX } from 'preact';
 import { useRef } from 'preact/hooks';
-import type { SliderZone } from './Slider';
 import { playSliderSound } from '../sound';
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function snapToStep(value: number, min: number, max: number, step: number): number {
-  const safeStep = step > 0 ? step : 1;
-  const snapped = Math.round((value - min) / safeStep) * safeStep + min;
-  const decimals = Math.max(0, `${safeStep}`.split('.')[1]?.length ?? 0);
-  return Number(clamp(snapped, min, max).toFixed(decimals));
-}
-
-function zoneStyle(zone: SliderZone, min: number, max: number): JSX.CSSProperties {
-  const range = Math.max(1e-9, max - min);
-  const from = clamp(zone.from, min, max);
-  const to = clamp(zone.to, from, max);
-  return {
-    left: `${((from - min) / range) * 100}%`,
-    width: `${((to - from) / range) * 100}%`,
-  };
-}
+import { clamp, snapToStep } from './Slider';
 
 export function RangeSlider({
   low,
@@ -32,7 +11,6 @@ export function RangeSlider({
   step = 1,
   onChange,
   onCommit,
-  zones,
   sound = false,
   ariaLabelLow,
   ariaLabelHigh,
@@ -44,7 +22,6 @@ export function RangeSlider({
   step?: number;
   onChange: (low: number, high: number) => void;
   onCommit?: (low: number, high: number) => void;
-  zones?: SliderZone[];
   sound?: string | false;
   ariaLabelLow?: string;
   ariaLabelHigh?: string;
@@ -57,7 +34,6 @@ export function RangeSlider({
   const safeHigh = clamp(high, safeLow, max);
   const lowPct = ((safeLow - min) / range) * 100;
   const highPct = ((safeHigh - min) / range) * 100;
-  const shownZones = (zones ?? []).filter((zone) => clamp(zone.to, min, max) > clamp(zone.from, min, max));
 
   const emit = (nextLow: number, nextHigh: number, which: 'low' | 'high'): void => {
     if (sound) playSliderSound((clamp(which === 'low' ? nextLow : nextHigh, min, max) - min) / range, sound);
@@ -93,7 +69,7 @@ export function RangeSlider({
   return (
     <div
       class="cp-slider cp-rslider"
-      style={{ ['--lo' as any]: `${lowPct}%`, ['--hi' as any]: `${highPct}%` }}
+      style={{ ['--lo' as string]: `${lowPct}%`, ['--hi' as string]: `${highPct}%` }}
       onPointerDown={(event) => {
         if (event.button !== 0) return;
         event.preventDefault();
@@ -119,15 +95,6 @@ export function RangeSlider({
       }}
     >
       <div class="cp-slider-track">
-        {shownZones.map((zone, index) => (
-          <div
-            key={`${zone.tone}-${index}`}
-            class="cp-slider-zone"
-            data-tone={zone.tone}
-            title={zone.label}
-            style={zoneStyle(zone, min, max)}
-          />
-        ))}
         <div class="cp-rslider-band" />
       </div>
       <input

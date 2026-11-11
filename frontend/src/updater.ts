@@ -82,12 +82,6 @@ export function dismissAvailableUpdate(): void {
   toast(`Hidden update ${displayVersion(info.latest_version)} for now`);
 }
 
-export function formatUpdateCheckTime(raw: string): string {
-  const stamp = Date.parse(raw || '');
-  if (Number.isNaN(stamp)) return 'Not checked yet';
-  return new Date(stamp).toLocaleString();
-}
-
 export async function openUpdateAction(): Promise<void> {
   const url = updateInfo.value?.action_url;
   if (!url) return;

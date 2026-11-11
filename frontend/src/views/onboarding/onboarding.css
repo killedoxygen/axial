@@ -55,8 +55,8 @@ html[data-desktop-chrome='native-decorated'] .cp-ob-chrome {
 .cp-ob-stage {
   position: relative;
   overflow: hidden;
-  border-radius: var(--r-xl);
-  background: color-mix(in oklab, var(--bg) 40%, var(--surface));
+  border-radius: var(--hold-xl);
+  background: var(--tile);
 }
 
 .cp-ob-stage .cp-mark {
@@ -80,7 +80,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
 
 /* The preview draws the unbuilt character in this colour. */
 .cp-ob-stage canvas {
-  color: var(--surface-3);
+  color: var(--fill-3);
 }
 
 .cp-ob-stage .cp-skin-three__status {
@@ -110,7 +110,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: var(--surface-3);
+  background: var(--fill-3);
   transition:
     width 240ms ease,
     background-color 240ms ease;
@@ -197,7 +197,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
   place-items: center;
   width: 28px;
   height: 28px;
-  border-radius: var(--r-xs);
+  border-radius: var(--hold-xs);
   background: #fff;
 }
 
@@ -208,8 +208,8 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
   margin: 0;
   padding: 14px 16px;
   list-style: none;
-  border-radius: var(--r-md);
-  background: var(--surface);
+  border-radius: var(--rad-row);
+  background: var(--fill);
 }
 
 .cp-ob-card-text {
@@ -235,7 +235,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
   width: 18px;
   height: 18px;
   border-radius: 999px;
-  border: 2px solid var(--surface-3);
+  border: 2px solid var(--fill-3);
   border-top-color: var(--accent);
   animation: cp-spin 800ms linear infinite;
 }
@@ -286,7 +286,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
   display: flex;
   padding: 4px;
   border-radius: 10px;
-  background: var(--surface);
+  background: var(--fill);
   cursor: pointer;
   transition:
     box-shadow 160ms ease,
@@ -310,7 +310,8 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
 }
 
 .cp-ob-look:has(:focus-visible) {
-  box-shadow: var(--focus-ring);
+  outline: 1.5px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .cp-ob-prefs {

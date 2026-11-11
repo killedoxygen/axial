@@ -134,9 +134,11 @@ function harness() {
     'ui/Dialog': { showChoice: async () => null },
     'ui-state': { navigate: () => {} },
     'views/instance/instance-actions': { openInstanceFolder: async () => {} },
-    'ui/Atoms': { Button: 'Button' },
-    'ui/Icons': { Icon: 'Icon' },
-    'ui/Modal': { Modal: 'Modal', ModalContent: 'ModalContent' },
+    'ui/Art': { Art: 'Art' },
+    'ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', Notice: 'Notice', Status: 'Status' },
+    'ui/Modal': { Modal: 'Modal', ModalContent: 'ModalContent', ModalHeader: 'ModalHeader', ModalTitle: 'ModalTitle' },
+    'ui/SelectionActionTray': { SelectionCheckbox: 'SelectionCheckbox' },
+    'views/discover/shared': { KIND_ICON: {} },
   };
   const modules = new Map<string, { exports: object }>();
   const sourceRoot = resolve(frontend, 'src');
@@ -305,6 +307,10 @@ for (const readFails of [false, true]) {
   });
 }
 
+function toggleFile(check: ViewNode): void {
+  (check.props.onToggle as (event: { stopPropagation(): void }) => void)({ stopPropagation() {} });
+}
+
 function nodes(value: unknown): ViewNode[] {
   if (Array.isArray(value)) return value.flatMap(nodes);
   if (!value || typeof value !== 'object') return [];
@@ -320,13 +326,13 @@ function text(value: unknown): string {
 }
 
 function addButton(tree: unknown): ViewNode {
-  const button = nodes(tree).find((node) => node.type === 'Button' && /Add selected|Queueing/.test(text(node)));
+  const button = nodes(tree).find((node) => node.type === 'Button' && /Add selected/.test(text(node)));
   assert.ok(button);
   return button;
 }
 
 function checks(tree: unknown): ViewNode[] {
-  return nodes(tree).filter((node) => node.type === 'input' && node.props.type === 'checkbox');
+  return nodes(tree).filter((node) => node.type === 'SelectionCheckbox');
 }
 
 for (const kind of ['install', 'pack', 'uninstall'] as const) {
@@ -399,12 +405,12 @@ test('pack revision refresh preserves customized choices and excludes newly avai
   const h = harness();
   t.after(h.dispose);
   await h.settle();
-  (checks(h.render())[1].props.onChange as () => void)();
+  toggleFile(checks(h.render())[1]);
   h.io.plan = async () => plan(['a', 'b', 'c']);
   h.activity.markContentChanged();
   const tree = await h.settle();
   assert.deepEqual(
-    checks(tree).map((node) => node.props.checked),
+    checks(tree).map((node) => node.props.selected),
     [true, false, false],
   );
   assert.equal(addButton(tree).props.disabled, false);
@@ -446,13 +452,13 @@ test('pack submission captures the selected files and closes once after its ackn
   const h = harness();
   t.after(h.dispose);
   await h.settle();
-  (checks(h.render())[1].props.onChange as () => void)();
+  toggleFile(checks(h.render())[1]);
   const admission = deferred<unknown>();
   h.io.post = () => admission.promise;
   const click = addButton(h.render()).props.onClick as () => void;
   click();
   click();
-  (checks(h.render())[1].props.onChange as () => void)();
+  toggleFile(checks(h.render())[1]);
   assert.deepEqual(
     h.calls.filter(([method]) => method === 'POST'),
     [

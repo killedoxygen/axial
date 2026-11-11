@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Button } from '../ui/Atoms';
+import { Button, Meter, Ring } from '../ui/Atoms';
+import { Face } from '../ui/Face';
 import { Icon, type IconName } from '../ui/Icons';
 import { updateInfo } from '../store';
 import type { UpdateFlowState } from '../types-update';
@@ -61,11 +62,9 @@ function triggerLabel(flow: UpdateFlowState, latest: string): string {
   }
 }
 
-function cardHeadIcon(phase: UpdateFlowState['phase']): IconName {
-  if (phase === 'downloading' || phase === 'applying') return 'download';
-  if (phase === 'ready' || phase === 'restart-pending') return 'refresh';
-  if (phase === 'failed') return 'alert';
-  return 'arrow-up';
+/** The card names the bare version; the dock's label keeps the `v`. */
+function bareVersion(version: string): string {
+  return version.replace(/^v/i, '');
 }
 
 function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }): JSX.Element {
@@ -76,106 +75,88 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
   const restartBlocked = restartBlockedByActivity();
   const restartRequested = updateRestartRequested.value;
   const restartRequired = phase === 'failed' && flow.can_restart;
-
-  const title =
-    phase === 'downloading'
-      ? 'Downloading update'
-      : phase === 'applying'
-        ? 'Installing update'
-        : phase === 'ready'
-          ? restartBlocked
-            ? 'Update ready'
-            : 'Restart to install'
-          : phase === 'restart-pending'
-            ? restartRequested
-              ? 'Restarting Axial'
-              : 'Restart to finish'
-            : phase === 'failed'
-              ? "Update didn't install"
-              : `Update ${latest}`;
-
-  let sub = 'A newer version of Axial is available.';
-  let subTone: 'default' | 'error' = 'default';
-  if (phase === 'downloading') {
-    sub = flow.total_bytes
-      ? `${formatBytes(flow.received_bytes)} of ${formatBytes(flow.total_bytes)}, then restarts`
-      : `${formatBytes(flow.received_bytes)}, then restarts`;
-  } else if (phase === 'applying') {
-    sub = 'Finishing up. Axial will restart.';
-  } else if (phase === 'ready') {
-    sub = restartBlocked ? 'Waiting for downloads and games to finish.' : `Axial will restart into ${latest}.`;
-  } else if (phase === 'restart-pending') {
-    sub = restartRequested
-      ? `Update installed. ${latest} will open shortly.`
-      : 'Installed. Restart when you are ready.';
-  } else if (phase === 'failed') {
-    sub = flow.message || 'Something went wrong while installing.';
-    subTone = 'error';
-  }
-
-  const busy = phase === 'downloading' || phase === 'applying';
-  const indeterminate = flow.percent == null || phase === 'applying';
+  const version = bareVersion(latest);
   const pct = flow.percent != null ? Math.round(Math.max(0, Math.min(100, flow.percent))) : null;
 
-  return (
-    <div class="cp-update-card cp-nodrag" role="dialog" aria-label="App update">
+  let head: JSX.Element;
+  if (phase === 'downloading' || phase === 'applying' || restartRequested) {
+    const title = restartRequested
+      ? 'Restarting Axial'
+      : phase === 'applying'
+        ? `Installing ${version}`
+        : `Downloading ${version}`;
+    head = (
       <div class="cp-update-card-head">
-        <span class="cp-update-card-badge" data-tone={subTone === 'error' ? 'error' : 'accent'}>
-          <Icon name={cardHeadIcon(phase)} size={15} stroke={2.2} />
-        </span>
-        <div class="cp-update-card-heading">
-          <div class="cp-update-card-title">{title}</div>
-          <div class="cp-update-card-sub" data-tone={subTone}>
-            {sub}
-          </div>
+        <Ring />
+        <strong>{title}</strong>
+      </div>
+    );
+  } else {
+    const failed = phase === 'failed';
+    const staged = phase === 'ready' || phase === 'restart-pending';
+    const title = failed ? "Update didn't install" : staged ? `${version} is ready` : `Axial ${version}`;
+    const sub = failed
+      ? flow.message || 'Something went wrong while installing.'
+      : staged
+        ? restartBlocked
+          ? 'Waiting for downloads and games to finish.'
+          : null
+        : info?.current_version
+          ? `You have ${info.current_version}`
+          : null;
+    head = (
+      <div class="cp-update-card-head">
+        <Face size={32} eyes={failed ? 'x' : staged ? 'happy' : 'open'} tone={failed ? 'err' : undefined} />
+        <div class="cp-update-card-id">
+          <strong>{title}</strong>
+          {sub && <span data-tone={failed ? 'error' : undefined}>{sub}</span>}
         </div>
       </div>
+    );
+  }
 
-      {busy && (
+  const bytes =
+    phase === 'downloading'
+      ? flow.total_bytes
+        ? `${formatBytes(flow.received_bytes)} of ${formatBytes(flow.total_bytes)}`
+        : formatBytes(flow.received_bytes)
+      : phase === 'applying'
+        ? 'Finishing up. Axial will restart.'
+        : restartRequested
+          ? `${version} will open shortly.`
+          : null;
+
+  return (
+    <div class="cp-update-card cp-pop cp-nodrag" role="dialog" aria-label="App update">
+      {head}
+
+      {bytes != null && (
         <div class="cp-update-progress">
-          <div
-            class="cp-boot-bar"
-            role="progressbar"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={pct ?? undefined}
-          >
-            <div
-              class="cp-boot-bar-fill"
-              data-indeterminate={indeterminate}
-              style={!indeterminate && pct != null ? { width: `${pct}%` } : undefined}
-            />
+          {phase === 'downloading' && pct != null && <Meter value={pct} ariaLabel="Update download progress" />}
+          <div class="cp-update-progress-line">
+            <span>{bytes}</span>
+            {phase === 'downloading' && pct != null && <span>{pct}%</span>}
           </div>
-          {!indeterminate && pct != null && <span class="cp-update-progress-pct">{pct}%</span>}
         </div>
       )}
 
       {(phase === 'idle' || (phase === 'failed' && !restartRequired)) && (
         <>
-          <div class="cp-update-card-actions">
-            {inApp ? (
-              <Button
-                variant="primary"
-                size="sm"
-                icon="refresh"
-                style={{ width: '100%' }}
-                disabled={phase === 'failed' && !flow.can_download}
-                onClick={() => void downloadAndInstallUpdate()}
-              >
-                {phase === 'failed' ? 'Try again' : 'Update & restart'}
-              </Button>
-            ) : (
-              <Button
-                variant="primary"
-                size="sm"
-                icon="globe"
-                style={{ width: '100%' }}
-                onClick={() => void openUpdateAction()}
-              >
-                {info?.action_label || 'Open release'}
-              </Button>
-            )}
-          </div>
+          {inApp ? (
+            <Button
+              variant="primary"
+              icon="refresh"
+              full
+              disabled={phase === 'failed' && !flow.can_download}
+              onClick={() => void downloadAndInstallUpdate()}
+            >
+              {phase === 'failed' ? 'Try again' : 'Update and restart'}
+            </Button>
+          ) : (
+            <Button variant="primary" icon="globe" full onClick={() => void openUpdateAction()}>
+              {info?.action_label || 'Open release'}
+            </Button>
+          )}
           <div class="cp-update-card-links">
             <Button variant="ghost" size="sm" onClick={() => void openUpdateNotes()}>
               Release notes
@@ -183,7 +164,6 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
             <Button
               variant="ghost"
               size="sm"
-              style={{ marginLeft: 'auto' }}
               onClick={() => {
                 dismissAvailableUpdate();
                 onClose();
@@ -196,33 +176,27 @@ function UpdateCard({ latest, onClose }: { latest: string; onClose: () => void }
       )}
 
       {phase === 'ready' && (
-        <div class="cp-update-card-actions">
-          <Button
-            variant="primary"
-            size="sm"
-            icon="refresh"
-            disabled={restartBlocked}
-            style={{ width: '100%' }}
-            onClick={() => void applyUpdateAndRestart()}
-          >
-            Restart now
-          </Button>
-        </div>
+        <Button
+          variant="primary"
+          icon="refresh"
+          full
+          disabled={restartBlocked}
+          onClick={() => void applyUpdateAndRestart()}
+        >
+          Restart now
+        </Button>
       )}
 
-      {(phase === 'restart-pending' || restartRequired) && (
-        <div class="cp-update-card-actions">
-          <Button
-            variant="primary"
-            size="sm"
-            icon="refresh"
-            disabled={restartRequested || restartBlocked}
-            style={{ width: '100%' }}
-            onClick={() => void restartDesktopApp()}
-          >
-            {restartRequested ? 'Restarting…' : 'Restart now'}
-          </Button>
-        </div>
+      {(phase === 'restart-pending' || restartRequired) && !restartRequested && (
+        <Button
+          variant="primary"
+          icon="refresh"
+          full
+          disabled={restartBlocked}
+          onClick={() => void restartDesktopApp()}
+        >
+          Restart now
+        </Button>
       )}
     </div>
   );

@@ -127,8 +127,8 @@ export function JavaPathField({
         options={options}
       />
       {(customOpen || isCustom || savedCustom) && (
-        <div class="cp-ovr-input">
-          <Icon name="folder" size={14} color="var(--text-mute)" />
+        <div class="cp-field cp-ovr-path">
+          <Icon name="folder" size={15} />
           <input
             type="text"
             value={value}
@@ -303,12 +303,12 @@ export function JvmArgsInput({
           />
         </div>
         {suggestions.length > 0 && (
-          <div class="cp-argbox-suggest" role="listbox">
+          <div class="cp-pop cp-menu cp-argbox-suggest" role="listbox">
             {suggestions.map((suggestion) => (
               <button
                 key={suggestion.insert}
                 type="button"
-                class="cp-argbox-suggest-row"
+                class="cp-menu-item cp-argbox-suggest-row"
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => applySuggestion(suggestion)}
               >

@@ -202,7 +202,8 @@ function harness() {
     {
       'preact/hooks': hooks,
       'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
-      '../../../ui/Atoms': { Button: 'Button', Pill: 'Pill' },
+      '../../../ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', IconButton: 'IconButton' },
+      '../../../ui/Segmented': { Segmented: 'Segmented' },
       '../../../ui/Select': { SelectField: 'SelectField' },
       '../../../ui/Icons': { Icon: 'Icon' },
       '../../../format': { formatBytes: String, fmtRelative: String },
@@ -275,25 +276,29 @@ test('the active Logs pane shows session output while the file inventory is excl
     nodes(tree).some((entry) => entry.type === 'ResourceStatus'),
     false,
   );
-  assert.equal(text(node(tree, 'Pill')), 'Live');
+  assert.equal(text(node(tree, 'Chip')), 'Live');
   assert.equal([...h.intervals.values()][0].delay, 2500);
   h.read(async () => history('New output'));
   h.poll();
   await flush();
   tree = h.render();
   assert.equal(node(tree, 'LogLines').props.text, 'New output');
-  const errorsFilter = nodes(tree).find((entry) => entry.type === 'button' && text(entry) === 'Errors');
-  assert.ok(errorsFilter);
-  (errorsFilter.props.onClick as () => void)();
+  const filter = node(tree, 'Segmented');
+  assert.ok(
+    (filter.props.options as { value: string; label: string }[]).some(
+      (o) => o.value === 'errors' && o.label === 'Errors',
+    ),
+  );
+  (filter.props.onChange as (value: string) => void)('errors');
   assert.equal(node(h.render(), 'LogLines').props.filter, 'errors');
-  const refresh = nodes(tree).find((entry) => entry.type === 'Button' && text(entry) === 'Refresh');
+  const refresh = nodes(tree).find((entry) => entry.type === 'IconButton' && entry.props.tooltip === 'Refresh');
   assert.ok(refresh);
   (refresh.props.onClick as () => void)();
   h.render();
   await flush();
   assert.equal(h.refreshes(), 1);
   assert.equal(h.calls.length, 3);
-  const folder = nodes(tree).find((entry) => entry.type === 'Button' && text(entry) === 'Open folder');
+  const folder = nodes(tree).find((entry) => entry.type === 'IconButton' && entry.props.tooltip === 'Open folder');
   assert.ok(folder);
   (folder.props.onClick as () => void)();
   assert.deepEqual(h.folders, [['instance-1', 'logs']]);
@@ -351,7 +356,7 @@ test('a retained session keeps reading output after the process exits until sett
   await flush();
   assert.equal(h.intervals.size, 1);
   assert.equal(
-    nodes(h.render()).some((entry) => entry.type === 'Pill'),
+    nodes(h.render()).some((entry) => entry.type === 'Chip'),
     false,
   );
   h.read(async () => history('Final drained output'));

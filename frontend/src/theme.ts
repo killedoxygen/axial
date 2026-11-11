@@ -3,7 +3,7 @@ import { defaults, local, saveLocalState, PRESET_HUES, canEditPreferences } from
 import { saveConfigPatch } from './hooks/use-autosave';
 import { config } from './store';
 import { Sound } from './sound';
-import { buildTheme, type Theme } from './tokens';
+import { buildTheme, neutralVars, type Theme } from './tokens';
 import { toast } from './toast';
 import { hasNativeDesktopRuntime, windowSetResizeBackground } from './native';
 import { nativePreferencesHydrated } from './preferences/persistence';
@@ -61,27 +61,8 @@ function applyCssVars(hue: number, dark: boolean, vibrancy: number, deferLogo = 
 
   const set = (k: string, v: string): void => el.style.setProperty(k, v);
 
-  // Neutral chassis follows the accent hue at low chroma so the whole
-  // surface stack harmonizes with the chosen accent.
-  if (dark) {
-    set('--bg-deep', `oklch(0.14 0.012 ${hue})`);
-    set('--bg', `oklch(0.175 0.012 ${hue})`);
-    set('--surface', `oklch(0.24 0.014 ${hue})`);
-    set('--surface-2', `oklch(0.30 0.015 ${hue})`);
-    set('--surface-3', `oklch(0.35 0.016 ${hue})`);
-    set('--text', `oklch(0.96 0.005 ${hue})`);
-    set('--text-dim', `oklch(0.74 0.010 ${hue})`);
-    set('--text-mute', `oklch(0.58 0.012 ${hue})`);
-  } else {
-    set('--bg-deep', `oklch(0.92 0.008 ${hue})`);
-    set('--bg', `oklch(0.95 0.006 ${hue})`);
-    set('--surface', `oklch(0.995 0.003 ${hue})`);
-    set('--surface-2', `oklch(0.945 0.006 ${hue})`);
-    set('--surface-3', `oklch(0.905 0.008 ${hue})`);
-    set('--text', `oklch(0.21 0.010 ${hue})`);
-    set('--text-dim', `oklch(0.45 0.010 ${hue})`);
-    set('--text-mute', `oklch(0.58 0.010 ${hue})`);
-  }
+  // The neutral ramp follows the accent hue at low chroma so every surface harmonizes with the chosen accent.
+  for (const [name, value] of Object.entries(neutralVars(dark, hue))) set(name, value);
 
   set('--accent', `oklch(${L} ${C} ${hue})`);
   set('--accent-strong', `oklch(${L - 0.08} ${C} ${hue})`);
@@ -228,52 +209,4 @@ export function resetThemeToDefault(): void {
     custom_hue: nextHue,
     custom_vibrancy: nextVibrancy,
   }, 'Failed to reset theme');
-}
-
-export function positionFieldMarker(
-  field: HTMLElement | null,
-  marker: HTMLElement | null,
-  hue: number,
-  vibrancy: number,
-): void {
-  if (!field || !marker) return;
-  marker.style.left = `${(hue / 360) * 100}%`;
-  marker.style.top = `${(1 - vibrancy / 100) * 100}%`;
-  marker.style.background = `oklch(0.78 0.14 ${hue})`;
-}
-
-export function initColorField(
-  field: HTMLElement | null,
-  marker: HTMLElement | null,
-  onDrag: (hue: number, vibrancy: number) => void,
-  onEnd?: () => void,
-): void {
-  if (!field) return;
-  let active = false;
-  function calc(e: PointerEvent): { hue: number; vibrancy: number } {
-    const r = field!.getBoundingClientRect();
-    const x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    const y = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
-    return { hue: Math.round(x * 360), vibrancy: Math.round((1 - y) * 100) };
-  }
-  field.addEventListener('pointerdown', (e: PointerEvent) => {
-    active = true;
-    field.setPointerCapture(e.pointerId);
-    const c = calc(e);
-    positionFieldMarker(field, marker, c.hue, c.vibrancy);
-    onDrag(c.hue, c.vibrancy);
-  });
-  field.addEventListener('pointermove', (e: PointerEvent) => {
-    if (!active) return;
-    const c = calc(e);
-    positionFieldMarker(field, marker, c.hue, c.vibrancy);
-    onDrag(c.hue, c.vibrancy);
-  });
-  field.addEventListener('pointerup', () => {
-    active = false;
-    if (onEnd) onEnd();
-  });
-  field.addEventListener('lostpointercapture', () => {
-    active = false;
-  });
 }

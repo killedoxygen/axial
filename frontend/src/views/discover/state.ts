@@ -17,6 +17,8 @@ export const category = signal('');
 export const sort = signal<ContentSort>('relevance');
 
 export const results = signal<SearchHit[]>([]);
+/** The result the pointer or the arrow keys last took; kept across a visit to its details. */
+export const resultInHand = signal<string | null>(null);
 export const total = signal(0);
 /** Signature of the search whose results are currently held, so remounts can skip refetching. */
 const loadedSearchKey = signal('');
@@ -55,6 +57,13 @@ export function requestDiscoverSearch(request: DiscoverSearchRequest): void {
 
 export function requestMoreDiscoverResults(request: DiscoverLoadMoreRequest): void {
   discoverSearchLifecycle.loadMore(request);
+}
+
+export function clearFilters(): void {
+  query.value = '';
+  loader.value = '';
+  gameVersion.value = '';
+  category.value = '';
 }
 
 export interface TrayItem {

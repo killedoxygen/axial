@@ -1,15 +1,16 @@
 import type { JSX } from 'preact';
 import { useCallback } from 'preact/hooks';
-import { Icon } from '../../../ui/Icons';
-import { Button } from '../../../ui/Atoms';
+import { Button, Empty, IconButton } from '../../../ui/Atoms';
+import { Art } from '../../../ui/Art';
 import { openContextMenu } from '../../../ui/ContextMenu';
-import { SelectionActionTray, SelectionCheckbox } from '../../../ui/SelectionActionTray';
-import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import { SelectionActionTray } from '../../../ui/SelectionActionTray';
+import { selectionMenuItem, useSelection } from '../../../ui/selection';
 import { formatBytes, fmtRelative } from '../../../format';
 import type { EnrichedInstance } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceMutationStatus, ResourceRow, ResourceStatus, ResourceToolbar } from '../components/resource-bits';
+import { ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
+import { Entry } from '../components/content-row';
 import { deleteWorlds, worldMenuItems } from '../world-actions';
 import { resourceMutationState } from '../bulk-actions';
 
@@ -46,56 +47,45 @@ export function WorldsPane({
     onRefresh();
   };
 
+  const openSaves = (): void => void openInstanceFolder(inst.id, 'saves');
+  const empty = worlds.length === 0 && resources.status === 'ready';
+
   return (
-    <div class="cp-instance-body">
-      <ResourceToolbar
-        title={`${worlds.length} world${worlds.length === 1 ? '' : 's'}`}
-        onRefresh={onRefresh}
-        action={{ icon: 'folder', label: 'Open saves', onClick: () => void openInstanceFolder(inst.id, 'saves') }}
-      />
+    <div class="cp-pane">
+      {!empty && (
+        <div class="cp-pane-bar">
+          <Button variant="secondary" icon="folder" onClick={openSaves}>
+            Open saves
+          </Button>
+          <IconButton icon="refresh" tooltip="Refresh" onClick={onRefresh} />
+        </div>
+      )}
       <ResourceStatus state={resources} onRetry={onRefresh} />
       <ResourceMutationStatus instanceId={inst.id} />
-      {worlds.length === 0 && resources.status === 'ready' ? (
-        <div class="cp-resource-empty cp-worlds-empty">
-          <div class="cp-worlds-empty-art" aria-hidden="true" />
-          <strong>No worlds yet</strong>
-          <p>Create a new world, import an existing save, or launch Minecraft and create one there.</p>
-          <div class="cp-worlds-empty-actions">
-            <Button variant="secondary" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'saves')}>
+      {empty ? (
+        <Empty
+          title="No worlds yet"
+          actions={
+            <Button variant="secondary" icon="folder" onClick={openSaves}>
               Import world
             </Button>
-          </div>
-        </div>
+          }
+        >
+          Create a new world, import an existing save, or launch Minecraft and create one there.
+        </Empty>
       ) : (
-        <div class="cp-resource-list">
+        <div class="cp-entries">
           {worlds.map((world) => (
-            <ResourceRow
+            <Entry
               key={world.name}
-              icon="globe"
-              name={world.name}
-              meta={`${formatBytes(world.size)}, changed ${fmtRelative(world.modified_at)}`}
+              art={<Art icon="globe" />}
+              title={world.name}
+              byline={`Changed ${fmtRelative(world.modified_at)}`}
+              num={formatBytes(world.size)}
               selected={selection.isSelected(world.name)}
-              leading={
-                <SelectionCheckbox
-                  selected={selection.isSelected(world.name)}
-                  label={selectionToggleLabel(selection.isSelected(world.name), world.name)}
-                  onToggle={(e) => {
-                    e.stopPropagation();
-                    selection.toggle(world.name);
-                  }}
-                />
-              }
-              onContextMenu={(e) => openContextMenu(e, menuItems(world.name))}
-              actions={
-                <button
-                  class="cp-resource-action"
-                  type="button"
-                  aria-label={`World actions for ${world.name}`}
-                  onClick={(e) => openContextMenu(e, menuItems(world.name))}
-                >
-                  <Icon name="dots" size={15} />
-                </button>
-              }
+              onToggle={() => selection.toggle(world.name)}
+              onMenu={(e) => openContextMenu(e, menuItems(world.name))}
+              menuLabel={`World actions for ${world.name}`}
             />
           ))}
         </div>

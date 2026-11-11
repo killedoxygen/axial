@@ -66,34 +66,51 @@ export function buildAccent(hue: number, dark: boolean, vibrancy = 100): AccentS
   };
 }
 
+/** The neutral ramp as CSS custom properties, tinted by the accent hue. `base.css` holds the same values for hue 140. */
+export function neutralVars(dark: boolean, hue: number): Record<string, string> {
+  const ramp = dark
+    ? {
+        '--bg-deep': '0.155 0.012',
+        '--bg': '0.185 0.012',
+        '--tile': '0.218 0.013',
+        '--fill': '0.232 0.013',
+        '--fill-2': '0.272 0.014',
+        '--fill-3': '0.33 0.015',
+        '--pop': '0.248 0.014',
+        '--text': '0.96 0.005',
+        '--text-dim': '0.74 0.01',
+        '--text-mute': '0.58 0.012',
+      }
+    : {
+        '--bg-deep': '0.925 0.008',
+        '--bg': '0.975 0.004',
+        '--tile': '0.948 0.006',
+        '--fill': '0.935 0.007',
+        '--fill-2': '0.905 0.008',
+        '--fill-3': '0.87 0.009',
+        '--pop': '0.995 0.003',
+        '--text': '0.21 0.01',
+        '--text-dim': '0.45 0.01',
+        '--text-mute': '0.58 0.01',
+      };
+  return Object.fromEntries(Object.entries(ramp).map(([name, lc]) => [name, `oklch(${lc} ${hue})`]));
+}
+
 export function buildNeutrals(dark: boolean, hue = 140): NeutralScale {
-  if (dark) {
-    return {
-      bg: `oklch(0.175 0.012 ${hue})`,
-      bgDeep: `oklch(0.14 0.012 ${hue})`,
-      surface: `oklch(0.24 0.014 ${hue})`,
-      surface2: `oklch(0.30 0.015 ${hue})`,
-      surface3: `oklch(0.35 0.016 ${hue})`,
-      line: 'oklch(1 0 0 / 0.07)',
-      lineStrong: 'oklch(1 0 0 / 0.14)',
-      text: `oklch(0.96 0.005 ${hue})`,
-      textDim: `oklch(0.74 0.010 ${hue})`,
-      textMute: `oklch(0.58 0.012 ${hue})`,
-      shadow: '0 24px 60px -20px rgba(0,0,0,0.6), 0 2px 6px rgba(0,0,0,0.3)',
-    };
-  }
+  const vars = neutralVars(dark, hue);
+  const ink = dark ? '1 0 0' : '0 0 0';
   return {
-    bg: `oklch(0.95 0.006 ${hue})`,
-    bgDeep: `oklch(0.92 0.008 ${hue})`,
-    surface: `oklch(0.995 0.003 ${hue})`,
-    surface2: `oklch(0.945 0.006 ${hue})`,
-    surface3: `oklch(0.905 0.008 ${hue})`,
-    line: 'oklch(0 0 0 / 0.07)',
-    lineStrong: 'oklch(0 0 0 / 0.14)',
-    text: `oklch(0.21 0.010 ${hue})`,
-    textDim: `oklch(0.45 0.010 ${hue})`,
-    textMute: `oklch(0.58 0.010 ${hue})`,
-    shadow: '0 24px 60px -20px rgba(0,0,0,0.25), 0 2px 6px rgba(0,0,0,0.08)',
+    bg: vars['--bg'],
+    bgDeep: vars['--bg-deep'],
+    surface: vars['--fill'],
+    surface2: vars['--fill-2'],
+    surface3: vars['--fill-3'],
+    line: `oklch(${ink} / 0.07)`,
+    lineStrong: `oklch(${ink} / 0.14)`,
+    text: vars['--text'],
+    textDim: vars['--text-dim'],
+    textMute: vars['--text-mute'],
+    shadow: dark ? '0 16px 40px -16px oklch(0 0 0 / 0.62)' : '0 16px 40px -16px oklch(0 0 0 / 0.28)',
   };
 }
 

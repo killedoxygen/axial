@@ -7,7 +7,7 @@ import vm from 'node:vm';
 
 /** @typedef {Parameters<typeof import('../../src/api').api>} ApiCall */
 /** @typedef {{ type: unknown, props: Record<string, unknown> }} ViewNode */
-/** @typedef {{ Button: { onClick: () => void, disabled?: boolean }, ChoicePills: { options: { value: string }[], onChange: (value: string) => void, value: string, disabled?: boolean } }} Controls */
+/** @typedef {{ Button: { onClick: () => void, disabled?: boolean }, OptionTiles: { options: { value: string }[], onChange: (value: string) => void, value: string, disabled?: boolean } }} Controls */
 /**
  * @typedef {{
  *   'views/settings/PerformanceSection': typeof import('../../src/views/settings/PerformanceSection'),
@@ -125,7 +125,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
     },
     'ui/Atoms': primitives(['Button', 'Pill', 'Toggle']),
     'ui/ChoicePills': primitives(['ChoicePills']),
-    'ui/SettingsSheet': primitives(['SettingRow', 'SettingsSection']),
+    'ui/SettingsSheet': primitives(['SettingRow', 'SettingsSection', 'OptionTiles']),
     'ui/Select': primitives(['SelectField']),
     // Config schema migration is shared-owner work, not mirrored in UI fixtures.
     'dto-core': {
@@ -247,7 +247,7 @@ test('Performance settings retain three modes, autosave and failure rollback', a
   });
   const { PerformanceSection } = h.load('views/settings/PerformanceSection');
   let view = h.render(PerformanceSection);
-  const choice = control(view, 'ChoicePills');
+  const choice = control(view, 'OptionTiles');
   assert.deepEqual(
     Array.from(choice.options, (option) => option.value),
     ['managed', 'vanilla', 'custom'],
@@ -255,16 +255,16 @@ test('Performance settings retain three modes, autosave and failure rollback', a
   assert.equal(nodes(view).filter((node) => node.type === 'SettingRow').length, 1);
   await h.settle();
   choice.onChange('vanilla');
-  assert.equal(control(h.render(PerformanceSection), 'ChoicePills').disabled, true);
+  assert.equal(control(h.render(PerformanceSection), 'OptionTiles').disabled, true);
   await h.settle();
   assert.equal(h.store.config.value.performance_mode, 'vanilla');
   assert.equal(JSON.stringify(h.calls[0]), JSON.stringify(['PUT', '/config', { performance_mode: 'vanilla' }]));
   view = h.render(PerformanceSection);
   await h.settle();
   fail = true;
-  control(view, 'ChoicePills').onChange('custom');
+  control(view, 'OptionTiles').onChange('custom');
   await h.settle();
-  assert.equal(control(h.render(PerformanceSection), 'ChoicePills').value, 'vanilla');
+  assert.equal(control(h.render(PerformanceSection), 'OptionTiles').value, 'vanilla');
   assert.match(h.notices[h.notices.length - 1][0], /Could not save performance settings: Setting is locked/);
 });
 
@@ -625,7 +625,7 @@ function deferredResponse() {
 
 /** @param {unknown} tree */
 function driverRows(tree) {
-  return nodes(tree).filter((node) => node.props.class === 'cp-settings-driver-row');
+  return nodes(tree).filter((node) => node.props.class === 'cp-lab-driver-row');
 }
 
 test('late list reads cannot overwrite an acknowledged native Resume and the same driver remains stoppable', async () => {

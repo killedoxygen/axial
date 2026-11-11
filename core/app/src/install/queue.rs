@@ -2177,6 +2177,37 @@ impl InstallQueue {
         .into_ready()
     }
 
+    /// The block textures in an installed version's client archive. Display only: the archive is
+    /// read at its inventoried revision, without the full verification a launch requires.
+    pub async fn block_textures(
+        &self,
+        version_id: &str,
+    ) -> Result<super::textures::BlockTexturesResponse, InstallError> {
+        axial_minecraft::portable_path::PortableFileName::new_exact(version_id)
+            .map_err(|_| InstallError::InvalidRequest)?;
+        let pin = self
+            .inner
+            .library
+            .admit()
+            .map_err(|_| InstallError::LibraryUnavailable)?;
+        let VersionInspection::Summary(summary) = self
+            .inspect_version(
+                &pin,
+                version_id,
+                artifacts::Inspection::Summary,
+                false,
+                None,
+            )
+            .await?
+        else {
+            return Err(InstallError::NotReady);
+        };
+        let version_id = version_id.to_owned();
+        tokio::task::spawn_blocking(move || super::textures::read(&summary, &version_id))
+            .await
+            .map_err(|_| InstallError::NotReady)?
+    }
+
     pub(crate) async fn has_ready_version(
         &self,
         pin: &GenerationPin,

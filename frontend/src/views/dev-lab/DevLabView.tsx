@@ -20,11 +20,13 @@ import { applyTheme, resetThemeToDefault } from '../../theme';
 import { toast } from '../../toast';
 import type { FeatureFlagViewModel } from '../../types-flags';
 import type { ToastKind } from '../../types-ui';
-import { Button, Card, Pill, Toggle } from '../../ui/Atoms';
+import { Button, Chip, Empty, Status, Tabs, Toggle, type TabItem } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
+import { Primitives } from './Primitives';
+import { OverrideChip } from '../../ui/SettingsSheet';
 import { route } from '../../ui-state';
 
-type LabTab = 'flags' | 'inspector' | 'playground';
+type LabTab = 'flags' | 'inspector' | 'playground' | 'primitives';
 type SoundKind = Parameters<typeof Sound.ui>[0];
 
 const TOAST_KINDS: ToastKind[] = ['success', 'info', 'error'];
@@ -59,29 +61,17 @@ function titleCase(value: string): string {
 function FlagRow({ flag }: { flag: FeatureFlagViewModel }): JSX.Element {
   const custom = flag.source === 'override';
   return (
-    <div class="cp-dev-flag-row">
+    <div class="cp-dev-flag">
+      <Toggle on={flag.enabled} ariaLabel={flag.title} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />
       <div class="cp-dev-flag-main">
         <div class="cp-dev-flag-head">
           <span class="cp-dev-flag-title">{flag.title}</span>
           <code class="cp-dev-flag-key">{flag.key}</code>
-          <span class="cp-dev-flag-meta">
-            <Pill tone={flag.stage === 'beta' ? 'info' : 'warn'}>{flag.stage}</Pill>
-            {flag.dev_only && <Pill>dev only</Pill>}
-            {custom && <Pill tone="accent">custom</Pill>}
-          </span>
+          <Chip tone={flag.stage === 'beta' ? 'info' : 'warn'}>{flag.stage}</Chip>
+          {flag.dev_only && <Chip>dev only</Chip>}
+          {custom && <OverrideChip label="Custom" onReset={() => void setFlagOverride(flag.key, null)} />}
         </div>
         <div class="cp-dev-flag-description">{flag.description}</div>
-      </div>
-      <div class="cp-dev-flag-controls">
-        {custom && (
-          <Button variant="ghost" size="sm" icon="refresh" onClick={() => void setFlagOverride(flag.key, null)}>
-            Reset
-          </Button>
-        )}
-        <span class="cp-dev-flag-state" data-on={flag.enabled}>
-          <span>{flag.enabled ? 'Enabled' : 'Disabled'}</span>
-          <Toggle on={flag.enabled} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />
-        </span>
       </div>
     </div>
   );
@@ -92,35 +82,29 @@ function FlagsPanel({ onRetry }: { onRetry: () => void }): JSX.Element {
   const loadState = featureFlagsLoadState.value;
 
   if (!flags) {
-    const failed = loadState.status === 'error';
-    const error = loadState.error || 'Unknown error';
+    if (loadState.status !== 'error') return <Status busy>Loading feature flags</Status>;
     return (
-      <div class="cp-dev-loading" data-error={failed} role={failed ? 'alert' : 'status'}>
-        <span>{failed ? `Could not load feature flags: ${error}` : 'Feature flags are still loading.'}</span>
-        {failed && (
-          <Button variant="secondary" size="sm" icon="refresh" onClick={onRetry}>
+      <Empty
+        eyes="x"
+        title="Could not load feature flags"
+        actions={
+          <Button variant="secondary" onClick={onRetry}>
             Retry
           </Button>
-        )}
-      </div>
+        }
+      >
+        {loadState.error || 'Unknown error'}
+      </Empty>
     );
   }
 
-  if (flags.length === 0) {
-    return (
-      <div class="cp-dev-empty" role="status">
-        No feature flags are available.
-      </div>
-    );
-  }
+  if (flags.length === 0) return <Empty title="No feature flags are available" />;
 
   return (
-    <div class="cp-dev-sheet">
-      <div class="cp-dev-flag-list">
-        {flags.map((flag) => (
-          <FlagRow key={flag.key} flag={flag} />
-        ))}
-      </div>
+    <div class="cp-dev-flags">
+      {flags.map((flag) => (
+        <FlagRow key={flag.key} flag={flag} />
+      ))}
     </div>
   );
 }
@@ -139,7 +123,7 @@ function InspectorPanel(): JSX.Element {
   ];
 
   return (
-    <div class="cp-dev-sheet cp-dev-inspector">
+    <div class="cp-dev-list">
       {items.map((item) => (
         <details key={item.key} class="cp-dev-inspector-row" open={item.open}>
           <summary>
@@ -157,7 +141,7 @@ function InspectorPanel(): JSX.Element {
 
 function ToastPlayground(): JSX.Element {
   return (
-    <Card class="cp-dev-play-card">
+    <div class="cp-dev-play-card">
       <div class="cp-dev-play-head">
         <div class="cp-dev-play-title">Toasts</div>
         <div class="cp-dev-play-hint">Fire a test toast in each tone.</div>
@@ -169,13 +153,13 @@ function ToastPlayground(): JSX.Element {
           </Button>
         ))}
       </div>
-    </Card>
+    </div>
   );
 }
 
 function SoundPlayground(): JSX.Element {
   return (
-    <Card class="cp-dev-play-card">
+    <div class="cp-dev-play-card">
       <div class="cp-dev-play-head">
         <div class="cp-dev-play-title">Sounds</div>
         <div class="cp-dev-play-hint">Audition the interface sound cues.</div>
@@ -187,13 +171,13 @@ function SoundPlayground(): JSX.Element {
           </Button>
         ))}
       </div>
-    </Card>
+    </div>
   );
 }
 
 function ThemePlayground(): JSX.Element {
   return (
-    <Card class="cp-dev-play-card">
+    <div class="cp-dev-play-card">
       <div class="cp-dev-play-head">
         <div class="cp-dev-play-title">Theme</div>
         <div class="cp-dev-play-hint">Apply a preset hue to the live theme.</div>
@@ -202,16 +186,16 @@ function ThemePlayground(): JSX.Element {
         {Object.entries(PRESET_HUES).map(([theme, hue]) => (
           <Button key={theme} variant="secondary" size="sm" onClick={() => applyTheme(theme, hue)}>
             <span class="cp-dev-theme-button">
-              <span class="cp-dev-theme-swatch" style={{ ['--cp-dev-hue' as any]: hue }} />
+              <span class="cp-dev-theme-swatch" style={{ ['--hue' as string]: hue }} />
               {titleCase(theme)}
             </span>
           </Button>
         ))}
-        <Button variant="ghost" size="sm" icon="refresh" onClick={() => resetThemeToDefault()}>
+        <Button variant="ghost" size="sm" onClick={() => resetThemeToDefault()}>
           Reset
         </Button>
       </div>
-    </Card>
+    </div>
   );
 }
 
@@ -246,36 +230,22 @@ export function DevLabView(): JSX.Element | null {
 
   if (!available) return null;
 
+  const tabs: TabItem<LabTab>[] = [
+    { id: 'flags', label: 'Flags', icon: 'sliders' },
+    ...(inspectorAvailable ? [{ id: 'inspector' as const, label: 'Inspector', icon: 'activity' as const }] : []),
+    { id: 'playground', label: 'Playground', icon: 'cube' },
+    { id: 'primitives', label: 'Primitives', icon: 'palette' },
+  ];
+
   return (
-    <div class="cp-view-page cp-dev-lab">
-      <div class="cp-page-header">
-        <div>
-          <h1>Dev lab</h1>
-          <div class="cp-page-sub">Developer workbench: feature flags, live state inspector, and UI playgrounds.</div>
-        </div>
-      </div>
-
-      <div class="cp-dev-tabs">
-        <button type="button" data-active={activeTab === 'flags'} onClick={() => setTab('flags')}>
-          <Icon name="sliders" size={15} stroke={1.8} />
-          Flags
-        </button>
-        {inspectorAvailable && (
-          <button type="button" data-active={activeTab === 'inspector'} onClick={() => setTab('inspector')}>
-            <Icon name="activity" size={15} stroke={1.8} />
-            Inspector
-          </button>
-        )}
-        <button type="button" data-active={activeTab === 'playground'} onClick={() => setTab('playground')}>
-          <Icon name="cube" size={15} stroke={1.8} />
-          Playground
-        </button>
-      </div>
-
-      <div class="cp-dev-tab-panel">
+    <div class="cp-view-page">
+      <h1 class="cp-h1">Dev lab</h1>
+      <Tabs tabs={tabs} active={activeTab} label="Dev lab sections" onSelect={setTab} />
+      <div role="tabpanel">
         {activeTab === 'flags' && <FlagsPanel onRetry={() => loadFlags(true)} />}
         {activeTab === 'inspector' && inspectorAvailable && <InspectorPanel />}
         {activeTab === 'playground' && <PlaygroundPanel />}
+        {activeTab === 'primitives' && <Primitives />}
       </div>
     </div>
   );

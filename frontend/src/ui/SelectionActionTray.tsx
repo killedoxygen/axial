@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { Button } from './Atoms';
-import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from './FloatingTray';
+import { FloatingTray, FloatingTrayLabel } from './FloatingTray';
 import { Icon, type IconName } from './Icons';
 import type { SelectionState } from './selection';
 
@@ -32,7 +32,6 @@ export function SelectionActionTray({
       <FloatingTrayLabel>
         {selectedCount} {noun} selected
       </FloatingTrayLabel>
-      <FloatingTrayDivider />
       {!allSelected && (
         <Button variant="ghost" size="sm" onClick={selectAll}>
           Select all
@@ -41,7 +40,6 @@ export function SelectionActionTray({
       <Button variant="ghost" size="sm" icon="x" onClick={clear}>
         Clear
       </Button>
-      {actions.length > 0 && <FloatingTrayDivider />}
       {actions.map((action) => (
         <Button
           key={action.label}
@@ -60,11 +58,14 @@ export function SelectionActionTray({
 
 export function SelectionCheckbox({
   selected,
+  mixed = false,
   label,
   onToggle,
   className,
 }: {
   selected: boolean;
+  /** Some, not all, of what it stands for is selected. */
+  mixed?: boolean;
   label: string;
   onToggle: (e: MouseEvent) => void;
   className?: string;
@@ -72,13 +73,13 @@ export function SelectionCheckbox({
   return (
     <button
       type="button"
-      class={className ? `cp-select-check ${className}` : 'cp-select-check'}
-      data-selected={selected}
-      aria-pressed={selected}
+      class={className ? `cp-check ${className}` : 'cp-check'}
+      data-selected={selected || mixed}
+      aria-pressed={mixed ? 'mixed' : selected}
       aria-label={label}
       onClick={onToggle}
     >
-      <Icon name="check" size={14} stroke={2.2} />
+      <Icon name={mixed ? 'minus' : 'check'} size={14} stroke={2.2} />
     </button>
   );
 }

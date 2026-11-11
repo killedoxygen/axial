@@ -415,6 +415,7 @@ function harness() {
     {
       'preact/hooks': viewHooks,
       '../../../ui/Icons': primitive('Icon'),
+      '../../../ui/Atoms': primitive('Chip', 'Notice'),
       '../../../ui/Select': primitive('SelectField'),
       '../../../ui/ChoicePills': primitive('ChoicePills'),
       '../../../ui/SettingsSheet': common.ui,

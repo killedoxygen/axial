@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Toggle } from '../../ui/Atoms';
+import { Chip, Toggle } from '../../ui/Atoms';
 import { Slider } from '../../ui/Slider';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { local, saveLocalState, canEditPreferences } from '../../state';
@@ -38,28 +38,35 @@ export function AudioSection(): JSX.Element {
       <SettingRow
         title="UI sounds"
         description="Soft audio feedback for buttons, sliders, and theme changes."
-        control={<Toggle on={soundsOn} onChange={toggleSounds} />}
+        control={<Toggle on={soundsOn} ariaLabel="UI sounds" onChange={toggleSounds} />}
       />
       <SettingRow
         title="Background music"
         description="Ambient track while you're in the launcher. Pauses automatically during gameplay."
-        control={<Toggle on={musicOn} onChange={toggleMusic} />}
+        control={<Toggle on={musicOn} ariaLabel="Background music" onChange={toggleMusic} />}
       />
       {musicOn && (
-        <SettingRow title="Music volume" description={`Ambient level: ${volume}%.`}>
-          <Slider
-            value={volume}
-            min={0}
-            max={100}
-            step={1}
-            sound="volume"
-            onChange={(v) => {
-              setVolume(v);
-              Music.setVolume(v);
-            }}
-            ariaLabel="Music volume"
-          />
-        </SettingRow>
+        <SettingRow
+          title="Music volume"
+          control={
+            <>
+              <Slider
+                class="cp-volume"
+                value={volume}
+                min={0}
+                max={100}
+                step={1}
+                sound="volume"
+                onChange={(v) => {
+                  setVolume(v);
+                  Music.setVolume(v);
+                }}
+                ariaLabel="Music volume"
+              />
+              <Chip>{volume}%</Chip>
+            </>
+          }
+        />
       )}
     </SettingsSection>
   );

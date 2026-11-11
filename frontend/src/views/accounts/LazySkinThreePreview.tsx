@@ -59,7 +59,7 @@ function SkinThreePreviewFallback({
 }): JSX.Element {
   return (
     <div
-      class="cp-skin-three cp-skin-three-sized"
+      class="cp-skin-three"
       data-skin-three-preview={failed ? 'error' : 'loading'}
       data-skin-three-interaction="idle"
       data-skin-three-cape={capeSrc ? 'loading' : 'none'}

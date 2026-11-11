@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import { api } from '../../api';
-import { Button, Pill } from '../../ui/Atoms';
+import { Button, Chip } from '../../ui/Atoms';
 import { toast } from '../../toast';
 import { versionById } from '../../store';
 import { fmtMem } from '../../format';
@@ -61,28 +61,28 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
   };
 
   return (
-    <div class="cp-settings-proof-history" aria-live="polite">
-      <div class="cp-settings-proof-history-head">
-        <div class="cp-settings-rule-status-copy">
+    <div class="cp-lab-block" aria-live="polite">
+      <div class="cp-lab-head">
+        <div class="cp-lab-title">
           <strong>Launch proof history</strong>
           <span>Recent local proofs recorded after launches.</span>
         </div>
-        {state.status === 'loading' && <span class="cp-settings-proof-muted">Loading</span>}
-        {state.status === 'error' && <span class="cp-settings-proof-error">Unavailable</span>}
+        {state.status === 'loading' && <Chip>Loading</Chip>}
+        {state.status === 'error' && <Chip tone="err">Unavailable</Chip>}
       </div>
 
       {state.status === 'error' && records.length === 0 && (
-        <div class="cp-settings-proof-empty">Launch proof history is unavailable. {state.error}</div>
+        <div class="cp-lab-note">Launch proof history is unavailable. {state.error}</div>
       )}
 
       {state.status !== 'error' && records.length === 0 && (
-        <div class="cp-settings-proof-empty">
+        <div class="cp-lab-note">
           {state.status === 'loading' ? 'Checking local launch proofs.' : 'No local launch proofs yet.'}
         </div>
       )}
 
       {records.length > 0 && (
-        <div class="cp-settings-proof-list">
+        <div class="cp-lab-list">
           {records.map((record) => {
             const scenario = record.scenario ?? {
               scenario_id: 'unknown_launch',
@@ -108,16 +108,16 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
             const version = minecraftVersionLabel(versionRecord, versionId || 'Unknown version');
 
             return (
-              <div class="cp-settings-proof-row" key={record.session_id}>
-                <div class="cp-settings-proof-main">
-                  <Pill tone={viewModel.outcome_tone}>{viewModel.outcome_label}</Pill>
-                  <div class="cp-settings-proof-title">
+              <div class="cp-lab-proof-row" key={record.session_id}>
+                <div class="cp-lab-main">
+                  <Chip tone={viewModel.outcome_tone}>{viewModel.outcome_label}</Chip>
+                  <div class="cp-lab-name">
                     <strong>{version}</strong>
                     <span>{labelFromToken(scenario.performance_mode, 'Unknown mode')}</span>
                   </div>
                 </div>
-                <div class="cp-settings-proof-evidence">
-                  <div class="cp-settings-proof-meta">
+                <div class="cp-lab-proof-evidence">
+                  <div class="cp-lab-meta">
                     <span>Launched {formatProofDate(record.launched_at)}</span>
                     <span>Recorded {formatProofDate(record.recorded_at)}</span>
                     {bootDuration && <span>{bootDuration}</span>}
@@ -125,23 +125,23 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
                     {benchmarkParts.length > 0 && <span>{benchmarkParts.join(', ')}</span>}
                   </div>
                   {budgetSummary && (
-                    <div class="cp-settings-proof-budget" data-pressure={budgetSummary.pressure ? 'true' : 'false'}>
+                    <div class="cp-lab-proof-budget" data-pressure={budgetSummary.pressure ? 'true' : 'false'}>
                       <strong>{budgetSummary.pressure_label}</strong>
                       {budgetSummary.details.length > 0 && <span>{budgetSummary.details.join(', ')}</span>}
                     </div>
                   )}
                   {evidenceSummary && (
-                    <div class="cp-settings-proof-guardian">
-                      <Pill tone={evidenceSummary.tone}>{evidenceSummary.label}</Pill>
+                    <div class="cp-lab-proof-guardian">
+                      <Chip tone={evidenceSummary.tone}>{evidenceSummary.label}</Chip>
                       {evidenceSummary.detail && <span>{evidenceSummary.detail}</span>}
                     </div>
                   )}
                 </div>
-                <div class="cp-settings-proof-compare" data-tone={comparison.tone}>
+                <div class="cp-lab-proof-compare" data-tone={comparison.tone}>
                   <strong>{comparison.label}</strong>
                   <span>{comparison.detail}</span>
                 </div>
-                <div class="cp-settings-proof-action">
+                <div class="cp-lab-proof-action">
                   <Button
                     variant="ghost"
                     size="sm"
@@ -160,7 +160,7 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
       )}
 
       {state.status === 'error' && records.length > 0 && (
-        <div class="cp-settings-proof-note">Could not refresh proof history. Showing the last loaded records.</div>
+        <div class="cp-lab-note">Could not refresh proof history. Showing the last loaded records.</div>
       )}
     </div>
   );

@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
-import { Icon } from '../../../ui/Icons';
-import { Button } from '../../../ui/Atoms';
+import { Button, Chip, Empty, IconButton } from '../../../ui/Atoms';
+import { Segmented } from '../../../ui/Segmented';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionTray, SelectionCheckbox } from '../../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
@@ -9,7 +9,7 @@ import { formatBytes, fmtDayLabel, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceEmpty, ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
+import { ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
 import { ScreenshotLightbox } from '../components/screenshot-lightbox';
 import { deleteScreenshots, screenshotFileUrl, screenshotMenuItems } from '../screenshot-actions';
 import { resourceMutationState } from '../bulk-actions';
@@ -108,72 +108,69 @@ export function ScreenshotsPane({
     if (!screenshots.some((shot) => shot.name === viewer.name)) setViewer(null);
   }, [screenshots, viewer, resources.status]);
 
+  const empty = screenshots.length === 0 && resources.status === 'ready';
+  const openFolder = (): void => void openInstanceFolder(inst.id, 'screenshots');
+
   return (
-    <div class="cp-instance-body">
-      <div class="cp-resource-toolbar cp-screenshots-toolbar">
-        <div class="cp-resource-toolbar-title">
-          <strong>
-            {screenshots.length} screenshot{screenshots.length === 1 ? '' : 's'}
-          </strong>
-          {totalBytes > 0 ? <span>{formatBytes(totalBytes)}</span> : null}
+    <div class="cp-pane">
+      {!empty && (
+        <div class="cp-pane-bar">
+          <Segmented<ScreenshotSort>
+            role="tablist"
+            ariaLabel="Sort screenshots"
+            value={sort}
+            onChange={setSort}
+            options={(Object.keys(SCREENSHOT_SORT_LABELS) as ScreenshotSort[]).map((item) => ({
+              value: item,
+              label: SCREENSHOT_SORT_LABELS[item],
+            }))}
+          />
+          <span class="cp-head-fill" />
+          {totalBytes > 0 && <Chip tone="bare">{formatBytes(totalBytes)}</Chip>}
+          <IconButton icon="refresh" tooltip="Refresh" onClick={onRefresh} />
+          <IconButton icon="folder" tooltip="Open screenshots" onClick={openFolder} />
         </div>
-        <div class="cp-screenshots-tools">
-          <div class="cp-mini-seg" role="tablist" aria-label="Sort screenshots">
-            {(Object.keys(SCREENSHOT_SORT_LABELS) as ScreenshotSort[]).map((item) => (
-              <button
-                key={item}
-                type="button"
-                role="tab"
-                aria-selected={sort === item}
-                data-active={sort === item}
-                onClick={() => setSort(item)}
-              >
-                {SCREENSHOT_SORT_LABELS[item]}
-              </button>
-            ))}
-          </div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={onRefresh}>
-            Refresh
-          </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            icon="folder"
-            onClick={() => void openInstanceFolder(inst.id, 'screenshots')}
-          >
-            Open screenshots
-          </Button>
-        </div>
-      </div>
+      )}
       <ResourceStatus state={resources} onRetry={onRefresh} />
       <ResourceMutationStatus instanceId={inst.id} />
-      {screenshots.length === 0 && resources.status === 'ready' ? (
-        <ResourceEmpty
-          icon="image"
+      {empty ? (
+        <Empty
           title="No screenshots yet"
-          hint="Minecraft saves screenshots here after you capture them in game."
-        />
+          actions={
+            <Button variant="secondary" icon="folder" onClick={openFolder}>
+              Open screenshots
+            </Button>
+          }
+        >
+          Minecraft saves screenshots here after you capture them in game.
+        </Empty>
       ) : (
         <div class="cp-shot-groups">
           {groups.map((group) => (
-            <section class="cp-shot-group" key={group.key}>
+            <section key={group.key}>
               {group.label ? (
-                <div class="cp-shot-group-head">
-                  <span class="cp-shot-group-label">{group.label}</span>
-                  <span class="cp-shot-group-count">{group.shots.length}</span>
-                  <span class="cp-shot-group-rule" aria-hidden="true" />
+                <div class="cp-head">
+                  <h2>{group.label}</h2>
+                  <Chip>{group.shots.length}</Chip>
                 </div>
               ) : null}
-              <div class="cp-screenshots-grid">
+              <div class="cp-shots">
                 {group.shots.map((shot) => (
                   <div
-                    class="cp-screenshot-tile"
+                    class="cp-shot"
                     data-selected={selection.isSelected(shot.name)}
                     key={shot.name}
                     onContextMenu={(e) => openContextMenu(e, menuItems(shot))}
                   >
+                    <button
+                      class="cp-shot-thumb"
+                      type="button"
+                      aria-label={`View ${shot.name}`}
+                      onClick={() => setViewer({ name: shot.name })}
+                    >
+                      <img src={screenshotFileUrl(inst, shot.name)} alt="" loading="lazy" />
+                    </button>
                     <SelectionCheckbox
-                      className="cp-screenshot-select"
                       selected={selection.isSelected(shot.name)}
                       label={selectionToggleLabel(selection.isSelected(shot.name), shot.name)}
                       onToggle={(e) => {
@@ -181,32 +178,21 @@ export function ScreenshotsPane({
                         selection.toggle(shot.name);
                       }}
                     />
-                    <button
-                      class="cp-screenshot-thumb"
-                      type="button"
-                      aria-label={`View ${shot.name}`}
-                      onClick={() => setViewer({ name: shot.name })}
-                    >
-                      <img src={screenshotFileUrl(inst, shot.name)} alt="" loading="lazy" />
-                    </button>
-                    <div class="cp-screenshot-caption">
-                      <div class="cp-screenshot-text">
-                        <div class="cp-screenshot-name" title={shot.name}>
+                    <div class="cp-shot-caption">
+                      <span class="cp-entry-id">
+                        <strong class="cp-entry-title" title={shot.name}>
                           {shot.name}
-                        </div>
-                        <div class="cp-screenshot-meta">
-                          <span>{formatBytes(shot.size)}</span>
-                          <span>{fmtRelative(shot.modified_at)}</span>
-                        </div>
-                      </div>
-                      <button
-                        class="cp-resource-action"
-                        type="button"
-                        aria-label={`Screenshot actions for ${shot.name}`}
+                        </strong>
+                        <span class="cp-entry-by">
+                          {formatBytes(shot.size)}, {fmtRelative(shot.modified_at)}
+                        </span>
+                      </span>
+                      <IconButton
+                        icon="dots"
+                        size={28}
+                        tooltip={`Screenshot actions for ${shot.name}`}
                         onClick={(e) => openContextMenu(e, menuItems(shot))}
-                      >
-                        <Icon name="dots" size={15} />
-                      </button>
+                      />
                     </div>
                   </div>
                 ))}

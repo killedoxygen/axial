@@ -4,9 +4,7 @@ import { errMessage } from '../../utils';
 import { signal } from '@preact/signals';
 
 export type ResourceMutationState =
-  | { status: 'idle' }
-  | { status: 'pending'; label: string }
-  | { status: 'error'; error: string };
+  { status: 'idle' } | { status: 'pending'; label: string } | { status: 'error'; error: string };
 
 const mutations = signal<ReadonlyMap<string, ResourceMutationState>>(new Map());
 const idleMutation: ResourceMutationState = { status: 'idle' };

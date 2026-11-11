@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect } from 'preact/hooks';
 import { Modal, ModalContent } from '../../../ui/Modal';
-import { IconButton } from '../../../ui/Atoms';
+import { Chip, IconButton } from '../../../ui/Atoms';
 import { formatBytes, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
 import { openInstanceFolder } from '../instance-actions';
@@ -74,25 +74,24 @@ export function ScreenshotLightbox({
         <div class="cp-shot-lightbox-bar">
           <div class="cp-shot-lightbox-title">
             <strong title={shot.name}>{shot.name}</strong>
-            <div class="cp-shot-lightbox-meta">
-              <span>{formatBytes(shot.size)}</span>
-              <span>{fmtRelative(shot.modified_at)}</span>
+            <div class="cp-chips">
+              <Chip mono>{formatBytes(shot.size)}</Chip>
+              <Chip icon="clock">{fmtRelative(shot.modified_at)}</Chip>
             </div>
           </div>
           <div class="cp-shot-lightbox-actions">
-            <span class="cp-shot-lightbox-count">
+            <Chip tone="bare">
               {index + 1} of {shots.length}
-            </span>
-            <IconButton icon="edit" size={30} tooltip="Rename" disabled={busy} onClick={rename} />
+            </Chip>
+            <IconButton icon="edit" tooltip="Rename" disabled={busy} onClick={rename} />
             <IconButton
               icon="folder"
-              size={30}
+
               tooltip="Open screenshots folder"
               onClick={() => void openInstanceFolder(inst.id, 'screenshots')}
             />
-            <IconButton icon="trash" size={30} danger tooltip="Delete" disabled={busy} onClick={remove} />
-            <span class="cp-shot-lightbox-sep" aria-hidden="true" />
-            <IconButton icon="x" size={30} tooltip="Close" onClick={onClose} />
+            <IconButton icon="trash" danger tooltip="Delete" disabled={busy} onClick={remove} />
+            <IconButton icon="x" tooltip="Close" onClick={onClose} />
           </div>
         </div>
         <ResourceMutationStatus instanceId={inst.id} />
@@ -103,7 +102,7 @@ export function ScreenshotLightbox({
               <IconButton
                 icon="chevron-left"
                 variant="overlay"
-                size={38}
+                size={36}
                 tooltip="Previous"
                 onClick={() => onSelect(prev.name)}
               />
@@ -114,7 +113,7 @@ export function ScreenshotLightbox({
               <IconButton
                 icon="chevron-right"
                 variant="overlay"
-                size={38}
+                size={36}
                 tooltip="Next"
                 onClick={() => onSelect(next.name)}
               />

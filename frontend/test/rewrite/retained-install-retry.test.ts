@@ -47,6 +47,8 @@ function nodes(value: unknown): Node[] {
   if (Array.isArray(value)) return value.flatMap(nodes);
   if (!value || typeof value !== 'object' || !('props' in value)) return [];
   const node = value as Node;
+  if (typeof node.type === 'function' && ['Row', 'FailureRow', 'Lead', 'Target'].includes(node.type.name))
+    return nodes(node.type(node.props));
   return [node, ...nodes(node.props.children)];
 }
 
@@ -103,10 +105,17 @@ function harness() {
   });
   const atoms = source<typeof import('../../src/ui/Atoms')>('ui/Atoms.tsx', {
     'preact/jsx-runtime': jsx, './Icons': { Icon: 'Icon' },
+    './Face': { Face: 'Face' },
   });
   const view = source<typeof import('../../src/views/downloads/DownloadsView')>('views/downloads/DownloadsView.tsx', {
     'preact/jsx-runtime': jsx, '../../ui/Atoms': atoms, '../../ui/Icons': { Icon: 'Icon' },
-    '../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
+    '../../ui/Face': { Face: 'Face' },
+    '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile' },
+    '../../ui-state': { navigate() {}, openCreate() {} },
+    '../discover/shared': { KIND_ICON: {} },
+    '../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
+    '../create/loader-logos': { LoaderLogo: 'LoaderLogo' },
+    '../../install-item': installItems,
     '../../hooks/use-now': { useNowTicker: () => 0 }, '../../machines/downloads': machine,
     '../../api': api, '../../dto-install': installContract, '../../store': store, '../../utils': utils,
   });
@@ -123,8 +132,10 @@ function harness() {
     },
     view() { return nodes(view.DownloadsView()); },
     retryButton(): Node | undefined {
-      const button = nodes(view.DownloadsView()).find((node) => node.type === atoms.Button);
-      return button ? atoms.Button(button.props) as Node : undefined;
+      const button = nodes(view.DownloadsView()).find(
+        (node) => node.type === atoms.Button && node.props.children === 'Retry settlement',
+      );
+      return button ? (atoms.Button(button.props) as Node) : undefined;
     },
   };
 }
@@ -294,15 +305,22 @@ test('ordinary failure retry and queue removal keep their existing routes and ex
   }];
   await h.load(failed);
   assert.equal(h.retryButton(), undefined);
-  const notice = h.view().find((node) => node.type === 'DownloadFailureNotice');
+  const failureView = h.view();
+  const notice = failureView.find(
+    (node) => node.props.children === 'Retry' && typeof node.props.onClick === 'function',
+  );
   assert.ok(notice);
-  (notice.props.onRetry as () => void)();
+  (notice.props.onClick as () => void)();
   await flush();
   assert.deepEqual(h.calls.find((call) => call.method === 'POST'), {
     method: 'POST', path: '/install/queue/retry', body: { kind: 'vanilla', version_id: '1.20.1' },
   });
   h.request(async () => queue(null, 3));
-  await (notice.props.onDismiss as () => Promise<void>)();
+  const dismiss = failureView.find(
+    (node) => node.props.children === 'Dismiss' && typeof node.props.onClick === 'function',
+  );
+  assert.ok(dismiss);
+  await (dismiss.props.onClick as () => Promise<void>)();
   await flush();
   assert.deepEqual(h.calls.filter((call) => call.method === 'DELETE').map((call) => call.path),
     ['/install/queue/failures/failed-operation']);

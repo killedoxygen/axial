@@ -23,7 +23,7 @@ export function SelectField<T extends string>({
   ariaLabel,
   disabled,
   placeholder,
-  width,
+  look = 'field',
 }: {
   value: T;
   onChange: (value: T) => void;
@@ -31,7 +31,8 @@ export function SelectField<T extends string>({
   ariaLabel?: string;
   disabled?: boolean;
   placeholder?: string;
-  width?: number | string;
+  /** `quiet`: a small refinement beside others. `ghost`: the same with no fill until hover. */
+  look?: 'field' | 'quiet' | 'ghost';
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(-1);
@@ -206,14 +207,13 @@ export function SelectField<T extends string>({
       <button
         type="button"
         ref={triggerRef}
-        class="cp-select-trigger"
+        class={look === 'field' ? 'cp-select-trigger' : `cp-select-trigger cp-select-trigger--${look}`}
         role="combobox"
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label={ariaLabel}
         data-state={open ? 'open' : 'closed'}
         disabled={disabled}
-        style={width != null ? { width } : undefined}
         onClick={() => (open ? closeList() : openList())}
         onKeyDown={onTriggerKeyDown}
       >
@@ -228,7 +228,7 @@ export function SelectField<T extends string>({
         createPortal(
           <div
             ref={listRef}
-            class="cp-select-content"
+            class="cp-select-content cp-pop"
             role="listbox"
             tabIndex={-1}
             aria-label={ariaLabel}
@@ -245,11 +245,11 @@ export function SelectField<T extends string>({
             }
             onKeyDown={onListKeyDown}
           >
-            <div class="cp-select-viewport">
+            <div class="cp-select-viewport cp-menu">
               {options.map((option, index) => (
                 <div
                   key={option.value}
-                  class="cp-select-item"
+                  class="cp-select-item cp-menu-item"
                   role="option"
                   data-index={index}
                   aria-selected={option.value === value}

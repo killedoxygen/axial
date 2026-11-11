@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
-import { Icon, type IconName } from '../../ui/Icons';
+import { Chip, type TabItem } from '../../ui/Atoms';
+import type { IconName } from '../../ui/Icons';
 import { SelectField } from '../../ui/Select';
-import type { SegmentedOption } from '../../ui/Segmented';
+import { formatCount } from '../../format';
 import type { ContentKind, ContentVersion } from '../../types-content';
 import type { EnrichedInstance } from '../../types-instance';
 import { contentTargets } from './state';
@@ -13,11 +14,11 @@ export const KIND_ICON: Record<ContentKind, IconName> = {
   shader_pack: 'palette',
 };
 
-export const KIND_TABS: SegmentedOption<ContentKind>[] = [
-  { value: 'mod', label: 'Mods', icon: KIND_ICON.mod },
-  { value: 'modpack', label: 'Modpacks', icon: KIND_ICON.modpack },
-  { value: 'resource_pack', label: 'Resource packs', icon: KIND_ICON.resource_pack },
-  { value: 'shader_pack', label: 'Shaders', icon: KIND_ICON.shader_pack },
+export const KIND_TABS: TabItem<ContentKind>[] = [
+  { id: 'mod', label: 'Mods', icon: KIND_ICON.mod },
+  { id: 'modpack', label: 'Modpacks', icon: KIND_ICON.modpack },
+  { id: 'resource_pack', label: 'Resource packs', icon: KIND_ICON.resource_pack },
+  { id: 'shader_pack', label: 'Shaders', icon: KIND_ICON.shader_pack },
 ];
 
 export const KIND_NOUN: Record<ContentKind, string> = {
@@ -29,10 +30,6 @@ export const KIND_NOUN: Record<ContentKind, string> = {
 
 export function usesLoaderFilter(kind: ContentKind): boolean {
   return kind === 'mod' || kind === 'modpack';
-}
-
-export function isAddable(kind: ContentKind): boolean {
-  return kind !== 'modpack';
 }
 
 export function versionFits(version: ContentVersion, kind: ContentKind, instance: EnrichedInstance | null): boolean {
@@ -76,41 +73,32 @@ export function compareMcDesc(a: string, b: string): number {
   return 0;
 }
 
+/** A provider slug as words: `game-mechanics` reads "Game mechanics". */
 export function tagLabel(value: string): string {
-  return value.replace(/[-_]/g, ' ');
+  const words = value.replace(/[-_]/g, ' ');
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-export function Spinner({ size = 14 }: { size?: number }): JSX.Element {
-  return <span class="cp-discover-spinner" style={{ width: size, height: size }} aria-hidden="true" />;
-}
-
-export function SkeletonCard(): JSX.Element {
+/** How used a project is. */
+export function ContentStats({ downloads, follows }: { downloads: number; follows: number }): JSX.Element {
   return (
-    <div class="cp-discover-card" aria-hidden="true">
-      <div class="cp-discover-card-icon cp-skeleton" />
-      <div class="cp-discover-card-main">
-        <div class="cp-skeleton cp-skeleton-line" style={{ width: '52%', height: 13 }} />
-        <div class="cp-skeleton cp-skeleton-line" style={{ width: '100%', marginTop: 12 }} />
-        <div class="cp-skeleton cp-skeleton-line" style={{ width: '68%' }} />
-        <div class="cp-skeleton cp-skeleton-line" style={{ width: '40%', marginTop: 14 }} />
-      </div>
-    </div>
+    <span class="cp-discover-stats">
+      <Chip tone="bare" icon="download" title={`${downloads.toLocaleString()} downloads`}>
+        {formatCount(downloads)}
+      </Chip>
+      <Chip tone="bare" icon="user" title={`${follows.toLocaleString()} followers`}>
+        {formatCount(follows)}
+      </Chip>
+    </span>
   );
 }
 
-export function ContentIcon({ url, kind, size = 24 }: { url?: string; kind: ContentKind; size?: number }): JSX.Element {
-  if (url) return <img src={url} alt="" loading="lazy" />;
-  return <Icon name={KIND_ICON[kind]} size={size} />;
-}
-
-/** Dropdown of instances that content can be added to; hidden when none fit. */
+/** The instances content can be added to, as a select; nothing when none fit. */
 export function InstanceTargetPicker({
   placeholder,
-  width,
   onPick,
 }: {
   placeholder: string;
-  width: number;
   onPick: (instanceId: string) => void;
 }): JSX.Element | null {
   const options = contentTargets.value.map((instance) => ({
@@ -118,14 +106,12 @@ export function InstanceTargetPicker({
     label: `${instance.name} (${instance.version_display.summary_label})`,
   }));
   if (options.length === 0) return null;
-
   return (
     <SelectField
       value=""
       onChange={onPick}
       options={[{ value: '', label: placeholder }, ...options]}
       ariaLabel={placeholder}
-      width={width}
     />
   );
 }

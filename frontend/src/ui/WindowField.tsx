@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import { Input } from './Atoms';
+import { Chip, Input } from './Atoms';
 import { Segmented } from './Segmented';
 import { buildWindowPresets, detectMaxScreenSize, type ScreenSize, type WindowPresetSpec } from './screen-presets';
 
@@ -68,47 +68,33 @@ export function WindowField({
     if (e.key === 'Enter') (e.currentTarget as HTMLInputElement | null)?.blur();
   };
 
-  const windowPct = Math.max(6, Math.min(100, (width / Math.max(1, screen.w)) * 100));
-
   return (
-    <div class="cp-winfield" data-inherit={inheriting ? 'true' : 'false'}>
-      <div class="cp-winfield-stage">
-        <div
-          class="cp-winfield-screen"
-          style={{ aspectRatio: `${screen.w} / ${screen.h}` }}
-          title={`Display ${screen.w} × ${screen.h}`}
-        >
-          <div class="cp-winfield-window" style={{ width: `${windowPct}%`, aspectRatio: `${width} / ${height}` }} />
-        </div>
-        <span class="cp-winfield-caption">{inheriting ? inherit!.label : `${width} × ${height}`}</span>
+    <div class="cp-winfield">
+      <Segmented<string>
+        ariaLabel="Window size preset"
+        value={activePreset}
+        onChange={(presetId) => {
+          const preset = presets.find((item) => item.id === presetId);
+          if (!preset) return;
+          if (!inheriting && preset.w === width && preset.h === height) return;
+          onCommit(preset.w, preset.h);
+        }}
+        options={[
+          ...presets.map((preset) => ({ value: preset.id, label: preset.label, title: `${preset.w} × ${preset.h}` })),
+          ...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom' }] : []),
+        ]}
+      />
+      <div class="cp-winfield-dims">
+        <label>
+          <span>Width</span>
+          <Input type="number" value={wDraft} onChange={setWDraft} onBlur={commitDrafts} onKeyDown={onDimKeyDown} />
+        </label>
+        <label>
+          <span>Height</span>
+          <Input type="number" value={hDraft} onChange={setHDraft} onBlur={commitDrafts} onKeyDown={onDimKeyDown} />
+        </label>
       </div>
-      <div class="cp-winfield-controls">
-        <Segmented<string>
-          size="sm"
-          ariaLabel="Window size preset"
-          value={activePreset}
-          onChange={(presetId) => {
-            const preset = presets.find((item) => item.id === presetId);
-            if (!preset) return;
-            if (!inheriting && preset.w === width && preset.h === height) return;
-            onCommit(preset.w, preset.h);
-          }}
-          options={[
-            ...presets.map((preset) => ({ value: preset.id, label: preset.label, title: `${preset.w} × ${preset.h}` })),
-            ...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom' }] : []),
-          ]}
-        />
-        <div class="cp-winfield-dims">
-          <label>
-            <span>Width</span>
-            <Input type="number" value={wDraft} onChange={setWDraft} onBlur={commitDrafts} onKeyDown={onDimKeyDown} />
-          </label>
-          <label>
-            <span>Height</span>
-            <Input type="number" value={hDraft} onChange={setHDraft} onBlur={commitDrafts} onKeyDown={onDimKeyDown} />
-          </label>
-        </div>
-      </div>
+      {inherit?.active && <Chip title={inherit.label}>Global</Chip>}
     </div>
   );
 }

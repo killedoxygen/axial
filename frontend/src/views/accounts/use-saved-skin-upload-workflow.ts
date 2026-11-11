@@ -17,7 +17,7 @@ import {
   stagedSkinVariant,
   uploadSkinName,
 } from './api';
-import { useSavedSkinUploadDrop } from './use-saved-skin-upload-drop';
+import { usePngDrop } from './use-png-drop';
 import { NO_CAPE_VALUE, type SkinVariant, type StagedSkinUpload, type UploadSkinVariant } from './types';
 
 export function useSavedSkinUploadWorkflow() {
@@ -147,11 +147,12 @@ export function useSavedSkinUploadWorkflow() {
       });
   };
 
-  const uploadDrop = useSavedSkinUploadDrop({
+  const uploadDrop = usePngDrop({
     busy: wardrobeBusy(),
-    setUploadDragActive,
+    setActive: setUploadDragActive,
     notifyError: setWardrobeNotice,
-    stageUploadFile,
+    tooMany: 'Drop one PNG skin file.',
+    stage: stageUploadFile,
   });
 
   const saveStagedUpload = (applyAfterSave: boolean): void => {

@@ -252,7 +252,7 @@ function harness(
       },
       './store': { config: configState },
       './sound': { Sound },
-      './tokens': { buildTheme: (value: unknown) => value },
+      './tokens': { buildTheme: (value: unknown) => value, neutralVars: () => ({}) },
       './toast': { toast: (message: string) => notices.push(message) },
       './native': native,
       './preferences/persistence': owner,

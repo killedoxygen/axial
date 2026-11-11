@@ -1,13 +1,17 @@
 import type { JSX } from 'preact';
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import { InstanceTile } from '../ui/InstanceVisual';
+import { Kbd, Ring } from '../ui/Atoms';
 import { Icon, type IconName } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
-import { route, navigate, commandPaletteOpen, type Route, openCreate, openAccountSwitcher } from '../ui-state';
+import { useDismiss } from '../hooks/use-dismiss';
+import { route, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
 import { launchSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
+import { activeAccount } from '../machines/accounts-state';
 import { accountDisplayName, accountSkinSrc } from '../player-skin';
+import { AccountHead, AccountKindChip, accountName } from '../views/accounts/account-face';
 import { Music, musicStateVersion } from '../music';
 import { local, saveLocalState, canEditPreferences } from '../state';
 import { Sound } from '../sound';
@@ -121,56 +125,13 @@ function RailButton({
   );
 }
 
-function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Element | null {
+function RailTray({ tooltip }: { tooltip: RailTooltipController }): JSX.Element {
   const current = route.value;
-  const listRef = useRef<HTMLDivElement>(null);
-  const [scrollCue, setScrollCue] = useState({ top: false, bottom: false });
   const list = [...instances.value].sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
-  const updateScrollCue = useCallback(() => {
-    const node = listRef.current;
-    if (!node) {
-      setScrollCue({ top: false, bottom: false });
-      return;
-    }
-
-    const scrollable = node.scrollHeight > node.clientHeight + 1;
-    const next = {
-      top: scrollable && node.scrollTop > 2,
-      bottom: scrollable && node.scrollTop < node.scrollHeight - node.clientHeight - 2,
-    };
-    setScrollCue((currentCue) =>
-      currentCue.top === next.top && currentCue.bottom === next.bottom ? currentCue : next,
-    );
-  }, []);
-
-  useEffect(() => {
-    updateScrollCue();
-    const node = listRef.current;
-    if (!node) return undefined;
-
-    let resizeObserver: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== 'undefined') {
-      resizeObserver = new ResizeObserver(updateScrollCue);
-      resizeObserver.observe(node);
-    }
-
-    window.addEventListener('resize', updateScrollCue);
-    return () => {
-      resizeObserver?.disconnect();
-      window.removeEventListener('resize', updateScrollCue);
-    };
-  }, [list.length, updateScrollCue]);
-
-  if (list.length === 0) return null;
   return (
-    <>
-      <div class="cp-rail-sep" aria-hidden="true" />
-      <div
-        class="cp-rail-instances-shell"
-        data-rail-instances-fade-top={scrollCue.top ? 'visible' : 'hidden'}
-        data-rail-instances-fade-bottom={scrollCue.bottom ? 'visible' : 'hidden'}
-      >
-        <div class="cp-rail-instances" ref={listRef} onScroll={updateScrollCue}>
+    <div class="cp-rail-tray">
+      {list.length > 0 && (
+        <div class="cp-rail-instances">
           {list.map((inst) => {
             const active = current.name === 'instance' && current.id === inst.id;
             const session = launchSessions.value[inst.id];
@@ -204,26 +165,28 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                   tooltip,
                 )}
               >
-                <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
-                {installing && (
-                  <span class="cp-rail-tile-install" aria-hidden="true">
-                    <Icon name={install.state === 'queued' ? 'clock' : 'download'} size={10} stroke={2.4} />
-                  </span>
-                )}
-                {playing && <span class="cp-rail-tile-dot" aria-hidden="true" />}
-                {session && !playing && !installing && (
-                  <span class="cp-rail-tile-session" aria-hidden="true">
-                    <Icon name="clock" size={10} stroke={2.4} />
-                  </span>
-                )}
+                <InstanceTile inst={inst} className="cp-rail-tile-art" />
+                {installing && <Ring size={44} progress={install.progress?.pct} />}
+                {session && !installing && <span class="cp-rail-tile-dot" aria-hidden="true" />}
               </button>
             );
           })}
         </div>
-        <span class="cp-rail-instances-fade cp-rail-instances-fade--top" aria-hidden="true" />
-        <span class="cp-rail-instances-fade cp-rail-instances-fade--bottom" aria-hidden="true" />
-      </div>
-    </>
+      )}
+      <button
+        class="cp-rail-btn"
+        data-accent="true"
+        data-icon="plus"
+        onClick={() => {
+          tooltip.hide();
+          openCreate();
+        }}
+        aria-label="New instance"
+        {...railTipAttrs('New instance', tooltip)}
+      >
+        <RailIcon name="plus" />
+      </button>
+    </div>
   );
 }
 
@@ -231,6 +194,8 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   musicStateVersion.value;
   const musicOn = Music.enabled;
   const soundsOn = local.sounds;
+
+  const account = activeAccount();
 
   const toggleSounds = (): void => {
     if (!canEditPreferences()) return;
@@ -249,28 +214,42 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
     icon,
     label,
     onSelect,
-    hint,
     right,
+    checked,
   }: {
     icon: IconName;
     label: string;
     onSelect: () => void;
-    hint?: string;
     right?: JSX.Element;
+    /** A setting the row switches: shown as a switch, announced as a checked menu item. */
+    checked?: boolean;
   }): JSX.Element => (
-    <button class="cp-userm-row" onClick={onSelect}>
-      <Icon name={icon} size={15} stroke={1.8} />
-      <span class="cp-userm-label">{label}</span>
-      {hint && <span class="cp-userm-hint">{hint}</span>}
+    <button
+      class="cp-menu-item"
+      role={checked === undefined ? 'menuitem' : 'menuitemcheckbox'}
+      aria-checked={checked}
+      onClick={onSelect}
+    >
+      <Icon name={icon} size={14} stroke={1.8} />
+      <span>{label}</span>
       {right}
+      {checked !== undefined && <span class="cp-toggle" data-on={checked} aria-hidden="true" />}
     </button>
   );
 
   return (
-    <div class="cp-userm" role="menu">
+    <div class="cp-userm cp-pop cp-menu" role="menu">
+      {account && (
+        <div class="cp-userm-me">
+          <AccountHead account={account} />
+          <strong>{accountName(account)}</strong>
+          <AccountKindChip account={account} />
+        </div>
+      )}
       <MenuRow
         icon="refresh"
         label="Switch account"
+        right={<Icon name="chevron-right" size={14} />}
         onSelect={() => {
           openAccountSwitcher();
           onClose();
@@ -284,36 +263,23 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
           onClose();
         }}
       />
-      <div class="cp-userm-divider" />
-      <MenuRow
-        icon={soundsOn ? 'volume' : 'volume-off'}
-        label="UI sounds"
-        onSelect={toggleSounds}
-        right={
-          <span class="cp-userm-pill" data-on={soundsOn}>
-            {soundsOn ? 'On' : 'Off'}
-          </span>
-        }
-      />
+      <div class="cp-menu-gap" />
+      <MenuRow icon={soundsOn ? 'volume' : 'volume-off'} label="UI sounds" onSelect={toggleSounds} checked={soundsOn} />
       <MenuRow
         icon={musicOn ? 'music' : 'music-off'}
         label="Background music"
         onSelect={toggleMusic}
-        right={
-          <span class="cp-userm-pill" data-on={musicOn}>
-            {musicOn ? 'On' : 'Off'}
-          </span>
-        }
+        checked={musicOn}
       />
-      <div class="cp-userm-divider" />
+      <div class="cp-menu-gap" />
       <MenuRow
         icon="settings"
-        label="Open settings"
+        label="Settings"
         onSelect={() => {
           navigate({ name: 'settings' });
           onClose();
         }}
-        hint={shortcutHint('open-settings')}
+        right={<Kbd>{shortcutHint('open-settings')}</Kbd>}
       />
     </div>
   );
@@ -324,21 +290,7 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
   const username = (accountDisplayName.value || config.value?.username || 'Player').slice(0, 24);
   const rootRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    const onClick = (e: MouseEvent): void => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    document.addEventListener('mousedown', onClick);
-    document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onClick);
-      document.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
+  useDismiss(rootRef, open, () => setOpen(false));
 
   return (
     <div class="cp-user-shell" ref={rootRef}>
@@ -354,12 +306,12 @@ function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Eleme
           setOpen((o) => !o);
         }}
         onPointerEnter={() => {
-          void import('../views/accounts/AccountSwitcherHost');
+          void import('../views/accounts/AccountSwitcher');
         }}
         aria-label={`${username}, account menu`}
         {...railTipAttrs(username, tooltip)}
       >
-        <PlayerHeadPreview textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={11} />
+        <PlayerHeadPreview textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={10} />
       </button>
     </div>
   );
@@ -383,46 +335,20 @@ export function Sidebar(): JSX.Element {
       <div class="cp-rail-brand" aria-hidden="true">
         <Logo className="cp-logo" size={34} />
       </div>
-      <button
-        class="cp-rail-btn"
-        data-icon="search"
-        onClick={() => {
-          tooltip.hide();
-          commandPaletteOpen.value = true;
-        }}
-        data-sound-silent="true"
-        aria-label="Search and jump to"
-        {...railTipAttrs('Search', tooltip)}
-      >
-        <RailIcon name="search" />
-      </button>
       <RailButton icon="home" label="Home" target={{ name: 'home' }} tooltip={tooltip} />
       <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
       <RailButton icon="compass" label="Discover" target={{ name: 'discover' }} tooltip={tooltip} />
-      <button
-        class="cp-rail-btn"
-        data-accent="true"
-        data-icon="plus"
-        onClick={() => {
-          tooltip.hide();
-          openCreate();
-        }}
-        aria-label="New instance"
-        {...railTipAttrs('New instance', tooltip)}
-      >
-        <RailIcon name="plus" />
-      </button>
-      <RailInstances tooltip={tooltip} />
+      <RailTray tooltip={tooltip} />
       <div class="cp-rail-spacer" />
       <RailButton icon="settings" label="Settings" target={{ name: 'settings' }} tooltip={tooltip} />
       <UserTrigger tooltip={tooltip} />
       {tip && (
         <div
-          class="cp-rail-tip"
+          class="cp-rail-tip cp-tip"
           style={{ '--cp-rail-tip-top': `${tip.top}px` } as JSX.CSSProperties}
           aria-hidden="true"
         >
-          <span>{tip.label}</span>
+          {tip.label}
         </div>
       )}
     </aside>

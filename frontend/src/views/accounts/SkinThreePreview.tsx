@@ -1,13 +1,11 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Icon } from '../../ui/Icons';
 import { addFloorSpotlight, addSceneLighting, buildSkinModel, modelBounds, type SkinModelBounds } from './skin-model';
 import { loadThree, type ThreeModule } from './skin-three-loader';
 import { loadOptionalBitmap, loadSkinBitmap } from './skin-textures';
 import type { SkinVariant } from './types';
 
 type SkinPreviewSide = 'front' | 'back';
-type SkinPreviewBadgeState = 'previewing' | 'queued';
 type SkinThreeCapeState = 'loading' | 'none' | 'loaded' | 'omitted';
 type SkinThreeFitState = 'pending' | 'fitted';
 const CLICK_PULSE_DURATION_MS = 420;
@@ -15,9 +13,7 @@ const DRAG_THRESHOLD_PX = 4;
 const FIT_FOV_DEGREES = 34;
 const FIT_ZOOM = 0.96;
 const OVERLAY_MODEL_GAP_PX = 14;
-const BADGE_HEIGHT_PX = 22;
 const NAMETAG_HEIGHT_PX = 26;
-const OVERLAY_ROW_GAP_PX = 6;
 const ASSEMBLE_MS = 900;
 const ASSEMBLE_MARGIN = 2;
 
@@ -32,16 +28,10 @@ export interface SkinThreePreviewProps {
   capeSrc?: string;
   name: string;
   nametag?: string | null;
-  onNametagEdit?: () => void;
-  badge?: {
-    state: SkinPreviewBadgeState;
-    label: string;
-  } | null;
   variant: SkinVariant;
   side: SkinPreviewSide;
   showOuterLayers: boolean;
   fitPadding?: SkinThreeFitPadding;
-  showHint?: boolean;
   /**
    * Staged mode: the model stands as a flat outline, in the canvas's CSS `color`, until this is
    * true, then assembles from the feet up. A new skin always assembles from the outline.
@@ -68,7 +58,6 @@ function cssColor(THREE: ThreeModule, element: Element): import('three').Color {
 
 interface SkinThreeFitMetrics {
   overlayTopPx: number;
-  hintBottomPx: number;
 }
 
 function fitCameraToCanvas({
@@ -115,21 +104,16 @@ function fitCameraToCanvas({
     return THREE.MathUtils.clamp(((1 - normalized) / 2) * height, 0, height);
   };
   const modelTop = projectY(bounds.centerY + bounds.halfHeight);
-  const modelBottom = projectY(bounds.centerY - bounds.halfHeight);
 
   return {
     overlayTopPx: Math.round(
       THREE.MathUtils.clamp(modelTop - overlayHeightPx - OVERLAY_MODEL_GAP_PX, 8, Math.max(8, height * 0.18)),
     ),
-    hintBottomPx: Math.round(THREE.MathUtils.clamp(height - modelBottom + 8, 8, 18)),
   };
 }
 
 function estimateOverlayHeightPx(props: SkinThreePreviewProps): number {
-  const rows = [props.badge ? BADGE_HEIGHT_PX : 0, props.nametag ? NAMETAG_HEIGHT_PX : 0].filter(
-    (height) => height > 0,
-  );
-  return rows.reduce((total, height) => total + height, 0) + Math.max(0, rows.length - 1) * OVERLAY_ROW_GAP_PX;
+  return props.nametag ? NAMETAG_HEIGHT_PX : 0;
 }
 
 async function setupScene(
@@ -386,7 +370,7 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
   const [interacting, setInteracting] = useState(false);
   const [capeState, setCapeState] = useState<SkinThreeCapeState>(props.capeSrc ? 'loading' : 'none');
   const [fitState, setFitState] = useState<SkinThreeFitState>('pending');
-  const [fitMetrics, setFitMetrics] = useState<SkinThreeFitMetrics>({ overlayTopPx: 10, hintBottomPx: 8 });
+  const [fitMetrics, setFitMetrics] = useState<SkinThreeFitMetrics>({ overlayTopPx: 10 });
   const handleRef = useRef<SceneHandle | null>(null);
   const built = props.built === true;
   const builtRef = useRef(built);
@@ -456,60 +440,17 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
       style={
         {
           '--skin-three-overlay-top': `${fitMetrics.overlayTopPx}px`,
-          '--skin-three-hint-bottom': `${fitMetrics.hintBottomPx}px`,
         } as JSX.CSSProperties
       }
     >
       <canvas ref={canvasRef} aria-hidden="true" />
       {!ready && !error && <div class="cp-skin-three__status">Preparing 3D preview...</div>}
       {error && <div class="cp-skin-three__status">3D preview unavailable</div>}
-      {(props.badge || props.nametag) && (
+      {props.nametag && (
         <div class="cp-skin-three__overlays">
-          {props.badge && (
-            <div
-              class="cp-skin-three__badge"
-              data-skin-three-badge={props.badge.state}
-              title={
-                props.badge.state === 'queued'
-                  ? 'Queued for Minecraft profile apply'
-                  : 'Preview selection differs from the equipped skin'
-              }
-            >
-              {props.badge.label}
-            </div>
-          )}
-          {props.nametag &&
-            (props.onNametagEdit ? (
-              <button
-                type="button"
-                class="cp-skin-three__nametag cp-skin-nametag cp-skin-nametag--editable"
-                title="Rename player"
-                aria-label={`Rename player ${props.nametag}`}
-                data-skin-three-nametag="editable"
-                onClick={props.onNametagEdit}
-              >
-                <span>{props.nametag}</span>
-                <Icon name="edit" size={11} />
-              </button>
-            ) : (
-              <div
-                class="cp-skin-three__nametag cp-skin-nametag"
-                title="Active player"
-                aria-label={`Active player: ${props.nametag}`}
-                data-skin-three-nametag="static"
-              >
-                <span>{props.nametag}</span>
-              </div>
-            ))}
-        </div>
-      )}
-      {props.showHint !== false && (
-        <div class="cp-skin-three__hint" data-skin-three-hint="drag-rotate" aria-hidden="true">
-          <span class="cp-skin-three__hint-icons">
-            <Icon name="arrow-left" size={10} />
-            <Icon name="arrow-right" size={10} />
-          </span>
-          <span>Drag to rotate</span>
+          <div class="cp-skin-nametag" title="Active player" aria-label={`Active player: ${props.nametag}`}>
+            <span>{props.nametag}</span>
+          </div>
         </div>
       )}
     </div>

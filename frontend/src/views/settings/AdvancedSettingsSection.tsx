@@ -106,13 +106,15 @@ export function AdvancedSettingsSection(): JSX.Element {
       <SettingRow
         title="Anonymous usage stats"
         description="Shares anonymous usage and launch stats to improve Axial. Never includes names, files, or personal data."
-        control={<Toggle on={telemetryEnabled} onChange={() => void toggleTelemetry()} />}
+        control={
+          <Toggle on={telemetryEnabled} ariaLabel="Anonymous usage stats" onChange={() => void toggleTelemetry()} />
+        }
       />
       <SettingRow
         title="Reload launcher"
         description="Restarts the interface if something looks stuck or out of date."
         control={
-          <Button variant="secondary" icon="refresh" onClick={reloadApplication}>
+          <Button variant="secondary" onClick={reloadApplication}>
             Reload
           </Button>
         }
@@ -122,7 +124,7 @@ export function AdvancedSettingsSection(): JSX.Element {
           title="Dev lab"
           description="Developer workbench: feature flags, live state inspector, and UI playgrounds."
           control={
-            <Button variant="secondary" icon="palette" onClick={() => navigate({ name: 'dev-lab' })}>
+            <Button variant="secondary" onClick={() => navigate({ name: 'dev-lab' })}>
               Open lab
             </Button>
           }
@@ -134,7 +136,7 @@ export function AdvancedSettingsSection(): JSX.Element {
           title="Reset launcher"
           description="Stops active work and deletes this isolated rewrite development profile and its managed library. Other profiles, external libraries and saved Microsoft system credentials are preserved."
           control={
-            <Button variant="danger" icon="trash" disabled={resetting} onClick={() => void resetLauncher()}>
+            <Button variant="danger" busy={resetting} disabled={resetting} onClick={() => void resetLauncher()}>
               {resetting ? 'Resetting…' : 'Reset'}
             </Button>
           }

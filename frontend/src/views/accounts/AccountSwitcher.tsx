@@ -1,280 +1,34 @@
 import type { JSX } from 'preact';
-import {
-  accountsNotice,
-  accountsOp,
-  accountsSnapshot,
-  actionEnabled,
-  actionUnavailableMessage,
-  activeAccount,
-  createOfflineAccount,
-  microsoftSignInAvailable,
-  refreshMicrosoftAuth,
-  removeAccount,
-  renameOfflineAccount,
-  selectAccount,
-  signInWithMicrosoftAccount,
-  syncMinecraftProfile,
-} from '../../machines/accounts';
-import { accountSkinSrc, accountSkinTextureSrc } from '../../player-skin';
-import { IconButton } from '../../ui/Atoms';
-import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
-import { Icon } from '../../ui/Icons';
-import { MicrosoftMark } from '../../ui/MicrosoftMark';
-import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
-import { accountSwitcherAnchor, expandAccountSwitcher, openAccountSwitcher } from '../../ui-state';
-import type { LauncherAccount } from './types';
+import { useEffect } from 'preact/hooks';
+import { accountsNotice, accountsSnapshot, refreshAccountsData } from '../../machines/accounts';
+import { Notice } from '../../ui/Atoms';
+import { Modal, ModalContent } from '../../ui/Modal';
+import { accountSwitcherOpen, closeAccountSwitcher } from '../../ui-state';
+import { AccountAdders, AccountList, ACCOUNTS_UNAVAILABLE } from './account-rows';
 
-export const SIGN_IN_UNAVAILABLE = 'Microsoft sign-in is available in the desktop app.';
+/** Switching account from anywhere: every account, then the ways to add one, hanging beside the rail's account button. */
+export function AccountSwitcher(): JSX.Element | null {
+  const open = accountSwitcherOpen.value;
+  useEffect(() => {
+    if (open) void refreshAccountsData();
+  }, [open]);
+  if (!open) return null;
 
-function accountTextureSrc(account: LauncherAccount, live: boolean): string | undefined {
-  return (live && accountSkinSrc.value) || accountSkinTextureSrc(account) || undefined;
-}
-
-function accountDisplayLabel(account: LauncherAccount): string {
-  if (account.kind === 'microsoft') {
-    return (account.minecraft_profile?.name ?? account.display_name) || 'Microsoft account';
-  }
-  return account.display_name;
-}
-
-function accountDetailLabel(account: LauncherAccount): string {
-  if (account.kind === 'microsoft') {
-    return account.view_model.detail || account.online_action.detail || 'Microsoft account';
-  }
-  return account.view_model.detail || 'Offline identity';
-}
-
-function offlineAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
-  return [
-    { icon: 'edit', label: 'Rename', onSelect: () => void renameOfflineAccount(account) },
-    { icon: 'x', label: 'Remove identity', onSelect: () => void removeAccount(account), danger: true },
-  ];
-}
-
-function activeAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
-  if (account.kind === 'offline') return offlineAccountMenuItems(account);
-  const syncAction = account.profile_sync_action;
-  const refreshAction = account.refresh_action;
-  const items: ContextMenuItem[] = [];
-  if (actionEnabled(syncAction)) {
-    items.push({
-      icon: 'refresh',
-      label: syncAction?.label ?? 'Sync Minecraft profile',
-      onSelect: () => void syncMinecraftProfile(),
-    });
-  }
-  if (actionEnabled(refreshAction)) {
-    items.push({
-      icon: 'refresh',
-      label: refreshAction?.label ?? 'Refresh Microsoft sign-in',
-      onSelect: () => void refreshMicrosoftAuth(),
-    });
-  }
-  if (microsoftSignInAvailable()) {
-    items.push({ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() });
-  }
-  items.push(
-    { label: '', onSelect: () => {}, divider: true },
-    { icon: 'x', label: 'Sign out', onSelect: () => void removeAccount(account), danger: true },
-  );
-  return items;
-}
-
-function idleAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
-  if (account.kind === 'offline') return offlineAccountMenuItems(account);
-  const items: ContextMenuItem[] = [];
-  if (microsoftSignInAvailable()) {
-    items.push({ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() });
-  }
-  items.push({ icon: 'x', label: 'Remove account', onSelect: () => void removeAccount(account), danger: true });
-  return items;
-}
-
-function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean }): JSX.Element {
-  const name = accountDisplayLabel(account);
-  const selectable = account.kind === 'offline' || actionEnabled(account.online_action);
-  const menuItems = idleAccountMenuItems(account);
-  return (
-    <div class="cp-acct__rowwrap">
-      <button
-        type="button"
-        class="cp-acct__row"
-        disabled={busy || !selectable}
-        title={
-          selectable ? `Switch to ${name}` : actionUnavailableMessage(account.online_action, 'Account unavailable')
-        }
-        onClick={() => void selectAccount(account)}
-        onContextMenu={(event) => {
-          event.preventDefault();
-          openContextMenu(event, menuItems);
-        }}
-      >
-        <PlayerHeadPreview
-          textureSrc={accountTextureSrc(account, false)}
-          size={34}
-          radius={9}
-          ariaLabel={`${name} head`}
-        />
-        <span class="cp-acct__row-id">
-          <span class="cp-acct__row-name">{name}</span>
-          <span class="cp-acct__row-detail">{accountDetailLabel(account)}</span>
-        </span>
-      </button>
-      <span class="cp-acct__row-menu">
-        <IconButton
-          icon="dots"
-          size={26}
-          tooltip="Account actions"
-          disabled={busy}
-          onClick={(event) => {
-            event.stopPropagation();
-            openContextMenu(event, menuItems);
-          }}
-        />
-      </span>
-    </div>
-  );
-}
-
-export function AccountSwitcherPanel(): JSX.Element {
   const snapshot = accountsSnapshot.value;
-  const busy = accountsOp.value !== null || snapshot.state !== 'ready';
-  const signingIn = accountsOp.value === 'sign-in';
-  const active = activeAccount(snapshot);
-  const others = snapshot.accounts.filter((account) => !account.active);
-  const microsoftCount = snapshot.accounts.filter((account) => account.kind === 'microsoft').length;
-  const signInAvailable = microsoftSignInAvailable(snapshot);
-  const notice = accountsNotice.value;
-
+  const notice = accountsNotice.value ?? (snapshot.state === 'unavailable' ? ACCOUNTS_UNAVAILABLE : null);
   return (
-    <div class="cp-acct" aria-label="Accounts">
-      {active ? (
-        <div class="cp-acct__me">
-          <PlayerHeadPreview
-            textureSrc={accountTextureSrc(active, true)}
-            size={44}
-            radius={11}
-            ariaLabel={`${accountDisplayLabel(active)} head`}
-          />
-          <span class="cp-acct__me-id">
-            <span class="cp-acct__me-name">{accountDisplayLabel(active)}</span>
-            <span class="cp-acct__me-detail">
-              {active.kind === 'microsoft' && <span class="cp-acct__me-dot" aria-hidden="true" />}
-              {accountDetailLabel(active)}
-            </span>
-          </span>
-          <span class="cp-acct__me-actions">
-            {accountSwitcherAnchor.value !== null && (
-              <IconButton icon="expand" size={28} tooltip="Open full view" onClick={() => expandAccountSwitcher()} />
-            )}
-            <IconButton
-              icon="dots"
-              size={28}
-              tooltip="Account actions"
-              disabled={busy}
-              onClick={(event) => openContextMenu(event, activeAccountMenuItems(active))}
-            />
-          </span>
-        </div>
-      ) : (
-        <div class="cp-acct__me cp-acct__me--empty">
-          <span class="cp-acct__me-id">
-            <span class="cp-acct__me-name">
-              {snapshot.state === 'loading' ? 'Loading accounts' : 'No account selected'}
-            </span>
-            <span class="cp-acct__me-detail">Pick an identity to launch with</span>
-          </span>
-        </div>
-      )}
-
-      {others.length > 0 && (
-        <>
-          <div class="cp-acct__sep" aria-hidden="true" />
-          <div class="cp-acct__label">Switch to</div>
-          <div class="cp-acct__rows">
-            {others.map((account) => (
-              <SwitchRow key={account.account_id} account={account} busy={busy} />
-            ))}
-          </div>
-        </>
-      )}
-
-      <div class="cp-acct__sep" aria-hidden="true" />
-      <button
-        type="button"
-        class="cp-acct__add"
-        disabled={busy || !signInAvailable}
-        onClick={() => void signInWithMicrosoftAccount()}
-      >
-        <span class="cp-acct__add-glyph">
-          <MicrosoftMark size={16} />
-        </span>
-        <span class="cp-acct__row-id">
-          <span class="cp-acct__row-name">
-            {microsoftCount === 0 ? 'Sign in with Microsoft' : 'Add Microsoft account'}
-          </span>
-          <span class="cp-acct__row-detail">
-            {signingIn
-              ? 'Waiting for Microsoft sign-in'
-              : !signInAvailable
-                ? SIGN_IN_UNAVAILABLE
-                : microsoftCount === 0
-                  ? 'Apply skins and launch online'
-                  : 'Sign in another Minecraft account'}
-          </span>
-        </span>
-      </button>
-      <button type="button" class="cp-acct__add" disabled={busy} onClick={() => void createOfflineAccount()}>
-        <span class="cp-acct__add-glyph">
-          <Icon name="plus" size={16} color="var(--text-mute)" />
-        </span>
-        <span class="cp-acct__row-id">
-          <span class="cp-acct__row-name">New offline identity</span>
-          <span class="cp-acct__row-detail">Create a local username</span>
-        </span>
-      </button>
-
-      {notice && (
-        <div class="cp-acct__notice" data-tone="err">
-          {notice}
-        </div>
-      )}
-      {snapshot.state === 'unavailable' && !notice && (
-        <div class="cp-acct__notice" data-tone="err">
-          Accounts are unavailable. Check that the local backend is running.
-        </div>
-      )}
-    </div>
-  );
-}
-
-export function AccountSwitcherChip(): JSX.Element {
-  const snapshot = accountsSnapshot.value;
-  const active = activeAccount(snapshot);
-  const name = active ? accountDisplayLabel(active) : 'Select account';
-  return (
-    <button
-      type="button"
-      class="cp-account-chip"
-      title="Switch account or identity"
-      onClick={(event) => {
-        const rect = event.currentTarget.getBoundingClientRect();
-        openAccountSwitcher({ x: rect.right, y: rect.bottom + 8 });
-      }}
-    >
-      <PlayerHeadPreview
-        textureSrc={active ? (accountSkinSrc.value ?? accountTextureSrc(active, true)) : undefined}
-        size={30}
-        radius={7}
-        ariaLabel={`${name} account`}
-      />
-      <span class="cp-account-chip__id">
-        <span class="cp-account-chip__name">{snapshot.state === 'loading' ? 'Loading' : name}</span>
-        <span class="cp-account-chip__mode">
-          {active ? (active.kind === 'microsoft' ? 'Microsoft account' : 'Offline identity') : 'No account selected'}
-        </span>
-      </span>
-      <Icon name="chevron-down" size={14} color="var(--text-dim)" />
-    </button>
+    <Modal open onOpenChange={(next) => !next && closeAccountSwitcher()}>
+      <ModalContent className="cp-pop cp-menu cp-account-switcher" aria-label="Accounts" showCloseButton={false}>
+        {snapshot.accounts.length > 0 && (
+          <AccountList accounts={snapshot.accounts} label="Accounts" onSwitched={closeAccountSwitcher} />
+        )}
+        <AccountAdders onDone={closeAccountSwitcher} />
+        {notice && (
+          <Notice tone="error" role="alert">
+            <p>{notice}</p>
+          </Notice>
+        )}
+      </ModalContent>
+    </Modal>
   );
 }

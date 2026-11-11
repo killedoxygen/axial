@@ -1,137 +1,83 @@
 import type { JSX } from 'preact';
-import { Button, Input } from '../../ui/Atoms';
+import { setWardrobeNotice, wardrobeContext } from '../../machines/skin-wardrobe';
+import { Input, Notice, Status } from '../../ui/Atoms';
 import { Segmented } from '../../ui/Segmented';
-import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
-import { CapePicker } from './CapePicker';
-import { stagedSkinPreviewSrc, uploadSkinName } from './api';
-import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
-import type { MinecraftCape, SkinVariant, StagedSkinUpload, UploadSkinVariant } from './types';
+import { stagedSkinPreviewSrc } from './api';
+import { SkinDialog, SkinField } from './SkinDialog';
+import { NO_CAPE_VALUE, type MinecraftCape, type UploadSkinVariant } from './types';
+import type { useSavedSkinUploadWorkflow } from './use-saved-skin-upload-workflow';
 
+const ARM_MODELS: Array<{ value: UploadSkinVariant; label: string }> = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'classic', label: 'Classic' },
+  { value: 'slim', label: 'Slim' },
+];
+
+/** A PNG that was picked or dropped, before it is saved: its name, arm model and cape. */
 export function SkinUploadDialog({
-  stagedUpload,
-  stagedVariant,
-  stagedName,
-  stagedCapeSrc,
-  stagedCapeId,
-  availableCapes,
-  skinName,
-  uploadVariant,
-  busy,
-  skinActionsEnabled,
-  skinActionDisabledReason,
-  stagedCanSave,
-  onClose,
-  onSkinNameChange,
-  onUploadVariantChange,
-  onStagedCapeChange,
-  onSave,
+  upload,
+  capes,
+  capeSrc,
+  disabledReason,
 }: {
-  stagedUpload: StagedSkinUpload | null;
-  stagedVariant: SkinVariant | null;
-  stagedName: string;
-  stagedCapeSrc?: string;
-  stagedCapeId: string;
-  availableCapes: MinecraftCape[];
-  skinName: string;
-  uploadVariant: UploadSkinVariant;
-  busy: boolean;
-  skinActionsEnabled: boolean;
-  skinActionDisabledReason: string;
-  stagedCanSave: boolean;
-  onClose: () => void;
-  onSkinNameChange: (value: string) => void;
-  onUploadVariantChange: (value: UploadSkinVariant) => void;
-  onStagedCapeChange: (value: string) => void;
-  onSave: (applyAfterSave: boolean) => void;
+  upload: ReturnType<typeof useSavedSkinUploadWorkflow>;
+  capes: MinecraftCape[];
+  capeSrc: (capeId: string | null) => string | undefined;
+  disabledReason: string;
 }): JSX.Element {
+  const staged = upload.stagedUpload;
   return (
-    <Modal
-      open={Boolean(stagedUpload)}
-      onOpenChange={(next) => {
-        if (!next && !busy) onClose();
-      }}
+    <SkinDialog
+      title="Add skin"
+      open={staged !== null}
+      busy={upload.busy}
+      preview={
+        staged && upload.stagedVariant
+          ? {
+              src: stagedSkinPreviewSrc(staged),
+              name: upload.stagedName,
+              variant: upload.stagedVariant,
+              capeSrc: capeSrc(upload.stagedCapeId === NO_CAPE_VALUE ? null : upload.stagedCapeId),
+            }
+          : null
+      }
+      capes={capes}
+      capeId={upload.stagedCapeId}
+      onCapeChange={upload.setStagedCapeId}
+      canSave={upload.stagedCanSave}
+      canWear={wardrobeContext.value.skinActionsEnabled}
+      disabledReason={disabledReason}
+      onClose={upload.clearStagedUpload}
+      onSave={upload.saveStagedUpload}
     >
-      <ModalContent className="cp-skinedit-modal" aria-label="Add skin" aria-describedby={undefined}>
-        <ModalHeader>
-          <ModalTitle>Add skin</ModalTitle>
-        </ModalHeader>
-        {stagedUpload && stagedVariant && (
-          <div class="cp-skinedit">
-            <div class="cp-skinedit__preview">
-              <SkinThreePreview
-                src={stagedSkinPreviewSrc(stagedUpload)}
-                capeSrc={stagedCapeSrc}
-                name={stagedName}
-                variant={stagedVariant}
-                side="front"
-                showOuterLayers
-              />
-            </div>
-            <div class="cp-skinedit__form">
-              <label class="cp-skinedit__field">
-                <span>Name</span>
-                <Input
-                  value={skinName}
-                  onChange={(value) => onSkinNameChange(value.slice(0, 64))}
-                  placeholder={uploadSkinName(stagedUpload.file) || 'Skin name'}
-                />
-              </label>
-              <div class="cp-skinedit__field">
-                <span>Model</span>
-                <Segmented<UploadSkinVariant>
-                  options={[
-                    { value: 'auto', label: 'Auto' },
-                    { value: 'classic', label: 'Classic' },
-                    { value: 'slim', label: 'Slim' },
-                  ]}
-                  value={uploadVariant}
-                  onChange={onUploadVariantChange}
-                />
-              </div>
-              {availableCapes.length > 0 && (
-                <div class="cp-skinedit__field">
-                  <span>Cape</span>
-                  <CapePicker capes={availableCapes} value={stagedCapeId} onChange={onStagedCapeChange} />
-                </div>
-              )}
-              {stagedUpload.normalizeStatus === 'error' ? (
-                <div class="cp-skin-inline-err">
-                  {stagedUpload.normalizeError || 'This file is not a valid Minecraft skin.'}
-                </div>
-              ) : stagedUpload.normalizeStatus === 'checking' ? (
-                <div class="cp-skinedit__meta">Checking skin file...</div>
-              ) : null}
-            </div>
-            <div class="cp-skinedit__footer">
-              <Button variant="ghost" disabled={busy} onClick={onClose}>
-                Cancel
-              </Button>
-              <Button
-                variant="secondary"
-                icon={busy ? 'refresh' : 'download'}
-                disabled={!stagedCanSave}
-                onClick={() => onSave(false)}
-              >
-                Save
-              </Button>
-              <Button
-                variant="primary"
-                icon={busy ? 'refresh' : 'check'}
-                disabled={!stagedCanSave || !skinActionsEnabled}
-                onClick={() => onSave(true)}
-                title={
-                  skinActionsEnabled
-                    ? 'Save locally, then apply to the active Minecraft account'
-                    : skinActionDisabledReason
-                }
-                sound="affirm"
-              >
-                Save & apply
-              </Button>
-            </div>
-          </div>
-        )}
-      </ModalContent>
-    </Modal>
+      <SkinField label="Name">
+        <Input
+          value={upload.skinName}
+          onChange={(value) => {
+            upload.setSkinName(value.slice(0, 64));
+            setWardrobeNotice(null);
+          }}
+          placeholder={upload.stagedName || 'Skin name'}
+          ariaLabel="Skin name"
+        />
+      </SkinField>
+      <SkinField label="Arm model">
+        <Segmented<UploadSkinVariant>
+          options={ARM_MODELS}
+          value={upload.uploadVariant}
+          onChange={(value) => {
+            upload.setUploadVariant(value);
+            setWardrobeNotice(null);
+          }}
+        />
+      </SkinField>
+      {staged?.normalizeStatus === 'error' ? (
+        <Notice tone="error" role="alert">
+          <p>{staged.normalizeError || 'This file is not a valid Minecraft skin.'}</p>
+        </Notice>
+      ) : (
+        staged?.normalizeStatus === 'checking' && <Status busy>Checking skin file</Status>
+      )}
+    </SkinDialog>
   );
 }

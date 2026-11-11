@@ -1,6 +1,5 @@
 import { api, apiFetch, apiResourceUrl, apiUrl, isApiError } from '../../api';
 import type { DefaultSkin } from '../../default-skins';
-import type { NativeDragDropPayload } from '../../native';
 import type {
   AccountListResponse,
   MinecraftCape,
@@ -78,51 +77,6 @@ export function isPngFile(file: File): boolean {
   const type = file.type.trim().toLowerCase();
   if (type) return type === 'image/png';
   return file.name.toLowerCase().endsWith('.png');
-}
-
-function cssPointFromNativeDrag(position: NativeDragDropPayload['position']): { x: number; y: number } | null {
-  if (!position) return null;
-  const pixelRatio = window.devicePixelRatio || 1;
-  if (pixelRatio > 1 && (position.x > window.innerWidth + 1 || position.y > window.innerHeight + 1)) {
-    return {
-      x: position.x / pixelRatio,
-      y: position.y / pixelRatio,
-    };
-  }
-  return position;
-}
-
-export function nativeDragPositionHitsElement(
-  position: NativeDragDropPayload['position'],
-  element: HTMLElement | null,
-): boolean {
-  const point = cssPointFromNativeDrag(position);
-  if (!point || !element) return false;
-  const rect = element.getBoundingClientRect();
-  return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
-}
-
-export function nativeDragTargetElement<T extends HTMLElement>(
-  position: NativeDragDropPayload['position'],
-  selector: string,
-): T | null {
-  const point = cssPointFromNativeDrag(position);
-  if (!point) return null;
-
-  for (const element of document.elementsFromPoint(point.x, point.y)) {
-    if (!(element instanceof HTMLElement)) continue;
-    const match = element.closest(selector);
-    if (match instanceof HTMLElement) return match as T;
-  }
-
-  for (const element of Array.from(document.querySelectorAll<HTMLElement>(selector))) {
-    const rect = element.getBoundingClientRect();
-    if (point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom) {
-      return element as T;
-    }
-  }
-
-  return null;
 }
 
 export async function fetchSavedSkinPng(skin: SavedSkinRecord): Promise<Blob> {

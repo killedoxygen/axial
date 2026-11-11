@@ -16,7 +16,6 @@ const SNAPSHOT_DB_NAME = 'axial-skin-snapshots';
 const SNAPSHOT_DB_VERSION = 1;
 const SNAPSHOT_STORE_NAME = 'snapshots';
 
-export type SnapshotSide = 'front' | 'back';
 export type SnapshotStatus = 'idle' | 'queued' | 'loading' | 'ready' | 'error';
 
 export interface SkinSnapshotInput {
@@ -39,7 +38,6 @@ interface SnapshotRig {
 interface SnapshotEntry {
   key: string;
   input: SkinSnapshotInput;
-  side: SnapshotSide;
   state: SnapshotState;
   listeners: Set<() => void>;
   priority: number;
@@ -55,8 +53,8 @@ let running = false;
 const entries = new Map<string, SnapshotEntry>();
 const queue: SnapshotEntry[] = [];
 
-function snapshotKey(input: SkinSnapshotInput, side: SnapshotSide): string {
-  return `v${SNAPSHOT_RENDER_VERSION}:${side}:${input.cacheKey}`;
+function snapshotKey(input: SkinSnapshotInput): string {
+  return `v${SNAPSHOT_RENDER_VERSION}:${input.cacheKey}`;
 }
 
 function snapshotDb(): Promise<IDBDatabase | null> {
@@ -160,7 +158,7 @@ function canvasBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   });
 }
 
-async function renderSnapshot(input: SkinSnapshotInput, side: SnapshotSide): Promise<Blob> {
+async function renderSnapshot(input: SkinSnapshotInput): Promise<Blob> {
   const { THREE, renderer, canvas } = await snapshotRig();
   const skinBitmap = await loadSkinBitmap(input.src, input.textureIdentity);
   const capeBitmap = await loadOptionalBitmap(input.capeSrc, 'cape snapshot', input.capeIdentity);
@@ -171,7 +169,7 @@ async function renderSnapshot(input: SkinSnapshotInput, side: SnapshotSide): Pro
     addSceneLighting(THREE, scene, disposables);
 
     const group = new THREE.Group();
-    group.rotation.y = side === 'back' ? SNAPSHOT_ROTATION + Math.PI : SNAPSHOT_ROTATION;
+    group.rotation.y = SNAPSHOT_ROTATION;
     scene.add(group);
     const parts = buildSkinModel({
       THREE,
@@ -273,7 +271,7 @@ function processQueue(): void {
 
   running = true;
   setEntryState(entry, { status: 'loading' });
-  void renderSnapshot(entry.input, entry.side)
+  void renderSnapshot(entry.input)
     .then((blob) => {
       setEntryBlob(entry, blob);
       void writeStoredSnapshotBlob(entry.key, blob);
@@ -314,8 +312,8 @@ function hydrateEntry(entry: SnapshotEntry): void {
     });
 }
 
-function ensureEntry(input: SkinSnapshotInput, side: SnapshotSide): SnapshotEntry {
-  const key = snapshotKey(input, side);
+function ensureEntry(input: SkinSnapshotInput): SnapshotEntry {
+  const key = snapshotKey(input);
   const existing = entries.get(key);
   if (existing) {
     existing.input = input;
@@ -326,7 +324,6 @@ function ensureEntry(input: SkinSnapshotInput, side: SnapshotSide): SnapshotEntr
   const entry: SnapshotEntry = {
     key,
     input,
-    side,
     state: { status: 'idle' },
     listeners: new Set(),
     priority: 0,
@@ -341,12 +338,12 @@ function ensureEntry(input: SkinSnapshotInput, side: SnapshotSide): SnapshotEntr
   return entry;
 }
 
-export function getSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide = 'front'): SnapshotState {
-  return ensureEntry(input, side).state;
+export function getSkinSnapshot(input: SkinSnapshotInput): SnapshotState {
+  return ensureEntry(input).state;
 }
 
-export function requestSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide = 'front', priority = 0): void {
-  const entry = ensureEntry(input, side);
+export function requestSkinSnapshot(input: SkinSnapshotInput, priority = 0): void {
+  const entry = ensureEntry(input);
   if (entry.state.status === 'ready' || entry.state.status === 'loading') return;
   entry.generationRequested = true;
   entry.priority = Math.max(entry.priority, priority);
@@ -356,8 +353,8 @@ export function requestSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide
   if (entry.hydrated) queueEntry(entry);
 }
 
-export function subscribeSkinSnapshot(input: SkinSnapshotInput, side: SnapshotSide, listener: () => void): () => void {
-  const entry = ensureEntry(input, side);
+export function subscribeSkinSnapshot(input: SkinSnapshotInput, listener: () => void): () => void {
+  const entry = ensureEntry(input);
   entry.listeners.add(listener);
   return () => {
     entry.listeners.delete(listener);

@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { Icon } from '../../../ui/Icons';
-import { Button, Meter } from '../../../ui/Atoms';
+import { Button, IconButton, Meter, Ring } from '../../../ui/Atoms';
+import { Face, type Eyes, type FaceTone } from '../../../ui/Face';
 import { DownloadFailureNotice } from '../../../ui/DownloadFailureNotice';
 import { openContextMenu, type ContextMenuItem } from '../../../ui/ContextMenu';
 import { navigate } from '../../../ui-state';
@@ -15,39 +16,35 @@ import type { InstallQueuedItemViewModel } from '../../../types-install';
 import { launchActionPresentation, launchNoticePresentation } from '../../../launch-presenters';
 import { openInstanceFolder } from '../instance-actions';
 
-export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
-  const { icon, primaryDetail, listDetails } = launchNoticePresentation(notice);
+const NOTICE_FACE: Record<LaunchNotice['tone'], { eyes: Eyes; tone?: FaceTone }> = {
+  info: { eyes: 'open' },
+  warned: { eyes: 'wide', tone: 'warn' },
+  intervened: { eyes: 'happy' },
+  success: { eyes: 'happy' },
+  error: { eyes: 'x', tone: 'err' },
+};
 
+export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
+  const { primaryDetail, listDetails } = launchNoticePresentation(notice);
   return (
-    <div class="cp-instance-notice-shell">
-      <section class="cp-notice" data-tone={notice.tone} aria-live="polite">
-        <span class="cp-notice-mark" aria-hidden="true">
-          <Icon name={icon} size={15} stroke={2.2} />
-        </span>
-        <div class="cp-notice-copy">
-          <strong>{notice.message}</strong>
-          {primaryDetail && <p>{primaryDetail}</p>}
-          {listDetails.length > 0 && (
-            <details class="cp-notice-details">
-              <summary>Details</summary>
-              <ul>
-                {listDetails.map((detail, index) => (
-                  <li key={`${index}:${detail}`}>{detail}</li>
-                ))}
-              </ul>
-            </details>
-          )}
-        </div>
-        <button
-          class="cp-notice-dismiss"
-          type="button"
-          aria-label="Dismiss launch notice"
-          onClick={() => clearLaunchNotice(inst.id)}
-        >
-          <Icon name="x" size={13} stroke={2.2} />
-        </button>
-      </section>
-    </div>
+    <section class="cp-notice" data-tone={notice.tone} aria-live="polite">
+      <Face {...NOTICE_FACE[notice.tone]} />
+      <div class="cp-notice-copy">
+        <strong>{notice.message}</strong>
+        {primaryDetail && <p>{primaryDetail}</p>}
+        {listDetails.length > 0 && (
+          <details class="cp-notice-details">
+            <summary>Details</summary>
+            <ul>
+              {listDetails.map((detail, index) => (
+                <li key={`${index}:${detail}`}>{detail}</li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </div>
+      <IconButton icon="x" size={28} tooltip="Dismiss launch notice" onClick={() => clearLaunchNotice(inst.id)} />
+    </section>
   );
 }
 
@@ -101,25 +98,20 @@ export function LaunchSplitButton({
         }
       : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
   return (
-    <div
-      class={`cp-instance-split-launch${progress ? ' cp-instance-split-launch--preparing' : ''}`}
-      role="group"
-      aria-label="Instance actions"
-      style={{ '--cp-launch-pct': `${pct}%` } as any}
-    >
-      {progress?.determinate && <span class="cp-instance-split-launch-fill" aria-hidden="true" />}
+    <div class="cp-launch" role="group" aria-label="Instance actions" data-busy={Boolean(progress)}>
       <button
-        class="cp-instance-split-launch-main"
+        class="cp-btn cp-btn--lg cp-btn--primary"
         type="button"
         onClick={disabled ? undefined : primaryAction}
         data-sound={usesInstallAction ? 'bright' : 'launchPress'}
         disabled={disabled}
       >
-        <Icon name={icon} size={18} stroke={1.8} />
+        {progress ? <Ring progress={progress.determinate ? pct : null} /> : <Icon name={icon} size={16} />}
         <span>{label}</span>
+        {progress?.determinate && <span class="cp-launch-pct">{Math.round(pct)}%</span>}
       </button>
       <button
-        class="cp-instance-split-launch-menu"
+        class="cp-btn cp-btn--lg cp-btn--primary cp-launch-menu"
         type="button"
         aria-label="Instance options"
         aria-haspopup="menu"
@@ -144,9 +136,8 @@ export function LaunchSplitButton({
           ])
         }
       >
-        <Icon name="chevron-down" size={16} stroke={2.3} />
+        <Icon name="chevron-down" size={14} />
       </button>
-      {progress?.determinate && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
     </div>
   );
 }
@@ -178,9 +169,9 @@ export function InstallBarrierPane({
 }): JSX.Element {
   if (installFailure) {
     return (
-      <div class="cp-instance-install-pane">
+      <section class="cp-install">
         <DownloadFailureNotice failure={installFailure} onRetry={onRetryInstall} trailing={<OpenDownloadsButton />} />
-      </div>
+      </section>
     );
   }
 
@@ -195,22 +186,16 @@ export function InstallBarrierPane({
   const detail = installProgress ? `${pct}% complete` : installQueued ? installQueuedView?.detail || '' : '';
 
   return (
-    <div class="cp-instance-install-pane" aria-live="polite">
-      <div class="cp-instance-install-head">
-        <span class="cp-instance-install-icon" aria-hidden="true">
-          <Icon name={installQueued ? 'clock' : 'download'} size={18} stroke={2} />
-        </span>
-        <div class="cp-instance-install-copy">
-          <h2>{heading}</h2>
-          <p>{body}</p>
-        </div>
-        {installProgress && <span class="cp-instance-install-pct">{pct}%</span>}
+    <section class="cp-install" aria-live="polite">
+      <div class="cp-install-copy">
+        <h2>{heading}</h2>
+        <p>{body}</p>
       </div>
       <Meter value={pct} height={6} ariaLabel={`Install progress for ${targetLabel}`} />
-      <div class="cp-instance-install-foot">
+      <div class="cp-install-foot">
         <span>{detail}</span>
         <OpenDownloadsButton />
       </div>
-    </div>
+    </section>
   );
 }

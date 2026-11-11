@@ -3,6 +3,9 @@ import type { Config, SystemInfo } from '../types-settings';
 import type { EnrichedInstance, InstanceMod, InstanceResourceSummary } from '../types-instance';
 import type { InstallQueueStateResponse } from '../types-install';
 import type { FeatureFlagViewModel, FlagsResponse } from '../types-flags';
+import type { AccountListResponse } from '../generated/AccountListResponse';
+import type { AccountView } from '../generated/AccountView';
+import type { AccountActionState } from '../generated/AccountActionState';
 import type { UpdateFlow } from '../generated/UpdateFlow';
 import type { UpdateInfo } from '../generated/UpdateInfo';
 import type { UpdateSnapshot } from '../generated/UpdateSnapshot';
@@ -668,16 +671,14 @@ function mockPacks(instanceId: string, folder: 'resourcepacks' | 'shaderpacks'):
   const kind = folder === 'resourcepacks' ? 'resource_pack' : 'shader_pack';
   const managed = (mockInstanceContent[instanceId] ?? [])
     .filter((entry) => entry.kind === kind)
-    .map(
-      (entry, index): InstancePackInfo => ({
-        name: entry.enabled ? entry.filename : `${entry.filename}.disabled`,
-        directory: false,
-        size: 3_100_000 + index * 1_700_000,
-        modified_at: daysAgo(index + 3),
-        enabled: entry.enabled,
-        metadata: mockPackMetadata[entry.filename] ?? { authors: [], icon: false },
-      }),
-    );
+    .map((entry, index): InstancePackInfo => ({
+      name: entry.enabled ? entry.filename : `${entry.filename}.disabled`,
+      directory: false,
+      size: 3_100_000 + index * 1_700_000,
+      modified_at: daysAgo(index + 3),
+      enabled: entry.enabled,
+      metadata: mockPackMetadata[entry.filename] ?? { authors: [], icon: false },
+    }));
   return [...managed, ...(mockLocalPacks[instanceId]?.[folder] ?? [])].sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -1141,7 +1142,103 @@ const flagRegistry: FlagDefinition[] = [
 
 const mockSetupPlans = new Map<string, ContentSelection[]>();
 
+function accountAction(label: string, enabled: boolean): AccountActionState {
+  return {
+    state_id: enabled ? 'ready' : 'offline',
+    label,
+    enabled,
+    disabled_reason: enabled ? undefined : 'Online Minecraft account required',
+  };
+}
+
+function accountFixture(index: number, name: string, online: boolean): AccountView {
+  const id = `mock-account-${index}`;
+  return {
+    active: index === 0,
+    view_model: { detail: online ? 'Microsoft account' : 'Offline account' },
+    account_id: id,
+    kind: online ? 'microsoft' : 'offline',
+    display_name: name,
+    minecraft_profile: online
+      ? {
+          id,
+          name,
+          skins: [],
+          capes: [
+            { id: 'mock-cape-migrator', state: 'ACTIVE', url: '' },
+            { id: 'mock-cape-vanilla', state: 'INACTIVE', url: '' },
+          ],
+        }
+      : undefined,
+    profile_cape_id: online ? 'mock-cape-migrator' : undefined,
+    account_revision: 1,
+    profile_revision: 1,
+    credential_revision: online ? 1 : 0,
+    created_revision: 1,
+    created_at: daysAgo(30),
+    updated_at: daysAgo(1),
+    msa_authenticated: online,
+    msa_refresh_available: online,
+    minecraft_profile_ready: online,
+    minecraft_ownership_verified: online,
+    online_mode_ready: online,
+    online_action: accountAction('Play online', online),
+    refresh_action: accountAction('Refresh sign-in', online),
+    profile_sync_action: accountAction('Sync profile', online),
+    skin_action: accountAction('Change skin', online),
+  };
+}
+
+/** `?accounts=N` seeds a crowd for checking how the account row compacts. */
+const mockAccountCount = Math.max(2, Number(new URLSearchParams(globalThis.location?.search).get('accounts')) || 2);
+let accountFixtures: AccountView[] = Array.from({ length: mockAccountCount }, (_, index) =>
+  index === 0
+    ? accountFixture(0, 'MockPlayer', true)
+    : accountFixture(index, index === 1 ? 'Sandbox' : `Player${index}`, index % 3 === 0),
+);
+let accountSelectionRevision = 0;
+
+function accountListResponse(): AccountListResponse {
+  return {
+    revision: 1,
+    selection_revision: accountSelectionRevision,
+    active_account_id: accountFixtures.find((account) => account.active)?.account_id ?? null,
+    launch_auth_mode: 'offline',
+    sign_in_available: true,
+    accounts: accountFixtures,
+  };
+}
+
 const handlers: Record<string, Handler> = {
+  'GET /versions/{id}/block-textures': async () => {
+    const { paintedTextures } = await import('./block-textures');
+    return {
+      textures: [...paintedTextures()].map(([name, rgba]) => ({ name, rgba: btoa(String.fromCharCode(...rgba)) })),
+    };
+  },
+  'GET /accounts': accountListResponse,
+  'POST /accounts/{id}/select': (_body, path = '') => {
+    const id = decodeURIComponent(path.split('/')[2] ?? '');
+    accountFixtures = accountFixtures.map((account) => ({ ...account, active: account.account_id === id }));
+    accountSelectionRevision += 1;
+    return { status: 'account_selected', account: accountFixtures.find((account) => account.active) };
+  },
+  'GET /skins': () => ({
+    skins: [
+      {
+        texture_key: 'mock-steve',
+        name: 'Steve',
+        variant: 'classic',
+        source: 'minecraft_default_skin',
+        cape_id: 'mock-cape-migrator',
+        created_at: daysAgo(3),
+        updated_at: daysAgo(3),
+        applied_at: daysAgo(1),
+        byte_size: 1200,
+      },
+    ],
+    pending: null,
+  }),
   'GET /config': () => configFixture,
   'PUT /config': (body) => {
     if (isRecord(body)) {
@@ -1470,6 +1567,8 @@ function handlerKey(method: string, path: string): string {
   const exact = `${method} ${path}`;
   if (Object.prototype.hasOwnProperty.call(handlers, exact)) return exact;
   if (method === 'PUT' && path.startsWith('/flags/')) return 'PUT /flags/{key}';
+  if (/^\/accounts\/[^/]+\/select$/.test(path)) return `${method} /accounts/{id}/select`;
+  if (/^\/versions\/[^/]+\/block-textures$/.test(path)) return `${method} /versions/{id}/block-textures`;
   if (/^\/instances\/[^/]+\/content$/.test(path)) return `${method} /instances/{id}/content`;
   if (/^\/instances\/[^/]+\/content\/uninstall$/.test(path)) return `${method} /instances/{id}/content/uninstall`;
   if (/^\/instances\/[^/]+\/content\/updates$/.test(path)) return `${method} /instances/{id}/content/updates`;

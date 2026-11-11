@@ -5,6 +5,7 @@ use axial_app::{
         AccountCommandResponse, AccountListResponse, AccountRemovedResponse, ProfileRefreshResponse,
     },
     content::provenance::RequiredRefusal,
+    install::textures::BlockTexturesResponse,
     instances::{
         delete::{DeletionResponse, DeletionSnapshot},
         model::JavaSelection,
@@ -101,6 +102,7 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     CreateNotice::export_all(&config)?;
     PreflightDiagnostics::export_all(&config)?;
     RequiredRefusal::export_all(&config)?;
+    BlockTexturesResponse::export_all(&config)?;
     Ok(())
 }
 

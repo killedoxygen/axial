@@ -3,6 +3,7 @@ use axial_app::{
     install::{
         model::{InstallEvent, InstallQueueRequest, InstallQueueStateResponse},
         queue::{InstallError, InstallQueue},
+        textures::BlockTexturesResponse,
     },
     instances::setup::SetupService,
 };
@@ -34,6 +35,7 @@ pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
             "/api/v1/install/queue/failures/{operation_id}",
             delete(dismiss_failure),
         )
+        .route("/api/v1/versions/{id}/block-textures", get(block_textures))
         .with_state(queue.clone())
         .merge(
             Router::new()
@@ -45,6 +47,12 @@ pub fn router(queue: Arc<InstallQueue>, setup: Arc<SetupService>) -> Router {
 
 async fn snapshot(State(queue): State<Arc<InstallQueue>>) -> Json<InstallQueueStateResponse> {
     Json(queue.snapshot())
+}
+async fn block_textures(
+    State(queue): State<Arc<InstallQueue>>,
+    Path(id): Path<String>,
+) -> ApiResult<BlockTexturesResponse> {
+    Ok(Json(queue.block_textures(&id).await?))
 }
 async fn enqueue(
     State(queue): State<Arc<InstallQueue>>,

@@ -101,7 +101,7 @@ function ModalContent({
       >
         {children}
         {showCloseButton && (
-          <button type="button" data-slot="modal-close" class="cp-modal-x" aria-label="Close" onClick={close}>
+          <button type="button" data-slot="modal-close" class="cp-modal-x cp-ibtn" aria-label="Close" onClick={close}>
             <Icon name="x" size={16} stroke={2} />
           </button>
         )}

@@ -4,11 +4,13 @@ import { getModpackFiles, installModpack } from '../../content';
 import { contentRevision } from '../../content-activity';
 import { formatBytes, plural } from '../../format';
 import { applyInstallQueueResponse } from '../../machines/downloads';
-import { Button } from '../../ui/Atoms';
-import { Icon } from '../../ui/Icons';
-import { Modal, ModalContent } from '../../ui/Modal';
+import { Button, Chip, Empty, Notice, Status } from '../../ui/Atoms';
+import { Art } from '../../ui/Art';
+import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
+import { SelectionCheckbox } from '../../ui/SelectionActionTray';
 import { errMessage } from '../../utils';
 import type { ModpackFilesPlan } from '../../types-content';
+import { KIND_ICON } from './shared';
 
 type PickerContext = { open: boolean; instanceId: string; canonicalId: string; versionId?: string };
 
@@ -152,83 +154,74 @@ export function ModpackPicker({
     }
   };
 
+  const allSelected = selected.size === files.length;
+  const toggle = (id: string): void => {
+    const next = new Set(selected);
+    if (!next.delete(id)) next.add(id);
+    setSelected(next);
+  };
+
   return (
     <Modal open onOpenChange={(next) => !next && onClose()}>
-      <ModalContent className="cp-pack-picker" aria-label="Choose modpack files">
-        <div class="cp-pack-picker-head">
-          <div>
-            <h2>{plan?.name ?? 'Choose pack files'}</h2>
-            <p>Only files compatible with this instance are shown. Pack configuration is never copied.</p>
-          </div>
-          {files.length > 0 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() =>
-                setSelected(
-                  selected.size === files.length ? new Set() : new Set(files.map((file) => file.selection_id)),
-                )
-              }
-            >
-              {selected.size === files.length ? 'Clear' : 'Select all'}
-            </Button>
-          )}
-        </div>
+      <ModalContent className="cp-dialog cp-pop cp-pack-picker" aria-label="Choose modpack files">
+        <ModalHeader>
+          <ModalTitle>{plan?.name ?? 'Choose pack files'}</ModalTitle>
+          <p class="cp-dialog-body">
+            Only files compatible with this instance are shown. Pack configuration is never copied.
+          </p>
+        </ModalHeader>
 
-        <div class="cp-pack-picker-list">
-          {!plan && !error && <div class="cp-resource-note">Reading pack contents…</div>}
+        <div class="cp-pack-files">
+          {!plan && !error && <Status busy>Reading pack contents</Status>}
           {plan && files.length === 0 && (
-            <div class="cp-resource-note">This pack has no compatible files that are not already installed.</div>
+            <Empty title="Nothing to add">This pack has no compatible files that are not already installed.</Empty>
           )}
           {files.map((file) => (
-            <label class="cp-pack-picker-row" key={file.selection_id}>
-              <input
-                type="checkbox"
-                checked={selected.has(file.selection_id)}
-                onChange={() => {
-                  const next = new Set(selected);
-                  if (next.has(file.selection_id)) next.delete(file.selection_id);
-                  else next.add(file.selection_id);
-                  setSelected(next);
+            <div class="cp-row" key={file.selection_id} onClick={() => toggle(file.selection_id)}>
+              <SelectionCheckbox
+                selected={selected.has(file.selection_id)}
+                label={`Include ${file.title}`}
+                onToggle={(event) => {
+                  event.stopPropagation();
+                  toggle(file.selection_id);
                 }}
               />
-              <span class="cp-pack-picker-kind" aria-hidden="true">
-                <Icon
-                  name={file.kind === 'mod' ? 'puzzle' : file.kind === 'shader_pack' ? 'palette' : 'image'}
-                  size={15}
-                />
-              </span>
-              <span class="cp-pack-picker-copy">
+              <Art icon={KIND_ICON[file.kind]} size={28} />
+              <span class="cp-pack-file">
                 <strong>{file.title}</strong>
-                <small>
-                  {!file.identified
-                    ? `${file.filename}, not recognized by the provider`
-                    : file.installed_version_id
-                      ? `${file.filename} · Installed (other version)`
-                      : file.filename}
-                </small>
+                <small>{file.filename}</small>
               </span>
-              {file.size != null && <span class="cp-pack-picker-size">{formatBytes(file.size)}</span>}
-            </label>
+              {!file.identified && <Chip title="Not recognized by the provider">Unrecognized</Chip>}
+              {file.installed_version_id && <Chip>Other version installed</Chip>}
+              {file.size != null && <Chip tone="bare">{formatBytes(file.size)}</Chip>}
+            </div>
           ))}
         </div>
 
         {error && (
-          <div class="cp-discover-conflict">
-            <Icon name="alert" size={13} /> {error}
-          </div>
+          <Notice tone="error" role="alert">
+            <p>{error}</p>
+          </Notice>
         )}
-        <div class="cp-discover-dialog-actions">
-          <span class="cp-pack-picker-summary">
-            {plural(selected.size, 'file', 'files')}
-            {selectedUpdates > 0 ? `, ${plural(selectedUpdates, 'update', 'updates')}` : ''}
-            {selectedBytes > 0 ? `, ${formatBytes(selectedBytes)}` : ''}
+        <div class="cp-dialog-actions">
+          {files.length > 0 && (
+            <Button
+              variant="ghost"
+              onClick={() => setSelected(allSelected ? new Set() : new Set(files.map((file) => file.selection_id)))}
+            >
+              {allSelected ? 'Clear' : 'Select all'}
+            </Button>
+          )}
+          <span class="cp-chips cp-head-fill">
+            <Chip tone="bare">{plural(selected.size, 'file', 'files')}</Chip>
+            {selectedUpdates > 0 && <Chip tone="bare">{plural(selectedUpdates, 'update', 'updates')}</Chip>}
+            {selectedBytes > 0 && <Chip tone="bare">{formatBytes(selectedBytes)}</Chip>}
           </span>
           <Button variant="ghost" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button onClick={() => void submit()} disabled={!plan || selected.size === 0 || busy}>
-            {busy ? 'Queueing…' : 'Add selected'}
+          <Button busy={busy} onClick={() => void submit()} disabled={!plan || selected.size === 0 || busy}>
+            Add selected
           </Button>
         </div>
       </ModalContent>

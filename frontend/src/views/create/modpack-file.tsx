@@ -70,7 +70,7 @@ export function useModpackFileImport(
       ref={inputRef}
       type="file"
       accept=".mrpack"
-      style={{ display: 'none' }}
+      hidden
       onChange={(event) => {
         const chosen = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = '';

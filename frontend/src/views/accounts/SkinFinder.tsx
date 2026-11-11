@@ -1,51 +1,41 @@
 import type { JSX } from 'preact';
-import { Icon } from '../../ui/Icons';
-import { Input } from '../../ui/Atoms';
+import { IconButton, Input, Ring } from '../../ui/Atoms';
 
+/** Try on any player's skin by username. Once one is on the stage, the field is also where it is let go. */
 export function SkinFinder({
   username,
   busy,
-  canLookup,
-  usernameError,
+  previewing,
+  invalid,
   onUsernameChange,
   onLookup,
+  onDismiss,
 }: {
   username: string;
   busy: boolean;
-  canLookup: boolean;
-  usernameError: string | null;
+  previewing: boolean;
+  invalid: boolean;
   onUsernameChange: (value: string) => void;
   onLookup: () => void;
+  onDismiss: () => void;
 }): JSX.Element {
-  const trimmed = username.trim();
   return (
-    <div class="cp-skinfinder" role="search" aria-label="Find player skin">
+    <div role="search" aria-label="Find a player's skin">
       <Input
         value={username}
         onChange={onUsernameChange}
         onKeyDown={(event) => {
-          if (event.key === 'Enter' && canLookup) onLookup();
+          if (event.key === 'Enter') onLookup();
         }}
-        placeholder="Fetch any player's skin by username"
+        placeholder="Try on a player's skin by username"
+        ariaLabel="Player username"
         icon="search"
+        invalid={invalid}
         trailing={
           busy ? (
-            <span class="cp-skinfinder__wait" aria-hidden="true">
-              <Icon name="refresh" size={14} />
-            </span>
-          ) : trimmed ? (
-            <button
-              type="button"
-              class="cp-skinfinder__go"
-              disabled={!canLookup}
-              title={usernameError || 'Preview this player skin on the stage'}
-              onClick={onLookup}
-            >
-              <span>Preview</span>
-              <kbd>Enter</kbd>
-            </button>
+            <Ring size={14} />
           ) : (
-            <span class="cp-skinfinder__hint">Previews on the stage, saves to your library</span>
+            previewing && <IconButton icon="x" size={24} tooltip="Stop previewing this player" onClick={onDismiss} />
           )
         }
       />

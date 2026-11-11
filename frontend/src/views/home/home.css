@@ -1,0 +1,133 @@
+/* Home reads from the top-left like every page: the hello where a page title sits, the last-played instance as
+   display type with its facts and Play, then the library as one shelf of covers. Behind the lead stands that
+   instance's world. */
+.cp-home {
+  position: relative;
+  gap: 0;
+  min-height: 100%;
+  overflow: hidden;
+}
+.cp-home > :not(.cp-vista) {
+  position: relative;
+}
+.cp-home-hello {
+  display: flex;
+  align-items: center;
+  min-height: var(--h-lg);
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.cp-home-lead {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  margin-top: clamp(84px, 15vh, 150px);
+}
+/* Pulled left by the first letter's side bearing, so its stem shares the chips' and the buttons' edge. */
+.cp-home-name {
+  max-width: 100%;
+  margin: 0 0 0 -3px;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 56px;
+  font-weight: 700;
+  letter-spacing: -0.028em;
+  line-height: 64px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.cp-home-lead > .cp-chips {
+  margin-top: 10px;
+}
+.cp-home-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 24px;
+}
+.cp-home-actions .cp-btn--primary {
+  min-width: 104px;
+}
+
+.cp-home-shelf {
+  min-width: 0;
+  margin-top: clamp(40px, 8vh, 72px);
+}
+.cp-home-shelf .cp-head {
+  margin-bottom: 12px;
+}
+.cp-home-shelf .cp-head svg {
+  margin: 0 -4px 0 -2px;
+}
+.cp-home-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 28px;
+}
+.cp-home-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  flex: none;
+  width: 120px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--hold-xl);
+  background: none;
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cp-home-item:focus-visible {
+  outline-offset: 3px;
+}
+.cp-home-cover {
+  display: grid;
+  place-items: center;
+  width: 120px;
+  height: 120px;
+  border-radius: var(--hold-xl);
+  transition:
+    scale 160ms ease,
+    background 120ms ease;
+}
+.cp-home-item:hover .cp-home-cover {
+  scale: 1.03;
+}
+.cp-home-title {
+  max-width: 100%;
+  margin-top: 10px;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.cp-home-new .cp-home-cover {
+  background: var(--fill);
+  color: var(--accent);
+}
+.cp-home-new:hover .cp-home-cover {
+  background: var(--fill-2);
+}
+.cp-home-new .cp-home-title {
+  color: var(--text-dim);
+}
+
+/* First run: the mascot, one line, one action, in the middle of the panel. */
+.cp-home--empty {
+  align-items: center;
+  justify-content: center;
+}
+.cp-home--empty h1 {
+  margin: 12px 0 16px;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 20px;
+}

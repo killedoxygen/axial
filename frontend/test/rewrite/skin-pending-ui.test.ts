@@ -108,7 +108,11 @@ function nodes(tree: unknown): ViewNode[] {
   return [node, ...nodes(node.props.children)];
 }
 
-function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin): Promise<'published' | 'cancelled' | undefined> => undefined }) {
+function harness(
+  native = {
+    exportNativeSavedSkinPng: async (_skin: typeof skin): Promise<'published' | 'cancelled' | undefined> => undefined,
+  },
+) {
   let nextTimer = 0;
   const timers = new Map<number, () => void>();
   const calls: [string, string][] = [];
@@ -202,42 +206,33 @@ function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin)
     },
   );
   const primitives = Object.fromEntries(
-    [
-      'SavedSkinCapeSection',
-      'SavedSkinDefaultStrip',
-      'SavedSkinFileInputs',
-      'SavedSkinLibraryGrid',
-      'SkinEditDialog',
-      'SkinFinder',
-      'SkinStage',
-      'SkinUploadDialog',
-    ].map((name) => [`./${name}`, { [name]: name }]),
+    ['CapePicker', 'SkinEditDialog', 'SkinFinder', 'SkinSnapshotImg', 'SkinStage', 'SkinUploadDialog', 'WearTile'].map(
+      (name) => [`./${name}`, { [name]: name }],
+    ),
   );
-  const { SavedSkinLibrary } = source<typeof import('../../src/views/accounts/SavedSkinLibrary')>(
-    'views/accounts/SavedSkinLibrary.tsx',
-    {
-      ...primitives,
-      '../../api': transport,
-      '../../default-skins': defaults,
-      '../../machines/skin-wardrobe': machine,
-      '../../player-skin': { profileCape: () => null },
-      '../../state': { local: { hideSkinNametag: false } },
-      './api': api,
-      './types': { NO_CAPE_VALUE: '__none' },
-      './AccountSwitcher': { AccountSwitcherChip: 'AccountSwitcherChip' },
-      './saved-skin-menu': { menuItemsForSavedSkin: () => [] },
-      './use-saved-skin-edit-workflow': { useSavedSkinEditWorkflow: () => ({ editReplacementDrop: {} }) },
-      './use-saved-skin-lookup-workflow': { useSavedSkinLookupWorkflow: () => ({}) },
-      './use-saved-skin-upload-workflow': { useSavedSkinUploadWorkflow: () => ({ uploadDrop: {} }) },
-      './use-saved-skin-native-drag-drop': { useSavedSkinNativeDragDrop() {} },
-      'preact/hooks': { useRef: <V>(value: V) => ({ current: value }), useMemo: <V>(read: () => V) => read() },
-      'preact/jsx-runtime': {
-        jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
-        jsxs: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
-        Fragment: 'Fragment',
-      },
+  const { Wardrobe } = source<typeof import('../../src/views/accounts/Wardrobe')>('views/accounts/Wardrobe.tsx', {
+    ...primitives,
+    '../../api': transport,
+    '../../default-skins': defaults,
+    '../../machines/skin-wardrobe': machine,
+    '../../player-skin': { profileCape: () => null },
+    '../../ui/Atoms': { Notice: 'Notice', Status: 'Status' },
+    '../../ui/Icons': { Icon: 'Icon' },
+    './api': api,
+    './types': { NO_CAPE_VALUE: '__none' },
+    './skin-menu': { savedSkinMenuItems: () => [] },
+    './use-palette-fit': { usePaletteFit() {} },
+    './use-saved-skin-edit-workflow': { useSavedSkinEditWorkflow: () => ({ editReplacementDrop: {} }) },
+    './use-saved-skin-lookup-workflow': { useSavedSkinLookupWorkflow: () => ({}) },
+    './use-saved-skin-upload-workflow': { useSavedSkinUploadWorkflow: () => ({ uploadDrop: {} }) },
+    './use-saved-skin-native-drag-drop': { useSavedSkinNativeDragDrop() {} },
+    'preact/hooks': { useRef: <V>(value: V) => ({ current: value }), useMemo: <V>(read: () => V) => read() },
+    'preact/jsx-runtime': {
+      jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
+      jsxs: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
+      Fragment: 'Fragment',
     },
-  );
+  });
   return {
     machine,
     api,
@@ -264,7 +259,7 @@ function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin)
       return accountRefreshes;
     },
     view() {
-      return nodes(SavedSkinLibrary({ skinActionDisabledReason: '', playerName: 'Player' }));
+      return nodes(Wardrobe({ skinActionDisabledReason: '' }));
     },
     async recheck() {
       const timer = timers.entries().next().value;
@@ -279,8 +274,8 @@ function harness(native = { exportNativeSavedSkinPng: async (_skin: typeof skin)
 function inlineErrors(h: ReturnType<typeof harness>): unknown[] {
   return h
     .view()
-    .filter((node) => node.props.class === 'cp-skin-inline-err')
-    .map((node) => node.props.children);
+    .filter((node) => node.type === 'Notice' && node.props.tone === 'error')
+    .map((node) => (node.props.children as ViewNode).props.children);
 }
 
 function nativeSkinBoundary(invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>) {
@@ -313,7 +308,7 @@ test('native picker validation failures reach the upload hook and wardrobe notic
       '../../machines/skin-wardrobe': h.machine,
       './api': h.api,
       './types': { NO_CAPE_VALUE: '__none' },
-      './use-saved-skin-upload-drop': { useSavedSkinUploadDrop: () => ({}) },
+      './use-png-drop': { usePngDrop: () => ({}) },
       'preact/hooks': {
         useEffect() {},
         useRef: <V>(value: V) => ({ current: value }),
@@ -417,7 +412,10 @@ test('accepted deferred apply exposes its later backend failure in the retained 
   h.setStatus(pending({ phase: 'failed', texture_key: null, error: failure }));
   await h.recheck();
   assert.deepEqual(inlineErrors(h), [failure]);
-  assert.equal(h.view().find((node) => node.type === 'SavedSkinLibraryGrid')?.props.pendingApplyKey, null);
+  assert.equal(
+    h.view().some((node) => node.type === 'WearTile' && node.props.queued === true),
+    false,
+  );
   assert.equal(h.machine.wardrobeData.value.skins[0].applied_at, null);
   assert.equal(h.timers.size, 0);
   assert.equal(h.calls.filter(([method, path]) => method === 'POST' && path.includes('/apply')).length, 1);
@@ -575,7 +573,10 @@ test('terminal status stops rechecking and removes the queued marker even when i
   h.setStatus(pending({ phase: 'failed', error: failure }));
   await h.recheck();
   assert.deepEqual(inlineErrors(h), [failure]);
-  assert.equal(h.view().find((node) => node.type === 'SavedSkinLibraryGrid')?.props.pendingApplyKey, null);
+  assert.equal(
+    h.view().some((node) => node.type === 'WearTile' && node.props.queued === true),
+    false,
+  );
   assert.equal(h.timers.size, 0);
 });
 
@@ -653,22 +654,29 @@ for (const missingTarget of [false, true]) {
   test(`onboarding profile seed ${missingTarget ? 'skips a missing target and completes' : 'keeps its pre-save selection while config is pending'}`, async () => {
     const savedConfig = deferred<void>();
     const calls: { method: string; path: string; body: string }[] = [];
-    const accountsSnapshot = { value: {
-      state: 'ready',
-      accounts: missingTarget ? [] : [{ account_id: accountA, kind: 'microsoft', active: true }],
-      selection_revision: missingTarget ? null : Number.MAX_SAFE_INTEGER,
-    } };
+    const accountsSnapshot = {
+      value: {
+        state: 'ready',
+        accounts: missingTarget ? [] : [{ account_id: accountA, kind: 'microsoft', active: true }],
+        selection_revision: missingTarget ? null : Number.MAX_SAFE_INTEGER,
+      },
+    };
     const config = { value: { revision: 7, onboarding_done: false } };
     const { finishOnboarding } = source<typeof import('../../src/views/onboarding/finish')>(
       'views/onboarding/finish.ts',
       {
-        '../../api': { api: async (method: string, path: string, body: unknown) => {
-          calls.push({ method, path, body: JSON.stringify(body) });
-          if (path.startsWith('/skins/from-profile')) throw new Error('Stale fixture selection');
-          if (method === 'POST' && path === '/onboarding/complete') { config.value.onboarding_done = true; return {}; }
-          if (method === 'GET' && path === '/config') return config.value;
-          throw new Error(`Unexpected onboarding request: ${method} ${path}`);
-        } },
+        '../../api': {
+          api: async (method: string, path: string, body: unknown) => {
+            calls.push({ method, path, body: JSON.stringify(body) });
+            if (path.startsWith('/skins/from-profile')) throw new Error('Stale fixture selection');
+            if (method === 'POST' && path === '/onboarding/complete') {
+              config.value.onboarding_done = true;
+              return {};
+            }
+            if (method === 'GET' && path === '/config') return config.value;
+            throw new Error(`Unexpected onboarding request: ${method} ${path}`);
+          },
+        },
         '../../default-skins': { DEFAULT_SKINS: [{ id: 'steve' }] },
         '../../dto-contract': { dtoError: () => null },
         '../../dto-core': { configResponse: (value: unknown) => value },
@@ -686,7 +694,8 @@ for (const missingTarget of [false, true]) {
     assert.equal(calls.length, 0);
     accountsSnapshot.value = {
       ...accountsSnapshot.value,
-      accounts: [{ account_id: accountB, kind: 'microsoft', active: true }], selection_revision: 3,
+      accounts: [{ account_id: accountB, kind: 'microsoft', active: true }],
+      selection_revision: 3,
     };
     savedConfig.resolve();
     await finished;
@@ -748,7 +757,6 @@ test('an acknowledged cancellation never rearms the old queue after a status rea
   assert.equal(h.timers.size, 0);
 });
 
-
 test('native Download PNG waits for settled publication and cannot replay or fetch a blob on an unknown response', async () => {
   const result = deferred<unknown>();
   const commands: string[] = [];
@@ -778,21 +786,29 @@ test('native Download PNG waits for settled publication and cannot replay or fet
     else assert.match(unknown.machine.wardrobeNotice.value ?? '', /outcome is unknown/);
   }
   let attempts = 0;
-  const lost = harness(nativeSkinBoundary(async () => {
-    attempts += 1;
-    throw new Error('transport disappeared');
-  }));
+  const lost = harness(
+    nativeSkinBoundary(async () => {
+      attempts += 1;
+      throw new Error('transport disappeared');
+    }),
+  );
   await lost.machine.downloadSavedSkin(skin);
   assert.equal(attempts, 1);
   assert.deepEqual(lost.calls, []);
   assert.deepEqual(lost.notices, []);
   assert.match(lost.machine.wardrobeNotice.value ?? '', /outcome is unknown/);
-  const refused = harness(nativeSkinBoundary(async () => {
-    throw { status: 'refused', message: 'A file already exists at that destination. Choose a new filename.' };
-  }));
+  const refused = harness(
+    nativeSkinBoundary(async () => {
+      throw { status: 'refused', message: 'A file already exists at that destination. Choose a new filename.' };
+    }),
+  );
   await refused.machine.downloadSavedSkin(skin);
   assert.match(refused.machine.wardrobeNotice.value ?? '', /already exists/);
-  const transportString = harness(nativeSkinBoundary(async () => { throw 'channel closed'; }));
+  const transportString = harness(
+    nativeSkinBoundary(async () => {
+      throw 'channel closed';
+    }),
+  );
   await transportString.machine.downloadSavedSkin(skin);
   assert.match(transportString.machine.wardrobeNotice.value ?? '', /outcome is unknown/);
 });

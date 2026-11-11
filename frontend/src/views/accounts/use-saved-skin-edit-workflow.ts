@@ -24,7 +24,7 @@ import {
   savedSkin,
   skinActionErrorMessage,
 } from './api';
-import { useSavedSkinEditReplacementDrop } from './use-saved-skin-edit-replacement-drop';
+import { usePngDrop } from './use-png-drop';
 import { NO_CAPE_VALUE, type SavedSkinRecord, type SkinVariant, type StagedSkinUpload } from './types';
 
 export function useSavedSkinEditWorkflow() {
@@ -203,11 +203,12 @@ export function useSavedSkinEditWorkflow() {
       });
   };
 
-  const editReplacementDrop = useSavedSkinEditReplacementDrop({
+  const editReplacementDrop = usePngDrop({
     busy: Boolean(editBusyKey),
-    setEditReplacementDragActive,
+    setActive: setEditReplacementDragActive,
     notifyError: setWardrobeNotice,
-    stageEditReplacementFile,
+    tooMany: 'Drop one PNG skin file to replace this texture.',
+    stage: stageEditReplacementFile,
   });
 
   const openEditTexturePicker = (): void => {
@@ -290,14 +291,16 @@ export function useSavedSkinEditWorkflow() {
             toast(await applySavedSkin(savedTextureKey, { capture }));
           } catch (err) {
             void refreshWardrobe();
-            if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Minecraft profile apply failed.'));
+            if (isWardrobeContextCurrent(capture))
+              setWardrobeNotice(skinActionErrorMessage(err, 'Minecraft profile apply failed.'));
           }
         } else {
           void refreshWardrobe();
           toast(savedMessage);
         }
       } catch (err) {
-        if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Could not update skin details.'));
+        if (isWardrobeContextCurrent(capture))
+          setWardrobeNotice(skinActionErrorMessage(err, 'Could not update skin details.'));
       }
     });
   };

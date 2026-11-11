@@ -1,15 +1,19 @@
 import { useRef } from 'preact/hooks';
 
-export function useSavedSkinUploadDrop({
+/** Drag handlers for a surface that takes exactly one dropped PNG. */
+export function usePngDrop({
   busy,
-  setUploadDragActive,
+  setActive,
   notifyError,
-  stageUploadFile,
+  tooMany,
+  stage,
 }: {
   busy: boolean;
-  setUploadDragActive: (active: boolean) => void;
+  setActive: (active: boolean) => void;
   notifyError: (text: string) => void;
-  stageUploadFile: (file: File) => void;
+  /** What to say when more than one file is dropped. */
+  tooMany: string;
+  stage: (file: File) => void;
 }): {
   onDrop: (event: DragEvent) => void;
   onDragEnter: (event: DragEvent) => void;
@@ -23,27 +27,28 @@ export function useSavedSkinUploadDrop({
       event.preventDefault();
       event.stopPropagation();
       dragDepthRef.current = 0;
-      setUploadDragActive(false);
+      setActive(false);
 
       const files = event.dataTransfer?.files;
       if (!files || files.length === 0) return;
       if (files.length !== 1) {
-        notifyError('Drop one PNG skin file.');
+        notifyError(tooMany);
         return;
       }
 
-      stageUploadFile(files[0]);
+      stage(files[0]);
     },
     onDragEnter(event) {
       if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
       event.preventDefault();
       event.stopPropagation();
       dragDepthRef.current += 1;
-      setUploadDragActive(true);
+      setActive(true);
     },
     onDragOver(event) {
       if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return;
       event.preventDefault();
+      event.stopPropagation();
       if (event.dataTransfer) event.dataTransfer.dropEffect = busy ? 'none' : 'copy';
     },
     onDragLeave(event) {
@@ -51,7 +56,7 @@ export function useSavedSkinUploadDrop({
       event.preventDefault();
       event.stopPropagation();
       dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-      if (dragDepthRef.current === 0) setUploadDragActive(false);
+      if (dragDepthRef.current === 0) setActive(false);
     },
   };
 }

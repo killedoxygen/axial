@@ -17,9 +17,8 @@ import test from 'node:test';
  * @property {ActionProps} Button
  * @property {ActionProps} IconButton
  * @property {{ onChange: (value: string) => void }} Input
- * @property {{ icon?: string, tone?: string, children?: unknown }} Pill
- * @property {Record<string, unknown>} Card
- * @property {{ action: { label: string, onClick: () => void } }} SectionHeading
+ * @property {{ icon?: string, tone?: string, children?: unknown }} Chip
+ * @property {{ title: string, actions?: unknown, children?: unknown }} Empty
  * @property {Record<string, unknown>} Icon
  * @property {InstanceCardProps} InstanceCard
  * @property {Record<string, unknown>} InstanceTile
@@ -29,7 +28,7 @@ import test from 'node:test';
  * @property {{ onToggle: (event: TestEvent) => void }} SelectionCheckbox
  */
 /** @typedef {{ [K in keyof PartProps]: (props: PartProps[K]) => unknown }} Parts */
-/** @typedef {{ FeatureBanner: RowProps, ListRow: RowProps, EmptyHome: Record<string, unknown> }} OwnComponents */
+/** @typedef {{ Lead: RowProps, Shelf: RowProps, ListRow: RowProps, SessionChip: PartProps['Chip'] }} OwnComponents */
 /** @typedef {{ label: string, onSelect?: () => void }} MenuItem */
 /** @typedef {{ e: TestEvent, menu: MenuItem[] } | { e: TestEvent, inst: LibraryInstance }} MenuCall */
 
@@ -83,9 +82,8 @@ const parts = /** @type {Parts} */ (
         'Button',
         'IconButton',
         'Input',
-        'Pill',
-        'Card',
-        'SectionHeading',
+        'Chip',
+        'Empty',
         'Icon',
         'InstanceCard',
         'InstanceTile',
@@ -97,6 +95,8 @@ const parts = /** @type {Parts} */ (
     )
   )
 );
+
+const facts = loadSource('src/ui/InstanceFacts.tsx', { './Atoms': parts, '../launch-presenters': presenters });
 
 /** @param {unknown} tree @param {(node: ViewNode) => boolean} predicate @returns {ViewNode[]} */
 function nodes(tree, predicate) {
@@ -197,6 +197,7 @@ function libraryHarness(initialInstances = []) {
     instances: { value: initialInstances },
     config: { value: { username: 'Offline player' } },
     launchSessions: { value: /** @type {Record<string, { viewModel: { playing: boolean, label: string } }>} */ ({}) },
+    launchState: { value: { status: 'idle' } },
     versionById: () => undefined,
   };
   /** @type {unknown[]} */
@@ -206,12 +207,15 @@ function libraryHarness(initialInstances = []) {
   const selectedIds = new Set();
   /** @type {{ navigations: { name: string, id?: string }[], create: number, menus: MenuCall[], filtered: string[] }} */
   const calls = { navigations: [], create: 0, menus: [], filtered: [] };
+  const launches = { selected: '', count: 0 };
   /** @type {Map<string, { state: string, installing: boolean, label?: string, queuedItem?: { title: string } }>} */
   const installs = new Map();
   const imports = {
     'preact/hooks': {
       /** @template T @param {() => T} fn */
       useMemo: (fn) => fn(),
+      useRef: () => ({ current: null }),
+      useLayoutEffect() {},
       /** @template T @param {T} fn */
       useCallback: (fn) => fn,
       /** @param {unknown} initial @returns {[unknown, (value: unknown) => void]} */
@@ -227,9 +231,37 @@ function libraryHarness(initialInstances = []) {
       },
     },
     '../../ui/Atoms': parts,
+    '../../ui/Face': { Face: 'Face' },
+    '../../vista/Vista': { Vista: () => null },
+    '../../actions': {
+      /** @param {string} id */
+      selectInstance(id) {
+        launches.selected = id;
+      },
+    },
+    '../../launch': {
+      launchGame() {
+        launches.count++;
+      },
+    },
     '../../ui/Icons': parts,
-    '../../ui/InstanceCard': parts,
-    '../../ui/InstanceVisual': { ...parts, guardedInstanceHue: () => 40 },
+    '../../ui/InstanceCard': {
+      ...loadSource('src/ui/InstanceCard.tsx', {
+        './InstanceVisual': parts,
+        './InstanceFacts': facts,
+        './Atoms': parts,
+        './Icons': parts,
+        './SelectionActionTray': parts,
+        './selection': {},
+        '../ui-state': {},
+        '../store': {},
+        '../instance-install-status': {},
+        '../launch-presenters': presenters,
+      }),
+      InstanceCard: parts.InstanceCard,
+    },
+    '../../ui/InstanceFacts': facts,
+    '../../ui/InstanceVisual': { ...parts, guardedInstanceHue: () => 40, artSeedFor: () => 0 },
     '../../ui/Segmented': parts,
     '../../ui/SelectionActionTray': parts,
     '../../ui/ContextMenu': {
@@ -281,7 +313,7 @@ function libraryHarness(initialInstances = []) {
     './PendingRemovalsNotice': { PendingRemovalsNotice: () => null },
     '../../format': {
       /** @param {string | undefined} iso */
-      fmtRelativeCompact: (iso) => iso ?? 'Never',
+      fmtRelative: (iso) => iso ?? 'Never',
     },
   };
   const { HomeView } = /** @type {typeof import('../../src/views/home/HomeView')} */ (
@@ -294,6 +326,7 @@ function libraryHarness(initialInstances = []) {
     store,
     calls,
     installs,
+    launches,
     selectedIds,
     home: () => HomeView(),
     library: () => {
@@ -303,7 +336,7 @@ function libraryHarness(initialInstances = []) {
   };
 }
 
-test('home retains newest featured instance, fourteen recent cards and See all without mutating the snapshot', () => {
+test('home retains newest lead, six recent covers and See all without mutating the snapshot', () => {
   const records = Array.from({ length: 18 }, (_, index) =>
     instance(String(index), {
       last_played_at: `2026-01-${String(index + 1).padStart(2, '0')}T00:00:00Z`,
@@ -311,56 +344,59 @@ test('home retains newest featured instance, fourteen recent cards and See all w
   );
   const h = libraryHarness(records);
   const home = h.home();
-  const featured = nodes(home, (node) => typeof node.type === 'function' && node.type.name === 'FeatureBanner')[0];
-  const featuredInstance = /** @type {LibraryInstance} */ (featured.props.inst);
-  assert.equal(featuredInstance.id, '17');
+  assert.equal(textOf(nodes(ownComponent(home, 'Lead'), (n) => n.props.class === 'cp-home-name')[0]), 'Instance 17');
+  const shelf = ownComponent(home, 'Shelf');
   assert.deepEqual(
-    ofType(home, parts.InstanceCard).map((node) => node.props.inst.id),
-    ['16', '15', '14', '13', '12', '11', '10', '9', '8', '7', '6', '5', '4', '3'],
+    ofType(shelf, parts.InstanceTile).map((n) => /** @type {LibraryInstance} */ (n.props.inst).id),
+    ['16', '15', '14', '13', '12', '11'],
   );
   assert.equal(records[0].id, '0');
   assert.equal(h.store.instances.value, records);
-  assert.match(textOf(home), /18 instances in your library/);
-  const action = ofType(home, parts.SectionHeading)[0].props.action;
-  assert.equal(action.label, 'See all');
-  action.onClick();
+  const action = ofType(shelf, parts.Button)[0];
+  assert.equal(textOf(action), 'See all 18');
+  action.props.onClick();
   assert.equal(h.calls.navigations[0].name, 'instances');
 });
 
-test('unavailable or omitted count availability hides summary counts without suppressing known counts', () => {
+test('unavailable or omitted count availability hides row counts without suppressing known zero', () => {
   for (const available of [false, undefined]) {
     const unknown = enrichedInstanceResponse(instance('unknown', { counts_available: available }));
     assert.equal(unknown.counts_available, false);
     const h = libraryHarness([unknown]);
     const library = h.library();
-    const summary = nodes(library, (node) => node.props.class === 'cp-page-sub')[0];
-    assert.equal(textOf(summary), '1 total');
-    const banner = ownComponent(h.home(), 'FeatureBanner');
+
+    const banner = ownComponent(h.home(), 'Lead');
     assert.doesNotMatch(textOf(banner), /\d+ mods/);
     ofType(library, parts.Segmented)[0].props.onChange('list');
     const row = ownComponent(h.library(), 'ListRow');
-    assert.doesNotMatch(textOf(row), /\d+ mods/);
+    assert.equal(nodes(row, (n) => n.props.class === 'cp-library-cell')[1].props.children, null);
     assert.match(textOf(row), /Backend Minecraft/);
   }
   const known = enrichedInstanceResponse(instance('known', { mods_count: 0 }));
   assert.equal(known.counts_available, true);
   const h = libraryHarness([known]);
   const library = h.library();
-  const summary = nodes(library, (node) => node.props.class === 'cp-page-sub')[0];
-  assert.equal(textOf(summary), '1 total, 0 mods across all');
-  assert.match(textOf(ownComponent(h.home(), 'FeatureBanner')), /0 mods/);
   ofType(library, parts.Segmented)[0].props.onChange('list');
-  assert.match(textOf(ownComponent(h.library(), 'ListRow')), /0 mods/);
+  assert.equal(
+    nodes(ownComponent(h.library(), 'ListRow'), (n) => n.props.class === 'cp-library-cell')[1].props.children,
+    0,
+  );
 });
 
-test('a partial count snapshot never becomes a total and malformed availability is rejected', () => {
+test('partial count snapshots retain each row availability and reject malformed availability', () => {
   const records = [
     enrichedInstanceResponse(instance('known')),
     enrichedInstanceResponse(instance('unknown', { counts_available: false, mods_count: 99 })),
   ];
   const h = libraryHarness(records);
-  const summary = nodes(h.library(), (node) => node.props.class === 'cp-page-sub')[0];
-  assert.equal(textOf(summary), '2 total');
+  ofType(h.library(), parts.Segmented)[0].props.onChange('list');
+  const rows = nodes(h.library(), (n) => typeof n.type === 'function' && n.type.name === 'ListRow');
+  assert.equal(rows.length, 2);
+  const counts = rows.map((node) => {
+    const component = /** @type {(props: Record<string, unknown>) => unknown} */ (node.type);
+    return nodes(component(node.props), (n) => n.props.class === 'cp-library-cell')[1].props.children;
+  });
+  assert.deepEqual(counts, [3, null]);
   for (const invalid of [null, 'false', 0, {}]) {
     assert.throws(
       () => enrichedInstanceResponse({ ...instance('invalid'), counts_available: invalid }),
@@ -369,15 +405,13 @@ test('a partial count snapshot never becomes a total and malformed availability 
   }
 });
 
-test('empty home keeps both create entrypoints and no featured instance', () => {
+test('empty home keeps its create entrypoint and no lead', () => {
   const h = libraryHarness();
   const home = h.home();
-  const empty = ownComponent(home, 'EmptyHome');
-  assert.match(textOf(empty), /Create your first instance/);
-  assert.equal(nodes(home, (node) => typeof node.type === 'function' && node.type.name === 'FeatureBanner').length, 0);
+  assert.match(textOf(home), /No instances yet/);
+  assert.equal(nodes(home, (n) => typeof n.type === 'function' && n.type.name === 'Lead').length, 0);
   ofType(home, parts.Button)[0].props.onClick();
-  ofType(empty, parts.Button)[0].props.onClick();
-  assert.equal(h.calls.create, 2);
+  assert.equal(h.calls.create, 1);
 });
 
 test('featured action renders the backend install and blocked labels and reasons', () => {
@@ -387,38 +421,38 @@ test('featured action renders the backend install and blocked labels and reasons
   ])) {
     const h = libraryHarness([
       instance('opaque-id', {
-        launch_action: { primary_action: action, label, disabled_reason: 'Backend refusal reason' },
+        launch_action: { primary_action: action, launchable: false, label, disabled_reason: 'Backend refusal reason' },
       }),
     ]);
-    const banner = ownComponent(h.home(), 'FeatureBanner');
+    const banner = ownComponent(h.home(), 'Lead');
     const button = ofType(banner, parts.Button)[0];
     assert.equal(textOf(button), label);
     assert.equal(button.props.icon, icon);
     if (action === 'blocked') assert.equal(button.props.title, 'Backend refusal reason');
     const click = event();
     button.props.onClick(click);
-    assert.equal(click.stopped, 1);
     assert.equal(h.calls.navigations[0].id, 'opaque-id');
   }
 });
 
-test('featured navigation handles Enter and Space once and leaves nested controls independent', () => {
-  const h = libraryHarness([instance('keyboard')]);
-  const banner = ownComponent(h.home(), 'FeatureBanner');
-  assert.equal(banner.props.role, 'button');
-  assert.equal(banner.props.tabIndex, 0);
-  for (const key of ['Enter', ' ']) {
-    const keyEvent = event(key);
-    banner.props.onKeyDown(keyEvent);
-    assert.equal(keyEvent.prevented, 1);
-  }
-  banner.props.onKeyDown(event('Enter', true));
-  banner.props.onKeyDown(event('Escape'));
-  assert.equal(h.calls.navigations.length, 2);
-  banner.props.onContextMenu(event());
+test('home Play launches the captured instance and shelf buttons navigate with contextual menus', () => {
+  const h = libraryHarness([instance('keyboard'), instance('shelf')]);
+  const lead = ownComponent(h.home(), 'Lead');
+  ofType(lead, parts.Button)[0].props.onClick();
+  assert.deepEqual(h.launches, { selected: 'keyboard', count: 1 });
+  ofType(lead, parts.Button)[1].props.onClick();
+  const shelf = ownComponent(h.home(), 'Shelf');
+  const cover = nodes(shelf, (n) => n.props.class === 'cp-home-item')[0];
+  assert.equal(cover.type, 'button');
+  /** @type {() => void} */ (cover.props.onClick)();
+  assert.deepEqual(
+    h.calls.navigations.map((n) => n.id),
+    ['keyboard', 'shelf'],
+  );
+  /** @type {(e: TestEvent) => void} */ (cover.props.onContextMenu)(event());
   const menu = h.calls.menus[0];
   assert.ok('inst' in menu);
-  assert.equal(menu.inst.id, 'keyboard');
+  assert.equal(menu.inst.id, 'shelf');
 });
 
 test('home preserves queue title and backend session label without inferring playing from existence', () => {
@@ -430,17 +464,20 @@ test('home preserves queue title and backend session label without inferring pla
     queuedItem: { title: 'Waiting for Java' },
   });
   h.store.launchSessions.value.busy = { viewModel: { playing: false, label: 'Settling process output' } };
-  let banner = ownComponent(h.home(), 'FeatureBanner');
+  let banner = ownComponent(h.home(), 'Lead');
   let button = ofType(banner, parts.Button)[0];
-  assert.equal(button.props.disabled, true);
-  assert.equal(textOf(button), 'Waiting for Java');
-  assert.equal(banner.props['aria-label'], 'Open Instance busy. Waiting for Java');
-  const sessionPill = ofType(banner, parts.Pill).find((node) => textOf(node) === 'Settling process output');
-  assert.ok(sessionPill);
+  assert.equal(textOf(button), 'Open');
+  assert.equal(banner.props['aria-label'], 'Instance busy');
+  const sessionPill = ownComponent(banner, 'SessionChip');
+  assert.equal(textOf(sessionPill), 'Settling process output');
   assert.equal(sessionPill.props.icon, 'clock');
-  assert.equal(sessionPill.props.tone, undefined);
+  assert.equal(sessionPill.props.tone, 'accent');
+  delete h.store.launchSessions.value.busy;
+  banner = ownComponent(h.home(), 'Lead');
+  assert.ok(ofType(banner, parts.Chip).some((n) => textOf(n) === 'Waiting for Java'));
+  h.store.launchSessions.value.busy = { viewModel: { playing: false, label: 'Settling process output' } };
   h.installs.clear();
-  banner = ownComponent(h.home(), 'FeatureBanner');
+  banner = ownComponent(h.home(), 'Lead');
   button = ofType(banner, parts.Button)[0];
   assert.equal(textOf(button), 'Open');
 });
@@ -475,9 +512,9 @@ test('list rows preserve backend labels, keyboard access and independent selecti
   assert.equal(row.props.role, 'button');
   assert.equal(row.props.tabIndex, 0);
   assert.equal(row.props['aria-label'], 'Open Instance row');
-  assert.match(textOf(row), /Backend build label/);
+  assert.match(textOf(row), /Backend loader Backend build/);
   assert.match(textOf(row), /Backend Minecraft/);
-  assert.match(textOf(row), /3 mods/);
+  assert.equal(nodes(row, (n) => n.props.class === 'cp-library-cell')[1].props.children, 3);
   const action = ofType(row, parts.Button)[0];
   assert.equal(textOf(action), 'Unavailable');
   assert.equal(action.props.title, 'Backend reason');
@@ -505,11 +542,13 @@ test('list rows preserve backend labels, keyboard access and independent selecti
 test('library distinguishes an empty library from an unmatched filter', () => {
   const h = libraryHarness();
   let library = h.library();
-  assert.match(textOf(library), /No instances yet/);
-  assert.equal(ofType(library, parts.Button).length, 2);
+  assert.equal(ofType(library, parts.Empty)[0].props.title, 'No instances yet');
+  assert.ok(ofType(library, parts.Empty)[0].props.actions);
+  assert.equal(ofType(library, parts.Button).length, 1);
   h.store.instances.value = [instance('existing')];
   ofType(library, parts.Input)[0].props.onChange('unmatched');
   library = h.library();
-  assert.match(textOf(library), /No matches/);
+  assert.equal(ofType(library, parts.Empty)[0].props.title, 'No matches');
+  assert.equal(ofType(library, parts.Empty)[0].props.actions, false);
   assert.equal(ofType(library, parts.Button).length, 1);
 });

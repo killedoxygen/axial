@@ -680,6 +680,17 @@ pub(crate) struct VersionSummary {
     pub(crate) evidence: Arc<InventoryEvidence>,
 }
 
+impl VersionSummary {
+    /// The client archive inventoried for `version_id`, while it keeps its observed revision.
+    pub(crate) fn client_archive(
+        &self,
+        version_id: &str,
+    ) -> Result<ManagedLibraryFile, super::queue::InstallError> {
+        self.evidence
+            .exact_file(&format!("versions/{version_id}/{version_id}.jar"))
+    }
+}
+
 pub(crate) struct ObservedDamage {
     evidence: InventoryEvidence,
     // Distinct supported reasons, not an enumeration of every damaged file.

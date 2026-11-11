@@ -1,4 +1,3 @@
-import { profileCape as accountProfileCape } from '../../player-skin';
 import type { JSX } from 'preact';
 import { apiResourceUrl } from '../../api';
 import type { DefaultSkin } from '../../default-skins';
@@ -6,360 +5,213 @@ import {
   applyDefaultSkin,
   applySkin,
   cancelPendingApply,
-  deleteSavedSkin,
-  downloadSavedSkin,
   flushPendingApply,
   resetProfileCape,
   resetProfileSkin,
-  resetWardrobePreview,
-  returnFromProfilePreview,
   saveProfileSkinLocally,
   wardrobeContext,
   wardrobeOp,
 } from '../../machines/skin-wardrobe';
-import { Button } from '../../ui/Atoms';
+import { profileCape } from '../../player-skin';
+import { Button, Empty, IconButton, Status } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
-import { Icon } from '../../ui/Icons';
 import { capeFileUrl, lookupCapeFileUrl, lookupSkinFileUrl, savedSkinFileUrl } from './api';
-import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
+import { LazySkinThreePreview } from './LazySkinThreePreview';
 import type { MinecraftSkinLookup, SavedSkinRecord, SkinVariant } from './types';
 
-const STAGE_FIT = { top: 0.15, bottom: 0.14, side: 0.08 };
+/** The figure fills its scene from head to feet; the scene is let out by these shares to make room for it. */
+const FIT = { top: 0.15, bottom: 0.14, side: 0.08 };
 
 export type SkinStageModel =
   | { kind: 'empty'; loading: boolean }
   | { kind: 'lookup'; profile: MinecraftSkinLookup; variant: SkinVariant }
-  | { kind: 'default'; skin: DefaultSkin }
-  | { kind: 'profile'; returnable: boolean }
+  | { kind: 'default'; skin: DefaultSkin; worn: boolean }
+  | { kind: 'profile' }
   | {
       kind: 'saved';
       skin: SavedSkinRecord;
       capeSrc?: string;
       queued: boolean;
       worn: boolean;
-      editing: boolean;
-      editingSrc: string | null;
-      editVariant: SkinVariant;
-      editCapeSrc?: string;
+      /** While it is being edited the stage shows the edit, not the saved skin. */
+      edit: { src: string | null; variant: SkinVariant; capeSrc?: string } | null;
+      menuItems: ContextMenuItem[];
     };
 
-function stageMenuButton(items: ContextMenuItem[]): JSX.Element | null {
-  if (items.length === 0) return null;
-  return (
-    <Button
-      variant="ghost"
-      size="lg"
-      icon="dots"
-      title="More actions"
-      onClick={(event) => openContextMenu(event, items)}
-    />
-  );
+/** From a skin that is only being tried on, the way back to the one worn. */
+export interface StageBack {
+  label: string;
+  run: () => void;
 }
 
+interface Figure {
+  name: string;
+  src: string;
+  variant: SkinVariant;
+  capeSrc?: string;
+}
+
+/** The skin in hand, as tall as the page allows; under it its name and one line of state or actions. */
 export function SkinStage({
   model,
-  nametag,
-  onRenameNametag,
+  back,
   onSaveLookup,
-  onDismissLookup,
-  onStartEdit,
   onOpenUploadPicker,
 }: {
   model: SkinStageModel;
-  nametag: string | null;
-  onRenameNametag?: () => void;
-  onSaveLookup: (applyAfterSave: boolean) => void;
-  onDismissLookup: () => void;
-  onStartEdit: (skin: SavedSkinRecord) => void;
+  back: StageBack | null;
+  onSaveLookup: (wear: boolean) => void;
   onOpenUploadPicker: () => void;
 }): JSX.Element {
   const op = wardrobeOp.value;
   const busy = op !== null;
-  const { skinActionsEnabled, account } = wardrobeContext.value;
+  const { skinActionsEnabled: canWear, account } = wardrobeContext.value;
 
-  const renderScene = (): JSX.Element | null => {
+  const figure = (): Figure | null => {
     switch (model.kind) {
       case 'lookup':
-        return (
-          <SkinThreePreview
-            src={lookupSkinFileUrl(model.profile)}
-            capeSrc={lookupCapeFileUrl(model.profile)}
-            name={model.profile.username}
-            nametag={model.profile.username}
-            variant={model.variant}
-            side="front"
-            showOuterLayers
-            fitPadding={STAGE_FIT}
-            showHint={false}
-          />
-        );
+        return {
+          name: model.profile.username,
+          src: lookupSkinFileUrl(model.profile),
+          variant: model.variant,
+          capeSrc: lookupCapeFileUrl(model.profile),
+        };
       case 'default':
-        return (
-          <SkinThreePreview
-            src={model.skin.src}
-            name={model.skin.name}
-            nametag={nametag}
-            onNametagEdit={onRenameNametag}
-            variant={model.skin.variant}
-            side="front"
-            showOuterLayers
-            fitPadding={STAGE_FIT}
-            showHint={false}
-          />
-        );
+        return { name: model.skin.name, src: model.skin.src, variant: model.skin.variant };
       case 'profile': {
-        const profileSkin = account?.profile_skin;
-        const profileCape = accountProfileCape(account);
-        if (!account || !profileSkin) return null;
-        return (
-          <SkinThreePreview
-            src={apiResourceUrl('/skin/profile/file')}
-            capeSrc={profileCape ? capeFileUrl(profileCape) : undefined}
-            name={account.display_name}
-            nametag={nametag}
-            onNametagEdit={onRenameNametag}
-            variant={profileSkin.variant}
-            side="front"
-            showOuterLayers
-            fitPadding={STAGE_FIT}
-            showHint={false}
-          />
-        );
+        const skin = account?.profile_skin;
+        const cape = profileCape(account);
+        if (!account || !skin) return null;
+        return {
+          name: account.display_name,
+          src: apiResourceUrl('/skin/profile/file'),
+          variant: skin.variant,
+          capeSrc: cape ? capeFileUrl(cape) : undefined,
+        };
       }
       case 'saved':
-        return (
-          <SkinThreePreview
-            src={model.editing && model.editingSrc ? model.editingSrc : savedSkinFileUrl(model.skin)}
-            capeSrc={model.editing ? model.editCapeSrc : model.capeSrc}
-            name={model.skin.name}
-            nametag={nametag}
-            onNametagEdit={onRenameNametag}
-            variant={model.editing ? model.editVariant : model.skin.variant}
-            side="front"
-            showOuterLayers
-            fitPadding={STAGE_FIT}
-            showHint={false}
-          />
-        );
+        return {
+          name: model.skin.name,
+          src: model.edit?.src ?? savedSkinFileUrl(model.skin),
+          variant: model.edit?.variant ?? model.skin.variant,
+          capeSrc: model.edit ? model.edit.capeSrc : model.capeSrc,
+        };
       case 'empty':
         return null;
     }
   };
 
-  const caption = (): { name: string; status: string | null } | null => {
-    switch (model.kind) {
-      case 'lookup':
-        return { name: model.profile.username, status: 'Current skin of this player' };
-      case 'default':
-        return { name: model.skin.name, status: 'Minecraft default skin' };
-      case 'profile':
-        return { name: account?.display_name ?? 'Minecraft profile', status: 'Current Minecraft profile skin' };
-      case 'saved':
-        if (model.queued) return { name: model.skin.name, status: 'Queued for the next launch' };
-        if (model.worn) return { name: model.skin.name, status: 'Worn on your Minecraft profile' };
-        return { name: model.skin.name, status: null };
-      case 'empty':
-        return null;
-    }
-  };
+  const wear = (run: () => void, working: boolean): JSX.Element | false =>
+    canWear && (
+      <Button icon="shirt" busy={working} disabled={busy} sound="affirm" onClick={run}>
+        Wear this skin
+      </Button>
+    );
+  const goBack = back && (
+    <Button variant="ghost" disabled={busy} onClick={back.run}>
+      {back.label}
+    </Button>
+  );
+  const more = (items: ContextMenuItem[]): JSX.Element | false =>
+    items.length > 0 && (
+      <IconButton icon="dots" tooltip="More actions" onClick={(event) => openContextMenu(event, items)} />
+    );
 
-  const renderActions = (): JSX.Element | null => {
+  const state = (): JSX.Element | null => {
     switch (model.kind) {
       case 'lookup': {
-        const saveBusy = op?.kind === 'lookup';
+        const saving = op?.kind === 'lookup';
         return (
           <>
+            {canWear && (
+              <Button icon="shirt" busy={saving} disabled={busy} sound="affirm" onClick={() => onSaveLookup(true)}>
+                Save and wear
+              </Button>
+            )}
             <Button
-              variant="ghost"
-              size="lg"
-              icon="x"
-              disabled={saveBusy}
-              onClick={onDismissLookup}
-              title="Stop previewing this player skin"
+              variant={canWear ? 'secondary' : 'primary'}
+              icon={canWear ? undefined : 'download'}
+              busy={!canWear && saving}
+              disabled={busy}
+              title="Keep a copy in your skins"
+              onClick={() => onSaveLookup(false)}
             >
-              Dismiss
+              Save
             </Button>
-            {skinActionsEnabled ? (
-              <>
-                <Button
-                  variant="secondary"
-                  size="lg"
-                  icon={saveBusy ? 'refresh' : 'download'}
-                  disabled={busy}
-                  onClick={() => onSaveLookup(false)}
-                  title="Keep a copy in your library without wearing it"
-                >
-                  Save
-                </Button>
-                <Button
-                  variant="primary"
-                  size="lg"
-                  icon={saveBusy ? 'refresh' : 'check'}
-                  disabled={busy}
-                  onClick={() => onSaveLookup(true)}
-                  title="Save to your library and wear this skin"
-                  sound="affirm"
-                >
-                  Apply
-                </Button>
-              </>
-            ) : (
-              <Button
-                variant="primary"
-                size="lg"
-                icon={saveBusy ? 'refresh' : 'download'}
-                disabled={busy}
-                onClick={() => onSaveLookup(false)}
-                title="Keep a copy in your library"
-                sound="affirm"
-              >
-                Save
-              </Button>
-            )}
           </>
         );
       }
-      case 'default': {
-        const applying = op?.kind === 'apply' || op?.kind === 'upload';
-        return (
+      case 'default':
+        return model.worn ? (
+          <Status eyes="happy" tone="accent">
+            Wearing
+          </Status>
+        ) : (
           <>
-            {model.skin.id !== 'steve' && (
-              <Button
-                variant="secondary"
-                size="lg"
-                icon="refresh"
-                disabled={busy}
-                onClick={() => resetWardrobePreview()}
-                title="Reset the account avatar to Steve"
-              >
-                Reset
-              </Button>
-            )}
-            {skinActionsEnabled && (
-              <Button
-                variant="primary"
-                size="lg"
-                icon={applying ? 'refresh' : 'check'}
-                disabled={busy}
-                onClick={() => void applyDefaultSkin(model.skin)}
-                title="Wear this default skin on the active Minecraft account"
-                sound="affirm"
-              >
-                {applying ? 'Applying' : 'Apply'}
-              </Button>
-            )}
+            {wear(() => void applyDefaultSkin(model.skin), op?.kind === 'apply' || op?.kind === 'upload')}
+            {goBack}
           </>
         );
-      }
       case 'profile': {
-        const saving = op?.kind === 'save-profile';
         const menu: ContextMenuItem[] = [];
-        if (skinActionsEnabled) {
-          menu.push({ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() });
-        }
-        if (skinActionsEnabled && accountProfileCape(account)) {
+        if (canWear) menu.push({ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() });
+        if (canWear && profileCape(account)) {
           menu.push({ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() });
         }
         return (
           <>
-            {model.returnable && (
+            <Status eyes="happy" tone="accent">
+              Wearing
+            </Status>
+            {canWear && (
               <Button
                 variant="secondary"
-                size="lg"
-                icon="refresh"
+                icon="download"
+                busy={op?.kind === 'save-profile'}
                 disabled={busy}
-                onClick={() => returnFromProfilePreview()}
-                title="Return to your skin"
-              >
-                Back
-              </Button>
-            )}
-            {skinActionsEnabled && (
-              <Button
-                variant="primary"
-                size="lg"
-                icon={saving ? 'refresh' : 'download'}
-                disabled={busy}
+                title="Keep a copy of this skin in your skins"
                 onClick={() => void saveProfileSkinLocally()}
-                title="Keep a copy of this skin in your library"
-                sound="affirm"
               >
                 Save
               </Button>
             )}
-            {stageMenuButton(menu)}
+            {goBack}
+            {more(menu)}
           </>
         );
       }
       case 'saved': {
-        if (model.editing) return null;
-        const applying = op?.kind === 'apply' && op.key === model.skin.texture_key;
-        const flushing = op?.kind === 'flush';
-        const canceling = op?.kind === 'cancel-pending';
-        const menu: ContextMenuItem[] = [
-          { icon: 'refresh', label: 'Reset preview to Steve', onSelect: () => resetWardrobePreview() },
-          { icon: 'download', label: 'Download PNG', onSelect: () => void downloadSavedSkin(model.skin) },
-        ];
-        if (!model.worn) {
-          menu.push(
-            { label: '', onSelect: () => {}, divider: true },
-            { icon: 'trash', label: 'Delete', onSelect: () => void deleteSavedSkin(model.skin), danger: true },
-          );
-        }
-        if (model.queued) {
-          return (
-            <>
-              <Button
-                variant="secondary"
-                size="lg"
-                icon={canceling ? 'refresh' : 'x'}
-                disabled={busy}
-                onClick={() => void cancelPendingApply()}
-                title="Cancel the queued skin change"
-              >
-                Cancel
-              </Button>
-              <Button
-                variant="primary"
-                size="lg"
-                icon={flushing ? 'refresh' : 'check'}
-                disabled={!skinActionsEnabled || busy}
-                onClick={() => void flushPendingApply()}
-                title="Apply the queued skin change now"
-                sound="affirm"
-              >
-                {flushing ? 'Applying' : 'Apply now'}
-              </Button>
-              {stageMenuButton(menu)}
-            </>
-          );
-        }
+        if (model.edit) return null;
+        const key = model.skin.texture_key;
         return (
           <>
-            <Button
-              variant="secondary"
-              size="lg"
-              icon="edit"
-              disabled={busy}
-              onClick={() => onStartEdit(model.skin)}
-              title="Rename, retexture, or change this skin's cape"
-            >
-              Edit skin
-            </Button>
-            {skinActionsEnabled && !model.worn && (
-              <Button
-                variant="primary"
-                size="lg"
-                icon={applying ? 'refresh' : 'check'}
-                disabled={busy}
-                onClick={() => void applySkin(model.skin.texture_key)}
-                title="Wear this skin on the active Minecraft account"
-                sound="affirm"
-              >
-                {applying ? 'Applying' : 'Apply'}
-              </Button>
+            {model.queued ? (
+              <>
+                <Status busy>Queued for the next launch</Status>
+                <Button
+                  icon="check"
+                  busy={op?.kind === 'flush'}
+                  disabled={!canWear || busy}
+                  sound="affirm"
+                  onClick={() => void flushPendingApply()}
+                >
+                  Wear now
+                </Button>
+                <Button variant="ghost" disabled={busy} onClick={() => void cancelPendingApply()}>
+                  Cancel
+                </Button>
+              </>
+            ) : model.worn ? (
+              <Status eyes="happy" tone="accent">
+                Wearing
+              </Status>
+            ) : (
+              <>
+                {wear(() => void applySkin(key), op?.kind === 'apply' && op.key === key)}
+                {goBack}
+              </>
             )}
-            {stageMenuButton(menu)}
+            {more(model.menuItems)}
           </>
         );
       }
@@ -368,41 +220,38 @@ export function SkinStage({
     }
   };
 
+  const shown = figure();
   return (
-    <section class="cp-skinhall__stage" aria-label="Skin preview">
-      <div class="cp-skinhall__backdrop" aria-hidden="true" />
-      {model.kind === 'empty' ? (
-        <div class="cp-skinhall__empty">
-          <Icon name="image" size={28} color="var(--text-mute)" />
-          <span>{model.loading ? 'Loading skins' : 'No skin selected yet'}</span>
-          {!model.loading && (
+    <section class="cp-stage" aria-label="Skin preview">
+      {shown ? (
+        <>
+          <div class="cp-stage-figure">
+            <LazySkinThreePreview
+              src={shown.src}
+              capeSrc={shown.capeSrc}
+              name={shown.name}
+              variant={shown.variant}
+              side="front"
+              showOuterLayers
+              fitPadding={FIT}
+            />
+          </div>
+          <div class="cp-stage-caption">
+            <h2 title={shown.name}>{shown.name}</h2>
+            <div class="cp-stage-state">{state()}</div>
+          </div>
+        </>
+      ) : model.kind === 'empty' && model.loading ? (
+        <Status busy>Loading skins</Status>
+      ) : (
+        <Empty
+          title="No skin yet"
+          actions={
             <Button variant="secondary" icon="plus" disabled={busy} onClick={onOpenUploadPicker}>
               Add skin
             </Button>
-          )}
-        </div>
-      ) : (
-        <>
-          <div class="cp-skinhall__scene">{renderScene()}</div>
-          <div class="cp-skinhall__foot">
-            {(() => {
-              const line = caption();
-              if (!line) return null;
-              return (
-                <div class="cp-skinhall__caption">
-                  <span class="cp-skinhall__caption-name">{line.name}</span>
-                  {line.status && <span class="cp-skinhall__caption-status">{line.status}</span>}
-                </div>
-              );
-            })()}
-            <div class="cp-skinhall__actions">{renderActions()}</div>
-            <div class="cp-skinhall__hint" aria-hidden="true">
-              <Icon name="arrow-left" size={10} />
-              <Icon name="arrow-right" size={10} />
-              <span>Drag to rotate</span>
-            </div>
-          </div>
-        </>
+          }
+        />
       )}
     </section>
   );

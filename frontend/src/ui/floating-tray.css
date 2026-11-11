@@ -1,54 +1,63 @@
+/* An overlay over the list it acts on, centred on the content area: one line, so a pill like the controls in it. */
 .cp-floating-tray-position {
   position: fixed;
-  left: 68px;
+  left: 72px;
   right: 0;
-  bottom: 18px;
+  bottom: 20px;
   z-index: 850;
   display: flex;
   justify-content: center;
+  padding: 0 28px;
   pointer-events: none;
-  padding: 0 24px;
 }
-
 .cp-floating-tray {
-  pointer-events: auto;
-  max-width: min(720px, 100%);
-  min-height: 48px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 8px;
-  border-radius: var(--r-lg);
-  background: var(--surface);
-  color: var(--text);
-  box-shadow:
-    var(--shadow),
-    0 0 0 1px var(--line);
+  gap: 2px;
+  padding: 4px;
+  border-radius: var(--rad-ctl);
+  pointer-events: auto;
 }
-
+/* Its actions are the small button at the tray's line height, one fill above the surface. */
+.cp-floating-tray .cp-btn {
+  height: var(--h);
+}
+.cp-floating-tray .cp-btn--secondary,
+.cp-floating-tray .cp-btn--ghost:hover:not([disabled]),
+.cp-floating-tray .cp-select-trigger {
+  background: var(--fill-3);
+}
+.cp-floating-tray .cp-btn.cp-btn--danger {
+  padding-left: 11px;
+  background: color-mix(in oklab, var(--err) 20%, var(--pop));
+  color: var(--err-text);
+}
+/* What changes the selection, then what acts on it. */
+.cp-floating-tray .cp-btn--ghost + .cp-btn:not(.cp-btn--ghost) {
+  margin-left: 6px;
+}
+/* A soft destructive action carries a plain icon, not a socket. */
+.cp-floating-tray .cp-btn--danger > svg:first-child {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  padding: 0;
+  background: none;
+  stroke-width: 2;
+}
 .cp-floating-tray-label {
-  padding: 0 10px;
-  font-size: 13px;
-  font-weight: 700;
+  padding: 0 8px 0 14px;
+  font-size: 12.5px;
+  font-weight: 650;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-
-.cp-floating-tray-divider {
-  width: 1px;
-  height: 24px;
-  margin: 0 2px;
-  background: var(--line);
-  flex: 0 0 auto;
-}
-
 .cp-floating-tray-reserve {
   flex: 0 0 auto;
   width: 100%;
   pointer-events: none;
   animation: none !important;
 }
-
 @media (max-width: 820px) {
   .cp-floating-tray {
     flex-wrap: wrap;

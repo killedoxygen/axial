@@ -14,7 +14,7 @@ import {
   benchmarkSuiteDriverResponse,
   benchmarkSuiteDriversResponse,
 } from '../../dto-performance';
-import { Button, Pill } from '../../ui/Atoms';
+import { Button, Chip } from '../../ui/Atoms';
 import { SelectField } from '../../ui/Select';
 import { errMessage } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
@@ -272,15 +272,15 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
   const rows = driversState.data;
 
   return (
-    <div class="cp-settings-driver-history" aria-live="polite">
-      <div class="cp-settings-driver-history-head">
-        <div class="cp-settings-rule-status-copy">
+    <div class="cp-lab-block" aria-live="polite">
+      <div class="cp-lab-head">
+        <div class="cp-lab-title">
           <strong>Benchmark drivers</strong>
           <span>Recent background suite drivers for local benchmark runs.</span>
         </div>
-        <div class="cp-settings-driver-actions">
-          {driversState.status === 'loading' && <span class="cp-settings-proof-muted">Loading</span>}
-          {driversState.status === 'error' && <span class="cp-settings-proof-error">Unavailable</span>}
+        <div class="cp-lab-status">
+          {driversState.status === 'loading' && <Chip>Loading</Chip>}
+          {driversState.status === 'error' && <Chip tone="err">Unavailable</Chip>}
           <Button
             variant="secondary"
             size="sm"
@@ -293,8 +293,8 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
         </div>
       </div>
 
-      <div class="cp-settings-driver-start">
-        <label class="cp-settings-driver-start-field cp-settings-driver-start-field--instance">
+      <div class="cp-lab-driver-start">
+        <label class="cp-lab-driver-start-field cp-lab-driver-start-field--instance">
           <span>Instance</span>
           <SelectField
             value={startInstanceId}
@@ -314,7 +314,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
             }
           />
         </label>
-        <label class="cp-settings-driver-start-field cp-settings-driver-start-field--mode">
+        <label class="cp-lab-driver-start-field cp-lab-driver-start-field--mode">
           <span>Suite mode</span>
           <SelectField
             value={startSuiteMode}
@@ -324,12 +324,9 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
             options={suiteModes.map((mode) => ({ value: mode, label: labelFromToken(mode, mode) }))}
           />
         </label>
-        <label
-          class="cp-settings-driver-start-field cp-settings-driver-start-field--interval"
-          data-invalid={showIntervalError ? 'true' : 'false'}
-        >
+        <label class="cp-lab-driver-start-field cp-lab-driver-start-field--interval">
           <span>Interval</span>
-          <div class="cp-settings-driver-interval-input">
+          <div class="cp-field" aria-invalid={showIntervalError || undefined}>
             <input
               type="number"
               min={BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS}
@@ -343,7 +340,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
               onInput={(event) => setIntervalSeconds((event.currentTarget as HTMLInputElement).value)}
               onBlur={normalizeIntervalSeconds}
             />
-            <span>s</span>
+            <span class="cp-unit">s</span>
           </div>
         </label>
         <Button size="sm" icon="play" sound="affirm" disabled={!canStartDriver} onClick={() => void startDriver()}>
@@ -351,24 +348,24 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
         </Button>
       </div>
       {showIntervalError && (
-        <div class="cp-settings-driver-start-error">
+        <div class="cp-lab-driver-start-error">
           Interval must be {BENCHMARK_SUITE_DRIVER_MIN_INTERVAL_SECONDS}-{BENCHMARK_SUITE_DRIVER_MAX_INTERVAL_SECONDS}{' '}
           seconds.
         </div>
       )}
 
       {driversState.status === 'error' && rows.length === 0 && (
-        <div class="cp-settings-proof-empty">Benchmark driver status is unavailable. {driversState.error}</div>
+        <div class="cp-lab-note">Benchmark driver status is unavailable. {driversState.error}</div>
       )}
 
       {driversState.status !== 'error' && rows.length === 0 && (
-        <div class="cp-settings-proof-empty">
+        <div class="cp-lab-note">
           {driversState.status === 'loading' ? 'Checking recent benchmark drivers.' : 'No recent benchmark drivers.'}
         </div>
       )}
 
       {rows.length > 0 && (
-        <div class="cp-settings-driver-list">
+        <div class="cp-lab-list">
           {rows.map((row) => {
             const driver = row.driver;
             const suite = row.suite;
@@ -386,20 +383,20 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
             const resuming = resumingIds.has(driver.id);
 
             return (
-              <div class="cp-settings-driver-row" key={driver.id}>
-                <div class="cp-settings-driver-main">
-                  <Pill tone={row.view_model.state_tone}>{row.view_model.state_label}</Pill>
-                  <div class="cp-settings-driver-title">
+              <div class="cp-lab-driver-row" key={driver.id}>
+                <div class="cp-lab-main">
+                  <Chip tone={row.view_model.state_tone}>{row.view_model.state_label}</Chip>
+                  <div class="cp-lab-name">
                     <strong title={suiteId}>{suiteId}</strong>
                     <span>{labelFromToken(mode, 'Unknown mode')}</span>
                   </div>
                 </div>
-                <div class="cp-settings-driver-meta">
+                <div class="cp-lab-meta">
                   <span>{suiteProgressLabel(suite)}</span>
                   <span>{pendingRunLabel(suite)}</span>
                   <span>{driverUpdatedLabel(driver)}</span>
                 </div>
-                <div class="cp-settings-driver-sessions">
+                <div class="cp-lab-driver-sessions">
                   {driver.active_session_id && (
                     <span title={driver.active_session_id}>Active {compactId(driver.active_session_id)}</span>
                   )}
@@ -408,7 +405,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
                   )}
                   {!driver.active_session_id && !driver.last_session_id && <span>No session yet</span>}
                 </div>
-                <div class="cp-settings-driver-control">
+                <div class="cp-lab-driver-control">
                   {canCheckQualification && (
                     <Button
                       variant="secondary"
@@ -444,24 +441,24 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
                   )}
                 </div>
                 {checkState && (
-                  <div class="cp-settings-driver-qualification">
+                  <div class="cp-lab-driver-qualification">
                     {checkState.status === 'loading' && (
                       <>
-                        <Pill tone="info">Checking</Pill>
+                        <Chip tone="info">Checking</Chip>
                         <span>Reading Family C suite evidence.</span>
                       </>
                     )}
                     {checkState.status === 'error' && (
                       <>
-                        <Pill tone="err">Unavailable</Pill>
+                        <Chip tone="err">Unavailable</Chip>
                         <span>{checkState.error}</span>
                       </>
                     )}
                     {checkState.status === 'ready' && (
                       <>
-                        <Pill tone={checkState.data.view_model.status_tone}>
+                        <Chip tone={checkState.data.view_model.status_tone}>
                           {checkState.data.view_model.status_label}
-                        </Pill>
+                        </Chip>
                         <span>{checkState.data.view_model.missing_summary}</span>
                         <span>{checkState.data.view_model.suite_summary}</span>
                         <span>{checkState.data.view_model.evidence_summary}</span>
@@ -476,7 +473,7 @@ export function BenchmarkSuiteDriversBlock({ matrixState }: { matrixState: Bench
       )}
 
       {driversState.status === 'error' && rows.length > 0 && (
-        <div class="cp-settings-proof-note">Could not refresh benchmark drivers. Showing the last loaded rows.</div>
+        <div class="cp-lab-note">Could not refresh benchmark drivers. Showing the last loaded rows.</div>
       )}
     </div>
   );

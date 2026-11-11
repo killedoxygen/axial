@@ -1,8 +1,7 @@
 import type { JSX } from 'preact';
 import { contentRevision } from '../../../content-activity';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Icon } from '../../../ui/Icons';
-import { Button, Input } from '../../../ui/Atoms';
+import { Button, Empty, IconButton, Input } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionTray } from '../../../ui/SelectionActionTray';
@@ -16,12 +15,13 @@ import { openInstanceFolder } from '../instance-actions';
 import { ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
 import {
   ContentRow,
+  UpdateAll,
   compareContentRows,
   contentRowMatches,
   fileDisplayName,
   type ContentRowView,
 } from '../components/content-row';
-import { PackOrigin, packMembership } from '../components/pack-origin';
+import { packMembership } from '../components/pack-origin';
 import { useModImport } from '../components/mod-import';
 import { resourceMutationState } from '../bulk-actions';
 import {
@@ -113,13 +113,12 @@ export function ModsPane({
       key: mod.name,
       title: entry?.title ?? details?.title ?? fileDisplayName(mod.name),
       fileName: mod.name,
-      details: [details?.version, details?.authors.join(', ')].filter((text): text is string => Boolean(text)),
+      version: details?.version,
+      details: details?.authors.length ? [details.authors.join(', ')] : [],
       iconUrl: details?.icon ? modIconUrl(inst.id, mod.name) : undefined,
       fallbackIcon: 'puzzle',
-      managed: Boolean(entry),
       pack: membership.get(`mods/${modBaseName(mod.name)}`),
       enabled: mod.enabled,
-      size: mod.size,
       update: update && {
         version: update.latest_version_number,
         disabled: busy,
@@ -133,7 +132,11 @@ export function ModsPane({
   const membership = useMemo(() => packMembership(packs), [packs]);
   const rows = mods
     .map((mod) => ({ mod, view: modRow(mod) }))
-    .sort((left, right) => compareContentRows(left.view, right.view));
+    .sort(
+      (left, right) =>
+        Number(Boolean(right.view.update)) - Number(Boolean(left.view.update)) ||
+        compareContentRows(left.view, right.view),
+    );
   const filteredRows = rows.filter(
     ({ mod, view }) =>
       contentRowMatches(view, q) && (filter === 'all' || (filter === 'enabled' ? mod.enabled : !mod.enabled)),
@@ -155,28 +158,20 @@ export function ModsPane({
     refreshAll();
   };
 
+  const empty = resources.status === 'ready' && mods.length === 0;
+  const browse = (): void => navigate({ name: 'discover', target: inst.id });
+
   return (
     <div
-      class="cp-instance-body"
+      class="cp-pane"
       ref={dropSurfaceRef}
       data-drop-state={modImport.dropActive ? 'active' : 'idle'}
       {...modImport.dropHandlers}
     >
       {modImport.input}
-      <div class="cp-resource-toolbar">
-        <div>
-          <strong>
-            {mods.length} mod{mods.length === 1 ? '' : 's'}
-          </strong>
-          <Input
-            value={q}
-            onChange={setQ}
-            placeholder="Filter mods…"
-            icon="search"
-            style={{ width: 200, height: 30 }}
-          />
-        </div>
-        <div>
+      {!empty && (
+        <div class="cp-pane-bar">
+          <Input value={q} onChange={setQ} placeholder="Search mods" icon="search" />
           <SelectField
             value={filter}
             onChange={setFilter}
@@ -186,45 +181,27 @@ export function ModsPane({
               { value: 'disabled', label: 'Disabled' },
             ]}
             ariaLabel="Filter mods by state"
-            width={116}
           />
-          <Button variant="secondary" size="sm" icon="refresh" onClick={refreshAll}>
-            Refresh
-          </Button>
-          <Button variant="secondary" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'mods')}>
-            Open folder
-          </Button>
-          <Button variant="secondary" size="sm" icon="plus" disabled={modImport.busy} onClick={modImport.pick}>
-            Add jar files
-          </Button>
-          <Button
-            variant="soft"
-            size="sm"
-            icon="compass"
-            onClick={() => navigate({ name: 'discover', target: inst.id })}
-          >
-            Add content
-          </Button>
-        </div>
-      </div>
-      <PackOrigin packs={packs} instanceId={inst.id} />
-      {pendingUpdates.length > 0 && (
-        <div class="cp-mods-updates" role="status">
-          <Icon name="arrow-up" size={14} color="var(--accent)" />
-          <span>
-            {pendingUpdates.length} update{pendingUpdates.length === 1 ? '' : 's'} available
-            {packKept > 0 &&
-              `. ${bulkUpdates.length === 0 ? (packKept === 1 ? 'It' : 'All') : packKept} came with ${packTitle} and ${
-                packKept === 1 ? 'stays' : 'stay'
-              } with it`}
-          </span>
           {bulkUpdates.length > 0 && (
-            <span class="cp-mods-updates-action">
-              <Button size="sm" disabled={busy} onClick={() => void applyModUpdates(inst, bulkUpdates)}>
-                {packKept > 0 ? `Update ${bulkUpdates.length}` : 'Update all'}
-              </Button>
-            </span>
+            <UpdateAll
+              count={bulkUpdates.length}
+              noun="mod"
+              note={
+                packKept > 0
+                  ? `${packKept} more came with ${packTitle} and ${packKept === 1 ? 'stays' : 'stay'} with it`
+                  : undefined
+              }
+              disabled={busy}
+              onClick={() => void applyModUpdates(inst, bulkUpdates)}
+            />
           )}
+          <span class="cp-head-fill" />
+          <IconButton icon="refresh" tooltip="Refresh" onClick={refreshAll} />
+          <IconButton icon="folder" tooltip="Open folder" onClick={() => void openInstanceFolder(inst.id, 'mods')} />
+          <IconButton icon="archive" tooltip="Add jar files" disabled={modImport.busy} onClick={modImport.pick} />
+          <Button variant="soft" icon="plus" onClick={browse}>
+            Add mods
+          </Button>
         </div>
       )}
       <ResourceStatus state={resources} onRetry={onRefresh} />
@@ -234,30 +211,29 @@ export function ModsPane({
           {provenanceError || provenance?.updateError}
         </div>
       ) : null}
-      <div class="cp-content-list" data-drop-state={modImport.dropActive ? 'active' : 'idle'}>
-        {resources.status === 'ready' && filteredRows.length === 0 ? (
-          <div class="cp-mods-empty-row">
-            <strong>{mods.length === 0 ? 'No mods installed in this instance' : 'No mods match this filter'}</strong>
-            {mods.length === 0 ? (
-              <>
-                {modImport.dropActive
-                  ? 'Drop to add.'
-                  : `Browse Discover to add mods that fit ${inst.version_display.summary_label}, or add jar files from your computer.`}
-                <div class="cp-mods-empty-actions">
-                  <Button size="sm" icon="compass" onClick={() => navigate({ name: 'discover', target: inst.id })}>
-                    Browse Discover
-                  </Button>
-                  <Button variant="secondary" size="sm" icon="plus" disabled={modImport.busy} onClick={modImport.pick}>
-                    Add jar files
-                  </Button>
-                </div>
-              </>
-            ) : (
-              'Try a different filter.'
-            )}
-          </div>
-        ) : (
-          filteredRows.map(({ mod, view }) => (
+      {empty ? (
+        <Empty
+          title="No mods installed in this instance"
+          actions={
+            <>
+              <Button variant="secondary" icon="compass" onClick={browse}>
+                Browse Discover
+              </Button>
+              <Button variant="secondary" icon="archive" disabled={modImport.busy} onClick={modImport.pick}>
+                Add jar files
+              </Button>
+            </>
+          }
+        >
+          {modImport.dropActive
+            ? 'Drop to add.'
+            : `Browse Discover to add mods that fit ${inst.version_display.summary_label}, or add jar files from your computer.`}
+        </Empty>
+      ) : resources.status === 'ready' && filteredRows.length === 0 ? (
+        <Empty title="No mods match this filter">Try a different filter.</Empty>
+      ) : (
+        <div class="cp-entries">
+          {filteredRows.map(({ mod, view }) => (
             <ContentRow
               key={mod.name}
               view={view}
@@ -270,9 +246,9 @@ export function ModsPane({
                 )
               }
             />
-          ))
-        )}
-      </div>
+          ))}
+        </div>
+      )}
       <SelectionActionTray
         selection={selection}
         itemLabel="mod"

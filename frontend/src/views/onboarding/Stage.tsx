@@ -28,7 +28,6 @@ export function Stage({ player }: { player: Player | null }): JSX.Element {
         side="front"
         showOuterLayers
         fitPadding={FIT}
-        showHint={false}
       />
     </aside>
   );

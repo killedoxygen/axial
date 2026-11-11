@@ -1,0 +1,28 @@
+/* World art has no frame. It is anchored to the panel's top-right corner, most of the panel wide, and thins out
+   leftwards under the text and downwards into the page. */
+.cp-vista {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 88%;
+  aspect-ratio: 2.3;
+  opacity: 0;
+  -webkit-mask-image:
+    linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.35) 26%, #000 58%),
+    linear-gradient(to bottom, #000 48%, transparent 96%);
+  mask-image:
+    linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.35) 26%, #000 58%),
+    linear-gradient(to bottom, #000 48%, transparent 96%);
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
+  transition: opacity 600ms ease;
+  pointer-events: none;
+}
+.cp-vista[data-ready='true'] {
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-vista {
+    transition: none;
+  }
+}

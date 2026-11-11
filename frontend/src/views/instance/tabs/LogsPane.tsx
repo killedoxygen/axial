@@ -1,8 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import { Button, Pill } from '../../../ui/Atoms';
+import { Button, Chip, Empty, IconButton } from '../../../ui/Atoms';
+import { Segmented } from '../../../ui/Segmented';
 import { SelectField } from '../../../ui/Select';
-import { Icon } from '../../../ui/Icons';
 import { formatBytes, fmtRelative } from '../../../format';
 import { errMessage } from '../../../utils';
 import { launchSessions } from '../../../store';
@@ -20,7 +20,7 @@ import {
 } from '../logs';
 import type { LogFilter } from '../logs';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceEmpty, ResourceStatus } from '../components/resource-bits';
+import { ResourceStatus } from '../components/resource-bits';
 import { LogLines } from '../components/log-line';
 
 type LogsPaneProps = {
@@ -100,104 +100,87 @@ function InstanceLogsPane({ inst, resources, processLive, onRefresh }: LogsPaneP
     };
   }, [inst.id, isLive, selected, selectedIsCompressedArchive, refreshRevision, sessionId, sessionSelected]);
 
+  const empty = !sessionLog && logs.length === 0 && resources.status === 'ready';
+  const openFolder = (): void => void openInstanceFolder(inst.id, 'logs');
+
   return (
-    <div class="cp-instance-body cp-logs-pane">
-      <div class="cp-resource-toolbar cp-logs-toolbar">
-        <strong>Logs</strong>
-        <div class="cp-logs-tools">
-          <div class="cp-mini-seg" role="tablist" aria-label="Filter log lines">
-            {(Object.keys(LOG_FILTER_LABELS) as LogFilter[]).map((item) => (
-              <button
-                key={item}
-                type="button"
-                role="tab"
-                aria-selected={filter === item}
-                data-active={filter === item}
-                onClick={() => setFilter(item)}
-              >
-                {LOG_FILTER_LABELS[item]}
-              </button>
-            ))}
-          </div>
-          <Button variant="secondary" size="sm" icon="refresh" onClick={refresh}>
-            Refresh
-          </Button>
-          <Button variant="secondary" size="sm" icon="folder" onClick={() => void openInstanceFolder(inst.id, 'logs')}>
-            Open folder
-          </Button>
-        </div>
-      </div>
-      {!sessionSelected && <ResourceStatus state={resources} onRetry={refresh} />}
-      {!sessionLog && logs.length === 0 && resources.status === 'ready' ? (
-        <ResourceEmpty
-          icon="terminal"
-          title="No logs yet"
-          hint="Launch this instance and Minecraft log files will appear here."
-        />
-      ) : (
-        <div class="cp-logview">
-          <div class="cp-logview-bar">
-            <div class="cp-logview-pick">
-              <Icon name="terminal" size={14} color="var(--text-mute)" />
-              <SelectField
-                value={selected}
-                onChange={setSelected}
-                ariaLabel="Log file"
-                width={260}
-                options={[
-                  ...(sessionLog ? [{ value: sessionLog, label: 'Session output' }] : []),
-                  ...sortedLogs.map((log) => ({
-                    value: log.name,
-                    label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
-                  })),
-                ]}
-              />
-              {isLive && (
-                <Pill tone="accent" icon="play">
-                  Live
-                </Pill>
-              )}
-            </div>
-            {selectedEntry && (
-              <span class="cp-logview-meta">
-                {formatBytes(selectedEntry.size)}, {fmtRelative(selectedEntry.modified_at)}
-              </span>
-            )}
-          </div>
-          <div class="cp-logview-body">
-            {selectedIsCompressedArchive && (
-              <div class="cp-logview-note">
-                This is a compressed log archive. Axial cannot preview .log.gz files here; use Open folder to extract
-                it, or select an uncompressed .log file.
-              </div>
-            )}
-            {!selectedIsCompressedArchive && currentTail.status === 'loading' && (
-              <div class="cp-logview-note">Loading log…</div>
-            )}
-            {!selectedIsCompressedArchive && currentTail.status === 'error' && (
-              <div class="cp-logview-note cp-logview-note--error">{currentTail.error}</div>
-            )}
-            {!selectedIsCompressedArchive && currentTail.status === 'ready' && (
-              <>
-                {currentTail.data?.truncated && (
-                  <div class="cp-logview-truncated">
-                    {sessionSelected ? (
-                      'Some session output was truncated.'
-                    ) : (
-                      <>Showing the last {formatBytes(Math.min(currentTail.data.size ?? 0, 128 * 1024))} of this log.</>
-                    )}
-                  </div>
-                )}
-                {sessionSelected && !currentTail.data?.text ? (
-                  <div class="cp-log-empty">No session output yet.</div>
-                ) : (
-                  <LogLines text={currentTail.data?.text ?? ''} filter={filter} />
-                )}
-              </>
-            )}
-          </div>
+    <div class="cp-pane">
+      {!empty && (
+        <div class="cp-pane-bar">
+          <SelectField
+            value={selected}
+            onChange={setSelected}
+            ariaLabel="Log file"
+            options={[
+              ...(sessionLog ? [{ value: sessionLog, label: 'Session output' }] : []),
+              ...sortedLogs.map((log) => ({
+                value: log.name,
+                label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
+              })),
+            ]}
+          />
+          {isLive && (
+            <Chip tone="accent" icon="play">
+              Live
+            </Chip>
+          )}
+          <Segmented<LogFilter>
+            role="tablist"
+            ariaLabel="Filter log lines"
+            value={filter}
+            onChange={setFilter}
+            options={(Object.keys(LOG_FILTER_LABELS) as LogFilter[]).map((item) => ({
+              value: item,
+              label: LOG_FILTER_LABELS[item],
+            }))}
+          />
+          <span class="cp-head-fill" />
+          {selectedEntry && (
+            <Chip tone="bare">
+              {formatBytes(selectedEntry.size)}, {fmtRelative(selectedEntry.modified_at)}
+            </Chip>
+          )}
+          <IconButton icon="refresh" tooltip="Refresh" onClick={refresh} />
+          <IconButton icon="folder" tooltip="Open folder" onClick={openFolder} />
         </div>
       )}
+      {!sessionSelected && <ResourceStatus state={resources} onRetry={refresh} />}
+      {empty ? (
+        <Empty
+          title="No logs yet"
+          actions={
+            <Button variant="secondary" icon="folder" onClick={openFolder}>
+              Open folder
+            </Button>
+          }
+        >
+          Launch this instance and Minecraft log files will appear here.
+        </Empty>
+      ) : selectedIsCompressedArchive ? (
+        <div class="cp-resource-note">
+          This is a compressed log archive. Axial cannot preview .log.gz files here; use Open folder to extract it, or
+          select an uncompressed .log file.
+        </div>
+      ) : currentTail.status === 'loading' ? (
+        <div class="cp-resource-note">Loading log…</div>
+      ) : currentTail.status === 'error' ? (
+        <div class="cp-resource-note cp-resource-note--error">{currentTail.error}</div>
+      ) : currentTail.status === 'ready' ? (
+        <>
+          {currentTail.data?.truncated && (
+            <div class="cp-resource-note">
+              {sessionSelected
+                ? 'Some session output was truncated.'
+                : `Showing the last ${formatBytes(Math.min(currentTail.data.size ?? 0, 128 * 1024))} of this log.`}
+            </div>
+          )}
+          {sessionSelected && !currentTail.data?.text ? (
+            <div class="cp-resource-note">No session output yet.</div>
+          ) : (
+            <LogLines text={currentTail.data?.text ?? ''} filter={filter} />
+          )}
+        </>
+      ) : null}
     </div>
   );
 }

@@ -1,14 +1,15 @@
 import type { JSX } from 'preact';
-import { Icon, type IconName } from './Icons';
+import { IconButton } from './Atoms';
+import { Face, type Eyes, type FaceTone } from './Face';
 import { toasts } from '../store';
 import { showOnboardingOverlay } from '../ui-state';
 import { dismissToast } from '../toast';
 import type { ToastKind } from '../types-ui';
 
-const ICON_FOR: Record<ToastKind, IconName> = {
-  success: 'check',
-  error: 'alert',
-  info: 'info',
+const FACE_FOR: Record<ToastKind, { eyes: Eyes; tone?: FaceTone }> = {
+  success: { eyes: 'happy' },
+  error: { eyes: 'x', tone: 'err' },
+  info: { eyes: 'open' },
 };
 
 export function ToastHost(): JSX.Element | null {
@@ -17,25 +18,15 @@ export function ToastHost(): JSX.Element | null {
   const list = toasts.value;
   return (
     <div class="cp-toasts" role="region" aria-live="polite" aria-label="Notifications">
-      {list.map((t) => {
-        const kind = t.type;
-        return (
-          <div key={t.id} class={`cp-toast cp-toast--${kind}`} role="status">
-            <span class="cp-toast-icon">
-              <Icon name={ICON_FOR[kind]} size={14} stroke={2.2} />
-            </span>
-            <span class="cp-toast-msg">{t.message}</span>
-            <button
-              class="cp-toast-close"
-              aria-label="Dismiss"
-              onClick={() => dismissToast(t.id)}
-              data-sound-silent="true"
-            >
-              <Icon name="x" size={12} stroke={2} />
-            </button>
-          </div>
-        );
-      })}
+      {list.map((t) => (
+        <div key={t.id} class="cp-toast cp-pop" role="status">
+          <Face {...FACE_FOR[t.type]} />
+          <span class="cp-toast-msg" title={t.message}>
+            {t.message}
+          </span>
+          <IconButton icon="x" size={28} tooltip="Dismiss" onClick={() => dismissToast(t.id)} />
+        </div>
+      ))}
     </div>
   );
 }

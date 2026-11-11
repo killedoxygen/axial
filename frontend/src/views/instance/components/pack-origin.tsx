@@ -1,4 +1,5 @@
-import { Fragment, type JSX } from 'preact';
+import type { JSX } from 'preact';
+import { Chip } from '../../../ui/Atoms';
 import { Icon } from '../../../ui/Icons';
 import { navigate } from '../../../ui-state';
 import type { InstanceContentPack } from '../../../types-content';
@@ -17,37 +18,28 @@ export function packLabel(pack: InstanceContentPack): string {
   return pack.version_number ? `${title} ${pack.version_number}` : title;
 }
 
-/** Names the modpack an instance was installed from, linking packs that have a Modrinth page. */
-export function PackOrigin({
-  packs,
-  instanceId,
-}: {
-  packs: InstanceContentPack[];
-  instanceId: string;
-}): JSX.Element | null {
-  if (packs.length === 0) return null;
+/** The modpacks an instance was installed from, as chips; a pack with a Modrinth page opens it. */
+export function PackChips({ packs, instanceId }: { packs: InstanceContentPack[]; instanceId: string }): JSX.Element {
   return (
-    <div class="cp-pack-origin">
-      <Icon name="stack" size={14} />
-      <span>
-        Installed from{' '}
-        {packs.map((pack, index) => (
-          <Fragment key={pack.canonical_id}>
-            {index > 0 && ', '}
-            {pack.provider === 'local' ? (
-              packLabel(pack)
-            ) : (
-              <button
-                type="button"
-                class="cp-pack-origin-link"
-                onClick={() => navigate({ name: 'content', id: pack.canonical_id, target: instanceId })}
-              >
-                {packLabel(pack)}
-              </button>
-            )}
-          </Fragment>
-        ))}
-      </span>
-    </div>
+    <>
+      {packs.map((pack) =>
+        pack.provider === 'local' ? (
+          <Chip key={pack.canonical_id} icon="stack" title={`Installed from ${packLabel(pack)}`}>
+            {packLabel(pack)}
+          </Chip>
+        ) : (
+          <button
+            key={pack.canonical_id}
+            type="button"
+            class="cp-chip cp-pack-chip"
+            title={`Installed from ${packLabel(pack)}`}
+            onClick={() => navigate({ name: 'content', id: pack.canonical_id, target: instanceId })}
+          >
+            <Icon name="stack" size={11} />
+            {packLabel(pack)}
+          </button>
+        ),
+      )}
+    </>
   );
 }

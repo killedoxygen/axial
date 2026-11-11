@@ -1,33 +1,30 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button } from '../../ui/Atoms';
-import { Segmented } from '../../ui/Segmented';
-import { ColorField } from './ColorField';
+import { Slider } from '../../ui/Slider';
+import { ThemeTiles } from '../../ui/SettingsSheet';
 import { applyTheme, resetThemeToDefault } from '../../theme';
 import { defaults, local, PRESET_HUES } from '../../state';
-import { Sound, playSliderSound } from '../../sound';
+import { Sound } from '../../sound';
 import { useTheme } from '../../hooks/use-theme';
 
-export function AccentModeToggle({ onChange }: { onChange?: (mode: 'dark' | 'light') => void }): JSX.Element {
-  const theme = useTheme();
-  const mode = theme.dark ? 'dark' : 'light';
+type Mode = 'dark' | 'light';
 
-  const applyMode = (next: 'dark' | 'light'): void => {
-    applyTheme(local.theme || 'custom', local.customHue, {
-      vibrancy: local.customVibrancy,
-      lightness: next === 'light' ? 60 : 0,
-    });
-    onChange?.(next);
-  };
-
+export function ThemeChoice(): JSX.Element {
+  const mode: Mode = useTheme().dark ? 'dark' : 'light';
   return (
-    <Segmented<'dark' | 'light'>
+    <ThemeTiles<Mode>
       value={mode}
-      onChange={applyMode}
       ariaLabel="Theme mode"
+      onChange={(next) =>
+        applyTheme(local.theme || 'custom', local.customHue, {
+          vibrancy: local.customVibrancy,
+          lightness: next === 'light' ? 60 : 0,
+        })
+      }
       options={[
         { value: 'dark', label: 'Dark' },
-        { value: 'light', label: 'Light', disabled: true, title: 'Light mode is in development' },
+        { value: 'light', label: 'Light', disabledReason: 'In development' },
       ]}
     />
   );
@@ -36,13 +33,12 @@ export function AccentModeToggle({ onChange }: { onChange?: (mode: 'dark' | 'lig
 export function AccentField({
   compact = false,
 }: {
-  /** A shorter field with presets only, for onboarding. */
+  /** Without Reset, for onboarding. */
   compact?: boolean;
 } = {}): JSX.Element {
   const initialHue = PRESET_HUES[local.theme] ?? local.customHue;
   const [hue, setHue] = useState<number>(initialHue);
-  const [vibrancy, setVibrancy] = useState<number>(local.customVibrancy);
-  const latest = useRef({ hue: initialHue, vibrancy: local.customVibrancy });
+  const latest = useRef(initialHue);
   const previewFrame = useRef<number | null>(null);
 
   useEffect(() => {
@@ -55,11 +51,9 @@ export function AccentField({
     if (previewFrame.current != null) return;
     previewFrame.current = requestAnimationFrame(() => {
       previewFrame.current = null;
-      const { hue: nextHue, vibrancy: nextVibrancy } = latest.current;
-      setHue(nextHue);
-      setVibrancy(nextVibrancy);
-      applyTheme('custom', nextHue, {
-        vibrancy: nextVibrancy,
+      setHue(latest.current);
+      applyTheme('custom', latest.current, {
+        vibrancy: local.customVibrancy,
         lightness: local.lightness,
         silent: true,
         transient: true,
@@ -70,23 +64,19 @@ export function AccentField({
   const applyPreset = (id: string): void => {
     const h = PRESET_HUES[id];
     if (h == null) return;
-    const nextVibrancy = local.customVibrancy;
-    latest.current = { hue: h, vibrancy: nextVibrancy };
+    latest.current = h;
     setHue(h);
-    setVibrancy(nextVibrancy);
-    applyTheme(id, null, { vibrancy: nextVibrancy, lightness: local.lightness });
+    applyTheme(id, null, { vibrancy: local.customVibrancy, lightness: local.lightness });
   };
 
   const resetToDefault = (): void => {
-    latest.current = { hue: defaults.customHue, vibrancy: defaults.customVibrancy };
+    latest.current = defaults.customHue;
     setHue(defaults.customHue);
-    setVibrancy(defaults.customVibrancy);
     resetThemeToDefault();
   };
 
-  const onDrag = (h: number, v: number): void => {
-    latest.current = { hue: h, vibrancy: v };
-    playSliderSound(h / 360, 'hue');
+  const onDrag = (h: number): void => {
+    latest.current = h;
     schedulePreview();
   };
 
@@ -95,58 +85,42 @@ export function AccentField({
       cancelAnimationFrame(previewFrame.current);
       previewFrame.current = null;
     }
-    const { hue: nextHue, vibrancy: nextVibrancy } = latest.current;
-    setHue(nextHue);
-    setVibrancy(nextVibrancy);
+    setHue(latest.current);
     Sound.ui('theme');
-    applyTheme('custom', nextHue, { vibrancy: nextVibrancy, lightness: local.lightness });
+    applyTheme('custom', latest.current, { vibrancy: local.customVibrancy, lightness: local.lightness });
   };
 
   return (
-    <div class="cp-accent-pane">
-      <div class="cp-accent-field">
-        <ColorField hue={hue} vibrancy={vibrancy} height={compact ? 104 : 140} onChange={onDrag} onEnd={onEnd} />
-      </div>
-      {!compact && (
-        <div class="cp-accent-readout">
-          <div
-            class="cp-accent-chip"
-            style={{ background: `oklch(0.78 ${(vibrancy / 100) * 0.14} ${hue})` }}
-            aria-hidden="true"
+    <div class="cp-accent">
+      <div class="cp-accent-presets" role="group" aria-label="Accent presets">
+        {Object.entries(PRESET_HUES).map(([id, h]) => (
+          <button
+            key={id}
+            type="button"
+            class="cp-swatch"
+            data-active={local.theme === id}
+            aria-label={id}
+            title={id}
+            style={{ ['--hue' as string]: h }}
+            onClick={() => applyPreset(id)}
           />
-          <div class="cp-accent-readout-labels">
-            <span>
-              hue <strong>{hue}°</strong>
-            </span>
-            <span>
-              chroma <strong>{vibrancy}%</strong>
-            </span>
-          </div>
-        </div>
-      )}
-      <div class="cp-accent-presets">
-        <div class="cp-swatch-row" role="group" aria-label="Accent presets">
-          {Object.entries(PRESET_HUES).map(([id, h]) => {
-            const active = local.theme === id;
-            return (
-              <button
-                key={id}
-                class="cp-swatch"
-                data-active={active}
-                aria-label={id}
-                title={id}
-                style={{ background: `oklch(0.78 0.14 ${h})`, color: `oklch(0.78 0.14 ${h})` }}
-                onClick={() => applyPreset(id)}
-              />
-            );
-          })}
-        </div>
-        {!compact && (
-          <Button variant="secondary" size="sm" icon="refresh" onClick={resetToDefault}>
-            Reset
-          </Button>
-        )}
+        ))}
       </div>
+      <Slider
+        class="cp-hue"
+        value={hue}
+        min={0}
+        max={360}
+        sound="hue"
+        ariaLabel="Accent hue"
+        onChange={onDrag}
+        onCommit={onEnd}
+      />
+      {!compact && (
+        <Button variant="ghost" onClick={resetToDefault}>
+          Reset
+        </Button>
+      )}
     </div>
   );
 }

@@ -1,0 +1,81 @@
+/* The app update card hangs 8px under the top bar's Update button, right edges together. */
+.cp-update-card {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 60;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 272px;
+  padding: 14px;
+  transform-origin: top right;
+  animation: cp-update-card-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cp-update-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 20px;
+}
+.cp-update-card-head > .cp-ring {
+  flex: none;
+  margin-right: -2px;
+  color: var(--accent);
+}
+.cp-update-card-head strong {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  line-height: 18px;
+}
+.cp-update-card-id {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.cp-update-card-id span,
+.cp-update-progress-line {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 17px;
+  font-variant-numeric: tabular-nums;
+}
+.cp-update-card-id span[data-tone='error'] {
+  color: var(--err-text);
+}
+.cp-update-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cp-update-progress-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+/* The ghost labels, not their padding, meet the card's content edges. */
+.cp-update-card-links {
+  display: flex;
+  justify-content: space-between;
+  margin: -4px -11px -6px;
+}
+
+@keyframes cp-update-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-update-card {
+    animation: none;
+  }
+}

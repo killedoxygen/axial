@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import { computed, signal } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button, Input } from './Atoms';
+import { Face } from './Face';
 
 type DialogResult = boolean | string | null;
 type DialogButtonVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
@@ -251,13 +252,14 @@ export function DialogHost(): JSX.Element | null {
     >
       <div
         ref={dialogRef}
-        class={`cp-dialog${spec.kind === 'choice' ? ' cp-dialog--choice' : ''}`}
+        class={`cp-dialog cp-pop${spec.kind === 'choice' ? ' cp-dialog--choice' : ''}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={spec.title ? 'cp-dlg-title' : undefined}
       >
         {spec.title && (
           <h2 id="cp-dlg-title" class="cp-dialog-title">
+            {spec.destructive && <Face eyes="wide" tone="warn" />}
             {spec.title}
           </h2>
         )}

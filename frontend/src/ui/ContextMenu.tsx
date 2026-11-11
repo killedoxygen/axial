@@ -58,18 +58,18 @@ export function ContextMenuHost(): JSX.Element | null {
   const max = 240;
   const lowerBound = 8;
   const clampedX = Math.max(lowerBound, Math.min(spec.x, window.innerWidth - max - lowerBound));
-  const estimatedHeight = spec.items.reduce((height, item) => height + (item.divider ? 9 : 32), 16);
+  const estimatedHeight = spec.items.reduce((height, item) => height + (item.divider ? 6 : 30), 10);
   const clampedY = Math.max(lowerBound, Math.min(spec.y, window.innerHeight - estimatedHeight - lowerBound));
 
   return (
-    <div ref={ref} class="cp-ctx-host" style={{ left: clampedX, top: clampedY }} role="menu">
+    <div ref={ref} class="cp-ctx-host cp-pop cp-menu" style={{ left: clampedX, top: clampedY }} role="menu">
       {spec.items.map((it, i) =>
         it.divider ? (
-          <div key={i} class="cp-ctx-divider" />
+          <div key={i} class="cp-menu-gap" />
         ) : (
           <button
             key={i}
-            class={`cp-ctx-item${it.danger ? ' cp-ctx-item--danger' : ''}`}
+            class={`cp-menu-item${it.danger ? ' cp-menu-item--danger' : ''}`}
             role="menuitem"
             onClick={() => {
               closeContextMenu();

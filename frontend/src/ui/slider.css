@@ -13,7 +13,7 @@
   position: absolute;
   inset: 12px 0;
   height: 4px;
-  background: var(--surface-3);
+  background: var(--fill-2);
   border-radius: 999px;
   overflow: hidden;
 }
@@ -21,8 +21,7 @@
   position: absolute;
   inset: 0 auto 0 0;
   width: var(--slider-filled);
-  background: linear-gradient(90deg, var(--accent-strong), var(--accent));
-  opacity: 0.72;
+  background: var(--accent);
   border-radius: 999px;
   z-index: 2;
 }
@@ -38,8 +37,6 @@
 }
 .cp-slider-zone[data-tone='sweet'] {
   background: color-mix(in oklab, var(--accent) 28%, transparent);
-  border: 1px dashed var(--accent-line);
-  border-radius: 999px;
 }
 .cp-slider-zone[data-tone='high'] {
   background: color-mix(in oklab, #f6c85f 24%, transparent);
@@ -52,29 +49,23 @@
   top: 50%;
   left: var(--slider-filled);
   z-index: 3;
-  width: 18px;
-  height: 18px;
-  border-radius: 999px;
-  background: var(--accent-fill);
-  opacity: 1;
-  border: 2px solid var(--surface);
-  box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.3),
-    0 0 0 0 var(--accent-soft);
-  transform: translate(-50%, -50%);
-  transition:
-    box-shadow 140ms ease,
-    transform 80ms ease;
+  width: 14px;
+  height: 14px;
+  border-radius: 4.4px;
+  background: var(--text);
+  translate: -50% -50%;
+  transition: scale 120ms ease;
   pointer-events: none;
 }
-.cp-slider:hover .cp-slider-thumb,
-.cp-slider:focus-within .cp-slider-thumb {
-  box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.3),
-    0 0 0 4px var(--accent-soft);
+.cp-slider:hover .cp-slider-thumb {
+  scale: 1.14;
 }
 .cp-slider:active .cp-slider-thumb {
-  transform: translate(-50%, -50%) scale(0.96);
+  scale: 1.04;
+}
+.cp-slider:has(input:focus-visible) .cp-slider-thumb {
+  outline: 1.5px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .cp-slider > input[type='range'] {
@@ -107,8 +98,7 @@
   bottom: 0;
   left: var(--lo);
   right: calc(100% - var(--hi));
-  background: linear-gradient(90deg, var(--accent-strong), var(--accent));
-  opacity: 0.72;
+  background: var(--accent);
   border-radius: 999px;
   z-index: 2;
 }
@@ -133,29 +123,4 @@
 }
 .cp-rslider-thumb--hi {
   left: var(--hi);
-}
-
-.cp-slider-ticks {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 6px;
-  font-size: 10.5px;
-  color: var(--text-mute);
-  letter-spacing: 0;
-}
-.cp-slider-ticks button {
-  background: none;
-  border: none;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
-  padding: 0 2px;
-  transition: color 120ms;
-}
-.cp-slider-ticks button:hover {
-  color: var(--text);
-}
-.cp-slider-ticks button[data-active='true'] {
-  color: var(--accent);
-  font-weight: 700;
 }

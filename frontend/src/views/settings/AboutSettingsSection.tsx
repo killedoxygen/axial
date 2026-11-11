@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { Button } from '../../ui/Atoms';
+import { Button, Chip } from '../../ui/Atoms';
+import { Face } from '../../ui/Face';
 import { hasNativeDesktopRuntime, openExternalURL } from '../../native';
 import { appVersion, updateCheckState, updateInfo } from '../../store';
 import { toast } from '../../toast';
@@ -11,7 +12,6 @@ import {
   canInstallUpdateInApp,
   checkForUpdates,
   dismissAvailableUpdate,
-  formatUpdateCheckTime,
   hasVisibleUpdate,
   openUpdateAction,
   openUpdateChecksum,
@@ -44,6 +44,15 @@ function displayReleaseChannel(version: string): string {
   }
 }
 
+function checkedLabel(raw: string | undefined): string | undefined {
+  const stamp = Date.parse(raw || '');
+  if (Number.isNaN(stamp)) return undefined;
+  const at = new Date(stamp);
+  const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const day = at.toDateString() === new Date().toDateString() ? 'today' : at.toLocaleDateString();
+  return `Last checked ${day} at ${time}`;
+}
+
 async function openHomepage(): Promise<void> {
   try {
     await openExternalURL('https://github.com/killedoxygen/axial');
@@ -71,22 +80,21 @@ export function AboutSettingsSection(): JSX.Element {
     : restartRequired
       ? updateRestartRequested.value
         ? 'Restarting Axial...'
-        : 'Restart Axial before continuing.'
+        : 'Restart Axial before continuing'
       : flowStaged
         ? flowState.phase === 'restart-pending'
           ? updateRestartRequested.value
-            ? `Update installed. Axial is restarting into ${displayReleaseVersion(latestVersion)}.`
-            : `Update installed. Restart Axial when you are ready.`
-          : `${displayReleaseVersion(latestVersion)} is downloaded and ready to install.`
+            ? `Update installed. Axial is restarting into ${displayReleaseVersion(latestVersion)}`
+            : 'Update installed. Restart Axial when you are ready'
+          : `${displayReleaseVersion(latestVersion)} is downloaded and ready to install`
         : checking
           ? 'Checking for updates...'
           : info
             ? info.available
-              ? `${displayReleaseChannel(latestVersion)} update available: ${displayReleaseVersion(info.current_version)} → ${displayReleaseVersion(latestVersion)}`
-              : `Current release: ${displayReleaseVersion(info.current_version)}`
-            : 'Updates have not been checked yet.';
+              ? `${latestVersion.replace(/^[vV]/, '')} is available`
+              : 'Axial is up to date'
+            : 'Updates have not been checked yet';
   const visibleUpdate = hasVisibleUpdate() && !flowBusy && !flowStaged;
-  const checkedAt = info ? formatUpdateCheckTime(info.checked_at) : 'Not checked yet';
   const restartBlocked = restartBlockedByActivity();
   const restartRequested = updateRestartRequested.value;
 
@@ -97,77 +105,40 @@ export function AboutSettingsSection(): JSX.Element {
 
   return (
     <SettingsSection>
-      <SettingRow title="Axial" description={`Version ${appVersion.value}. A focused Minecraft launcher.`}>
-        <div style={{ color: 'var(--text-mute)', fontSize: 12 }}>Channel: {releaseChannel}</div>
-        <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <Button variant="secondary" icon="globe" onClick={() => void openHomepage()}>
-            Homepage
-          </Button>
-          <Button
-            variant="secondary"
-            icon="refresh"
-            disabled={checking}
-            onClick={() => void checkForUpdates({ force: true })}
-          >
-            {checking ? 'Checking...' : 'Check'}
-          </Button>
-          {hasNativeDesktopRuntime() && (
-            <Button variant="secondary" icon="refresh" onClick={() => void restartDesktopApp()}>
-              Restart
+      <div class="cp-about">
+        <Face eyes="open" size={48} />
+        <div class="cp-about-name">
+          <h2>Axial</h2>
+          <span class="cp-chips">
+            <Chip mono>{appVersion.value.replace(/^[vV]/, '')}</Chip>
+            <Chip>{releaseChannel}</Chip>
+          </span>
+        </div>
+      </div>
+      <SettingRow title={status} description={checkedLabel(info?.checked_at)}>
+        <div class="cp-setting-control">
+          {flowState.phase === 'ready' && (
+            <Button
+              variant="primary"
+              icon="refresh"
+              disabled={restartBlocked}
+              onClick={() => void applyUpdateAndRestart()}
+            >
+              Restart to update
             </Button>
           )}
-        </div>
-        <div style={{ marginTop: 12, color: 'var(--text)', fontSize: 13, fontWeight: 700 }}>{status}</div>
-        <div style={{ marginTop: 4, color: 'var(--text-mute)', fontSize: 12 }}>Last checked: {checkedAt}</div>
-        {checkState === 'error' && !flowBusy && !flowStaged && (
-          <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>Could not check for updates.</div>
-        )}
-        {flowState.phase === 'failed' && flowState.message && (
-          <div style={{ marginTop: 8, color: 'var(--err)', fontSize: 12 }}>{flowState.message}</div>
-        )}
-        {flowBusy && (
-          <div style={{ marginTop: 8, color: 'var(--text-mute)', fontSize: 12, fontVariantNumeric: 'tabular-nums' }}>
-            {flowState.phase === 'applying'
-              ? 'Installing...'
-              : flowState.total_bytes
-                ? `${flowState.percent ?? 0}%, ${formatBytes(flowState.received_bytes)} of ${formatBytes(flowState.total_bytes)}`
-                : formatBytes(flowState.received_bytes)}
-          </div>
-        )}
-        {flowStaged && (
-          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {flowState.phase === 'ready' ? (
-              <Button
-                variant="primary"
-                icon="refresh"
-                disabled={restartBlocked}
-                onClick={() => void applyUpdateAndRestart()}
-              >
-                Restart to update
-              </Button>
-            ) : (
-              <Button
-                variant="primary"
-                icon="refresh"
-                disabled={restartRequested || restartBlocked}
-                onClick={() => void restartDesktopApp()}
-              >
-                {restartRequested ? 'Restarting…' : 'Restart now'}
-              </Button>
-            )}
-            <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>
-              Notes
+          {flowStaged && flowState.phase !== 'ready' && (
+            <Button
+              variant="primary"
+              icon="refresh"
+              disabled={restartRequested || restartBlocked}
+              onClick={() => void restartDesktopApp()}
+            >
+              {restartRequested ? 'Restarting…' : 'Restart now'}
             </Button>
-          </div>
-        )}
-        {flowState.phase === 'ready' && restartBlocked && (
-          <div style={{ marginTop: 8, color: 'var(--text-mute)', fontSize: 12 }}>
-            Waiting for downloads and running games to finish.
-          </div>
-        )}
-        {visibleUpdate && (
-          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {canInstallUpdateInApp() ? (
+          )}
+          {visibleUpdate &&
+            (canInstallUpdateInApp() ? (
               <Button
                 variant="primary"
                 icon="download"
@@ -180,21 +151,59 @@ export function AboutSettingsSection(): JSX.Element {
               <Button variant="primary" icon="globe" onClick={() => void openUpdateAction()}>
                 {info?.action_label || 'Open release'}
               </Button>
-            )}
-            <Button variant="secondary" icon="tag" onClick={() => void openUpdateNotes()}>
-              Notes
+            ))}
+          {(flowStaged || visibleUpdate) && (
+            <Button variant="secondary" onClick={() => void openUpdateNotes()}>
+              Release notes
             </Button>
-            {info?.checksum_url && (
-              <Button variant="secondary" icon="shield-check" onClick={() => void openUpdateChecksum()}>
-                Checksum
-              </Button>
-            )}
-            <Button variant="secondary" icon="x" onClick={dismiss}>
+          )}
+          {visibleUpdate && info?.checksum_url && (
+            <Button variant="secondary" onClick={() => void openUpdateChecksum()}>
+              Checksum
+            </Button>
+          )}
+          <Button variant="secondary" disabled={checking} onClick={() => void checkForUpdates({ force: true })}>
+            {checking ? 'Checking...' : 'Check'}
+          </Button>
+          {hasNativeDesktopRuntime() && (
+            <Button variant="secondary" onClick={() => void restartDesktopApp()}>
+              Restart
+            </Button>
+          )}
+          {visibleUpdate && (
+            <Button variant="ghost" onClick={dismiss}>
               Dismiss
             </Button>
-          </div>
+          )}
+        </div>
+        {checkState === 'error' && !flowBusy && !flowStaged && (
+          <p class="cp-about-line" data-tone="err">
+            Could not check for updates.
+          </p>
+        )}
+        {flowState.phase === 'failed' && flowState.message && (
+          <p class="cp-about-line" data-tone="err">
+            {flowState.message}
+          </p>
+        )}
+        {flowBusy && (
+          <p class="cp-about-line">
+            {flowState.phase === 'applying'
+              ? 'Installing...'
+              : flowState.total_bytes
+                ? `${flowState.percent ?? 0}%, ${formatBytes(flowState.received_bytes)} of ${formatBytes(flowState.total_bytes)}`
+                : formatBytes(flowState.received_bytes)}
+          </p>
+        )}
+        {flowState.phase === 'ready' && restartBlocked && (
+          <p class="cp-about-line">Waiting for downloads and running games to finish.</p>
         )}
       </SettingRow>
+      <div>
+        <Button variant="secondary" onClick={() => void openHomepage()}>
+          Homepage
+        </Button>
+      </div>
     </SettingsSection>
   );
 }

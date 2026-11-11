@@ -1,246 +1,595 @@
+/* The design language, taken from the brand mark.
+   - Head: anything you press or type in is a pill, 28 / 32 / 36 high.
+   - Eye: anything that marks or labels (chips, checks, keycaps, thumbs, the socket a solid button's icon sits in)
+     is a rounded square whose corner is 5/16 of its side.
+   - Ring: the eye's outline, traced. The only mark for "still going".
+   - Face: the mascot carries an outcome wherever a generic status icon would sit. Neutral shows no face.
+   Flat: nothing on the panel casts a shadow. Colour comes from the theme only.
+   A row in hand sets --chip-bg (and --chip-bg-hover): what rests on it (chips, art, quiet buttons) lifts one fill. */
+
+/* ── Buttons ── */
 .cp-btn {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
   justify-content: center;
-  height: 36px;
-  padding: 0 16px;
+  gap: 6px;
+  height: var(--h);
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--rad-ctl);
+  background: var(--chip-bg, var(--fill));
+  color: var(--text);
   font-family: inherit;
   font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0;
-  border: none;
-  border-radius: var(--r-sm);
-  cursor: pointer;
   white-space: nowrap;
+  cursor: pointer;
   transition:
     background 120ms ease,
     color 120ms ease,
-    scale 70ms ease,
-    box-shadow 120ms ease;
-  color: var(--text);
-  background: var(--surface-2);
+    scale 90ms ease;
 }
 .cp-btn:hover:not([disabled]) {
-  background: var(--surface-3);
+  background: var(--chip-bg-hover, var(--fill-2));
 }
 .cp-btn:active:not([disabled]) {
-  scale: 0.97;
-}
-.cp-btn:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
+  background: var(--fill-3);
+  scale: 0.96;
 }
 .cp-btn[disabled] {
+  opacity: 0.38;
   cursor: not-allowed;
-  opacity: 0.5;
 }
-
+.cp-btn svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
 .cp-btn--sm {
-  height: 30px;
-  padding: 0 12px;
-  font-size: 12px;
-  gap: 6px;
-  border-radius: var(--r-xs);
+  height: var(--h-sm);
+  padding: 0 11px;
+  gap: 5px;
+  font-size: 12.5px;
+}
+.cp-btn--sm svg {
+  width: 14px;
+  height: 14px;
 }
 .cp-btn--lg {
-  height: 44px;
-  padding: 0 22px;
-  font-size: 14px;
-  gap: 10px;
-  border-radius: var(--r-md);
+  height: var(--h-lg);
+  padding: 0 18px;
+  gap: 7px;
+  font-size: 13.5px;
 }
 .cp-btn--full {
   width: 100%;
 }
-
-.cp-btn--primary {
-  background: var(--accent-fill);
-  color: var(--accent-on);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.14),
-    0 1px 0 oklch(0 0 0 / 0.18),
-    0 10px 24px -16px oklch(from var(--accent-fill) l c h / 0.55);
+/* A plain leading icon sits closer to the edge than text does. */
+.cp-btn:has(> svg:first-child) {
+  padding-left: 11px;
 }
-.cp-btn--primary:hover:not([disabled]) {
-  background: var(--accent-fill-hover);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.18),
-    0 1px 0 oklch(0 0 0 / 0.18),
-    0 12px 26px -16px oklch(from var(--accent-fill) l c h / 0.7);
+.cp-btn--sm:has(> svg:first-child) {
+  padding-left: 9px;
 }
-
-.cp-btn--secondary {
-  background: var(--surface-2);
-  color: var(--text);
+.cp-btn--lg:has(> svg:first-child) {
+  padding-left: 14px;
 }
-.cp-btn--secondary:hover:not([disabled]) {
-  background: var(--surface-3);
-}
-
-.cp-btn--soft {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.cp-btn--soft:hover:not([disabled]) {
-  background: color-mix(in oklab, var(--accent-soft) 70%, var(--accent-line));
-}
-
 .cp-btn--ghost {
   background: transparent;
   color: var(--text-dim);
 }
 .cp-btn--ghost:hover:not([disabled]) {
-  background: var(--surface-2);
+  background: var(--fill);
   color: var(--text);
 }
-
-.cp-btn--danger {
-  background: oklch(0.6 0.18 25);
-  color: oklch(0.99 0.02 25);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.12),
-    0 1px 0 oklch(0 0 0 / 0.18);
+.cp-btn--ghost:active:not([disabled]) {
+  background: var(--fill-2);
 }
+.cp-btn--soft {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cp-btn--soft:hover:not([disabled]) {
+  background: color-mix(in oklab, var(--accent) 24%, transparent);
+}
+.cp-btn--soft:active:not([disabled]) {
+  background: color-mix(in oklab, var(--accent) 30%, transparent);
+}
+/* The solid actions are the mascot: a head whose leading icon sits in its eye. */
+.cp-btn--primary,
+.cp-btn--danger {
+  --solid: var(--accent-fill);
+  --solid-hover: var(--accent-fill-hover);
+  background: var(--solid);
+  color: var(--accent-on);
+}
+.cp-btn--danger {
+  --solid: var(--err-fill);
+  --solid-hover: oklch(from var(--err) 0.6 0.17 h);
+  color: oklch(0.985 0.015 25);
+}
+.cp-btn--primary:hover:not([disabled]),
 .cp-btn--danger:hover:not([disabled]) {
-  background: oklch(0.65 0.18 25);
+  background: var(--solid-hover);
+}
+.cp-btn--primary:active:not([disabled]),
+.cp-btn--danger:active:not([disabled]) {
+  background: var(--solid);
+}
+.cp-btn--primary > svg:first-child,
+.cp-btn--danger > svg:first-child {
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  padding: 4px;
+  margin: 0 1px 0 -5px;
+  border-radius: 6.25px;
+  background: oklch(from var(--solid) calc(l - 0.2) calc(c - 0.05) h);
+  stroke-width: 2.6;
+}
+.cp-btn--sm:is(.cp-btn--primary, .cp-btn--danger) > svg:first-child {
+  width: 18px;
+  height: 18px;
+  padding: 3.5px;
+  margin-left: -4px;
+  border-radius: 5.6px;
+}
+.cp-btn--lg:is(.cp-btn--primary, .cp-btn--danger) > svg:first-child {
+  width: 24px;
+  height: 24px;
+  padding: 5px;
+  margin-left: -8px;
+  border-radius: 7.5px;
+}
+/* An action that Enter runs carries the key at its end. */
+.cp-btn > .cp-kbd {
+  margin: 0 -5px 0 2px;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, currentColor 40%, transparent);
+  color: inherit;
+}
+.cp-btn--lg > .cp-kbd {
+  margin-right: -9px;
+}
+/* A busy button swaps its icon for the ring; a solid one keeps it in the socket. */
+.cp-btn > .cp-ring:first-child {
+  color: inherit;
+}
+.cp-btn:not(.cp-btn--primary, .cp-btn--danger) > .cp-ring:first-child {
+  margin: 0 2px 0 -2px;
+}
+.cp-btn:is(.cp-btn--primary, .cp-btn--danger) > .cp-ring:first-child {
+  padding: 3px;
 }
 
 .cp-ibtn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: none;
-  border-radius: var(--r-xs);
+  flex: none;
+  width: var(--h);
+  height: var(--h);
+  padding: 0;
+  border: 0;
+  border-radius: var(--rad-ctl);
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
   transition:
     background 120ms ease,
     color 120ms ease,
-    scale 70ms ease;
+    scale 90ms ease;
 }
 .cp-ibtn:hover:not([disabled]) {
-  background: var(--surface-3);
+  background: var(--fill);
   color: var(--text);
 }
 .cp-ibtn:active:not([disabled]) {
+  background: var(--fill-2);
   scale: 0.92;
 }
-.cp-ibtn:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-.cp-ibtn--active {
-  background: var(--accent-fill);
-  color: var(--accent-on);
-}
-.cp-ibtn[disabled] {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
-.cp-ibtn--danger:hover:not([disabled]) {
-  background: oklch(0.7 0.18 25 / 0.18);
-  color: var(--err);
-}
-
-.cp-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 9px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0;
-  border: none;
-  background: var(--surface-3);
-  color: var(--text-dim);
-}
-.cp-pill--accent {
+.cp-ibtn--active,
+.cp-ibtn--active:hover:not([disabled]) {
   background: var(--accent-soft);
   color: var(--accent);
 }
-.cp-pill--ok {
-  background: oklch(0.78 0.14 150 / 0.16);
-  color: var(--ok);
+.cp-ibtn--danger:hover:not([disabled]) {
+  background: color-mix(in oklab, var(--err) 15%, transparent);
+  color: var(--err-text);
 }
-.cp-pill--warn {
-  background: oklch(0.8 0.14 70 / 0.16);
-  color: var(--warn);
+.cp-ibtn--overlay {
+  background: oklch(0 0 0 / 0.4);
+  color: #fff;
 }
-.cp-pill--err {
-  background: oklch(0.7 0.18 25 / 0.16);
-  color: var(--err);
-}
-.cp-pill--info {
-  background: oklch(0.78 0.1 240 / 0.16);
-  color: var(--info);
+.cp-ibtn[disabled] {
+  opacity: 0.38;
+  cursor: not-allowed;
 }
 
-.cp-kbd {
-  font-family: inherit;
-  font-size: 10.5px;
-  font-weight: 500;
-  padding: 2px 6px;
-  border-radius: 6px;
-  background: var(--surface-3);
-  color: var(--text-dim);
-}
-
+/* ── Fields. Text sits 14px in, a leading icon 11px, an inner mark 6px. ── */
 .cp-field {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 36px;
-  padding: 0 12px;
-  border-radius: var(--r-sm);
-  background: color-mix(in oklab, var(--bg) 55%, var(--surface));
-  border: none;
-  box-shadow: inset 0 0 0 1px var(--line);
-  transition: box-shadow 120ms;
   min-width: 0;
+  height: var(--h);
+  padding: 0 14px;
+  border-radius: var(--rad-ctl);
+  background: var(--fill);
+  transition: box-shadow 120ms ease;
 }
-.cp-field:focus-within {
-  box-shadow: var(--focus-border);
+.cp-field:has(> svg:first-child, > .cp-face:first-child) {
+  padding-left: 11px;
+}
+.cp-field:has(> .cp-face:first-child) {
+  padding-left: 6px;
+}
+.cp-field:has(> .cp-unit:last-child) {
+  padding-right: 6px;
+}
+.cp-field > svg:first-child:not(.cp-face) {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: var(--text-mute);
+  transition: color 120ms ease;
+}
+.cp-field:hover > svg:first-child:not(.cp-face) {
+  color: var(--text);
+}
+.cp-field:focus-within > svg:first-child:not(.cp-face) {
+  color: var(--accent);
+}
+.cp-field:hover > .cp-unit {
+  background: var(--fill-3);
+  color: var(--text);
 }
 .cp-field input {
   flex: 1;
   min-width: 0;
-  background: transparent;
-  border: none;
+  border: 0;
   outline: none;
+  background: transparent;
   color: var(--text);
   font-size: 13px;
+  font-weight: 500;
+}
+.cp-field:focus-within {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.cp-field--lead,
+.cp-field.cp-field--lead:has(> svg:first-child) {
+  gap: 10px;
+  height: var(--h-lg);
+  padding: 0 8px 0 14px;
+}
+.cp-field--lead > svg:first-child:not(.cp-face) {
+  width: 16px;
+  height: 16px;
+}
+.cp-field--lead input {
+  font-size: 13.5px;
+}
+.cp-field[aria-invalid='true'] {
+  box-shadow: inset 0 0 0 1.5px var(--err-text);
+}
+.cp-field:has(input:disabled) {
+  opacity: 0.38;
+}
+.cp-unit {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 6.25px;
+  background: var(--fill-2);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
 }
 
-.cp-card {
-  background: var(--surface);
-  border: none;
-  border-radius: var(--r-lg);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.05),
-    var(--shadow-raised);
+/* ── Art: a holder at the rail button's corner, sized by --art ── */
+.cp-art {
+  --art: 36px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: var(--art);
+  height: var(--art);
+  overflow: hidden;
+  border-radius: min(calc(var(--art) * 0.27), var(--hold-xl));
+  background: var(--chip-bg, var(--fill));
+  color: var(--text-mute);
+  transition: background 120ms ease;
+}
+.cp-art:has(img) {
+  background: none;
+}
+.cp-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.cp-art img[data-pixel] {
+  image-rendering: pixelated;
+}
+.cp-art svg {
+  width: 45%;
+  height: 45%;
+}
+
+/* ── Chips and keycaps. A chip holds a fact; it is never a status. ── */
+.cp-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+.cp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: var(--rad-chip);
+  background: var(--chip-bg, var(--fill));
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+.cp-chip svg {
+  flex: none;
+  width: 11px;
+  height: 11px;
+}
+.cp-chip--mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+}
+.cp-chip--bare {
+  padding: 0;
+  background: none;
+  color: var(--text-mute);
+  font-weight: 500;
+}
+.cp-chip--accent {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cp-chip--warn {
+  background: color-mix(in oklab, var(--warn) 14%, transparent);
+  color: var(--warn-text);
+}
+.cp-chip--err {
+  background: color-mix(in oklab, var(--err) 15%, transparent);
+  color: var(--err-text);
+}
+.cp-kbd {
+  display: inline-grid;
+  place-items: center;
+  box-sizing: border-box;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 5.6px;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--text-mute) 55%, transparent);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+}
+.cp-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.cp-legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 500;
+}
+.cp-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.cp-legend .cp-keys {
+  gap: 4px;
+}
+
+/* ── The face, the ring, and a status: one of them beside a word ── */
+.cp-face {
+  display: block;
+  flex: none;
+  color: var(--accent);
+}
+.cp-face[data-tone='warn'] {
+  color: var(--warn-text);
+}
+.cp-face[data-tone='err'] {
+  color: var(--err-text);
+}
+.cp-face[data-tone='mute'] {
+  color: var(--asleep);
+}
+.cp-ring {
+  display: block;
+  flex: none;
+  color: var(--accent);
+}
+.cp-ring-track {
+  opacity: 0.26;
+}
+.cp-ring-run {
+  transition: stroke-dasharray 420ms cubic-bezier(0.2, 0, 0, 1);
+}
+.cp-ring[data-busy='true'] .cp-ring-run {
+  animation: cp-ring-run 1100ms linear infinite;
+}
+@keyframes cp-ring-run {
+  to {
+    stroke-dashoffset: -100;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-ring[data-busy='true'] .cp-ring-run {
+    animation-duration: 2400ms;
+  }
+}
+.cp-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 20px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.cp-status[data-tone='accent'] {
+  color: var(--accent);
+}
+.cp-status[data-tone='err'] {
+  color: var(--err-text);
+}
+.cp-status[data-tone='warn'] {
+  color: var(--warn-text);
+}
+.cp-status[data-tone='mute'] {
+  color: var(--text-mute);
+}
+.cp-status > :is(.cp-face, .cp-ring) {
+  color: inherit;
+}
+.cp-status > .cp-ring {
+  margin: 0 7px;
+}
+/* In a table a status with no face keeps the words on one edge. */
+.cp-tr .cp-status:not(:has(.cp-face, .cp-ring)) {
+  padding-left: 34px;
+}
+
+/* ── Switch: a head with one eye, left and muted when off, right and accent when on ── */
+.cp-toggle {
   position: relative;
+  display: inline-block;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--rad-ctl);
+  background: var(--fill-2);
+  cursor: pointer;
+  transition:
+    background 160ms ease,
+    scale 90ms ease;
+}
+.cp-toggle::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 3.75px;
+  background: var(--text-mute);
+  transition:
+    translate 160ms ease,
+    background 160ms ease;
+}
+.cp-toggle[data-on='true'] {
+  background: color-mix(in oklab, var(--accent) 32%, var(--fill));
+}
+.cp-toggle[data-on='true']::after {
+  translate: 14px 0;
+  background: var(--accent);
+}
+.cp-toggle:active:not(:disabled) {
+  scale: 0.94;
+}
+.cp-toggle:disabled {
+  opacity: 0.38;
+  cursor: default;
 }
 
+/* ── Checkbox ── */
+.cp-check {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--rad-xs);
+  background: var(--fill-3);
+  color: transparent;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+.cp-check:hover {
+  background: oklch(from var(--fill-3) calc(l + 0.07) c h);
+  color: var(--text-mute);
+}
+.cp-check svg {
+  width: 11px;
+  height: 11px;
+  stroke-width: 3;
+}
+.cp-check[data-selected='true'] {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+}
+.cp-check:disabled {
+  opacity: 0.38;
+}
+/* Radio: a round head whose eye opens when chosen. */
+.cp-radio {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--rad-ctl);
+  background: var(--fill-3);
+}
+.cp-radio[data-on='true'] {
+  background: color-mix(in oklab, var(--accent) 32%, var(--fill));
+}
+.cp-radio[data-on='true']::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 1.9px;
+  background: var(--accent);
+}
+/* ── Progress bar ── */
 .cp-meter {
   height: 4px;
-  border-radius: 999px;
-  background: var(--surface-3);
+  border-radius: 2px;
+  background: var(--fill-2);
   overflow: hidden;
 }
 .cp-meter > span {
   display: block;
   height: 100%;
-  border-radius: 999px;
+  border-radius: 2px;
   background: var(--accent);
   transition: width 200ms ease;
-}
-.cp-meter--ok > span {
-  background: var(--ok);
 }
 .cp-meter--warn > span {
   background: var(--warn);
@@ -249,79 +598,328 @@
   background: var(--err);
 }
 
-.cp-section-head {
+/* ── Tabs: pills in a row. The current one takes the rail's selection, a neutral fill and an accent icon. ── */
+.cp-tabs {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 2px;
 }
-.cp-section-head h2 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: 0;
-}
-.cp-section-head .cp-section-action {
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: var(--accent);
-  font-size: 12.5px;
-  font-weight: 600;
+.cp-tabs button {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  border-radius: var(--r-xs);
+  justify-content: center;
+  gap: 7px;
+  height: var(--h);
+  padding: 0 14px 0 11px;
+  border: 0;
+  border-radius: var(--rad-ctl);
+  background: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
   transition:
     background 120ms ease,
-    scale 70ms ease;
+    color 120ms ease,
+    scale 90ms ease;
 }
-.cp-section-head .cp-section-action:hover {
-  background: var(--accent-softer);
+.cp-tabs button:has(.cp-tab-count) {
+  padding-right: 8px;
 }
-.cp-section-head .cp-section-action:active {
-  scale: 0.96;
+.cp-tab-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  color: var(--text-mute);
+  transition: color 120ms ease;
 }
-.cp-toggle {
-  width: 42px;
-  height: 24px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  border: none;
-  position: relative;
+.cp-tab-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.cp-tabs button:hover:not(:disabled, [data-active='true']) {
+  background: var(--fill);
+  color: var(--text);
+}
+.cp-tabs button:hover:not(:disabled, [data-active='true']) .cp-tab-icon {
+  color: var(--text-dim);
+}
+.cp-tabs button:active:not(:disabled) {
+  scale: 0.97;
+}
+.cp-tabs button:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+/* Standing where a page title would: one step larger. */
+.cp-tabs--lead {
+  flex-wrap: nowrap;
+}
+.cp-tabs--lead button {
+  height: var(--h-lg);
+  gap: 8px;
+  padding: 0 16px 0 12px;
+  font-size: 14px;
+  font-weight: 650;
+}
+.cp-tabs--lead .cp-tab-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.cp-tabs button[data-active='true'] {
+  background: var(--fill-2);
+  color: var(--text);
+}
+.cp-tabs button[data-active='true'] .cp-tab-icon {
+  color: var(--accent);
+}
+.cp-tab-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--rad-xs);
+  background: color-mix(in oklab, var(--text) 7%, transparent);
+  color: var(--text-mute);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.cp-tabs button[data-active='true'] .cp-tab-count {
+  background: color-mix(in oklab, var(--text) 12%, transparent);
+  color: var(--text);
+}
+@media (max-width: 640px) {
+  .cp-tabs button {
+    padding: 0 10px;
+  }
+  .cp-tabs .cp-tab-label {
+    display: none;
+  }
+}
+
+/* ── Notice and empty state: the face speaks, on the open panel ── */
+.cp-notice {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+.cp-notice:has(> .cp-ibtn) {
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+}
+.cp-notice > .cp-face {
+  margin-top: 1px;
+}
+.cp-notice-copy {
+  min-width: 0;
+  max-width: 78ch;
+}
+.cp-notice-copy strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.cp-notice-copy p {
+  margin: 1px 0 0;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.cp-notice-copy > .cp-btn {
+  margin-top: 8px;
+}
+.cp-notice-details {
+  margin-top: 8px;
+  max-width: 100%;
+}
+.cp-notice-details summary {
+  width: max-content;
+  max-width: 100%;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  list-style: none;
   cursor: pointer;
-  transition: background 160ms ease;
-  flex-shrink: 0;
-  padding: 0;
+  user-select: none;
 }
-.cp-toggle:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
+.cp-notice-details summary::-webkit-details-marker {
+  display: none;
 }
-.cp-toggle:disabled {
-  cursor: default;
-  opacity: 0.55;
+.cp-notice-details summary:hover {
+  color: var(--text);
 }
-.cp-toggle[data-on='true'] {
-  background: var(--accent-fill);
+.cp-notice-details ul {
+  max-height: 118px;
+  overflow: auto;
+  margin: 7px 0 0;
+  padding: 8px 10px 8px 24px;
+  border-radius: var(--hold-sm);
+  background: var(--fill);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.45;
 }
-.cp-toggle::after {
-  content: '';
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: var(--text);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-  transition:
-    transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    background 180ms ease;
+.cp-notice-details li {
+  padding-right: 6px;
+  overflow-wrap: anywhere;
 }
-.cp-toggle[data-on='true']::after {
-  transform: translateX(18px);
-  background: var(--accent-on);
+.cp-notice-details li + li {
+  margin-top: 5px;
+}
+.cp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 32px 24px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.cp-empty > .cp-face {
+  margin-bottom: 8px;
+}
+.cp-empty h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.cp-empty p {
+  margin: 0;
+  max-width: 44ch;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.cp-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.cp-crash {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+/* ── Page furniture ── */
+.cp-h1 {
+  margin: 0;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+.cp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+.cp-head h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.cp-head-fill {
+  flex: 1;
+}
+/* An open row: no container and no rule. The hover fill spans the row so it reads as one line at any width. */
+.cp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  margin: 0 -8px;
+  padding: 4px 8px;
+  border-radius: var(--rad-row);
+  transition: background 120ms ease;
+}
+/* In hand: under the pointer, or reached with the arrow keys. */
+.cp-row:is(:hover, [data-active='true']) {
+  --chip-bg: var(--fill-2);
+  --chip-bg-hover: var(--fill-3);
+  background: var(--fill);
+}
+/* A table: one grid sets the columns, rows are subgrids that light as a whole. */
+.cp-table {
+  display: grid;
+  column-gap: 16px;
+  row-gap: 2px;
+}
+.cp-tr {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  align-items: center;
+  min-height: 40px;
+  margin: 0 -10px;
+  padding: 0 10px;
+  border-radius: var(--rad-row);
+  font-size: 13px;
+  transition: background 120ms ease;
+}
+.cp-tr:not(.cp-th):is(:hover, [data-selected='true']) {
+  --chip-bg: var(--fill-2);
+  --chip-bg-hover: var(--fill-3);
+  background: var(--fill);
+}
+/* Selected carries a breath of accent, so it never reads as a hover. */
+.cp-tr:not(.cp-th)[data-selected='true'] {
+  background: color-mix(in oklab, var(--accent) 9%, var(--fill));
+}
+.cp-th {
+  min-height: 28px;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 600;
+}
+.cp-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--rad-ctl);
+  background: var(--fill-3);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+/* Hung from its target by the tip host. */
+.cp-tip--float {
+  position: fixed;
+  z-index: 1400;
+  translate: -50% 0;
+  pointer-events: none;
+}
+.cp-tip--float[data-placement='above'] {
+  translate: -50% -100%;
+}
+.cp-tip .cp-kbd {
+  margin-right: -4px;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--text) 30%, transparent);
+  color: var(--text);
+}
+.cp-tip .cp-chip {
+  margin-right: -4px;
+  background: color-mix(in oklab, var(--text) 10%, transparent);
+  color: var(--text);
 }

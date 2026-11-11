@@ -1,7 +1,7 @@
 import type { RefObject } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { consumeNativeSkinDrop, onNativeDragDrop, type NativeDragDropPayload } from '../../native';
-import { nativeDragPositionHitsElement, nativeDragTargetElement } from './api';
+import { nativeDragPositionHitsElement, nativeDragTargetElement } from '../../native-content';
 
 export function useSavedSkinNativeDragDrop({
   dropSurfaceRef,

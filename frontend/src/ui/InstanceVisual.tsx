@@ -25,12 +25,9 @@ export function nextArtSeed(seed: number): number {
   return next || 1;
 }
 
-export function instanceHue(inst: VisualInstance): number {
-  return artSeedFor(inst) % 360;
-}
-
-export function guardedInstanceHue(inst: VisualInstance, theme: Theme): number {
-  return resolveTileHue(instanceHue(inst), theme);
+/** The seed's hue, moved off the accent's neighbourhood so a tile never reads as the theme. */
+function tileHue(inst: VisualInstance, theme: Theme): number {
+  return resolveTileHue(artSeedFor(inst) % 360, theme);
 }
 
 function isLoaderKey(value: string | undefined): value is LoaderKey {
@@ -54,7 +51,7 @@ function GlyphMark({ loader, className }: { loader: LoaderKey; className: string
       aria-hidden="true"
       class={`${className} ${className}--mask`}
       data-loader={loader}
-      style={{ ['--cp-loader-src' as any]: `url("${src}")` }}
+      style={{ '--cp-loader-src': `url("${src}")` }}
     />
   );
 }
@@ -64,30 +61,16 @@ export function InstanceGlyph({ inst, className }: { inst: VisualInstance; class
   return <GlyphMark loader={loaderKeyForInstance(inst, version)} className={className} />;
 }
 
-export function InstanceTile({
-  inst,
-  radius,
-  className,
-  style,
-}: {
-  inst: VisualInstance;
-  radius?: number;
-  className?: string;
-  style?: JSX.CSSProperties;
-}): JSX.Element {
+export function InstanceTile({ inst, className }: { inst: VisualInstance; className?: string }): JSX.Element {
   const theme = useTheme();
-  const version = versionById(inst.version_id);
-  const loader = loaderKeyForInstance(inst, version);
-
+  const loader = loaderKeyForInstance(inst, versionById(inst.version_id));
   return (
     <div
-      class={`cp-tile${className ? ` ${className}` : ''}`}
-      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme), borderRadius: radius, ...style }}
+      class={className ? `cp-tile ${className}` : 'cp-tile'}
+      style={{ '--cp-tile-h': tileHue(inst, theme) }}
       aria-hidden="true"
     >
-      <div class="cp-tile-identity">
-        <GlyphMark loader={loader} className="cp-tile-glyph" />
-      </div>
+      <GlyphMark loader={loader} className="cp-tile-glyph" />
     </div>
   );
 }

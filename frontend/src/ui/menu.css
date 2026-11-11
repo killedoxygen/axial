@@ -1,0 +1,63 @@
+/* Anything that floats: one surface, one soft shadow, no border. */
+.cp-pop {
+  border-radius: var(--rad-pop);
+  background: var(--pop);
+  box-shadow: var(--shadow-pop);
+  color: var(--text);
+}
+.cp-menu {
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 5px;
+}
+.cp-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  min-height: 30px;
+  padding: 0 12px 0 10px;
+  border: 0;
+  border-radius: var(--rad-ctl);
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  transition: background 100ms ease;
+}
+.cp-menu-item > svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+.cp-menu-item:is(:hover, [data-highlighted]) {
+  background: var(--fill-3);
+}
+.cp-menu-item:focus-visible {
+  outline-offset: -1.5px;
+}
+.cp-menu-item[data-disabled] {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+.cp-menu-item--danger {
+  color: var(--err-text);
+}
+.cp-menu-item--danger:hover {
+  background: color-mix(in oklab, var(--err) 15%, transparent);
+}
+/* Groups are set apart by space, never a rule. */
+.cp-menu-gap {
+  flex: none;
+  height: 6px;
+}
+.cp-ctx-host {
+  position: fixed;
+  z-index: 1300;
+  animation: cp-float-up 120ms ease;
+}

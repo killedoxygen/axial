@@ -1,3 +1,4 @@
+import { signal } from '@preact/signals';
 import type { ContentUpdate, InstanceContentEntry, InstanceContentPack } from '../../types-content';
 
 export interface ModProvenance {
@@ -12,12 +13,13 @@ export interface ModProvenance {
   updateError?: string;
 }
 
-const provenanceCache = new Map<string, ModProvenance>();
+// A signal, so the instance header's pack chips follow whichever pane last read provenance.
+const provenanceCache = signal<ReadonlyMap<string, ModProvenance>>(new Map());
 const provenanceGenerations = new Map<string, number>();
 let nextGeneration = 0;
 
 export function cachedModProvenance(instanceId: string): ModProvenance | null {
-  return provenanceCache.get(instanceId) ?? null;
+  return provenanceCache.value.get(instanceId) ?? null;
 }
 
 export function beginModProvenanceRefresh(instanceId: string): number {
@@ -31,10 +33,12 @@ export function isCurrentModProvenanceRefresh(instanceId: string, generation: nu
 }
 
 export function cacheModProvenance(instanceId: string, provenance: ModProvenance): void {
-  provenanceCache.set(instanceId, provenance);
+  provenanceCache.value = new Map(provenanceCache.value).set(instanceId, provenance);
 }
 
 export function clearModProvenance(instanceId: string): void {
-  provenanceCache.delete(instanceId);
+  const next = new Map(provenanceCache.value);
+  next.delete(instanceId);
+  provenanceCache.value = next;
   provenanceGenerations.delete(instanceId);
 }

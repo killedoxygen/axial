@@ -16,7 +16,6 @@ function row(title: string, fileName: string, overrides: Partial<ContentRowView>
     fileName,
     details: [],
     fallbackIcon: 'puzzle',
-    managed: false,
     enabled: true,
     ...overrides,
   };

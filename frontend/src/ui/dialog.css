@@ -10,45 +10,52 @@
   animation: cp-fade-in 120ms ease;
 }
 .cp-dialog {
-  width: min(420px, 100%);
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow);
-  padding: 22px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
+  width: min(420px, 100%);
+  padding: 20px;
+  border-radius: var(--rad-dialog);
   animation: cp-float-up 160ms ease;
 }
 .cp-dialog--choice {
   width: min(520px, 100%);
 }
 .cp-dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin: 0;
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
 }
 .cp-dialog-body {
   margin: 0;
-  font-size: 13.5px;
   color: var(--text-dim);
+  font-size: 13px;
   line-height: 1.5;
   white-space: pre-wrap;
 }
 .cp-dialog-actions {
   display: flex;
-  gap: 8px;
   justify-content: flex-end;
+  gap: 8px;
 }
 .cp-dialog-actions--choice {
   flex-wrap: wrap;
 }
+/* On the overlay surface a quiet button needs a fill of its own to read as one. */
+.cp-dialog-actions .cp-btn--ghost {
+  background: var(--fill-3);
+  color: var(--text);
+}
+.cp-dialog-actions .cp-btn--ghost:hover:not([disabled]) {
+  background: oklch(from var(--fill-3) calc(l + 0.04) c h);
+}
 .cp-dialog-error {
   margin-top: -6px;
+  color: var(--err-text);
   font-size: 12px;
   font-weight: 500;
-  color: var(--err);
 }

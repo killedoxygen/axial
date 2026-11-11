@@ -1,17 +1,17 @@
 import type { JSX } from 'preact';
 import { useEffect } from 'preact/hooks';
-import { accountsSnapshot, activeAccount, refreshAccountsData, renameOfflineAccount } from '../../machines/accounts';
+import { accountsSnapshot, activeAccount, refreshAccountsData } from '../../machines/accounts';
 import { refreshWardrobe, setWardrobeContext } from '../../machines/skin-wardrobe';
 import { FALLBACK_SKIN_ACCOUNT_KEY, launcherSkinAccountKey } from '../../player-skin';
-import { config } from '../../store';
-import { SavedSkinLibrary } from './SavedSkinLibrary';
+import { AccountRow } from './AccountRow';
+import { Wardrobe } from './Wardrobe';
 
+/** The accounts on one line, then the wardrobe of the one being played as, down to the page's bottom edge. */
 export function AccountsView(): JSX.Element {
   const snapshot = accountsSnapshot.value;
   const active = activeAccount(snapshot);
   const account = active?.kind === 'microsoft' ? active : null;
-  const playerName = active?.display_name || config.value?.username || 'Player';
-  const skinAccountKey = active ? launcherSkinAccountKey(active.account_id) : FALLBACK_SKIN_ACCOUNT_KEY;
+  const accountKey = active ? launcherSkinAccountKey(active.account_id) : FALLBACK_SKIN_ACCOUNT_KEY;
   const skinAction = snapshot.state === 'ready' ? active?.skin_action : undefined;
   const skinActionsEnabled = skinAction?.enabled === true;
 
@@ -21,21 +21,15 @@ export function AccountsView(): JSX.Element {
   }, []);
 
   useEffect(() => {
-    setWardrobeContext({
-      accountKey: skinAccountKey,
-      selectionRevision: snapshot.selection_revision,
-      skinActionsEnabled,
-      account,
-    });
-  }, [skinAccountKey, snapshot.selection_revision, skinActionsEnabled, account]);
+    setWardrobeContext({ accountKey, selectionRevision: snapshot.selection_revision, skinActionsEnabled, account });
+  }, [accountKey, snapshot.selection_revision, skinActionsEnabled, account]);
 
   return (
-    <div class="cp-skinhall">
-      <SavedSkinLibrary
-        key={skinAccountKey}
+    <div class="cp-view-page cp-accounts-page">
+      <AccountRow />
+      <Wardrobe
+        key={accountKey}
         skinActionDisabledReason={skinAction?.disabled_reason || 'Online Minecraft account required'}
-        playerName={playerName}
-        onRenameNametag={active?.kind === 'offline' ? () => void renameOfflineAccount(active) : undefined}
       />
     </div>
   );

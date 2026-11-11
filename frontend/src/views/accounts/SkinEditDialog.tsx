@@ -1,232 +1,138 @@
 import type { JSX } from 'preact';
-import { Button, Input } from '../../ui/Atoms';
+import { deleteSavedSkin, wardrobeContext } from '../../machines/skin-wardrobe';
+import { Button, Input, Notice, Status } from '../../ui/Atoms';
 import { Segmented } from '../../ui/Segmented';
-import { Modal, ModalContent, ModalHeader, ModalTitle } from '../../ui/Modal';
-import { CapePicker } from './CapePicker';
 import { savedSkinFileUrl, stagedSkinPreviewSrc } from './api';
-import { LazySkinThreePreview as SkinThreePreview } from './LazySkinThreePreview';
-import type { MinecraftCape, SavedSkinRecord, SkinVariant, StagedSkinUpload } from './types';
+import { SkinDialog, SkinField } from './SkinDialog';
+import { NO_CAPE_VALUE, type MinecraftCape, type SavedSkinRecord, type SkinVariant } from './types';
+import type { useSavedSkinEditWorkflow } from './use-saved-skin-edit-workflow';
 
+const ARM_MODELS: Array<{ value: SkinVariant; label: string }> = [
+  { value: 'classic', label: 'Classic' },
+  { value: 'slim', label: 'Slim' },
+];
+
+/** A saved skin's name, arm model, cape and texture. A PNG dropped on the dialog replaces the texture. */
 export function SkinEditDialog({
-  editingSkin,
-  editReplacement,
-  editReplacementDragActive,
-  editPreviewCapeSrc,
-  editName,
-  trimmedEditName,
-  editVariant,
-  editCapeId,
-  availableCapes,
-  editBusyKey,
-  editDetectBusyKey,
-  editDetectError,
-  editReplacementReady,
-  editHasChanges,
-  skinActionsEnabled,
-  skinActionDisabledReason,
-  deleteKey,
-  onClose,
-  onEditReplacementDragEnter,
-  onEditReplacementDragOver,
-  onEditReplacementDragLeave,
-  onEditReplacementDrop,
-  onEditNameChange,
-  onEditVariantChange,
-  onEditCapeChange,
-  onDetectModel,
-  onOpenTexturePicker,
-  onClearEditReplacement,
-  onDelete,
-  onSave,
+  skin,
+  edit,
+  capes,
+  capeSrc,
+  deleting,
+  disabledReason,
 }: {
-  editingSkin: SavedSkinRecord | null;
-  editReplacement: StagedSkinUpload | null;
-  editReplacementDragActive: boolean;
-  editPreviewCapeSrc?: string;
-  editName: string;
-  trimmedEditName: string;
-  editVariant: SkinVariant;
-  editCapeId: string;
-  availableCapes: MinecraftCape[];
-  editBusyKey: string | null;
-  editDetectBusyKey: string | null;
-  editDetectError: string | null;
-  editReplacementReady: boolean;
-  editHasChanges: boolean;
-  skinActionsEnabled: boolean;
-  skinActionDisabledReason: string;
-  deleteKey: string | null;
-  onClose: () => void;
-  onEditReplacementDragEnter: (event: DragEvent) => void;
-  onEditReplacementDragOver: (event: DragEvent) => void;
-  onEditReplacementDragLeave: (event: DragEvent) => void;
-  onEditReplacementDrop: (event: DragEvent) => void;
-  onEditNameChange: (value: string) => void;
-  onEditVariantChange: (value: SkinVariant) => void;
-  onEditCapeChange: (value: string) => void;
-  onDetectModel: (skin: SavedSkinRecord) => void;
-  onOpenTexturePicker: () => void;
-  onClearEditReplacement: () => void;
-  onDelete: (skin: SavedSkinRecord) => void;
-  onSave: (textureKey: string, applyAfterSave?: boolean) => void;
+  skin: SavedSkinRecord | null;
+  edit: ReturnType<typeof useSavedSkinEditWorkflow>;
+  capes: MinecraftCape[];
+  capeSrc: (capeId: string | null) => string | undefined;
+  deleting: boolean;
+  disabledReason: string;
 }): JSX.Element {
-  const saving = editingSkin ? editBusyKey === editingSkin.texture_key : false;
-  const canSave = Boolean(
-    editingSkin &&
-    editBusyKey === null &&
-    editDetectBusyKey === null &&
-    editReplacementReady &&
-    editHasChanges &&
-    trimmedEditName.length > 0,
-  );
-
+  const busy = edit.editBusyKey !== null;
+  const locked = busy || edit.editDetectBusyKey !== null;
+  const replacement = edit.editReplacement;
   return (
-    <Modal
-      open={Boolean(editingSkin)}
-      onOpenChange={(next) => {
-        if (!next && editBusyKey === null) onClose();
-      }}
+    <SkinDialog
+      title="Edit skin"
+      open={skin !== null}
+      busy={busy}
+      preview={
+        skin && {
+          src: replacement ? stagedSkinPreviewSrc(replacement) : savedSkinFileUrl(skin),
+          name: edit.trimmedEditName || skin.name,
+          variant: edit.editVariant,
+          capeSrc: capeSrc(edit.editCapeId === NO_CAPE_VALUE ? null : edit.editCapeId),
+        }
+      }
+      capes={capes}
+      capeId={edit.editCapeId}
+      onCapeChange={edit.setEditCapeId}
+      canSave={Boolean(
+        skin &&
+        !locked &&
+        edit.editReplacementReady &&
+        edit.savedSkinEditHasChanges(skin) &&
+        edit.trimmedEditName.length > 0,
+      )}
+      canWear={wardrobeContext.value.skinActionsEnabled}
+      disabledReason={disabledReason}
+      extraAction={
+        skin &&
+        !skin.applied_at && (
+          <Button variant="ghost" icon="trash" disabled={busy || deleting} onClick={() => void deleteSavedSkin(skin)}>
+            Delete
+          </Button>
+        )
+      }
+      onClose={edit.cancelEdit}
+      onSave={(wear) => skin && void edit.saveSkinMetadata(skin.texture_key, wear)}
+      dropKey={skin?.texture_key}
+      data-drop={edit.editReplacementDragActive}
+      onDragEnter={edit.editReplacementDrop.onDragEnter}
+      onDragOver={edit.editReplacementDrop.onDragOver}
+      onDragLeave={edit.editReplacementDrop.onDragLeave}
+      onDrop={edit.editReplacementDrop.onDrop}
     >
-      <ModalContent className="cp-skinedit-modal" aria-label="Edit skin" aria-describedby={undefined}>
-        <ModalHeader>
-          <ModalTitle>Edit skin</ModalTitle>
-        </ModalHeader>
-        {editingSkin && (
-          <div
-            class="cp-skinedit"
-            data-saved-skin-edit-drop-surface={editingSkin.texture_key}
-            data-saved-skin-edit-drop-state={editReplacementDragActive ? 'active' : 'idle'}
-            onDragEnter={onEditReplacementDragEnter}
-            onDragOver={onEditReplacementDragOver}
-            onDragLeave={onEditReplacementDragLeave}
-            onDrop={onEditReplacementDrop}
-          >
-            <div class="cp-skinedit__preview">
-              <SkinThreePreview
-                src={editReplacement ? stagedSkinPreviewSrc(editReplacement) : savedSkinFileUrl(editingSkin)}
-                capeSrc={editPreviewCapeSrc}
-                name={trimmedEditName || editingSkin.name}
-                variant={editVariant}
-                side="front"
-                showOuterLayers
-              />
-            </div>
-            <div class="cp-skinedit__form">
-              <label class="cp-skinedit__field">
-                <span>Name</span>
-                <Input
-                  value={editName}
-                  onChange={(value) => onEditNameChange(value.slice(0, 64))}
-                  placeholder="Skin name"
-                />
-              </label>
-              <div class="cp-skinedit__field">
-                <span>Model</span>
-                <div class="cp-skinedit__inline">
-                  <Segmented<SkinVariant>
-                    options={[
-                      { value: 'classic', label: 'Classic' },
-                      { value: 'slim', label: 'Slim' },
-                    ]}
-                    value={editVariant}
-                    onChange={onEditVariantChange}
-                  />
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    icon={editDetectBusyKey === editingSkin.texture_key ? 'refresh' : 'search'}
-                    disabled={editBusyKey !== null || editDetectBusyKey !== null}
-                    onClick={() => onDetectModel(editingSkin)}
-                    title="Detect the model from the skin texture"
-                  >
-                    Detect
-                  </Button>
-                </div>
-              </div>
-              {availableCapes.length > 0 && (
-                <div class="cp-skinedit__field">
-                  <span>Cape</span>
-                  <CapePicker capes={availableCapes} value={editCapeId} onChange={onEditCapeChange} />
-                </div>
-              )}
-              <div class="cp-skinedit__field">
-                <span>Texture</span>
-                <div class="cp-skinedit__inline">
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    icon="image"
-                    disabled={editBusyKey !== null || editDetectBusyKey !== null}
-                    onClick={onOpenTexturePicker}
-                    title="Replace this skin PNG, or drop a file on this panel"
-                  >
-                    Replace PNG
-                  </Button>
-                  {editReplacement && (
-                    <>
-                      <span class="cp-skinedit__meta">
-                        {editReplacement.normalizeStatus === 'error'
-                          ? editReplacement.normalizeError || 'Skin validation failed.'
-                          : editReplacement.normalizeStatus === 'checking'
-                            ? 'Validating...'
-                            : 'Replacement ready'}
-                      </span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        icon="x"
-                        disabled={editBusyKey !== null}
-                        onClick={onClearEditReplacement}
-                      >
-                        Remove
-                      </Button>
-                    </>
-                  )}
-                </div>
-              </div>
-              {editDetectError && <div class="cp-skin-inline-err">{editDetectError}</div>}
-            </div>
-            <div class="cp-skinedit__footer">
-              {!editingSkin.applied_at && (
-                <Button
-                  variant="ghost"
-                  icon="trash"
-                  disabled={editBusyKey !== null || deleteKey === editingSkin.texture_key}
-                  onClick={() => onDelete(editingSkin)}
-                  style={{ marginRight: 'auto' }}
-                >
-                  Delete
-                </Button>
-              )}
-              <Button variant="ghost" disabled={editBusyKey !== null} onClick={onClose}>
-                Cancel
-              </Button>
-              <Button
-                variant="secondary"
-                icon={saving ? 'refresh' : 'download'}
-                disabled={!canSave}
-                onClick={() => onSave(editingSkin.texture_key)}
-              >
-                Save
-              </Button>
-              <Button
-                variant="primary"
-                icon={saving ? 'refresh' : 'check'}
-                disabled={!canSave || !skinActionsEnabled}
-                onClick={() => onSave(editingSkin.texture_key, true)}
-                title={
-                  skinActionsEnabled
-                    ? 'Save changes, then apply to the active Minecraft account'
-                    : skinActionDisabledReason
-                }
-                sound="affirm"
-              >
-                Save & apply
-              </Button>
-            </div>
-          </div>
+      <SkinField label="Name">
+        <Input
+          value={edit.editName}
+          onChange={(value) => edit.setEditName(value.slice(0, 64))}
+          placeholder="Skin name"
+          ariaLabel="Skin name"
+        />
+      </SkinField>
+      <SkinField label="Arm model">
+        <Segmented<SkinVariant>
+          options={ARM_MODELS}
+          value={edit.editVariant}
+          onChange={(value) => {
+            edit.setEditVariant(value);
+            edit.setEditDetectError(null);
+          }}
+        />
+        <Button
+          variant="ghost"
+          size="sm"
+          busy={skin !== null && edit.editDetectBusyKey === skin.texture_key}
+          disabled={locked}
+          title="Detect the arm model from the texture"
+          onClick={() => skin && void edit.detectSavedSkinModel(skin)}
+        >
+          Detect
+        </Button>
+      </SkinField>
+      <SkinField label="Texture">
+        <Button
+          variant="secondary"
+          size="sm"
+          icon="image"
+          disabled={locked}
+          title="Replace this skin's PNG, or drop a file on this dialog"
+          onClick={edit.openEditTexturePicker}
+        >
+          Replace PNG
+        </Button>
+        {replacement &&
+          (replacement.normalizeStatus === 'checking' ? (
+            <Status busy>Checking</Status>
+          ) : (
+            replacement.normalizeStatus === 'ready' && (
+              <Status eyes="happy" tone="accent">
+                Ready
+              </Status>
+            )
+          ))}
+        {replacement && (
+          <Button variant="ghost" size="sm" disabled={busy} onClick={edit.clearEditReplacement}>
+            Remove
+          </Button>
         )}
-      </ModalContent>
-    </Modal>
+      </SkinField>
+      {(edit.editDetectError || replacement?.normalizeStatus === 'error') && (
+        <Notice tone="error" role="alert">
+          <p>{edit.editDetectError || replacement?.normalizeError || 'Skin validation failed.'}</p>
+        </Notice>
+      )}
+    </SkinDialog>
   );
 }

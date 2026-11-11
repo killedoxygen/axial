@@ -4,9 +4,10 @@ import { useEffect, useErrorBoundary, useLayoutEffect, useState } from 'preact/h
 import { AppFrame } from './shell/AppFrame';
 import { BootSplash } from './shell/BootSplash';
 import { HomeView } from './views/home/HomeView';
-import { Button, Card } from './ui/Atoms';
+import { Button, Empty } from './ui/Atoms';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
+import { TipHost } from './ui/Tip';
 import { ToastHost } from './ui/ToastHost';
 import {
   accountSwitcherOpen,
@@ -25,17 +26,17 @@ import { reloadApplication } from './preferences/persistence';
 
 type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
 type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
-type AccountSwitcherHostComponent = (typeof import('./views/accounts/AccountSwitcherHost'))['AccountSwitcherHost'];
+type AccountSwitcherComponent = (typeof import('./views/accounts/AccountSwitcher'))['AccountSwitcher'];
 
 let loadedCommandPalette: CommandPaletteComponent | null = null;
-let loadedAccountSwitcherHost: AccountSwitcherHostComponent | null = null;
+let loadedAccountSwitcher: AccountSwitcherComponent | null = null;
 
 const deferredViewPreloads: (() => Promise<void>)[] = [
   async () => {
     loadedCommandPalette ??= (await import('./ui/CommandPalette')).CommandPalette;
   },
   async () => {
-    loadedAccountSwitcherHost ??= (await import('./views/accounts/AccountSwitcherHost')).AccountSwitcherHost;
+    loadedAccountSwitcher ??= (await import('./views/accounts/AccountSwitcher')).AccountSwitcher;
   },
 ];
 
@@ -167,24 +168,24 @@ function LazyCommandPalette(): JSX.Element | null {
   return CommandPaletteView ? <CommandPaletteView /> : null;
 }
 
-function LazyAccountSwitcherHost(): JSX.Element | null {
-  const [AccountSwitcherHostView, setAccountSwitcherHostView] = useState<AccountSwitcherHostComponent | null>(
-    () => loadedAccountSwitcherHost,
+function LazyAccountSwitcher(): JSX.Element | null {
+  const [AccountSwitcherView, setAccountSwitcherView] = useState<AccountSwitcherComponent | null>(
+    () => loadedAccountSwitcher,
   );
 
   useEffect(() => {
-    if (AccountSwitcherHostView) return;
+    if (AccountSwitcherView) return;
     let mounted = true;
-    void import('./views/accounts/AccountSwitcherHost').then((module) => {
-      loadedAccountSwitcherHost = module.AccountSwitcherHost;
-      if (mounted) setAccountSwitcherHostView(() => module.AccountSwitcherHost);
+    void import('./views/accounts/AccountSwitcher').then((module) => {
+      loadedAccountSwitcher = module.AccountSwitcher;
+      if (mounted) setAccountSwitcherView(() => module.AccountSwitcher);
     });
     return () => {
       mounted = false;
     };
-  }, [AccountSwitcherHostView]);
+  }, [AccountSwitcherView]);
 
-  return AccountSwitcherHostView ? <AccountSwitcherHostView /> : null;
+  return AccountSwitcherView ? <AccountSwitcherView /> : null;
 }
 
 function CurrentView(): JSX.Element {
@@ -226,44 +227,23 @@ function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.El
   });
 
   if (error) {
+    const reload = (): void => {
+      void (async () => {
+        try { setReloadFailed(!(await reloadApplication())); }
+        catch { setReloadFailed(true); }
+      })();
+    };
     return (
-      <div
-        style={{
-          minHeight: '100vh',
-          display: 'grid',
-          placeItems: 'center',
-          padding: 24,
-          background: 'var(--bg)',
-        }}
-      >
-        <Card
-          padding={24}
-          style={{
-            width: 'min(420px, 100%)',
-            display: 'grid',
-            gap: 14,
-          }}
+      <div class="cp-crash">
+        <Empty
+          eyes="x"
+          title="Axial hit a render error"
+          actions={<Button variant="secondary" icon="refresh" onClick={reload}>Reload</Button>}
         >
-          <div>
-            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6 }}>Axial hit a render error</div>
-            <div style={{ color: 'var(--text-dim)', fontSize: 13, lineHeight: 1.45 }}>
-              Reloading usually gets the launcher back in sync with the backend.
-            </div>
-          </div>
-          {reloadFailed && (
-            <p style={{ color: 'var(--text-dim)', fontSize: 13, margin: 0 }}>
-              Interface preferences could not be confirmed. Keep this window open and retry Reload.
-            </p>
-          )}
-          <Button variant="secondary" icon="refresh" onClick={() => {
-            void (async () => {
-              try { setReloadFailed(!(await reloadApplication())); }
-              catch { setReloadFailed(true); }
-            })();
-          }}>
-            Reload
-          </Button>
-        </Card>
+          {reloadFailed
+            ? 'Interface preferences could not be confirmed. Keep this window open and retry Reload.'
+            : 'Reloading usually gets the launcher back in sync with the backend.'}
+        </Empty>
       </div>
     );
   }
@@ -279,11 +259,12 @@ function AppContent(): JSX.Element {
         <CurrentView />
       </AppFrame>
       {createOpen.value && <CreateOverlay />}
-      {accountSwitcherOpen.value && <LazyAccountSwitcherHost />}
+      {accountSwitcherOpen.value && <LazyAccountSwitcher />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />
       <ContextMenuHost />
       <ToastHost />
+      <TipHost />
       {commandPaletteOpen.value && <LazyCommandPalette />}
       <BootSplash />
     </>

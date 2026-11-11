@@ -1,26 +1,86 @@
 .cp-memfield {
+  --gap: 4px;
   min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
 }
 .cp-memfield-readout {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-  font-size: 12.5px;
-  color: var(--text-dim);
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
 }
-.cp-memfield-readout strong {
+.cp-memfield-readout > strong {
+  margin-right: 6px;
   color: var(--text);
-  font-size: 13.5px;
-  font-weight: 600;
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 32px;
+  letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
-.cp-memfield-band {
-  color: var(--text-mute);
-  font-size: 11.5px;
-  font-weight: 600;
+.cp-memfield-gauge {
+  position: relative;
+  margin-top: 12px;
+}
+.cp-memfield-blocks {
+  display: grid;
+  grid-template-columns: repeat(var(--blocks), minmax(0, 1fr));
+  gap: var(--gap);
+  height: 28px;
+}
+/* Each block is two halves, since a handle can stop half way through a gigabyte. */
+.cp-memfield-blocks > i {
+  display: flex;
+  overflow: hidden;
+  border-radius: var(--hold-xs);
+}
+.cp-memfield-blocks b {
+  flex: 1;
+  background: var(--fill);
+}
+.cp-memfield-blocks b[data-cell='base'] {
+  background: var(--fill-3);
+}
+.cp-memfield-blocks b[data-cell='on'] {
+  background: var(--accent);
+}
+.cp-memfield-blocks b[data-cell='warn'] {
+  background: var(--warn);
+}
+.cp-memfield-blocks b[data-cell='err'] {
+  background: var(--err);
+}
+.cp-memfield-blocks b[data-cell='warn-off'] {
+  background: color-mix(in oklab, var(--warn) 15%, var(--fill));
+}
+.cp-memfield-blocks b[data-cell='err-off'] {
+  background: color-mix(in oklab, var(--err) 17%, var(--fill));
+}
+
+/* The slider spans the boundaries it can reach: from the end of the first block to the end of the last. */
+.cp-memfield-gauge > .cp-rslider {
+  position: absolute;
+  inset: 0 calc(var(--gap) / -2) 0 calc((100% + var(--gap)) / var(--blocks) - var(--gap) / 2);
+  width: auto;
+}
+.cp-memfield-gauge .cp-slider-track {
+  display: none;
+}
+/* A handle is a bar standing in the gap between two blocks, so the blocks beside it keep their corners. */
+.cp-memfield-gauge .cp-rslider .cp-slider-thumb {
+  width: var(--gap);
+  height: 40px;
+  border-radius: calc(var(--gap) / 2);
+  scale: none;
+}
+.cp-memfield-gauge .cp-rslider:has(input:focus-visible) .cp-slider-thumb {
+  outline: 0;
+}
+.cp-memfield-gauge .cp-rslider:has(.cp-rslider-input:first-of-type:focus-visible) .cp-rslider-thumb--lo,
+.cp-memfield-gauge .cp-rslider:has(.cp-rslider-input:last-of-type:focus-visible) .cp-rslider-thumb--hi {
+  width: 6px;
+  border-radius: 3px;
+  outline: 2px solid var(--bg);
+  outline-offset: 0;
 }

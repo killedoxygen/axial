@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { Button, Input, Pill } from '../../ui/Atoms';
+import { Button, Input, Chip } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { MicrosoftMark } from '../../ui/MicrosoftMark';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
@@ -61,11 +61,11 @@ function SignedIn({ identity }: { identity: IdentityState }): JSX.Element {
         <div class="cp-ob-card-text">
           <span class="cp-ob-card-title">{identity.player?.name}</span>
           <span class="cp-ob-chips">
-            <Pill>Microsoft account</Pill>
-            <Pill>Java Edition</Pill>
+            <Chip>Microsoft account</Chip>
+            <Chip>Java Edition</Chip>
           </span>
         </div>
-        <Icon name="check-circle" size={22} color="var(--ok)" />
+        <Icon name="check-circle" size={22} color="var(--accent)" />
       </div>
       <Button variant="ghost" size="lg" onClick={() => void identity.signIn()}>
         Use a different account

@@ -57,7 +57,7 @@ export function useModImport(
       type="file"
       accept=".jar"
       multiple
-      style={{ display: 'none' }}
+      hidden
       onChange={(event) => {
         const chosen = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = '';

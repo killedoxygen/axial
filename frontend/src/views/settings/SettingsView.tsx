@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { Icon, type IconName } from '../../ui/Icons';
+import { Tabs, type TabItem } from '../../ui/Atoms';
 import { resetViewScroll } from '../../ui-state';
 import { AppearanceSection } from './AppearanceSection';
 import { AudioSection } from './AudioSection';
@@ -12,7 +12,7 @@ import { AboutSettingsSection } from './AboutSettingsSection';
 
 type SectionId = 'appearance' | 'audio' | 'launching' | 'performance' | 'shortcuts' | 'advanced' | 'about';
 
-const SECTIONS: Array<{ id: SectionId; label: string; icon: IconName }> = [
+const SECTIONS: TabItem<SectionId>[] = [
   { id: 'appearance', label: 'Appearance', icon: 'palette' },
   { id: 'audio', label: 'Audio', icon: 'headphones' },
   { id: 'launching', label: 'Launching', icon: 'play' },
@@ -27,26 +27,16 @@ export function SettingsView(): JSX.Element {
 
   return (
     <div class="cp-settings">
-      <aside class="cp-settings-rail">
-        <h1>Settings</h1>
-        <div class="cp-settings-rail-list">
-          {SECTIONS.map((s) => (
-            <button
-              key={s.id}
-              class="cp-settings-rail-btn"
-              data-active={section === s.id}
-              onClick={() => {
-                setSection(s.id);
-                resetViewScroll();
-              }}
-            >
-              <Icon name={s.icon} size={16} stroke={1.8} />
-              {s.label}
-            </button>
-          ))}
-        </div>
-      </aside>
-      <div class="cp-settings-body">
+      <Tabs
+        tabs={SECTIONS}
+        active={section}
+        label="Settings sections"
+        onSelect={(id) => {
+          setSection(id);
+          resetViewScroll();
+        }}
+      />
+      <div class="cp-settings-page" role="tabpanel">
         {section === 'appearance' && <AppearanceSection />}
         {section === 'audio' && <AudioSection />}
         {section === 'launching' && <LaunchingSection />}

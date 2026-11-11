@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import { Pill } from '../../ui/Atoms';
+import { Chip } from '../../ui/Atoms';
 import type { BenchmarkMatrixState } from './PerformanceLabTypes';
 import { familyLabel, labelFromToken } from './PerformanceLabFormat';
 
@@ -11,18 +11,18 @@ export function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkM
   const targets = matrix?.representative_targets ?? [];
 
   return (
-    <div class="cp-settings-benchmark-matrix" aria-live="polite">
-      <div class="cp-settings-benchmark-matrix-head">
-        <div class="cp-settings-rule-status-copy">
+    <div class="cp-lab-block" aria-live="polite">
+      <div class="cp-lab-head">
+        <div class="cp-lab-title">
           <strong>Benchmark matrix</strong>
           <span>Descriptor reference for advanced local benchmark naming and suite driver modes.</span>
         </div>
-        {matrixState.status === 'loading' && <span class="cp-settings-proof-muted">Loading</span>}
-        {matrixState.status === 'error' && <span class="cp-settings-proof-error">Unavailable</span>}
+        {matrixState.status === 'loading' && <Chip>Loading</Chip>}
+        {matrixState.status === 'error' && <Chip tone="err">Unavailable</Chip>}
       </div>
 
       {!matrix && (
-        <div class="cp-settings-proof-empty">
+        <div class="cp-lab-note">
           {matrixState.status === 'loading'
             ? 'Checking benchmark descriptors.'
             : `Benchmark matrix is unavailable. ${matrixState.error}`}
@@ -31,24 +31,24 @@ export function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkM
 
       {matrix && (
         <>
-          <div class="cp-settings-benchmark-counts">
-            <Pill tone="neutral">
+          <div class="cp-lab-benchmark-counts">
+            <Chip tone="neutral">
               <strong>{modes.length}</strong> modes
-            </Pill>
-            <Pill tone="neutral">
+            </Chip>
+            <Chip tone="neutral">
               <strong>{profiles.length}</strong> profiles
-            </Pill>
-            <Pill tone="neutral">
+            </Chip>
+            <Chip tone="neutral">
               <strong>{runTypes.length}</strong> run types
-            </Pill>
-            <Pill tone="neutral">
+            </Chip>
+            <Chip tone="neutral">
               <strong>{targets.length}</strong> targets
-            </Pill>
-            <Pill tone="neutral">
+            </Chip>
+            <Chip tone="neutral">
               <strong>v{matrix.schema_version}</strong> schema
-            </Pill>
+            </Chip>
           </div>
-          <div class="cp-settings-benchmark-lists">
+          <div class="cp-lab-benchmark-lists">
             <div>
               <span>Modes</span>
               <strong>{modes.map((mode) => labelFromToken(mode.id, mode.id)).join(', ') || 'None'}</strong>
@@ -81,9 +81,7 @@ export function BenchmarkMatrixBlock({ state: matrixState }: { state: BenchmarkM
             </div>
           </div>
           {matrixState.status === 'error' && (
-            <div class="cp-settings-proof-note">
-              Could not refresh benchmark descriptors. Showing the last loaded matrix.
-            </div>
+            <div class="cp-lab-note">Could not refresh benchmark descriptors. Showing the last loaded matrix.</div>
           )}
         </>
       )}

@@ -1,8 +1,8 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Button, Kbd } from '../../ui/Atoms';
-import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from '../../ui/FloatingTray';
-import { OverrideChip, SettingRow, SettingsSection } from '../../ui/SettingsSheet';
+import { Button, Keys } from '../../ui/Atoms';
+import { FloatingTray, FloatingTrayLabel } from '../../ui/FloatingTray';
+import { OverrideChip } from '../../ui/SettingsSheet';
 import {
   SHORTCUTS,
   captureCombo,
@@ -62,66 +62,53 @@ export function ShortcutsSection(): JSX.Element {
 
   return (
     <>
-      <SettingsSection>
+      <div class="cp-shortcuts">
         {SHORTCUTS.map((def) => {
           const override = def.fixed ? null : shortcutOverride(def.id);
-          const combos = effectiveCombos(def);
-          const chips = combos.map((combo) => (
-            <span key={comboParts(combo).join('+')} class="cp-settings-combo">
-              {comboParts(combo).map((part) => (
-                <Kbd key={part}>{part}</Kbd>
-              ))}
-            </span>
+          const chips = effectiveCombos(def).map((combo) => (
+            <Keys key={comboParts(combo).join('+')} parts={comboParts(combo)} />
           ));
           const isRecording = recording === def.id;
           return (
-            <SettingRow
-              key={def.id}
-              title={def.label}
-              aside={override && <OverrideChip label="Custom" onReset={() => setShortcutOverride(def.id, null)} />}
-              control={
-                def.fixed ? (
-                  <span class="cp-settings-combos">{chips}</span>
-                ) : (
-                  <button
-                    type="button"
-                    class="cp-shortcut-edit"
-                    data-recording={isRecording}
-                    title="Click, then press the new key combo. Esc cancels."
-                    onClick={() => setRecording(isRecording ? null : def.id)}
-                  >
-                    {isRecording ? (
-                      preview.length > 0 ? (
-                        <span class="cp-settings-combo">
-                          {preview.map((part) => (
-                            <Kbd key={part}>{part}</Kbd>
-                          ))}
-                        </span>
-                      ) : (
-                        <span class="cp-shortcut-listening">Listening…</span>
-                      )
-                    ) : (
-                      <span class="cp-settings-combos">{chips}</span>
-                    )}
-                  </button>
-                )
-              }
-            />
+            <div key={def.id} class="cp-shortcut">
+              {def.fixed ? (
+                <span class="cp-shortcut-keys">{chips}</span>
+              ) : (
+                <button
+                  type="button"
+                  class="cp-shortcut-keys"
+                  data-recording={isRecording}
+                  aria-label={`Change the shortcut for ${def.label}`}
+                  title="Click, then press the new key combo. Esc cancels."
+                  onClick={() => setRecording(isRecording ? null : def.id)}
+                >
+                  {!isRecording ? (
+                    chips
+                  ) : preview.length > 0 ? (
+                    <Keys parts={preview} />
+                  ) : (
+                    <span class="cp-shortcut-listening">Listening…</span>
+                  )}
+                </button>
+              )}
+              <span class="cp-shortcut-name">
+                {def.label}
+                {override && <OverrideChip label="Custom" onReset={() => setShortcutOverride(def.id, null)} />}
+              </span>
+            </div>
           );
         })}
-      </SettingsSection>
+      </div>
       {recordingDef && (
         <FloatingTray ariaLabel={`Recording a shortcut for ${recordingDef.label}`}>
           <FloatingTrayLabel>{recordingDef.label}</FloatingTrayLabel>
-          <FloatingTrayDivider />
           <span class="cp-shortcut-hud-combo">
             {preview.length > 0 ? (
-              preview.map((part) => <Kbd key={part}>{part}</Kbd>)
+              <Keys parts={preview} />
             ) : (
               <span class="cp-shortcut-hud-hint">Press the new key combo</span>
             )}
           </span>
-          <FloatingTrayDivider />
           <span class="cp-shortcut-hud-hint">Esc cancels</span>
           <Button variant="ghost" size="sm" onClick={() => setRecording(null)}>
             Cancel

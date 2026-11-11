@@ -248,13 +248,6 @@ export const showOnboardingOverlay = signal(false);
 export const createOpen = signal(false);
 export const accountSwitcherOpen = signal(false);
 
-export interface AccountSwitcherAnchor {
-  x: number;
-  y: number;
-}
-
-export const accountSwitcherAnchor = signal<AccountSwitcherAnchor | null>(null);
-
 export interface CreateDraftItem {
   canonical_id: string;
   kind: ContentKind;
@@ -313,16 +306,10 @@ export function closeCreate(): void {
   createModpack.value = null;
 }
 
-export function openAccountSwitcher(anchor?: AccountSwitcherAnchor): void {
-  accountSwitcherAnchor.value = anchor ?? null;
+export function openAccountSwitcher(): void {
   accountSwitcherOpen.value = true;
-}
-
-export function expandAccountSwitcher(): void {
-  accountSwitcherAnchor.value = null;
 }
 
 export function closeAccountSwitcher(): void {
   accountSwitcherOpen.value = false;
-  accountSwitcherAnchor.value = null;
 }
