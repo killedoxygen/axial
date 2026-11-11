@@ -166,7 +166,9 @@ impl MetadataStore {
         memory: bool,
     ) -> StorageResult<Self> {
         connection.busy_timeout(limits.busy_timeout)?;
-        Self::configure(&ExecutionBudget::new(&mut connection, limits), memory)?;
+        let budget = ExecutionBudget::new(&mut connection, limits)?;
+        Self::configure(&budget, memory)?;
+        drop(budget);
         Ok(Self {
             connection: Mutex::new(connection),
             mutation_closed: AtomicBool::new(false),
@@ -241,7 +243,7 @@ impl MetadataStore {
         E: From<StorageError>,
     {
         let mut connection = self.lock().map_err(E::from)?;
-        let budget = ExecutionBudget::new(&mut connection, self.limits);
+        let budget = ExecutionBudget::new(&mut connection, self.limits).map_err(E::from)?;
         budget
             .pragma_update(None, "query_only", true)
             .map_err(StorageError::from)
@@ -278,7 +280,7 @@ impl MetadataStore {
         if self.is_mutation_closed() {
             return Err(StorageError::Closed.into());
         }
-        let budget = ExecutionBudget::new(&mut connection, self.limits);
+        let budget = ExecutionBudget::new(&mut connection, self.limits).map_err(E::from)?;
         // The budget holds the connection's mutable borrow; use an unchecked
         // IMMEDIATE transaction through it under our exclusive connection mutex.
         let transaction = match Transaction::new_unchecked(&budget, TransactionBehavior::Immediate)
@@ -365,7 +367,9 @@ impl MetadataStore {
     fn check_after_failed_callback(&self, connection: &mut Connection) {
         // A feature error may wrap SQLite's corruption error. Checking here
         // permits typed feature errors without losing storage's fail-closed rule.
-        if verify_integrity(&ExecutionBudget::new(connection, self.limits)).is_err() {
+        let verified = ExecutionBudget::new(connection, self.limits)
+            .and_then(|budget| verify_integrity(&budget));
+        if verified.is_err() {
             self.mutation_closed.store(true, Ordering::Release);
         }
     }
@@ -391,18 +395,18 @@ impl std::ops::Deref for ExecutionBudget<'_> {
 }
 
 impl<'a> ExecutionBudget<'a> {
-    fn new(connection: &'a mut Connection, limits: StorageLimits) -> Self {
+    fn new(connection: &'a mut Connection, limits: StorageLimits) -> StorageResult<Self> {
         let started = Instant::now();
         let mut instructions = 0_u64;
-        let _ = connection.progress_handler(
+        connection.progress_handler(
             1_000,
             Some(move || {
                 instructions = instructions.saturating_add(1_000);
                 instructions > limits.max_vm_instructions
                     || started.elapsed() >= limits.execution_timeout
             }),
-        );
-        Self(connection)
+        )?;
+        Ok(Self(connection))
     }
 }
 
