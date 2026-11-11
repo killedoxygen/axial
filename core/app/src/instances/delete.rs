@@ -840,13 +840,7 @@ mod tests {
 
     fn fixture() -> (DeletionJournal, InstanceRecord) {
         let storage = Arc::new(MetadataStore::in_memory().unwrap());
-        storage
-            .migrate(&[
-                super::super::directory::MIGRATION,
-                super::super::create::MIGRATION,
-                MIGRATION,
-            ])
-            .unwrap();
+        storage.migrate(crate::storage::SCHEMA).unwrap();
         let registry = Registry::new(storage);
         let record = insert_instance(&registry);
         (DeletionJournal { registry }, record)
@@ -854,29 +848,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_deletion_retry_preserves_its_exact_admission_for_later_settlement() {
-        use super::super::create::{CreateInstanceRequest, CreateTarget};
-        use crate::files::PortableName;
-        let (_root, mut service) = super::super::create::tests::fixture();
-        let instance = service
-            .create(
-                CreateInstanceRequest {
-                    name: "Retry deletion".into(),
-                    selection_id: "vanilla|1.21.4".into(),
-                    ..Default::default()
-                },
-                CreateTarget {
-                    selection_id: "vanilla|1.21.4".into(),
-                    version_id: "1.21.4".into(),
-                    minecraft_version: "1.21.4".into(),
-                    loader_key: "vanilla".into(),
-                },
-                service.creation_admission_for_tests().await.unwrap(),
-            )
-            .unwrap()
-            .join()
-            .await
-            .unwrap()
-            .unwrap();
+        let (_root, mut service) = creation::fixture();
+        let instance = creation::create(&service, "Retry deletion").await;
         let admitted = service.directories.admit(&instance.id).unwrap();
         let journal = DeletionJournal {
             registry: service.registry().clone(),
@@ -1047,18 +1020,8 @@ mod tests {
 
     #[test]
     fn durable_restart_preserves_precommit_and_postcommit_obligations() {
-        let root = tempfile::Builder::new()
-            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-            .unwrap();
+        let crate::testing::Fixture { root, storage, .. } = crate::testing::Fixture::new();
         let metadata = root.path().join("metadata.sqlite");
-        let storage = Arc::new(MetadataStore::open(&metadata).unwrap());
-        storage
-            .migrate(&[
-                super::super::directory::MIGRATION,
-                super::super::create::MIGRATION,
-                MIGRATION,
-            ])
-            .unwrap();
         let registry = Registry::new(storage);
         let instance = insert_instance(&registry);
         let journal = DeletionJournal { registry };
@@ -1331,55 +1294,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_setup_commit_restores_payload_registry_and_pending_setup() {
-        let (_root, service) = creation::fixture();
-        let admitted = queued_setup(&service).await;
-        let id = admitted.record().instance.id.clone();
-        let source = creation::payload_path(&service, &id);
-        service.registry().select(&id).unwrap();
-        service
-            .registry()
-            .storage()
-            .transaction(|db| {
-                db.execute_batch(
-                    "CREATE TRIGGER refuse_setup_removal BEFORE DELETE ON instance_setups
-                 BEGIN SELECT RAISE(ABORT, 'injected setup commit failure'); END;",
-                )
-                .map_err(StorageError::from)
-            })
-            .unwrap();
-        let operation = uuid::Uuid::new_v4();
-        assert!(matches!(
-            service
-                .delete_pristine_setup_admitted(admitted, operation)
-                .unwrap()
-                .join()
-                .await
-                .unwrap(),
-            Err(DeletionError::Storage(_))
-        ));
-        assert!(source.join("mods").is_dir());
-        assert!(
-            !source
-                .with_file_name(format!("deleted-{operation}"))
-                .exists()
-        );
-        let restored = service.directories.admit_for_setup_settlement(&id).unwrap();
-        restored.validate_current().unwrap();
-        assert_eq!(
-            service.registry().last_instance_id().unwrap(),
-            Some(id.clone())
-        );
-        assert!(super::super::setup::has_pending(service.registry().storage(), &id).unwrap());
-        assert_eq!(
-            service.deletion_status(operation).unwrap().status,
-            DeletionStatus::Aborted
-        );
-        assert!(service.pending_deletions().unwrap().is_empty());
-        assert!(!service.has_unsettled_effects());
-    }
-
-    #[tokio::test]
     async fn dropping_setup_removal_waiter_does_not_abandon_accepted_cleanup() {
         let (_root, service) = creation::fixture();
         let admitted = queued_setup(&service).await;
@@ -1511,52 +1425,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_setup_removal_failure_preserves_files_setup_and_selection() {
-        for intent in [DeleteIntent::KeepFiles, DeleteIntent::DeleteFiles] {
+    async fn setup_removal_commit_failure_restores_files_setup_and_selection() {
+        for intent in [None, Some(DeleteIntent::KeepFiles), Some(DeleteIntent::DeleteFiles)] {
             let (_root, service) = creation::fixture();
             let admitted = queued_setup(&service).await;
             let id = admitted.record().instance.id.clone();
             let source = creation::payload_path(&service, &id);
-            std::fs::write(source.join("options.txt"), b"user data").unwrap();
             service.registry().select(&id).unwrap();
-            drop(admitted);
             service
                 .registry()
                 .storage()
                 .transaction(|tx| {
                     tx.execute_batch(
                         "CREATE TRIGGER refuse_setup_removal BEFORE DELETE ON instance_setups
-                     BEGIN SELECT RAISE(ABORT, 'injected setup commit failure'); END;",
+                         BEGIN SELECT RAISE(ABORT, 'injected setup commit failure'); END;",
                     )
                     .map_err(StorageError::from)
                 })
                 .unwrap();
             let operation = uuid::Uuid::new_v4();
-            assert!(matches!(
-                service
-                    .delete(&id, intent, operation)
+            let result = match intent {
+                // A pristine removal must leave the payload untouched to qualify.
+                None => service
+                    .delete_pristine_setup_admitted(admitted, operation)
                     .unwrap()
                     .join()
                     .await
-                    .unwrap(),
-                Err(DeletionError::Storage(_))
-            ));
-            assert_eq!(
-                std::fs::read(source.join("options.txt")).unwrap(),
-                b"user data"
-            );
+                    .unwrap()
+                    .map(|_| ()),
+                Some(intent) => {
+                    std::fs::write(source.join("options.txt"), b"user data").unwrap();
+                    drop(admitted);
+                    let task = service.delete(&id, intent, operation).unwrap();
+                    task.join().await.unwrap().map(|_| ())
+                }
+            };
+            assert!(matches!(result, Err(DeletionError::Storage(_))), "{intent:?}");
+            assert!(source.join("mods").is_dir());
+            if intent.is_some() {
+                assert_eq!(std::fs::read(source.join("options.txt")).unwrap(), b"user data");
+            }
+            assert!(!source.with_file_name(format!("deleted-{operation}")).exists());
             service
                 .directories
                 .admit_for_setup_settlement(&id)
                 .unwrap()
                 .validate_current()
                 .unwrap();
-            assert_eq!(
-                service.registry().last_instance_id().unwrap(),
-                Some(id.clone())
-            );
+            assert_eq!(service.registry().last_instance_id().unwrap(), Some(id.clone()));
             assert!(super::super::setup::has_pending(service.registry().storage(), &id).unwrap());
-            if intent == DeleteIntent::KeepFiles {
+            if intent == Some(DeleteIntent::KeepFiles) {
                 assert!(matches!(
                     service.deletion_status(operation),
                     Err(DeletionError::NotFound)
@@ -1633,48 +1551,13 @@ mod tests {
         assert!(!service.has_unsettled_effects());
     }
 
+    /// The user moved the parked payload away; a foreign directory may then
+    /// occupy the source or park name. Only a committed deletion with no
+    /// foreign occupant completes, and foreign bytes are never removed.
     #[tokio::test]
-    async fn missing_source_keeps_precommit_pending_and_completes_committed_cleanup() {
+    async fn displaced_park_preserves_foreign_bytes_and_completes_only_committed_cleanup() {
         for committed in [false, true] {
-            let (_root, service) = creation::fixture();
-            let (journal, mut record, source, parked) = prepared_deletion(&service).await;
-            std::fs::rename(&source, &parked).unwrap();
-            if committed {
-                journal.commit(&mut record).unwrap();
-            }
-            let displaced = source.with_file_name("moved-by-user");
-            std::fs::rename(&parked, &displaced).unwrap();
-            let result = service
-                .delete(
-                    &record.instance.instance.id,
-                    DeleteIntent::DeleteFiles,
-                    record.operation_id,
-                )
-                .unwrap()
-                .join()
-                .await
-                .unwrap();
-            if committed {
-                assert_eq!(result.unwrap().status, DeletionStatus::Removed);
-                assert!(service.pending_deletions().unwrap().is_empty());
-                assert!(!service.has_unsettled_effects());
-            } else {
-                assert!(matches!(result, Err(DeletionError::FilesPreserved)));
-                assert_pending_deletion(&service, &record);
-            }
-            assert!(!source.exists());
-            assert!(!parked.exists());
-            assert_eq!(
-                std::fs::read(displaced.join("options.txt")).unwrap(),
-                b"user-owned settings"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn replacement_source_and_park_preserve_foreign_bytes_and_pending_intent() {
-        for committed in [false, true] {
-            for replace_source in [false, true] {
+            for occupant in [None, Some("source"), Some("park")] {
                 let (_root, service) = creation::fixture();
                 let (journal, mut record, source, parked) = prepared_deletion(&service).await;
                 std::fs::rename(&source, &parked).unwrap();
@@ -1683,9 +1566,11 @@ mod tests {
                 }
                 let displaced = source.with_file_name("moved-by-user");
                 std::fs::rename(&parked, &displaced).unwrap();
-                let replacement = if replace_source { &source } else { &parked };
-                std::fs::create_dir(replacement).unwrap();
-                std::fs::write(replacement.join("canary"), b"foreign payload").unwrap();
+                let occupant = occupant.map(|name| if name == "source" { &source } else { &parked });
+                if let Some(occupant) = occupant {
+                    std::fs::create_dir(occupant).unwrap();
+                    std::fs::write(occupant.join("canary"), b"foreign payload").unwrap();
+                }
                 let result = service
                     .delete(
                         &record.instance.instance.id,
@@ -1696,18 +1581,24 @@ mod tests {
                     .join()
                     .await
                     .unwrap();
-                assert!(matches!(result, Err(DeletionError::FilesPreserved)));
-                assert_pending_deletion(&service, &record);
-                assert_eq!(
-                    std::fs::read(replacement.join("canary")).unwrap(),
-                    b"foreign payload"
-                );
+                if committed && occupant.is_none() {
+                    assert_eq!(result.unwrap().status, DeletionStatus::Removed);
+                    assert!(service.pending_deletions().unwrap().is_empty());
+                    assert!(!service.has_unsettled_effects());
+                } else {
+                    assert!(matches!(result, Err(DeletionError::FilesPreserved)));
+                    assert_pending_deletion(&service, &record);
+                }
+                for path in [&source, &parked] {
+                    assert_eq!(path.exists(), occupant == Some(path));
+                }
+                if let Some(occupant) = occupant {
+                    assert_eq!(std::fs::read(occupant.join("canary")).unwrap(), b"foreign payload");
+                }
                 assert_eq!(
                     std::fs::read(displaced.join("options.txt")).unwrap(),
                     b"user-owned settings"
                 );
-                assert_eq!(source.exists(), replace_source);
-                assert_eq!(parked.exists(), !replace_source);
             }
         }
     }
@@ -1765,15 +1656,14 @@ mod tests {
 
     #[test]
     fn file_deletion_intent_has_no_default_or_ambiguous_value() {
-        assert!(serde_json::from_str::<DeleteIntent>("null").is_err());
-        assert!(serde_json::from_str::<DeleteIntent>("true").is_err());
-        assert_eq!(
-            serde_json::from_str::<DeleteIntent>("\"keep_files\"").unwrap(),
-            DeleteIntent::KeepFiles
-        );
-        assert_eq!(
-            serde_json::from_str::<DeleteIntent>("\"delete_files\"").unwrap(),
-            DeleteIntent::DeleteFiles
-        );
+        for raw in ["null", "true", "\"\""] {
+            assert!(serde_json::from_str::<DeleteIntent>(raw).is_err());
+        }
+        for (raw, intent) in [
+            ("\"keep_files\"", DeleteIntent::KeepFiles),
+            ("\"delete_files\"", DeleteIntent::DeleteFiles),
+        ] {
+            assert_eq!(serde_json::from_str::<DeleteIntent>(raw).unwrap(), intent);
+        }
     }
 }

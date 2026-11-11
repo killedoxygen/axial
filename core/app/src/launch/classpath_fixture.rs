@@ -2,13 +2,7 @@ use super::super::logs::{LogCollector, LogStream};
 use super::*;
 use crate::{
     install::artifacts::{ActivatedFile, ActivatedVersion},
-    instances::{
-        create::{CreateInstanceRequest, CreateTarget, InstanceService},
-        directory::{InstanceDirectories, Registry},
-    },
-    library::{LibraryLifecycle, LibraryOpenOutcome},
-    storage::MetadataStore,
-    tasks::{Exclusions, TaskOwner},
+    instances::create::{CreateInstanceRequest, CreateTarget},
 };
 use axial_minecraft::process::{OwnedProcess, SpawnError};
 use sha1::{Digest, Sha1};
@@ -128,29 +122,13 @@ async fn execute(
 #[tokio::test]
 #[ignore = "requires AXIAL_TEST_WINDOWS_RUNTIME_ROOT pointing to frozen official Java 17"]
 async fn real_java_loads_verified_classpath_from_canonical_windows_capabilities() {
-    let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
-    let root = tempfile::Builder::new()
+    let fixture = crate::testing::Fixture::builder()
         .prefix("Java classpath café ")
-        .tempdir_in(&parent)
-        .unwrap();
-    let canonical_root = std::fs::canonicalize(root.path()).unwrap();
-    let library = match LibraryLifecycle::open(&canonical_root) {
-        LibraryOpenOutcome::Ready(library) => library,
-        other => panic!("fixture library unavailable: {other:?}"),
-    };
-    let storage = Arc::new(MetadataStore::in_memory().unwrap());
-    storage
-        .migrate(&[
-            crate::instances::directory::MIGRATION,
-            crate::instances::create::MIGRATION,
-            crate::content::install::MIGRATION,
-            crate::performance::mutation::MIGRATION,
-        ])
-        .unwrap();
-    let tasks = TaskOwner::new(1).unwrap();
-    let directories =
-        InstanceDirectories::new(Registry::new(storage), library.clone(), Exclusions::new());
-    let instances = InstanceService::new(directories.clone(), tasks.clone());
+        .tasks(1)
+        .in_memory()
+        .build();
+    let canonical_root = fixture.root.path();
+    let instances = fixture.instances();
     let created = instances
         .create(
             CreateInstanceRequest {
@@ -171,7 +149,7 @@ async fn real_java_loads_verified_classpath_from_canonical_windows_capabilities(
         .await
         .unwrap()
         .unwrap();
-    let instance = directories.admit(&created.id).unwrap();
+    let instance = fixture.directories.admit(&created.id).unwrap();
     let mut jar = zip::ZipWriter::new(Cursor::new(Vec::new()));
     jar.start_file(
         "net/minecraft/client/main/Main.class",
@@ -244,7 +222,7 @@ async fn real_java_loads_verified_classpath_from_canonical_windows_capabilities(
         .into();
     let control = execute(&command, &control_args).await;
     let production = execute(&command, command.args()).await;
-    let shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+    let shutdown = fixture.tasks.shutdown(Duration::from_secs(5)).await;
     let prefix_kind = match command.installed.client_jar().components().next() {
         Some(Component::Prefix(prefix)) => match prefix.kind() {
             Prefix::Disk(_) => "disk",

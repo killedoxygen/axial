@@ -90,13 +90,16 @@ fn device_uses_the_lower_observed_tier_without_fallbacks() {
 #[test]
 fn canonical_loader_versions_survive_reports_but_not_unstructured_logs() {
     use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
-    for component in [
-        LoaderComponentId::Fabric,
-        LoaderComponentId::Quilt,
-        LoaderComponentId::Forge,
-        LoaderComponentId::NeoForge,
+    // The identity codec, not the generic 96-byte field bound, limits length.
+    let long = "x".repeat(100);
+    for (component, loader) in [
+        (LoaderComponentId::Fabric, "0.19.5"),
+        (LoaderComponentId::Quilt, "0.19.5"),
+        (LoaderComponentId::Forge, "0.19.5"),
+        (LoaderComponentId::NeoForge, "0.19.5"),
+        (LoaderComponentId::Fabric, long.as_str()),
     ] {
-        let version = installed_version_id_for(component, "1.20.1", "0.19.5").unwrap();
+        let version = installed_version_id_for(component, "1.20.1", loader).unwrap();
         let mut report = session_report();
         report.version_id = version.clone();
         report.scenario.version_id = Some(version.clone());
@@ -175,28 +178,6 @@ fn typed_loader_versions_reject_malformed_and_encoded_sensitive_values() {
         comparison.comparison.as_mut().unwrap().baseline.version_id = version;
         assert!(sanitize_report(&mut comparison, &redactor).is_err());
     }
-}
-
-#[test]
-fn canonical_loader_report_uses_the_identity_codecs_length_bound() {
-    let version = axial_minecraft::loaders::installed_version_id_for(
-        axial_minecraft::loaders::LoaderComponentId::Fabric,
-        "1.20.1",
-        &"x".repeat(100),
-    )
-    .unwrap();
-    assert!(version.len() > 96);
-    let mut report = session_report();
-    report.version_id = version.clone();
-    report.scenario.version_id = Some(version.clone());
-    report.comparison.as_mut().unwrap().baseline.version_id = version.clone();
-    let decoded = decode_report(&encode_report(&report).unwrap()).unwrap();
-    assert_eq!(decoded.version_id, version);
-    assert_eq!(
-        decoded.scenario.version_id.as_deref(),
-        Some(version.as_str())
-    );
-    assert_eq!(decoded.comparison.unwrap().baseline.version_id, version);
 }
 
 #[test]

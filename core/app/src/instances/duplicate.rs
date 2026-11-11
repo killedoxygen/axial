@@ -246,16 +246,12 @@ pub(crate) fn choose_duplicate_name(
 mod tests {
     use super::*;
     use crate::{
-        instances::{
-            create::tests::{create, fixture, payload_path},
-            directory::Registry,
-        },
-        library::{LibraryId, LibraryLifecycle, LibraryOpenOutcome},
+        instances::create::tests::{create, fixture, payload_path},
         performance::duplicate::seed_managed,
-        storage::{MetadataStore, rusqlite::params},
-        tasks::{Exclusions, TaskOwner},
+        storage::rusqlite::params,
+        testing::Fixture,
     };
-    use std::{collections::BTreeMap, path::Path, sync::Arc};
+    use std::{collections::BTreeMap, path::Path};
 
     fn tree_bytes(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         fn collect(
@@ -278,18 +274,6 @@ mod tests {
         let mut files = BTreeMap::new();
         collect(root, root, &mut files);
         files
-    }
-
-    fn reopen(root: &Path, library_id: LibraryId) -> InstanceService {
-        let library = match LibraryLifecycle::open_with_id(root, library_id) {
-            LibraryOpenOutcome::Ready(library) => library,
-            other => panic!("restarted duplicate fixture: {other:?}"),
-        };
-        let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
-        InstanceService::new(
-            InstanceDirectories::new(Registry::new(storage), library, Exclusions::new()),
-            TaskOwner::new(16).unwrap(),
-        )
     }
 
     fn interrupted(service: &InstanceService, source: &InstanceId, phase: &str) -> InstanceId {
@@ -385,7 +369,8 @@ mod tests {
     #[tokio::test]
     async fn managed_duplicate_restart_cancels_building_and_finishes_verified_publication() {
         for phase in ["building", "ready", "published"] {
-            let (root, service) = fixture();
+            let fixture = Fixture::new();
+            let service = fixture.instances();
             let source = create(&service, "Managed source").await;
             let admitted = service.directories.admit(&source.id).unwrap();
             seed_managed(&admitted).await;
@@ -393,11 +378,11 @@ mod tests {
             let source_path = payload_path(&service, &source.id);
             let before = tree_bytes(&source_path);
             let id = interrupted(&service, &source.id, phase);
-            let library_id = service.directories.library().admit().unwrap().library_id();
             assert_eq!(service.registry().list().unwrap().len(), 1);
             drop(service);
 
-            let service = reopen(root.path(), library_id);
+            let fixture = Fixture::builder().reopen(fixture);
+            let service = fixture.instances();
             let recovered = service
                 .recover_creation(&id)
                 .unwrap()
@@ -465,7 +450,8 @@ mod tests {
                 "witness missing",
                 "witness malformed",
             ] {
-                let (root, service) = fixture();
+                let fixture = Fixture::new();
+                let service = fixture.instances();
                 let source = create(&service, "Managed source").await;
                 let admitted = service.directories.admit(&source.id).unwrap();
                 let state = seed_managed(&admitted).await;
@@ -543,10 +529,10 @@ mod tests {
                     );
                 }
                 let destination_before = tree_bytes(&destination);
-                let library_id = service.directories.library().admit().unwrap().library_id();
                 drop(service);
 
-                let service = reopen(root.path(), library_id);
+                let fixture = Fixture::builder().reopen(fixture);
+                let service = fixture.instances();
                 assert!(
                     matches!(
                         service.recover_creation(&id).unwrap().join().await.unwrap(),
@@ -571,37 +557,22 @@ mod tests {
     }
 
     #[test]
-    fn default_names_follow_retained_copy_suffixes_and_fill_holes() {
+    fn names_fill_copy_suffix_holes_and_refuse_explicit_conflicts() {
         let occupied = vec!["Pack".into(), "Pack copy".into(), "Pack copy 3".into()];
-        assert_eq!(
-            choose_duplicate_name("Pack", &occupied, None),
-            Ok("Pack copy 2".into())
-        );
-        assert_eq!(
-            choose_duplicate_name("Pack", &occupied, Some(" \t ")),
-            Ok("Pack copy 2".into())
-        );
-        assert_eq!(
-            choose_duplicate_name("Other", &occupied, None),
-            Ok("Other copy".into())
-        );
-    }
-
-    #[test]
-    fn explicit_names_trim_and_reject_conflicts_without_silently_renaming() {
-        let occupied = vec!["Pack".into(), "Pending copy".into()];
-        assert_eq!(
-            choose_duplicate_name("Pack", &occupied, Some(" Pending copy ")),
-            Err(DuplicateNameError::Conflict)
-        );
-        assert_eq!(
-            choose_duplicate_name("Pack", &occupied, Some(" My copy \n")),
-            Ok("My copy".into())
-        );
-        assert_eq!(
-            choose_duplicate_name("Pack", &occupied, Some("pack")),
-            Ok("pack".into())
-        );
+        for (source, requested, expected) in [
+            ("Pack", None, Ok("Pack copy 2")),
+            ("Pack", Some(" \t "), Ok("Pack copy 2")),
+            ("Other", None, Ok("Other copy")),
+            ("Pack", Some(" Pack copy "), Err(DuplicateNameError::Conflict)),
+            ("Pack", Some(" My copy \n"), Ok("My copy")),
+            ("Pack", Some("pack"), Ok("pack")),
+        ] {
+            assert_eq!(
+                choose_duplicate_name(source, &occupied, requested),
+                expected.map(String::from),
+                "{source} {requested:?}"
+            );
+        }
     }
 
     #[test]

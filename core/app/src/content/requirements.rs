@@ -625,58 +625,40 @@ mod tests {
     }
 
     #[test]
-    fn fabric_predicates_follow_loader_ordering() {
+    fn predicates_follow_fabric_ordering_and_maven_interval_notation() {
+        use LoaderComponentId::{Fabric, NeoForge};
         let cases = [
-            ("0.19.3", ">=0.20.1", Some(false)),
-            ("0.20.1", ">=0.20.1", Some(true)),
-            ("1.21.1", ">=1.21- <1.21.2-", Some(true)),
-            ("1.21.2", ">=1.21- <1.21.2-", Some(false)),
-            ("1.21.1", "~1.21 <1.21.2", Some(true)),
-            ("0.8.13+mc1.21.1", "0.8.x", Some(true)),
-            ("0.7.4+mc1.21", "=0.8.13+mc1.21.1", Some(false)),
-            ("0.8.13+mc1.21.1", "0.8.13+mc1.21.1", Some(true)),
-            ("1.0.0-beta.5+mc1.21.1", "1.0.0-beta.5+mc1.21.1", Some(true)),
-            ("1.0.0-beta.4", ">=1.0.0-beta.5", Some(false)),
-            ("1.21.1", "*", Some(true)),
-            ("24w14a", ">=1.21", None),
-            ("1.21.1", ">=banana", None),
+            (Fabric, "0.19.3", ">=0.20.1", Some(false)),
+            (Fabric, "0.20.1", ">=0.20.1", Some(true)),
+            (Fabric, "1.21.1", ">=1.21- <1.21.2-", Some(true)),
+            (Fabric, "1.21.2", ">=1.21- <1.21.2-", Some(false)),
+            (Fabric, "1.21.1", "~1.21 <1.21.2", Some(true)),
+            (Fabric, "0.8.13+mc1.21.1", "0.8.x", Some(true)),
+            (Fabric, "0.7.4+mc1.21", "=0.8.13+mc1.21.1", Some(false)),
+            (Fabric, "0.8.13+mc1.21.1", "0.8.13+mc1.21.1", Some(true)),
+            (Fabric, "1.0.0-beta.5+mc1.21.1", "1.0.0-beta.5+mc1.21.1", Some(true)),
+            (Fabric, "1.0.0-beta.4", ">=1.0.0-beta.5", Some(false)),
+            (Fabric, "1.21.1", "*", Some(true)),
+            (Fabric, "24w14a", ">=1.21", None),
+            (Fabric, "1.21.1", ">=banana", None),
+            (NeoForge, "21.1.77", "[21.1.77,)", Some(true)),
+            (NeoForge, "21.1.76", "[21.1.77,)", Some(false)),
+            (NeoForge, "1.21.1", "[1.21.1,1.21.2)", Some(true)),
+            (NeoForge, "1.21.2", "[1.21.1,1.21.2)", Some(false)),
+            (NeoForge, "1.21.1", "[1.21.1]", Some(true)),
+            (NeoForge, "1.21", "[1.20,1.20.6],[1.21,)", Some(true)),
+            (NeoForge, "21.1.77", "*", Some(true)),
+            (NeoForge, "21.1.77", "21.1.200", Some(true)),
         ];
-        for (version, predicate, expected) in cases {
+        for (loader, version, predicate, expected) in cases {
             assert_eq!(
-                satisfies(LoaderComponentId::Fabric, version, &[predicate.to_string()]),
+                satisfies(loader, version, &[predicate.to_string()]),
                 expected,
                 "{version} {predicate}"
             );
         }
-        assert_eq!(
-            satisfies(
-                LoaderComponentId::Fabric,
-                "1.21.1",
-                &["1.21".to_string(), "1.21.1".to_string()]
-            ),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn maven_ranges_follow_interval_notation() {
-        let cases = [
-            ("21.1.77", "[21.1.77,)", Some(true)),
-            ("21.1.76", "[21.1.77,)", Some(false)),
-            ("1.21.1", "[1.21.1,1.21.2)", Some(true)),
-            ("1.21.2", "[1.21.1,1.21.2)", Some(false)),
-            ("1.21.1", "[1.21.1]", Some(true)),
-            ("1.21", "[1.20,1.20.6],[1.21,)", Some(true)),
-            ("21.1.77", "*", Some(true)),
-            ("21.1.77", "21.1.200", Some(true)),
-        ];
-        for (version, range, expected) in cases {
-            assert_eq!(
-                satisfies(LoaderComponentId::NeoForge, version, &[range.to_string()]),
-                expected,
-                "{version} {range}"
-            );
-        }
+        let any_of = ["1.21".to_string(), "1.21.1".to_string()];
+        assert_eq!(satisfies(Fabric, "1.21.1", &any_of), Some(true));
     }
 
     #[test]

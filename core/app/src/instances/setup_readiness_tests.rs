@@ -54,19 +54,7 @@ fn compose_fixture(
     library: crate::library::LibraryLifecycle,
 ) -> (SetupService, Arc<AccountDirectory>) {
     let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
-    storage
-        .migrate(&[
-            super::super::directory::MIGRATION,
-            super::super::create::MIGRATION,
-            super::super::delete::MIGRATION,
-            crate::content::install::MIGRATION,
-            crate::performance::mutation::MIGRATION,
-            crate::accounts::directory::MIGRATION,
-            crate::install::queue::MIGRATION,
-            crate::performance::rules::MIGRATION,
-            crate::skins::store::MIGRATION,
-        ])
-        .unwrap();
+    storage.migrate(crate::storage::SCHEMA).unwrap();
     let instances = Arc::new(InstanceService::new(
         super::super::directory::InstanceDirectories::new(
             super::super::directory::Registry::new(storage.clone()),
@@ -888,119 +876,53 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
     }
 }
 
-fn accept_request(listener: &std::net::TcpListener, label: &str) -> (std::net::TcpStream, Vec<u8>) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{label} request was not received"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => panic!("{label} fixture accept failed: {error}"),
-        }
-    };
-    let request = read_request_head(&mut stream, label);
-    (stream, request)
-}
-
-fn read_request_head(stream: &mut std::net::TcpStream, label: &str) -> Vec<u8> {
-    use std::io::Read;
-
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
-        .unwrap();
-    let mut request = [0_u8; 4096];
-    let mut length = 0;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !request[..length]
-        .windows(4)
-        .any(|bytes| bytes == b"\r\n\r\n")
-    {
-        stream
-            .set_read_timeout(Some(
-                deadline
-                    .checked_duration_since(std::time::Instant::now())
-                    .unwrap(),
-            ))
-            .unwrap();
-        assert!(
-            length < request.len(),
-            "{label} request headers exceed their bound"
-        );
-        let read = stream.read(&mut request[length..]).unwrap();
-        assert!(read > 0, "{label} request ended before its headers");
-        length += read;
-    }
-    request[..length].to_vec()
-}
-
 const FABRIC_BUILDS: &[u8] = br#"[{"loader":{"version":"0.16.14","stable":true,"maven":"net.fabricmc:fabric-loader:0.16.14"},"intermediary":{"version":"1.21.4","maven":"net.fabricmc:intermediary:1.21.4"},"launcherMeta":{"mainClass":{"client":"net.fabricmc.loader.impl.launch.knot.KnotClient"}}}]"#;
 
-/// Answers `paths` in order with `200 OK` and `body`. The last response is
-/// held: after its headers, the request is reported on the returned receiver
-/// and the body waits for release. The thread returns whether that body was
-/// delivered; a departed client is tolerated only when `may_disconnect`.
+/// Answers `paths` in order with `200 OK` and `body` from a scripted server at
+/// the returned origin. The last body is held: its request is reported on the
+/// returned receiver and the body waits for release. The thread returns whether
+/// that body was delivered; a departed client is tolerated only when
+/// `may_disconnect`.
 fn serve_held(
-    listener: std::net::TcpListener,
     label: &'static str,
     paths: Vec<String>,
     body: Vec<u8>,
     may_disconnect: bool,
 ) -> (
+    String,
     tokio::sync::oneshot::Receiver<()>,
     std::sync::mpsc::Sender<()>,
     std::thread::JoinHandle<bool>,
 ) {
-    use std::io::Write;
-
+    use crate::testing::{Reply, Server};
+    let mut replies = vec![];
+    for index in 1..=paths.len() {
+        let reply = Reply::ok(body.clone());
+        replies.push(match (index == paths.len(), may_disconnect) {
+            (false, _) => reply,
+            (true, false) => reply.held(),
+            (true, true) => reply.held().may_disconnect(),
+        });
+    }
+    let mut server = Server::start(replies);
+    let origin = server.origin.clone();
     let (requested, observed) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let mut requested = Some(requested);
-        let mut delivered = true;
-        for (index, path) in paths.iter().enumerate() {
-            let (mut stream, request) = accept_request(&listener, label);
-            assert!(request.starts_with(format!("GET {path} HTTP/1.1\r\n").as_bytes()));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            let held = index + 1 == paths.len();
-            if held {
-                requested
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap_or_else(|_| panic!("{label} request observer dropped"));
-                released
-                    .recv_timeout(std::time::Duration::from_secs(8))
-                    .unwrap_or_else(|_| panic!("{label} body was not released"));
-            }
-            match stream.write_all(&body) {
-                Ok(()) => {}
-                Err(error)
-                    if held
-                        && may_disconnect
-                        && matches!(
-                            error.kind(),
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        ) =>
-                {
-                    delivered = false;
-                }
-                Err(error) => panic!("{label} body write failed: {error}"),
-            }
+    let thread = std::thread::spawn(move || {
+        for path in &paths {
+            let line = server.blocking_request().line;
+            assert_eq!(line, format!("GET {path} HTTP/1.1"), "{label}");
         }
-        delivered
+        requested
+            .send(())
+            .unwrap_or_else(|_| panic!("{label} request observer dropped"));
+        released
+            .recv_timeout(std::time::Duration::from_secs(8))
+            .unwrap_or_else(|_| panic!("{label} body was not released"));
+        server.release();
+        server.finish().delivered
     });
-    (observed, release, server)
+    (origin, observed, release, thread)
 }
 
 fn profile_build(
@@ -1777,71 +1699,28 @@ async fn dropped_resolution_caller_keeps_owned_fetch_until_shutdown() {
 
 #[tokio::test]
 async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
+    use crate::testing::{Reply, Server};
     use futures_util::FutureExt;
-    use std::io::Write;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
     let library = service.instances.directories().library().clone();
     let owner = service.instances.tasks.clone();
     let registry_revision = service.installs.snapshot().registry_revision;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    // The provider build is fetched once; both later install resolutions fail.
+    let server = Server::start(vec![
+        Reply::ok(FABRIC_BUILDS),
+        Reply::status(404, ""),
+        Reply::status(404, ""),
+    ]);
+    let base = server.origin.clone();
     service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
     service.installs = Arc::new(
         (*service.installs)
             .clone()
             .with_loader_url(format!("{base}/unavailable-resolution").parse().unwrap()),
     );
-    let (stop, stopped) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let mut requests = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match stopped.try_recv() {
-                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => return requests,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            assert!(
-                Instant::now() < deadline,
-                "resolution fixture was not stopped"
-            );
-            let mut stream = match listener.accept() {
-                Ok((stream, _)) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("resolution fixture accept failed: {error}"),
-            };
-            assert!(
-                requests.len() < 4,
-                "resolution fixture request bound exceeded"
-            );
-            let request = read_request_head(&mut stream, "resolution");
-            if request.starts_with(b"GET /v2/versions/loader/1.21.4 HTTP/1.1\r\n") {
-                let body = FABRIC_BUILDS;
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                stream.write_all(body).unwrap();
-                requests.push("catalog");
-            } else {
-                assert!(request.starts_with(b"GET /unavailable-resolution HTTP/1.1\r\n"));
-                stream
-                    .write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .unwrap();
-                requests.push("unavailable-resolution");
-            }
-        }
-    });
     let service = Arc::new(service);
     let mut caller = None;
     let absent = |path: &std::path::Path| {
@@ -1953,7 +1832,6 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
     })
     .catch_unwind()
     .await;
-    let stopped = stop.send(());
     service.installs.close_admission();
     let shutdown = std::panic::AssertUnwindSafe(owner.shutdown(Duration::from_secs(15)))
         .catch_unwind()
@@ -1974,7 +1852,7 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
     };
     let observers =
         tokio::time::timeout(Duration::from_secs(5), service.installs.join_observers()).await;
-    let server = tokio::task::spawn_blocking(move || server.join());
+    let server = tokio::task::spawn_blocking(move || server.finish());
     let server = tokio::time::timeout(Duration::from_secs(18), server).await;
     let final_state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let pin = library.admit().unwrap();
@@ -1999,7 +1877,7 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
     let pins = library.wait_for_pins(Duration::from_secs(2)).await;
     let preserved = if matches!(&shutdown, Ok(Ok(())))
         && matches!(&observers, Ok(Ok(())))
-        && matches!(&server, Ok(Ok(Ok(_))))
+        && matches!(&server, Ok(Ok(_)))
         && receipted
         && idle
         && !unsettled
@@ -2011,7 +1889,6 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
         None
     };
     let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert!(stopped.is_ok(), "resolution fixture stopped before cleanup");
         assert!(
             matches!(shutdown, Ok(Ok(()))),
             "resolution owner did not join"
@@ -2026,8 +1903,11 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
         );
         let requests = server
             .expect("HTTP server join timed out")
-            .expect("HTTP server join task failed")
-            .expect("HTTP server failed");
+            .expect("HTTP server failed")
+            .requests
+            .iter()
+            .map(|request| request.path().to_owned())
+            .collect::<Vec<_>>();
         assert!(receipted && idle && !unsettled && runtime_settled.is_ok());
         assert!(
             pins.is_ok(),
@@ -2098,9 +1978,9 @@ async fn automatic_resolution_keeps_the_freshly_selected_provider_build() {
         assert_eq!(
             requests,
             [
-                "catalog",
-                "unavailable-resolution",
-                "unavailable-resolution"
+                "/v2/versions/loader/1.21.4",
+                "/unavailable-resolution",
+                "/unavailable-resolution"
             ]
         );
         assert!(matches!(explicit, Err(InstanceError::VersionUnavailable)));
@@ -2141,19 +2021,7 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
     let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
     let library = service.instances.directories().library().clone();
     let owner = service.instances.tasks.clone();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
-    service.installs = Arc::new(
-        (*service.installs).clone().with_loader_url(
-            format!("{base}/pending-install-resolution")
-                .parse()
-                .unwrap(),
-        ),
-    );
-    let (observed, release, server) = serve_held(
-        listener,
+    let (base, observed, release, server) = serve_held(
         "creation provider",
         vec![
             "/v2/versions/loader/1.21.4".into(),
@@ -2161,6 +2029,14 @@ async fn shutdown_preserves_created_instance_while_install_provider_is_pending()
         ],
         FABRIC_BUILDS.to_vec(),
         true,
+    );
+    service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
+    service.installs = Arc::new(
+        (*service.installs).clone().with_loader_url(
+            format!("{base}/pending-install-resolution")
+                .parse()
+                .unwrap(),
+        ),
     );
     let service = Arc::new(service);
     let mut caller = None;
@@ -2474,24 +2350,16 @@ async fn explicit_build_resolution_cancels_without_publishing() {
         let (mut service, _) = open_fixture(root.path(), crate::library::LibraryId::new());
         let library = service.instances.directories().library().clone();
         let owner = service.instances.tasks.clone();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        service.installs = Arc::new(
-            (*service.installs).clone().with_loader_url(
-                format!(
-                    "http://{}/v2/versions/loader/1.21.4",
-                    listener.local_addr().unwrap()
-                )
-                .parse()
-                .unwrap(),
-            ),
-        );
-        let (observed, release, server) = serve_held(
-            listener,
+        let (base, observed, release, server) = serve_held(
             "explicit build",
             vec!["/v2/versions/loader/1.21.4".into()],
             FABRIC_BUILDS.to_vec(),
             cancel_fetch,
+        );
+        service.installs = Arc::new(
+            (*service.installs)
+                .clone()
+                .with_loader_url(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap()),
         );
         let service = Arc::new(service);
         let mut release = Some(release);
@@ -2792,23 +2660,13 @@ async fn loader_picker_fetches(retain_runtime: &std::cell::Cell<bool>) {
         let library = service.instances.directories().library().clone();
         let owner = service.instances.tasks.clone();
         let registry_revision = service.installs.snapshot().registry_revision;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        service.loader_build_url = Some(
-            format!(
-                "http://{}/v2/versions/loader/1.21.4",
-                listener.local_addr().unwrap()
-            )
-            .parse()
-            .unwrap(),
-        );
-        let (observed, release, server) = serve_held(
-            listener,
+        let (base, observed, release, server) = serve_held(
             "loader",
             vec!["/v2/versions/loader/1.21.4".into()],
             FABRIC_BUILDS.to_vec(),
             true,
         );
+        service.loader_build_url = Some(format!("{base}/v2/versions/loader/1.21.4").parse().unwrap());
         let service = Arc::new(service);
         let mut release = Some(release);
         let mut caller = None;
@@ -3144,19 +3002,7 @@ async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         };
         let queue_before = service.installs.snapshot();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        service.loader_game_url = Some(
-            format!("http://{}/v2/versions/game", listener.local_addr().unwrap())
-                .parse()
-                .unwrap(),
-        );
         let (path, body) = if hold_manifest {
-            service.loader_manifest_url = Some(
-                format!("http://{}/manifest.json", listener.local_addr().unwrap())
-                    .parse()
-                    .unwrap(),
-            );
             ("/manifest.json", manifest.clone())
         } else {
             (
@@ -3165,8 +3011,12 @@ async fn dropped_loader_versions_caller_keeps_owned_fetch_until_shutdown() {
                     .to_vec(),
             )
         };
-        let (observed, release, server) =
-            serve_held(listener, "supported-version", vec![path.into()], body, true);
+        let (base, observed, release, server) =
+            serve_held("supported-version", vec![path.into()], body, true);
+        service.loader_game_url = Some(format!("{base}/v2/versions/game").parse().unwrap());
+        if hold_manifest {
+            service.loader_manifest_url = Some(format!("{base}/manifest.json").parse().unwrap());
+        }
         let service = Arc::new(service);
         let mut caller = None;
         let mut release = Some(release);

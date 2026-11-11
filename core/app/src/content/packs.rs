@@ -1330,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_override_root_directories_preserve_payload_selection() {
+    fn client_overrides_win_and_server_overrides_are_never_adopted() {
         let archive = archive_with_directories(
             serde_json::json!({"formatVersion":1,"game":"minecraft","name":"Directory fixture",
                 "versionId":"1","dependencies":{"minecraft":"1.21.4"},"files":[]}),
@@ -1359,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn override_directories_do_not_waive_unsafe_paths_or_conflicting_payloads() {
+    fn overrides_refuse_unsafe_reserved_and_conflicting_paths() {
         let index = serde_json::json!({"dependencies":{"minecraft":"1.21.4"}});
         for directory in ["overrides/../", "overrides//", "client-overrides/../../"] {
             assert!(matches!(
@@ -1376,6 +1376,9 @@ mod tests {
                 Err(PackError::Invalid(_))
             ));
         }
+        for reserved in ["overrides/axial.content.json", "overrides/mods/CON.jar"] {
+            assert!(archive(index.clone(), &[(reserved, b"unsafe")]).is_err());
+        }
         for extras in [
             [
                 ("overrides/config/A.txt", b"a".as_slice()),
@@ -1391,26 +1394,6 @@ mod tests {
                 Err(PackError::Conflict(_))
             ));
         }
-    }
-
-    #[test]
-    fn client_override_precedence_is_authenticated_without_adopting_server_files() {
-        let archive = archive(
-            serde_json::json!({"dependencies":{"minecraft":"1.21.4"}}),
-            &[
-                ("overrides/config/settings.txt", b"common"),
-                ("client-overrides/config/settings.txt", b"client"),
-                ("server-overrides/config/server.txt", b"server"),
-            ],
-        )
-        .unwrap();
-        let plan = archive.plan_all(true).unwrap();
-        assert_eq!(plan.destinations(), vec!["config/settings.txt"]);
-        assert_eq!(
-            archive.override_bytes(&plan.overrides[0]).unwrap(),
-            b"client"
-        );
-        assert!(archive.plan_all(false).unwrap().destinations().is_empty());
     }
 
     #[tokio::test]
@@ -1441,34 +1424,6 @@ mod tests {
             file.authenticated_file(&client, &cancel).await,
             Err(PackError::Cancelled)
         ));
-    }
-
-    #[test]
-    fn pack_archive_rejects_traversal_reserved_and_destination_aliases() {
-        for path in [
-            "overrides/../outside",
-            "overrides/axial.content.json",
-            "overrides/mods/CON.jar",
-        ] {
-            assert!(
-                archive(
-                    serde_json::json!({"dependencies":{"minecraft":"1.21.4"}}),
-                    &[(path, b"untrusted")]
-                )
-                .is_err(),
-                "{path}"
-            );
-        }
-        assert!(
-            archive(
-                serde_json::json!({"dependencies":{"minecraft":"1.21.4"}}),
-                &[
-                    ("overrides/config/A.txt", b"one"),
-                    ("overrides/config/a.txt", b"two"),
-                ]
-            )
-            .is_err()
-        );
     }
 
     #[test]

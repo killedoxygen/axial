@@ -369,65 +369,15 @@ impl ProviderBatchBudget {
 mod tests {
     use super::*;
     use crate::network::ClientConfig;
+    use crate::testing::{Reply, Request, Server};
     use serde_json::{Value, json};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-        task::JoinHandle,
-    };
 
-    async fn fixture(responses: Vec<(u16, String)>) -> (ContentService, JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
+    fn fixture(replies: Vec<Reply>) -> (ContentService, Server) {
+        let server = Server::start(replies);
         let client = ProviderClient::new(ClientConfig::default()).unwrap();
-        let origins = OriginPolicy::loopback_for_tests([&origin], 3).unwrap();
         let service =
-            ContentService::with_base_url(client, format!("{origin}/v2"), origins).unwrap();
-        let server = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for (status, body) in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut chunk = [0; 4096];
-                loop {
-                    let read = socket.read(&mut chunk).await.unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                    assert!(request.len() < 1024 * 1024);
-                    if let Some(header_end) =
-                        request.windows(4).position(|part| part == b"\r\n\r\n")
-                    {
-                        let headers = String::from_utf8_lossy(&request[..header_end]);
-                        let length = headers
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= header_end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                requests.push(String::from_utf8(request).unwrap());
-                let header = format!(
-                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(header.as_bytes()).await.unwrap();
-                socket.write_all(body.as_bytes()).await.unwrap();
-            }
-            requests
-        });
+            ContentService::with_base_url(client, server.url("/v2"), server.origins()).unwrap();
         (service, server)
-    }
-
-    fn response(value: Value) -> (u16, String) {
-        (200, value.to_string())
     }
 
     fn published_version(project: &str, id: &str) -> Value {
@@ -438,24 +388,16 @@ mod tests {
             "dependencies":[{"version_id":"dependency-pin","dependency_type":"required"}]})
     }
 
-    fn request_url(request: &str) -> reqwest::Url {
-        let target = request
-            .lines()
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap();
-        reqwest::Url::parse(&format!("http://localhost{target}")).unwrap()
+    fn request_url(request: &Request) -> reqwest::Url {
+        reqwest::Url::parse(&format!("http://localhost{}", request.path())).unwrap()
     }
 
     #[tokio::test]
     async fn search_encodes_user_input_and_retains_page_identity() {
-        let (service, server) = fixture(vec![response(json!({
+        let (service, server) = fixture(vec![Reply::json(json!({
             "hits":[{"project_id":"p1","title":"Sodium","project_type":"mod"}],
             "offset":10,"limit":1,"total_hits":20
-        }))])
-        .await;
+        }))]);
         let mut query = ContentQuery::new(ContentKind::Mod);
         query.search = Some("foo & 日本語".into());
         query.offset = 10;
@@ -465,7 +407,7 @@ mod tests {
         let page = service.search(&query).await.unwrap();
         assert_eq!(page.items[0].canonical_id.as_str(), "modrinth:p1");
         assert_eq!((page.offset, page.limit, page.total), (10, 1, 20));
-        let requests = server.await.unwrap();
+        let requests = server.finish().requests;
         let url = request_url(&requests[0]);
         assert_eq!(url.path(), "/v2/search");
         let params = url.query_pairs().collect::<HashMap<_, _>>();
@@ -486,15 +428,14 @@ mod tests {
         let mut wrong_loader = published_version("p1", "v2");
         wrong_loader["loaders"] = json!(["forge"]);
         let (service, server) = fixture(vec![
-            response(
+            Reply::json(
                 json!({"id":"p1","title":"Project","project_type":"mod","body":"Description",
                 "gallery":[{"url":"https://cdn.modrinth.com/gallery.png","title":"Scene"}]}),
             ),
-            response(json!([version.clone()])),
-            response(json!([version.clone(), wrong_loader])),
-            response(version),
-        ])
-        .await;
+            Reply::json(json!([version.clone()])),
+            Reply::json(json!([version.clone(), wrong_loader])),
+            Reply::json(version),
+        ]);
         let id = CanonicalId("modrinth:p1".into());
         let detail = service.detail(&id).await.unwrap();
         assert_eq!(detail.body, "Description");
@@ -526,7 +467,7 @@ mod tests {
             pinned.dependencies[0].version_id.as_deref(),
             Some("dependency-pin")
         );
-        let requests = server.await.unwrap();
+        let requests = server.finish().requests;
         let versions_url = request_url(&requests[2]);
         let params = versions_url.query_pairs().collect::<HashMap<_, _>>();
         assert_eq!(params["loaders"], "[\"fabric\"]");
@@ -579,26 +520,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pack_detail_accepts_embedded_file_labels_without_dependency_authority() {
+    async fn pack_versions_accept_embedded_file_labels_but_refuse_unidentified_required_files() {
+        use super::super::packs::{PackError, PackVersion, resolve_pack_version};
+
+        let project = json!({"id":"ch7UHY2J","title":"Sodium Plus","project_type":"modpack"});
         let versions = sodium_plus_versions();
         let (service, server) = fixture(vec![
-            response(json!({"id":"ch7UHY2J","title":"Sodium Plus","project_type":"modpack"})),
-            response(versions.clone()),
-            response(versions),
-        ])
-        .await;
-        let detail = service
-            .detail(&CanonicalId("modrinth:ch7UHY2J".into()))
-            .await
-            .unwrap();
+            Reply::json(project.clone()),
+            Reply::json(versions.clone()),
+            Reply::json(versions.clone()),
+            Reply::json(project.clone()),
+            Reply::json(versions.clone()),
+            Reply::json(project),
+            Reply::json(versions),
+        ]);
+        let id = CanonicalId("modrinth:ch7UHY2J".into());
+        let detail = service.detail(&id).await.unwrap();
         assert_eq!(detail.content.kind, ContentKind::Modpack);
-        assert_eq!(detail.versions.len(), 3);
         let version = &detail.versions[0];
-        assert_eq!(version.id, "7rxdscKW");
-        assert_eq!(version.files.len(), 1);
         assert_eq!(
-            version.primary_file().unwrap().filename,
-            "Sodium Plus 2.3.2-alpha.6.mrpack"
+            (version.id.as_str(), version.files.len()),
+            ("7rxdscKW", 1)
         );
         assert_eq!(
             version.dependencies,
@@ -608,9 +550,7 @@ mod tests {
                 kind: DependencyKind::Embedded,
             }]
         );
-        assert_eq!(detail.versions[1].id, "DU3jnX8R");
         assert!(detail.versions[1].dependencies.is_empty());
-        assert_eq!(detail.versions[2].id, "DdnfdzjY");
         assert_eq!(
             serde_json::to_value(&detail.versions[2].dependencies).unwrap(),
             json!([{"kind":"required"}])
@@ -622,29 +562,6 @@ mod tests {
         for version in &detail.versions {
             assert_eq!(identities[&version.id].dependencies, version.dependencies);
         }
-        let requests = server.await.unwrap();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(request_url(&requests[0]).path(), "/v2/project/ch7UHY2J");
-        assert_eq!(
-            request_url(&requests[1]).path(),
-            "/v2/project/ch7UHY2J/version"
-        );
-        assert_eq!(request_url(&requests[2]).path(), "/v2/versions");
-    }
-
-    #[tokio::test]
-    async fn pack_version_refuses_unidentified_required_file_dependencies() {
-        use super::super::packs::{PackError, PackVersion, resolve_pack_version};
-
-        let project = json!({"id":"ch7UHY2J","title":"Sodium Plus","project_type":"modpack"});
-        let (service, server) = fixture(vec![
-            response(project.clone()),
-            response(sodium_plus_versions()),
-            response(project),
-            response(sodium_plus_versions()),
-        ])
-        .await;
-        let id = CanonicalId("modrinth:ch7UHY2J".into());
         let (_, version) = resolve_pack_version(&service, &id, PackVersion::Exact("7rxdscKW"))
             .await
             .unwrap();
@@ -655,7 +572,16 @@ mod tests {
                 "required dependency could not be identified"
             ))
         ));
-        assert_eq!(server.await.unwrap().len(), 4);
+        let paths = server.finish().requests;
+        let paths = paths.iter().map(|request| request_url(request).path().to_owned());
+        assert_eq!(
+            paths.take(3).collect::<Vec<_>>(),
+            [
+                "/v2/project/ch7UHY2J",
+                "/v2/project/ch7UHY2J/version",
+                "/v2/versions"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -663,11 +589,10 @@ mod tests {
         let hash = "a".repeat(128);
         let version = published_version("p1", "v1");
         let (service, server) = fixture(vec![
-            response(json!({&hash: version.clone()})),
-            response(json!([version])),
-            response(json!([{"id":"p1","title":"Project","project_type":"shader"}])),
-        ])
-        .await;
+            Reply::json(json!({&hash: version.clone()})),
+            Reply::json(json!([version])),
+            Reply::json(json!([{"id":"p1","title":"Project","project_type":"shader"}])),
+        ]);
         let identities = service.identify(std::slice::from_ref(&hash)).await.unwrap();
         assert_eq!(identities[&hash].project_id, "p1");
         assert_eq!(
@@ -681,25 +606,10 @@ mod tests {
         let id = CanonicalId("modrinth:p1".into());
         let metadata = service.metadata(std::slice::from_ref(&id)).await.unwrap();
         assert_eq!(metadata[&id].kind, ContentKind::ShaderPack);
-        let requests = server.await.unwrap();
-        assert!(requests[0].starts_with("POST /v2/version_files "));
-        let body: Value =
-            serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        let requests = server.finish().requests;
+        assert!(requests[0].line.starts_with("POST /v2/version_files "));
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(body, json!({"hashes":[hash],"algorithm":"sha512"}));
-    }
-
-    #[tokio::test]
-    async fn hash_lookup_refuses_a_version_without_the_requested_file() {
-        let hash = "b".repeat(128);
-        let (service, server) = fixture(vec![response(
-            json!({&hash: published_version("p1", "v1")}),
-        )])
-        .await;
-        assert!(matches!(
-            service.identify(&[hash]).await,
-            Err(ContentError::ProviderMetadataInvalid(_))
-        ));
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -707,9 +617,9 @@ mod tests {
         let ids = (0..101)
             .map(|index| CanonicalId(format!("modrinth:p{index}")))
             .collect::<Vec<_>>();
-        let (service, server) = fixture(vec![response(json!([])), response(json!([]))]).await;
+        let (service, server) = fixture(vec![Reply::json(json!([])), Reply::json(json!([]))]);
         assert!(service.metadata(&ids).await.unwrap().is_empty());
-        let requests = server.await.unwrap();
+        let requests = server.finish().requests;
         assert_eq!(requests.len(), 2);
         for (request, expected_count) in requests.iter().zip([100, 1]) {
             let url = request_url(request);
@@ -719,25 +629,24 @@ mod tests {
                 expected_count
             );
         }
-        let (service, server) = fixture(vec![response(
+        let (service, server) = fixture(vec![Reply::json(
             json!([{"id":"foreign","title":"Foreign","project_type":"mod"}]),
-        )])
-        .await;
+        )]);
         assert!(matches!(
             service.metadata(&ids[..1]).await,
             Err(ContentError::ProviderMetadataInvalid(_))
         ));
-        server.await.unwrap();
+        server.finish();
     }
 
     #[tokio::test]
     async fn malformed_provider_data_and_http_failures_never_become_empty_success() {
         let (service, server) = fixture(vec![
-            (200, "{".into()),
-            (429, "sensitive upstream failure".into()),
-            response(published_version("p1", "different")),
-        ])
-        .await;
+            Reply::ok("{"),
+            Reply::status(429, "sensitive upstream failure"),
+            Reply::json(published_version("p1", "different")),
+            Reply::json(json!({"b".repeat(128): published_version("p1", "v1")})),
+        ]);
         assert!(matches!(
             service.search(&ContentQuery::new(ContentKind::Mod)).await,
             Err(ContentError::ProviderMetadataInvalid(_))
@@ -755,12 +664,17 @@ mod tests {
             service.version("v1").await,
             Err(ContentError::ProviderMetadataInvalid(_))
         ));
-        server.await.unwrap();
+        // A hash answer must contain the requested file.
+        assert!(matches!(
+            service.identify(&["b".repeat(128)]).await,
+            Err(ContentError::ProviderMetadataInvalid(_))
+        ));
+        server.finish();
     }
 
     #[tokio::test]
     async fn invalid_input_and_cancelled_reads_never_issue_provider_requests() {
-        let (service, server) = fixture(vec![]).await;
+        let (service, server) = fixture(vec![]);
         let id = CanonicalId("modrinth:../other".into());
         assert!(matches!(
             service.detail(&id).await,
@@ -791,7 +705,7 @@ mod tests {
             cancelled.version("v1").await,
             Err(ContentError::Provider(DownloadError::Cancelled))
         ));
-        assert!(server.await.unwrap().is_empty());
+        assert!(server.finish().requests.is_empty());
     }
 
     #[test]

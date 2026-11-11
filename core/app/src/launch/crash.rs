@@ -776,33 +776,25 @@ Suspected Mods: /home/alice/mod.jar (secret)
 
     #[test]
     fn hs_err_exports_structured_module_and_symbol_without_extension_or_offset() {
-        let evidence = parse_crash_evidence(CrashArtifactKind::JvmFatalError, HS_ERR)
-            .expect("hs_err evidence");
-        let frame = evidence.problematic_frame.expect("problematic frame");
-        assert_eq!(frame.module.as_str(), "libGLX_nvidia");
-        assert_eq!(
-            frame.symbol.as_ref().map(|value| value.as_str()),
-            Some("glXSwapBuffers")
-        );
-        let encoded = serde_json::to_string(&frame).unwrap();
-        assert!(!encoded.contains(".so"));
-        assert!(!encoded.contains("0x"));
-    }
-
-    #[test]
-    fn hs_err_vm_frame_uses_the_same_structured_redaction() {
-        let evidence = parse_crash_evidence(
-            CrashArtifactKind::JvmFatalError,
-            b"# Problematic frame:\n# V  [libjvm.so+0xc1a55] VMError::report_and_die+0x2",
-        )
-        .expect("VM frame");
-        let frame = evidence.problematic_frame.expect("problematic frame");
-        assert_eq!(frame.kind, CrashNativeFrameKind::Vm);
-        assert_eq!(frame.module.as_str(), "libjvm");
-        assert_eq!(
-            frame.symbol.as_ref().map(|value| value.as_str()),
-            Some("VMError::report_and_die")
-        );
+        for (raw, kind, module, symbol) in [
+            (HS_ERR, CrashNativeFrameKind::Native, "libGLX_nvidia", "glXSwapBuffers"),
+            (
+                b"# Problematic frame:\n# V  [libjvm.so+0xc1a55] VMError::report_and_die+0x2"
+                    .as_slice(),
+                CrashNativeFrameKind::Vm,
+                "libjvm",
+                "VMError::report_and_die",
+            ),
+        ] {
+            let evidence =
+                parse_crash_evidence(CrashArtifactKind::JvmFatalError, raw).expect("hs_err");
+            let frame = evidence.problematic_frame.expect("problematic frame");
+            assert_eq!(frame.kind, kind);
+            assert_eq!(frame.module.as_str(), module);
+            assert_eq!(frame.symbol.as_ref().map(|value| value.as_str()), Some(symbol));
+            let encoded = serde_json::to_string(&frame).unwrap();
+            assert!(!encoded.contains(".so") && !encoded.contains("0x"));
+        }
     }
 
     #[test]
@@ -944,38 +936,25 @@ Suspected Mods: /home/alice/mod.jar (secret)
                 "[]",
                 r#"{"kind":"native","module":"raw_secret_value","symbol":null}"#,
             ),
+            base("null", &format!(r#"[{{"name":"{}"}}]"#, "x".repeat(97)), "null"),
+            base(
+                "null",
+                &format!(r#"[{{"name":"mod","version":"{}"}}]"#, "1".repeat(65)),
+                "null",
+            ),
+            base(
+                &format!(r#""example.{}Exception""#, "X".repeat(120)),
+                "[]",
+                "null",
+            ),
+            base(
+                "null",
+                "[]",
+                r#"{"kind":"native","module":"private.dll","symbol":null}"#,
+            ),
         ] {
             assert!(serde_json::from_str::<CrashEvidence>(&invalid).is_err());
         }
-
-        let long_name = "x".repeat(97);
-        let invalid = base("null", &format!(r#"[{{"name":"{long_name}"}}]"#), "null");
-        assert!(serde_json::from_str::<CrashEvidence>(&invalid).is_err());
-
-        let long_version = "1".repeat(65);
-        let invalid = base(
-            "null",
-            &format!(r#"[{{"name":"mod","version":"{long_version}"}}]"#),
-            "null",
-        );
-        assert!(serde_json::from_str::<CrashEvidence>(&invalid).is_err());
-
-        let long_exception = format!("example.{}Exception", "X".repeat(120));
-        assert!(
-            serde_json::from_str::<CrashEvidence>(&base(
-                &format!(r#""{long_exception}""#),
-                "[]",
-                "null"
-            ))
-            .is_err()
-        );
-
-        let extension_frame = base(
-            "null",
-            "[]",
-            r#"{"kind":"native","module":"private.dll","symbol":null}"#,
-        );
-        assert!(serde_json::from_str::<CrashEvidence>(&extension_frame).is_err());
 
         let mods = (0..=MAX_SUSPECTED_MODS)
             .map(|index| format!(r#"{{"name":"mod{index}"}}"#))

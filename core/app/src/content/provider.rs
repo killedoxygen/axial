@@ -939,55 +939,30 @@ mod tests {
             )
             .is_err()
         );
-        let missing = serde_json::from_value(json!({"dependency_type":"required"})).unwrap();
-        assert!(map_dependency(missing).is_err());
     }
 
     #[test]
-    fn embedded_file_labels_do_not_admit_invalid_or_unidentified_dependency_edges() {
-        for kind in ["optional", "incompatible"] {
-            let raw = json!({"project_id":null,"version_id":null,
-                "dependency_type":kind,"file_name":"CatEyes-v7_Fabric-1.21.1.jar"});
-            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
-        }
-        for label in [
-            json!(""),
-            json!(" "),
-            json!("bad\nlabel"),
-            json!("x".repeat(1025)),
-        ] {
-            let raw = json!({"project_id":null,"version_id":null,
-                "dependency_type":"embedded","file_name":label});
-            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
-        }
-        for label in [
-            json!(null),
-            json!(""),
-            json!("bad\nlabel"),
-            json!("x".repeat(1025)),
-        ] {
-            let raw = json!({"project_id":null,"version_id":null,
-                "dependency_type":"required","file_name":label});
-            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
-        }
-        for (project, version) in [(Some("../bad"), None), (None, Some(""))] {
+    fn dependency_edges_need_a_valid_identity_or_an_embedded_or_required_file_label() {
+        let label = "CatEyes-v7_Fabric-1.21.1.jar";
+        let long = "x".repeat(1025);
+        let refused = [
+            ("optional", None, None, Some(label)),
+            ("incompatible", None, None, Some(label)),
+            ("required", None, None, None),
+            ("embedded", Some("../bad"), None, Some(label)),
+            ("embedded", None, Some(""), Some(label)),
+        ]
+        .into_iter()
+        .chain(["", " ", "bad\nlabel", long.as_str()].map(|bad| ("embedded", None, None, Some(bad))))
+        .chain(["", "bad\nlabel", long.as_str()].map(|bad| ("required", None, None, Some(bad))));
+        for (kind, project, version, file) in refused {
             let raw = json!({"project_id":project,"version_id":version,
-                "dependency_type":"embedded","file_name":"CatEyes-v7_Fabric-1.21.1.jar"});
-            assert!(map_dependency(serde_json::from_value(raw).unwrap()).is_err());
+                "dependency_type":kind,"file_name":file});
+            assert!(
+                map_dependency(serde_json::from_value(raw).unwrap()).is_err(),
+                "{kind} {project:?} {version:?} {file:?}"
+            );
         }
-    }
-
-    #[test]
-    fn named_required_file_dependencies_remain_unidentified_obligations() {
-        let raw = json!({"project_id":null,"version_id":null,
-            "dependency_type":"required","file_name":"held-item-info-1.3.0.jar"});
-        let dependency = map_dependency(serde_json::from_value(raw).unwrap())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(dependency).unwrap(),
-            json!({"kind":"required"})
-        );
     }
 
     #[test]

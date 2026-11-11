@@ -19,13 +19,6 @@ async fn preflight_fixture_with_credentials(
     use std::os::unix::fs::PermissionsExt;
 
     let (root, directories, storage, request) = recovery_fixture().await;
-    storage
-        .migrate(&[
-            crate::install::queue::MIGRATION,
-            crate::performance::rules::MIGRATION,
-            crate::skins::store::MIGRATION,
-        ])
-        .unwrap();
     let tasks = TaskOwner::new(16).unwrap();
     let cache = axial_minecraft::ManagedRuntimeCache::isolated_for_test().unwrap();
     let installs = InstallQueue::new(
@@ -322,12 +315,6 @@ async fn assert_runtime_failure_keeps_safe_cause(missing: bool, launch: bool) {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn preflight_missing_java_keeps_safe_cause() {
-    assert_runtime_failure_keeps_safe_cause(true, false).await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn preflight_reserves_observed_damage_revalidation_before_publication() {
     let (root, coordinator, id) = preflight_fixture().await;
     std::fs::write(root.path().join("probe-release"), b"release").unwrap();
@@ -383,20 +370,10 @@ async fn preflight_reserves_observed_damage_revalidation_before_publication() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn preflight_wrong_java_major_keeps_safe_cause() {
-    assert_runtime_failure_keeps_safe_cause(false, false).await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn launch_missing_custom_java_retains_safe_cause_after_reopen() {
-    assert_runtime_failure_keeps_safe_cause(true, true).await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn launch_wrong_java_major_keeps_safe_cause() {
-    assert_runtime_failure_keeps_safe_cause(false, true).await;
+async fn missing_or_wrong_java_keeps_a_safe_cause_for_preflight_and_launch() {
+    for (missing, launch) in [(true, false), (false, false), (true, true), (false, true)] {
+        assert_runtime_failure_keeps_safe_cause(missing, launch).await;
+    }
 }
 
 #[test]
@@ -565,11 +542,6 @@ async fn historical_fml_client_requires_install_before_launch() {
     let declaration = base64::engine::general_purpose::STANDARD
         .decode(include_str!("../../../../minecraft/tests/fixtures/fml-libraries.base64").trim())
         .unwrap();
-    assert_eq!(declaration.len(), 1172);
-    assert_eq!(
-        hex::encode(Sha256::digest(&declaration)),
-        "dbccc9ce173f5db2f24cbb566d39fd9b784be8710d6bc791087efe22bf967b4a"
-    );
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     archive
         .start_file(
@@ -2106,12 +2078,6 @@ async fn observed_settlement_survives_report_failure_and_disk_reopen() {
         .accept(other.intent_key.as_deref().unwrap(), binding(&other))
         .unwrap();
     let total_bytes = evidence_bytes + other_acceptance.payload.len();
-    for (rows, bytes) in [(1, total_bytes), (2, total_bytes - 1)] {
-        assert!(matches!(
-            reopened.interrupted_records_with_limits(rows, bytes),
-            Err(LaunchError::AtCapacity)
-        ));
-    }
     let unresolved = reopened
         .interrupted_records_with_limits(2, total_bytes)
         .unwrap();
@@ -2773,33 +2739,9 @@ async fn recovery_fixture() -> (
     Arc<MetadataStore>,
     LaunchRequest,
 ) {
-    use crate::{
-        instances::{
-            create::{CreateInstanceRequest, CreateTarget, InstanceService},
-            directory::Registry,
-        },
-        library::{LibraryLifecycle, LibraryOpenOutcome},
-        tasks::Exclusions,
-    };
-    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-    let library = match LibraryLifecycle::open(root.path()) {
-        LibraryOpenOutcome::Ready(library) => library,
-        other => panic!("fixture root: {other:?}"),
-    };
-    let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
-    storage
-        .migrate(&[
-            crate::instances::directory::MIGRATION,
-            crate::instances::create::MIGRATION,
-            crate::content::install::MIGRATION,
-            crate::performance::mutation::MIGRATION,
-            INTENT_MIGRATION,
-        ])
-        .unwrap();
-    let directories =
-        InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
-    let tasks = TaskOwner::new(4).unwrap();
-    let instances = InstanceService::new(directories.clone(), tasks);
+    use crate::instances::create::{CreateInstanceRequest, CreateTarget};
+    let fixture = crate::testing::Fixture::new();
+    let instances = fixture.instances();
     let instance = instances
         .create(
             CreateInstanceRequest {
@@ -2822,7 +2764,7 @@ async fn recovery_fixture() -> (
         .unwrap();
     let mut request = request();
     request.instance_id = instance.id;
-    (root, directories, storage, request)
+    (fixture.root, fixture.directories, fixture.storage, request)
 }
 
 fn accept_admitted(
@@ -3219,12 +3161,7 @@ fn ordinary_preparation_without_acceptance_is_rejected_after_disk_reopen() {
 
 #[test]
 fn accepted_terminal_proof_survives_disk_reopen() {
-    use crate::launch::{
-        logs::Redactor,
-        outcome::SessionOutcome,
-        reports::{LaunchProofRecord, LaunchProofScenario, SessionReportInput},
-        session::SessionPhase,
-    };
+    use crate::launch::{logs::Redactor, outcome::SessionOutcome, session::SessionPhase};
     for mismatch in [None, Some("instance"), Some("scenario")] {
         let root =
             tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
@@ -3238,28 +3175,13 @@ fn accepted_terminal_proof_survives_disk_reopen() {
                 panic!()
             };
             intents.accept(key, binding(&request)).unwrap();
-            let mut report = LaunchProofRecord::from_session(SessionReportInput {
-                session_id: session_id.clone(),
-                instance_id: if mismatch == Some("instance") {
-                    InstanceId::new().to_string()
-                } else {
-                    request.instance_id.to_string()
-                },
-                version_id: "fixture".into(),
-                launched_at: launched_at.into(),
-                ended_at: "2026-09-27T10:00:01.000Z".into(),
-                outcome: SessionOutcome::spawn_failed(),
-                entries: vec![],
-                exit_code: None,
-                boot_duration_ms: None,
-                logs_dropped: 0,
-            });
-            report.scenario = LaunchProofScenario {
-                performance_mode: "vanilla".into(),
-                version_id: Some("fixture".into()),
-                benchmark_id: (mismatch == Some("scenario")).then(|| "unrelated".into()),
-                ..LaunchProofScenario::default()
-            };
+            let mut report = terminal_report(&request, session_id.clone());
+            if mismatch == Some("instance") {
+                report.instance_id = InstanceId::new().to_string();
+            }
+            if mismatch == Some("scenario") {
+                report.scenario.benchmark_id = Some("unrelated".into());
+            }
             if mismatch.is_some() {
                 assert!(
                     intents

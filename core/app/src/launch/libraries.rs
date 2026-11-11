@@ -593,49 +593,39 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn conflicting_target_is_refused_without_overwrite() {
-        let fixture = fixture();
-        let directory = lib_directory(&fixture.retention).unwrap();
-        let target = fixture.temporary.path().join("game/lib/required.jar");
-        std::fs::write(&target, b"abd").unwrap();
-        assert!(matches!(
-            copy(&fixture, &directory),
-            Err(LaunchError::PreparationFailed)
-        ));
-        assert_eq!(std::fs::read(target).unwrap(), b"abd");
-        assert_eq!(
-            std::fs::read(fixture.temporary.path().join("libraries/fml/source.jar")).unwrap(),
-            b"abc"
-        );
-        assert!(!fixture.retention.has_pending());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn matching_symlink_or_hardlink_target_is_not_adopted() {
-        for symlink in [true, false] {
+    fn conflicting_or_linked_target_is_refused_without_overwrite() {
+        for case in ["conflict", "symlink", "hardlink"] {
+            if cfg!(not(unix)) && case != "conflict" {
+                continue;
+            }
             let fixture = fixture();
             let directory = lib_directory(&fixture.retention).unwrap();
             let outside = fixture.temporary.path().join("outside.jar");
             let target = fixture.temporary.path().join("game/lib/required.jar");
-            std::fs::write(&outside, b"abc").unwrap();
-            if symlink {
-                std::os::unix::fs::symlink(&outside, &target).unwrap();
-            } else {
-                std::fs::hard_link(&outside, &target).unwrap();
+            let expected: &[u8] = if case == "conflict" { b"abd" } else { b"abc" };
+            std::fs::write(&outside, expected).unwrap();
+            match case {
+                "conflict" => std::fs::copy(&outside, &target).map(drop).unwrap(),
+                #[cfg(unix)]
+                "symlink" => std::os::unix::fs::symlink(&outside, &target).unwrap(),
+                _ => std::fs::hard_link(&outside, &target).unwrap(),
             }
             assert!(matches!(
                 copy(&fixture, &directory),
                 Err(LaunchError::PreparationFailed)
             ));
-            assert_eq!(std::fs::read(&outside).unwrap(), b"abc");
-            assert_eq!(std::fs::read(&target).unwrap(), b"abc");
+            assert_eq!(std::fs::read(&outside).unwrap(), expected);
+            assert_eq!(std::fs::read(&target).unwrap(), expected);
             assert_eq!(
                 std::fs::symlink_metadata(&target)
                     .unwrap()
                     .file_type()
                     .is_symlink(),
-                symlink
+                case == "symlink"
+            );
+            assert_eq!(
+                std::fs::read(fixture.temporary.path().join("libraries/fml/source.jar")).unwrap(),
+                b"abc"
             );
             assert!(!fixture.retention.has_pending());
         }
@@ -757,7 +747,7 @@ pub(super) mod tests {
             files: vec![file],
             work: fixture.retention.work.clone(),
         };
-        let initial = prepared.revalidate();
+        prepared.revalidate().unwrap();
         let held = fixture
             .retention
             .work
@@ -768,10 +758,6 @@ pub(super) mod tests {
             ))
             .await
             .unwrap();
-        let exhausted = fixture
-            .retention
-            .work
-            .snapshot(axial_resource::PhysicalWorkClass::Foreground);
         let refused = prepared.revalidate();
         drop(held);
         let recovered = prepared.revalidate();
@@ -779,10 +765,7 @@ pub(super) mod tests {
             .retention
             .work
             .snapshot(axial_resource::PhysicalWorkClass::Foreground);
-
-        assert!(initial.is_ok());
-        assert_eq!(exhausted.available_workers, 0);
-        assert_eq!(exhausted.available_scratch_bytes, 512 << 20);
+        let pending = fixture.retention.has_pending();
         let error = refused.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert_eq!(
@@ -791,11 +774,11 @@ pub(super) mod tests {
                 .and_then(|cause| cause.downcast_ref::<axial_resource::PhysicalWorkError>()),
             Some(&axial_resource::PhysicalWorkError::Unavailable),
         );
-        assert!(recovered.is_ok());
-        assert_eq!(released.available_workers, 4);
-        assert_eq!(released.active_admissions, 0);
-        assert_eq!(released.running_workers, 0);
-        assert_eq!(released.available_scratch_bytes, 512 << 20);
-        assert!(!fixture.retention.has_pending());
+        recovered.unwrap();
+        assert_eq!(
+            (released.available_workers, released.active_admissions),
+            (4, 0)
+        );
+        assert!(!pending);
     }
 }

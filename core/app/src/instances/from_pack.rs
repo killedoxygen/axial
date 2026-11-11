@@ -740,56 +740,19 @@ mod tests {
         assert_eq!(service.registry().list().unwrap().len(), 1);
     }
 
-    /// A loopback origin standing in for `cdn.modrinth.com`, answering each
-    /// download with the next body.
-    async fn member_origin(
-        bodies: Vec<&'static [u8]>,
-    ) -> (
-        reqwest::Url,
-        axial_minecraft::download::TransferClient,
-        tokio::task::JoinHandle<()>,
-    ) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = reqwest::Url::parse(&format!(
-            "http://{}/member.zip",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let task = tokio::spawn(async move {
-            for body in bodies {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    let mut chunk = [0; 1024];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0 && request.len() + count <= 8192);
-                    request.extend_from_slice(&chunk[..count]);
-                }
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(head.as_bytes()).await.unwrap();
-                socket.write_all(body).await.unwrap();
-            }
-        });
-        let client = axial_minecraft::download::TransferClient::build(
-            axial_minecraft::download::TransferClientConfig::bounded(
-                std::time::Duration::from_secs(5),
-                std::time::Duration::from_secs(5),
-                std::time::Duration::from_secs(10),
-                vec![
-                    axial_minecraft::download::TransferOrigin::from_loopback_http_for_test_support(
-                        &url,
-                    )
-                    .unwrap(),
-                ],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        (url, client, task)
+    /// A transfer client admitting only the scripted loopback `member.zip`.
+    fn member_client(server: &crate::testing::Server) -> (reqwest::Url, axial_minecraft::download::TransferClient) {
+        use axial_minecraft::download::{TransferClient, TransferClientConfig, TransferOrigin};
+        use std::time::Duration;
+        let url = reqwest::Url::parse(&server.url("/member.zip")).unwrap();
+        let origin = TransferOrigin::from_loopback_http_for_test_support(&url).unwrap();
+        let config = TransferClientConfig::bounded(
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            vec![origin],
+        );
+        (url, TransferClient::build(config.unwrap()).unwrap())
     }
 
     #[tokio::test]
@@ -859,7 +822,11 @@ mod tests {
 
         // After a restart nothing is retained in memory: the setup reads the
         // stored copy. A payload failing its hashes installs nothing.
-        let (url, client, origin) = member_origin(vec![b"member BYTES", MEMBER]).await;
+        let cdn = crate::testing::Server::start(vec![
+            crate::testing::Reply::ok(b"member BYTES".as_slice()),
+            crate::testing::Reply::ok(MEMBER),
+        ]);
+        let (url, client) = member_client(&cdn);
         let mutations = ContentMutations::new(
             service.directories().clone(),
             crate::network::ProviderClient::new(crate::network::ClientConfig::default()).unwrap(),
@@ -891,7 +858,7 @@ mod tests {
         assert_eq!(std::fs::read(game.join(STORED_ARCHIVE)).unwrap(), bytes);
 
         install().await.unwrap();
-        origin.await.unwrap();
+        cdn.finish();
         provider.await.unwrap();
         assert_eq!(
             std::fs::read(game.join("resourcepacks/member.zip")).unwrap(),

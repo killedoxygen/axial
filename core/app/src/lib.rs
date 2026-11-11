@@ -23,4 +23,6 @@ pub mod storage;
 pub mod system;
 pub mod tasks;
 pub mod telemetry;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod update;

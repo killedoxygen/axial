@@ -207,15 +207,9 @@ pub(super) mod tests {
     use crate::{
         content::catalog::ContentService,
         install::artifacts::{ActivatedFile, ActivatedVersion},
-        instances::{
-            create::{CreateInstanceRequest, CreateTarget, InstanceService},
-            directory::{InstanceDirectories, Registry},
-        },
-        library::{LibraryLifecycle, LibraryOpenOutcome},
+        instances::create::{CreateInstanceRequest, CreateTarget, InstanceService},
         network::{ClientConfig, ProviderClient},
         performance::PerformanceService,
-        storage::MetadataStore,
-        tasks::{Exclusions, TaskOwner},
     };
     use sha1::{Digest, Sha1};
     use std::os::unix::fs::PermissionsExt;
@@ -250,15 +244,15 @@ pub(super) mod tests {
         PreparedSession,
         crate::library::ApplicationRootPin,
     ) {
-        let parent = std::env::temp_dir().canonicalize().unwrap();
-        let root = if legacy {
-            tempfile::Builder::new()
-                .prefix("legacy launch ")
-                .tempdir_in(parent)
-                .unwrap()
-        } else {
-            tempfile::tempdir_in(parent).unwrap()
-        };
+        let crate::testing::Fixture {
+            root,
+            library,
+            storage,
+            directories,
+            tasks,
+        } = crate::testing::Fixture::builder()
+            .prefix(if legacy { "legacy launch " } else { ".tmp" })
+            .build();
         let (version_id, metadata, java_version) = if legacy {
             (
                 "1.4.7",
@@ -273,26 +267,6 @@ pub(super) mod tests {
                 "17.0.10",
             )
         };
-        let library = match LibraryLifecycle::open(root.path()) {
-            LibraryOpenOutcome::Ready(library) => library,
-            other => panic!("fixture library unavailable: {other:?}"),
-        };
-        let storage = Arc::new(MetadataStore::in_memory().unwrap());
-        storage
-            .migrate(&[
-                crate::instances::directory::MIGRATION,
-                crate::instances::create::MIGRATION,
-                crate::content::install::MIGRATION,
-                crate::performance::mutation::MIGRATION,
-                crate::performance::rules::MIGRATION,
-            ])
-            .unwrap();
-        let tasks = TaskOwner::new(4).unwrap();
-        let directories = InstanceDirectories::new(
-            Registry::new(storage.clone()),
-            library.clone(),
-            Exclusions::new(),
-        );
         let instances = InstanceService::new(directories.clone(), tasks.clone());
         let instance = instances
             .create(

@@ -15,7 +15,7 @@ pub mod transport;
 use axial_app::{
     accounts::{
         credential_store::CredentialStore,
-        directory::{AccountDirectory, MIGRATION as ACCOUNTS_MIGRATION},
+        directory::AccountDirectory,
         session::AuthService,
     },
     catalog::Catalog,
@@ -39,7 +39,7 @@ use axial_app::{
     public::DEVELOPMENT_APPLICATION_ID,
     resources::{ResourceService, folders::FolderService},
     runtime::discovery::RuntimeDiscovery,
-    settings::{SETTINGS_MIGRATION, SettingsStore},
+    settings::SettingsStore,
     skins::{ProfileMedia, library::SavedSkinLibrary, store::SavedSkinStore},
     storage::MetadataStore,
     tasks::{Exclusions, TaskOwner, retry_until_settled},
@@ -604,15 +604,7 @@ async fn start_profile_inner(
             .map_err(|error| error.to_string())?;
         let metadata = Arc::new(MetadataStore::open(profile.root().join("metadata.sqlite"))
             .map_err(|_| "Could not open replacement metadata. Existing data has been preserved.".to_string())?);
-        metadata.migrate(&[SETTINGS_MIGRATION, ACCOUNTS_MIGRATION,
-            axial_app::instances::directory::MIGRATION, axial_app::instances::delete::MIGRATION,
-            axial_app::instances::create::MIGRATION,
-            axial_app::install::queue::MIGRATION,
-            axial_app::content::install::MIGRATION, axial_app::performance::rules::MIGRATION,
-            axial_app::performance::mutation::MIGRATION,
-            axial_app::performance::benchmarks::MIGRATION,
-            axial_app::skins::store::MIGRATION,
-            axial_app::launch::coordinator::INTENT_MIGRATION])
+        metadata.migrate(axial_app::storage::SCHEMA)
             .map_err(|_| "Could not migrate replacement metadata. Existing data has been preserved.".to_string())?;
         let settings = Arc::new(SettingsStore::new_with_telemetry_identity(metadata.clone(), telemetry_for_init.export_configured())
             .map_err(|error| error.to_string())?);

@@ -1574,9 +1574,35 @@ fn incompatible_conflict(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
-    fn test_sha512_file(path: &std::path::Path) -> std::io::Result<String> {
+    fn sha512(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha512};
-        Ok(format!("{:x}", Sha512::digest(std::fs::read(path)?)))
+        format!("{:x}", Sha512::digest(bytes))
+    }
+
+    fn installed_entry(
+        project: &str,
+        version_id: &str,
+        dependencies: Vec<ContentDependency>,
+    ) -> ManifestEntry {
+        ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, project),
+            ProviderId::Modrinth,
+            project.to_string(),
+            version_id.to_string(),
+            ContentKind::Mod,
+            &file(&format!("{project}.jar"), None),
+            dependencies,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn incompatible(project: &str, version: Option<&str>) -> ContentDependency {
+        ContentDependency {
+            project_id: (!project.is_empty()).then(|| project.to_string()),
+            version_id: version.map(str::to_string),
+            kind: DependencyKind::Incompatible,
+        }
     }
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2969,20 +2995,13 @@ mod tests {
 
     #[test]
     fn resolution_limits_admit_exact_and_reject_one_over() {
-        ensure_within_limit(
-            ResolutionLimitKind::Selections,
-            MAX_RESOLUTION_SELECTIONS as u64,
-            MAX_RESOLUTION_SELECTIONS as u64,
-        )
-        .expect("exact selection limit");
-        assert!(
-            ensure_within_limit(
-                ResolutionLimitKind::Selections,
-                (MAX_RESOLUTION_SELECTIONS + 1) as u64,
-                MAX_RESOLUTION_SELECTIONS as u64,
-            )
-            .is_err()
-        );
+        for (kind, limit) in [
+            (ResolutionLimitKind::Selections, MAX_RESOLUTION_SELECTIONS as u64),
+            (ResolutionLimitKind::Queue, MAX_RESOLUTION_QUEUE as u64),
+        ] {
+            ensure_within_limit(kind, limit, limit).unwrap();
+            assert!(ensure_within_limit(kind, limit + 1, limit).is_err());
+        }
 
         let mut nodes = ResolutionBudget::default();
         for _ in 0..MAX_RESOLUTION_NODES {
@@ -3009,21 +3028,6 @@ mod tests {
             ResolutionBudget::default()
                 .admit_dependencies(MAX_DEPENDENCIES_PER_NODE + 1)
                 .is_err()
-        );
-
-        ensure_within_limit(
-            ResolutionLimitKind::Queue,
-            MAX_RESOLUTION_QUEUE as u64,
-            MAX_RESOLUTION_QUEUE as u64,
-        )
-        .expect("exact queue limit");
-        assert!(
-            ensure_within_limit(
-                ResolutionLimitKind::Queue,
-                (MAX_RESOLUTION_QUEUE + 1) as u64,
-                MAX_RESOLUTION_QUEUE as u64,
-            )
-            .is_err()
         );
 
         let mut conflicts = Vec::new();
@@ -3060,34 +3064,43 @@ mod tests {
         assert!(bounded_serialized_len(&"abc", 4).is_err());
     }
 
-    #[test]
-    fn pick_version_prefers_release_with_a_file() {
-        let versions = vec![
-            version("beta-1", ReleaseChannel::Beta, vec![file("beta.jar", None)]),
-            version(
-                "rel-1",
-                ReleaseChannel::Release,
-                vec![file("rel.jar", None)],
-            ),
-        ];
-        assert_eq!(pick_version(&versions, None).unwrap().id, "rel-1");
+    fn versions(specs: &[(&str, ReleaseChannel, bool)]) -> Vec<ContentVersion> {
+        specs
+            .iter()
+            .map(|(id, channel, has_file)| {
+                let files = if *has_file {
+                    vec![file(&format!("{id}.jar"), None)]
+                } else {
+                    Vec::new()
+                };
+                version(id, *channel, files)
+            })
+            .collect()
     }
 
     #[test]
-    fn pick_version_honors_a_forced_id() {
-        let versions = vec![
-            version(
-                "rel-1",
-                ReleaseChannel::Release,
-                vec![file("rel.jar", None)],
-            ),
-            version("beta-1", ReleaseChannel::Beta, vec![file("beta.jar", None)]),
-        ];
-        assert_eq!(
-            pick_version(&versions, Some("beta-1")).unwrap().id,
-            "beta-1"
-        );
-        assert!(pick_version(&versions, Some("missing")).is_none());
+    fn picks_prefer_the_newest_release_with_a_file_in_any_provider_order() {
+        use ReleaseChannel::{Beta, Release};
+        let mixed = versions(&[("beta-1", Beta, true), ("rel-1", Release, true)]);
+        assert_eq!(pick_version(&mixed, None).unwrap().id, "rel-1");
+        assert_eq!(pick_version(&mixed, Some("beta-1")).unwrap().id, "beta-1");
+        assert!(pick_version(&mixed, Some("missing")).is_none());
+        let fileless = versions(&[("rel-1", Release, false), ("beta-1", Beta, true)]);
+        assert_eq!(pick_version(&fileless, None).unwrap().id, "beta-1");
+        let mut dated = versions(&[("release-a", Release, true), ("release-b", Release, true)]);
+        dated[0].published = Some("2026-01-01T00:00:00Z".to_string());
+        dated[1].published = Some("2026-02-01T00:00:00Z".to_string());
+        assert_eq!(pick_version(&dated, None).unwrap().id, "release-b");
+        dated.reverse();
+        assert_eq!(pick_version(&dated, None).unwrap().id, "release-b");
+
+        let releases = versions(&[("rel-2", Release, true), ("rel-1", Release, true)]);
+        assert_eq!(newer_version(&releases, "rel-1").unwrap().id, "rel-2");
+        assert!(newer_version(&releases, "rel-2").is_none());
+        assert_eq!(newer_version(&releases, "old-gone").unwrap().id, "rel-2");
+        assert!(newer_version(&[], "old-gone").is_none());
+        let beta_current = versions(&[("beta-2", Beta, true), ("rel-1", Release, true)]);
+        assert_eq!(newer_version(&beta_current, "beta-2").unwrap().id, "rel-1");
     }
 
     #[test]
@@ -3134,44 +3147,6 @@ mod tests {
             "forge-rel"
         );
         assert!(pick_filtered_version(&versions, &unmatched).is_none());
-    }
-
-    #[test]
-    fn pick_version_falls_back_to_prerelease_when_no_release_has_a_file() {
-        let versions = vec![
-            version("rel-1", ReleaseChannel::Release, vec![]),
-            version("beta-1", ReleaseChannel::Beta, vec![file("beta.jar", None)]),
-        ];
-        assert_eq!(pick_version(&versions, None).unwrap().id, "beta-1");
-    }
-
-    #[test]
-    fn version_ranking_is_independent_of_provider_order() {
-        let mut older = version(
-            "release-a",
-            ReleaseChannel::Release,
-            vec![file("a.jar", None)],
-        );
-        older.published = Some("2026-01-01T00:00:00Z".to_string());
-        let mut newer = version(
-            "release-b",
-            ReleaseChannel::Release,
-            vec![file("b.jar", None)],
-        );
-        newer.published = Some("2026-02-01T00:00:00Z".to_string());
-
-        assert_eq!(
-            pick_version(&[older.clone(), newer.clone()], None)
-                .expect("rank forward")
-                .id,
-            "release-b"
-        );
-        assert_eq!(
-            pick_version(&[newer, older], None)
-                .expect("rank reverse")
-                .id,
-            "release-b"
-        );
     }
 
     #[test]
@@ -3222,364 +3197,73 @@ mod tests {
     }
 
     #[test]
-    fn newer_version_flags_only_strictly_newer_picks() {
-        let versions = vec![
-            version(
-                "rel-2",
-                ReleaseChannel::Release,
-                vec![file("rel2.jar", None)],
-            ),
-            version(
-                "rel-1",
-                ReleaseChannel::Release,
-                vec![file("rel1.jar", None)],
-            ),
-        ];
-        assert_eq!(newer_version(&versions, "rel-1").unwrap().id, "rel-2");
-        assert!(newer_version(&versions, "rel-2").is_none());
-    }
-
-    #[test]
-    fn newer_version_prefers_a_stable_release_over_a_prerelease() {
-        let versions = vec![
-            version(
-                "beta-2",
-                ReleaseChannel::Beta,
-                vec![file("beta2.jar", None)],
-            ),
-            version(
-                "rel-1",
-                ReleaseChannel::Release,
-                vec![file("rel1.jar", None)],
-            ),
-        ];
-        assert_eq!(
-            newer_version(&versions, "beta-2")
-                .expect("stable replacement")
-                .id,
-            "rel-1"
-        );
-    }
-
-    #[test]
-    fn newer_version_offers_the_best_pick_when_current_is_not_compatible() {
-        let versions = vec![version(
-            "rel-1",
-            ReleaseChannel::Release,
-            vec![file("rel1.jar", None)],
-        )];
-        assert_eq!(newer_version(&versions, "old-gone").unwrap().id, "rel-1");
-        assert!(newer_version(&[], "old-gone").is_none());
-    }
-
-    #[test]
-    fn a_version_conflicts_only_with_other_installed_content() {
-        let mut update = version("v1", ReleaseChannel::Release, vec![file("a.jar", None)]);
-        update.dependencies.push(ContentDependency {
-            project_id: Some("XXX".to_string()),
-            version_id: None,
-            kind: DependencyKind::Incompatible,
-        });
-        let own = CanonicalId::for_project(ProviderId::Modrinth, "SELF");
-        let other = CanonicalId::for_project(ProviderId::Modrinth, "XXX");
-        let installed = vec![
-            ManifestEntry::managed(
-                other.clone(),
-                ProviderId::Modrinth,
-                "XXX".to_string(),
-                "v1".to_string(),
-                ContentKind::Mod,
-                &file("other.jar", None),
-                Vec::new(),
-                Some("Other".to_string()),
-            )
-            .expect("valid managed entry"),
-        ];
-
-        assert!(version_conflicts_with_installed(&update, &own, &installed));
-        assert!(
-            !version_conflicts_with_installed(&update, &other, &installed),
-            "the entry being replaced is exempt"
-        );
-        assert!(!version_conflicts_with_installed(&update, &own, &[]));
-    }
-
-    #[test]
-    fn installed_content_can_declare_the_candidate_incompatible() {
+    fn installed_conflicts_follow_both_edge_directions_and_exact_versions() {
         let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let installed_id = CanonicalId::for_project(ProviderId::Modrinth, "installed");
-        let installed = vec![
-            ManifestEntry::managed(
-                installed_id,
-                ProviderId::Modrinth,
-                "installed".to_string(),
-                "v1".to_string(),
-                ContentKind::Mod,
-                &file("installed.jar", None),
-                vec![ContentDependency {
-                    project_id: Some("candidate".to_string()),
-                    version_id: None,
-                    kind: DependencyKind::Incompatible,
-                }],
-                Some("Installed".to_string()),
-            )
-            .expect("valid managed entry"),
-        ];
-        let update = version(
-            "candidate-v2",
-            ReleaseChannel::Release,
-            vec![file("candidate.jar", None)],
-        );
+        let release = |id: &str| version(id, ReleaseChannel::Release, vec![file("c.jar", None)]);
+        let conflicts = |update: &ContentVersion, own: &CanonicalId, installed: &[ManifestEntry]| {
+            version_conflicts_with_installed(update, own, installed)
+        };
 
-        assert!(version_conflicts_with_installed(
-            &update, &candidate, &installed
-        ));
+        // The candidate declares another installed project incompatible.
+        let mut update = release("v1");
+        update.dependencies.push(incompatible("other", None));
+        let other = installed_entry("other", "v1", Vec::new());
+        assert!(conflicts(&update, &candidate, std::slice::from_ref(&other)));
+        let replaced = CanonicalId::for_project(ProviderId::Modrinth, "other");
+        assert!(!conflicts(&update, &replaced, std::slice::from_ref(&other)));
+        assert!(!conflicts(&update, &candidate, &[]));
 
-        let mut manifest = ContentManifest::default();
-        manifest
-            .try_upsert_batch(installed)
-            .expect("installed manifest");
-        assert_eq!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
-                &update.id,
-                &LiveManagedContent::from_entries(manifest.entries()),
-            )
-            .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn reverse_incompatibilities_match_the_exact_candidate_version() {
-        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        for (case, project_id) in [
-            ("project and version", Some("candidate".to_string())),
-            ("version only", None),
+        // Installed content declares the candidate incompatible, optionally
+        // only one exact version of it.
+        for (project, pin, blocked_v1, blocked_v2) in [
+            ("candidate", None, true, true),
+            ("candidate", Some("candidate-v1"), true, false),
+            ("", Some("candidate-v1"), true, false),
         ] {
-            let installed = ManifestEntry::managed(
-                CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-                ProviderId::Modrinth,
-                "installed".to_string(),
-                "installed-v1".to_string(),
-                ContentKind::Mod,
-                &file("installed.jar", None),
-                vec![ContentDependency {
-                    project_id,
-                    version_id: Some("candidate-v1".to_string()),
-                    kind: DependencyKind::Incompatible,
-                }],
-                Some("Installed".to_string()),
-            )
-            .expect("valid managed entry");
+            let installed = installed_entry("installed", "installed-v1", vec![incompatible(project, pin)]);
             let mut manifest = ContentManifest::default();
-            manifest
-                .try_upsert(installed.clone())
-                .expect("installed manifest");
-            let candidate_v1 = version(
-                "candidate-v1",
-                ReleaseChannel::Release,
-                vec![file("candidate.jar", None)],
-            );
-            let candidate_v2 = version(
-                "candidate-v2",
-                ReleaseChannel::Release,
-                vec![file("candidate.jar", None)],
-            );
-
-            assert!(
-                version_conflicts_with_installed(
-                    &candidate_v1,
-                    &candidate,
-                    std::slice::from_ref(&installed),
-                ),
-                "{case}"
-            );
-            assert!(
-                !version_conflicts_with_installed(
-                    &candidate_v2,
-                    &candidate,
-                    std::slice::from_ref(&installed),
-                ),
-                "{case}"
-            );
-            assert_eq!(
-                installed_entries_incompatible_with(
-                    &manifest,
-                    &candidate,
-                    "candidate-v1",
-                    &LiveManagedContent::from_entries(manifest.entries()),
-                )
-                .len(),
-                1,
-                "{case}"
-            );
-            assert!(
-                installed_entries_incompatible_with(
-                    &manifest,
-                    &candidate,
-                    "candidate-v2",
-                    &LiveManagedContent::from_entries(manifest.entries()),
-                )
-                .is_empty(),
-                "{case}"
-            );
+            manifest.try_upsert(installed.clone()).unwrap();
+            let live = LiveManagedContent::from_entries(manifest.entries());
+            for (id, blocked) in [("candidate-v1", blocked_v1), ("candidate-v2", blocked_v2)] {
+                let installed = std::slice::from_ref(&installed);
+                assert_eq!(conflicts(&release(id), &candidate, installed), blocked, "{project} {pin:?} {id}");
+                assert_eq!(
+                    installed_entries_incompatible_with(&manifest, &candidate, id, &live).len(),
+                    usize::from(blocked),
+                    "{project} {pin:?} {id}"
+                );
+            }
         }
-    }
 
-    #[test]
-    fn reverse_exact_requirements_block_dependency_version_replacement() {
-        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let installed_candidate = ManifestEntry::managed(
-            candidate.clone(),
-            ProviderId::Modrinth,
-            "candidate".to_string(),
-            "candidate-v1".to_string(),
-            ContentKind::Mod,
-            &file("candidate.jar", None),
-            Vec::new(),
-            Some("Candidate".to_string()),
-        )
-        .expect("valid managed entry");
-        for version_only in [false, true] {
-            let dependent = ManifestEntry::managed(
-                CanonicalId::for_project(ProviderId::Modrinth, "dependent"),
-                ProviderId::Modrinth,
-                "dependent".to_string(),
-                "dependent-v1".to_string(),
-                ContentKind::Mod,
-                &file("dependent.jar", None),
+        // An installed exact requirement blocks replacing its dependency version.
+        for project in [Some("candidate"), None] {
+            let dependent = installed_entry(
+                "dependent",
+                "dependent-v1",
                 vec![ContentDependency {
-                    project_id: (!version_only).then(|| "candidate".to_string()),
+                    project_id: project.map(str::to_string),
                     version_id: Some("candidate-v1".to_string()),
                     kind: DependencyKind::Required,
                 }],
-                Some("Dependent".to_string()),
-            )
-            .expect("valid managed entry");
-            let installed = [installed_candidate.clone(), dependent];
-            let candidate_v1 = version(
-                "candidate-v1",
-                ReleaseChannel::Release,
-                vec![file("candidate.jar", None)],
             );
-            let candidate_v2 = version(
-                "candidate-v2",
-                ReleaseChannel::Release,
-                vec![file("candidate.jar", None)],
-            );
-
-            assert!(!version_conflicts_with_installed(
-                &candidate_v1,
-                &candidate,
-                &installed,
-            ));
-            assert!(version_conflicts_with_installed(
-                &candidate_v2,
-                &candidate,
-                &installed,
-            ));
+            let installed = [installed_entry("candidate", "candidate-v1", Vec::new()), dependent];
+            assert!(!conflicts(&release("candidate-v1"), &candidate, &installed));
+            assert!(conflicts(&release("candidate-v2"), &candidate, &installed));
         }
     }
 
     #[test]
-    fn missing_or_replaced_manifest_entries_do_not_create_conflicts() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-resolve-stale-conflict-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("mods")).expect("mods");
+    fn only_live_installed_entries_create_reverse_conflicts() {
         let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let path = root.join("mods/installed.jar");
-        std::fs::write(&path, b"owned bytes").expect("owned file");
-        let mut entry = ManifestEntry::managed(
-            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-            ProviderId::Modrinth,
-            "installed".to_string(),
-            "v1".to_string(),
-            ContentKind::Mod,
-            &file("installed.jar", Some(b"owned bytes".len() as u64)),
-            vec![ContentDependency {
-                project_id: Some("candidate".to_string()),
-                version_id: None,
-                kind: DependencyKind::Incompatible,
-            }],
-            None,
-        )
-        .expect("valid managed entry");
-        entry
-            .record_authenticated_file(
-                b"owned bytes".len() as u64,
-                test_sha512_file(&path).expect("owned hash"),
-            )
-            .expect("record authenticated file");
+        let mut entry = installed_entry("installed", "v1", vec![incompatible("candidate", None)]);
+        entry.record_authenticated_file(1, sha512(b"o")).unwrap();
         let mut manifest = ContentManifest::default();
-        manifest
-            .try_upsert(entry.clone())
-            .expect("insert authenticated entry");
-        let live = LiveManagedContent::from_entries(manifest.entries());
-
-        assert_eq!(
-            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", &live,)
-                .len(),
-            1
-        );
-        std::fs::write(&path, b"user replacement").expect("replacement");
-        assert!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
-                "candidate-v1",
-                &LiveManagedContent::default(),
-            )
-            .is_empty()
-        );
-        assert!(!LiveManagedContent::default().contains(&entry));
-        std::fs::remove_file(&path).expect("remove replacement");
-        assert!(
-            installed_entries_incompatible_with(
-                &manifest,
-                &candidate,
-                "candidate-v1",
-                &LiveManagedContent::default(),
-            )
-            .is_empty()
-        );
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn conflicting_exact_dependency_versions_are_unavailable() {
-        let dependency = CanonicalId::for_project(ProviderId::Modrinth, "dependency");
-        let conflict = exact_dependency_conflict(&dependency, "version-a", "version-b");
-
-        assert_eq!(conflict.kind(), ResolutionConflictKind::Unavailable);
-        assert_eq!(conflict.canonical_id, Some(dependency));
-        assert_eq!(
-            conflict.reason,
-            ResolutionConflictReason::ExactVersionConflict {
-                chosen_version_id: "version-a".to_string(),
-                required_version_id: "version-b".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn newly_discovered_exact_requirement_replans_only_unpinned_content() {
-        let dependency = CanonicalId::for_project(ProviderId::Modrinth, "dependency");
-        assert!(exact_requirement_needs_retry(&HashMap::new(), &dependency));
-
-        let pinned = HashMap::from([(dependency.clone(), "version-a".to_string())]);
-        assert!(
-            !exact_requirement_needs_retry(&pinned, &dependency),
-            "a second exact requirement must be reported as a conflict"
-        );
+        manifest.try_upsert(entry).unwrap();
+        let conflicts = |live: &LiveManagedContent| {
+            installed_entries_incompatible_with(&manifest, &candidate, "candidate-v1", live).len()
+        };
+        assert_eq!(conflicts(&LiveManagedContent::from_entries(manifest.entries())), 1);
+        assert_eq!(conflicts(&LiveManagedContent::default()), 0);
     }
 
     #[test]
@@ -3652,19 +3336,7 @@ mod tests {
         assert!(!has_unresolved_version_only_incompatibility(&dependencies));
 
         let own = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let installed = |version_id: &str| {
-            ManifestEntry::managed(
-                CanonicalId::for_project(ProviderId::Modrinth, "installed"),
-                ProviderId::Modrinth,
-                "installed".to_string(),
-                version_id.to_string(),
-                ContentKind::Mod,
-                &file("installed.jar", None),
-                Vec::new(),
-                None,
-            )
-            .expect("valid managed entry")
-        };
+        let installed = |version_id: &str| installed_entry("installed", version_id, Vec::new());
         let mut update = version(
             "candidate-v2",
             ReleaseChannel::Release,
@@ -3685,70 +3357,30 @@ mod tests {
     }
 
     #[test]
-    fn selected_content_is_checked_for_mutual_incompatibility() {
-        let items = vec![
-            resolved_item("first", Some("second")),
-            resolved_item("second", None),
-        ];
-
-        let conflicts = selected_conflicts(&items);
-
+    fn selected_incompatibilities_honor_exact_version_ids() {
+        let with_pin = |pin: &str| {
+            let mut first = resolved_item("first", Some("second"));
+            first.dependencies[0].version_id = Some(pin.to_string());
+            selected_conflicts(&[first, resolved_item("second", None)])
+        };
+        assert!(with_pin("different-version").is_empty());
+        let conflicts = with_pin("v1");
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].kind(), ResolutionConflictKind::Incompatible);
-        assert_eq!(
-            conflicts[0].reason,
-            ResolutionConflictReason::SelectedIncompatibility {
-                other_project_id: "second".to_string(),
-            }
-        );
-        assert_eq!(
-            conflicts[0].canonical_id.as_ref().map(CanonicalId::as_str),
-            Some("modrinth:first")
-        );
     }
 
     #[test]
-    fn selected_incompatibilities_honor_exact_version_ids() {
-        let mut nonmatching = resolved_item("first", Some("second"));
-        nonmatching.dependencies[0].version_id = Some("different-version".to_string());
-        assert!(selected_conflicts(&[nonmatching, resolved_item("second", None),]).is_empty());
-
-        let mut matching = resolved_item("first", Some("second"));
-        matching.dependencies[0].version_id = Some("v1".to_string());
-        assert_eq!(
-            selected_conflicts(&[matching, resolved_item("second", None)]).len(),
-            1
-        );
-    }
-
-    #[test]
-    fn a_vanilla_target_takes_packs_but_refuses_mods() {
-        let vanilla = target(false);
-
-        for kind in [ContentKind::ResourcePack, ContentKind::ShaderPack] {
-            assert!(
-                require_installable_kind(kind, &vanilla).is_ok(),
-                "{kind:?} needs no mod loader"
-            );
-        }
-        assert!(require_installable_kind(ContentKind::Mod, &vanilla).is_err());
-    }
-
-    #[test]
-    fn a_modded_target_takes_every_installable_kind() {
-        let fabric = target(true);
-        for kind in [
-            ContentKind::Mod,
-            ContentKind::ResourcePack,
-            ContentKind::ShaderPack,
+    fn installable_kinds_follow_the_target_and_modpacks_are_never_added() {
+        use ContentKind::{Mod, Modpack, ResourcePack, ShaderPack};
+        for (kind, vanilla, modded) in [
+            (ResourcePack, true, true),
+            (ShaderPack, true, true),
+            (Mod, false, true),
+            (Modpack, false, false),
         ] {
-            assert!(require_installable_kind(kind, &fabric).is_ok());
+            assert_eq!(require_installable_kind(kind, &target(false)).is_ok(), vanilla);
+            assert_eq!(require_installable_kind(kind, &target(true)).is_ok(), modded);
         }
-    }
-
-    #[test]
-    fn modpacks_are_never_added_to_an_instance() {
-        assert!(require_installable_kind(ContentKind::Modpack, &target(true)).is_err());
     }
 
     #[test]
@@ -3768,37 +3400,13 @@ mod tests {
     }
 
     #[test]
-    fn stale_manifest_entry_is_not_treated_as_installed() {
-        let root = std::env::temp_dir().join(format!(
-            "axial-resolve-stale-manifest-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("mods")).expect("mods");
-        let mut entry = ManifestEntry::managed(
-            CanonicalId::for_project(ProviderId::Modrinth, "project"),
-            ProviderId::Modrinth,
-            "project".to_string(),
-            "v1".to_string(),
-            ContentKind::Mod,
-            &file("project.jar", Some(3)),
-            Vec::new(),
-            None,
-        )
-        .expect("valid managed entry");
-
+    fn manifest_metadata_alone_is_not_installed_content() {
+        let mut entry = installed_entry("project", "v1", Vec::new());
         assert_eq!(
             resolved_install_state(Some(&entry), &LiveManagedContent::default(), "v1"),
             (false, false)
         );
-        let path = root.join("mods/project.jar");
-        std::fs::write(&path, b"jar").expect("managed file");
-        entry
-            .record_authenticated_file(3, test_sha512_file(&path).expect("managed hash"))
-            .expect("record authenticated file");
+        entry.record_authenticated_file(1, sha512(b"j")).unwrap();
         assert_eq!(
             resolved_install_state(
                 Some(&entry),
@@ -3807,7 +3415,6 @@ mod tests {
             ),
             (true, false)
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

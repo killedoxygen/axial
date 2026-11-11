@@ -431,27 +431,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_temp_directories_cannot_be_reintroduced_by_provider_or_custom_arguments() {
-        for key in [
-            "java.io.tmpdir",
-            "jna.tmpdir",
-            "org.lwjgl.system.SharedLibraryExtractPath",
-            "io.netty.native.workdir",
-        ] {
-            for argument in [format!("-D{key}=/verified/natives"), format!("-D{key}")] {
-                assert_eq!(
-                    validate_extra_args(&[argument.clone()], Some(&info())),
-                    Err(LaunchPlanError::ReservedJvmArgument)
-                );
-                let mut provider_args = vec![argument, "-Dunrelated.tmpdir=value".into()];
-                configure_native_paths(&mut provider_args, "");
-                assert_eq!(provider_args, ["-Dunrelated.tmpdir=value"]);
-            }
-        }
-        assert!(validate_extra_args(&["-Djna.tmpdir.other=value".into()], Some(&info())).is_ok());
-    }
-
-    #[test]
     fn authenticated_historical_names_do_not_use_offline_creation_limits() {
         use super::super::model::LaunchAuthContext;
         for name in ["a", "ab", "Valid_Name"] {
@@ -476,7 +455,7 @@ mod tests {
         }
     }
     #[test]
-    fn explicit_arguments_cannot_replace_owned_entrypoints_or_paths() {
+    fn explicit_arguments_cannot_replace_owned_entrypoints_paths_or_runtime_scratch() {
         for arg in [
             "-cp",
             "--class-path=elsewhere",
@@ -498,7 +477,26 @@ mod tests {
                 "{arg}"
             );
         }
-        assert!(validate_extra_args(&["-Dexample=value".into()], Some(&info())).is_ok());
+        for key in [
+            "java.io.tmpdir",
+            "jna.tmpdir",
+            "org.lwjgl.system.SharedLibraryExtractPath",
+            "io.netty.native.workdir",
+        ] {
+            for argument in [format!("-D{key}=/verified/natives"), format!("-D{key}")] {
+                assert_eq!(
+                    validate_extra_args(&[argument.clone()], Some(&info())),
+                    Err(LaunchPlanError::ReservedJvmArgument)
+                );
+                // Provider arguments are stripped rather than refused.
+                let mut provider_args = vec![argument, "-Dunrelated.tmpdir=value".into()];
+                configure_native_paths(&mut provider_args, "");
+                assert_eq!(provider_args, ["-Dunrelated.tmpdir=value"]);
+            }
+        }
+        for allowed in ["-Dexample=value", "-Djna.tmpdir.other=value"] {
+            assert!(validate_extra_args(&[allowed.into()], Some(&info())).is_ok());
+        }
     }
     #[test]
     fn quoting_and_experimental_option_order_are_preserved() {

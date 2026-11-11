@@ -398,145 +398,80 @@ mod tests {
     }
 
     #[test]
-    fn resource_packs_alone_land_on_vanilla() {
-        let items = vec![item(
-            "faithful",
-            ContentKind::ResourcePack,
-            &["minecraft"],
-            &["1.21.6"],
-        )];
-
-        let ranked = rank_candidates(&items);
-
-        assert_eq!(ranked[0].loader, "");
-        assert_eq!(ranked[0].loader_label, "Vanilla");
-        assert_eq!(ranked[0].selection_id, "vanilla|1.21.6");
-        assert_eq!(ranked[0].summary, "Works here");
-    }
-
-    #[test]
-    fn a_pack_rides_along_with_whatever_loader_the_mods_need() {
-        let items = vec![
-            item("sodium", ContentKind::Mod, &["fabric"], &["1.21.6"]),
-            item(
-                "faithful",
-                ContentKind::ResourcePack,
-                &["minecraft"],
-                &["1.21.6"],
-            ),
-        ];
-
-        let ranked = rank_candidates(&items);
-
-        assert_eq!(ranked[0].loader, "fabric");
-        assert!(ranked[0].complete, "the pack must not veto the loader");
-    }
-
-    #[test]
-    fn a_shaders_iris_tag_is_never_mistaken_for_a_loader() {
-        let items = vec![item(
+    fn packs_and_shader_tags_never_choose_or_veto_a_loader() {
+        let pack = || item("faithful", ContentKind::ResourcePack, &["minecraft"], &["1.21.6"]);
+        let shader = item(
             "complementary",
             ContentKind::ShaderPack,
             &["iris", "optifine"],
             &["1.21.6"],
-        )];
-
-        let ranked = rank_candidates(&items);
-
-        assert_eq!(ranked[0].loader, "");
-        assert!(ranked[0].complete);
+        );
+        let sodium = item("sodium", ContentKind::Mod, &["fabric"], &["1.21.6"]);
+        for (items, selection) in [
+            (vec![pack()], "vanilla|1.21.6"),
+            (vec![shader], "vanilla|1.21.6"),
+            (
+                vec![sodium, pack()],
+                "loader_version|net.fabricmc.fabric-loader|1.21.6",
+            ),
+        ] {
+            let top = &rank_candidates(&items)[0];
+            assert_eq!((top.selection_id.as_str(), top.complete), (selection, true));
+        }
+        let vanilla = &rank_candidates(&[pack()])[0];
+        assert_eq!(
+            (vanilla.loader_label.as_str(), vanilla.summary.as_str()),
+            ("Vanilla", "Works here")
+        );
     }
 
     #[test]
-    fn snapshots_are_never_offered() {
-        let items = vec![item(
-            "sodium",
-            ContentKind::Mod,
-            &["fabric"],
-            &["1.21.6", "24w14a", "1.21.6-rc1"],
-        )];
-
-        let ranked = rank_candidates(&items);
-
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].game_version, "1.21.6");
+    fn every_compatible_release_is_offered_and_snapshots_never_are() {
+        let releases = [
+            "26.1", "1.21.11", "1.21.10", "1.21.9", "1.21.8", "1.21.7", "1.21.6", "1.21.5",
+            "1.21.4", "1.20.1", "1.19.4", "1.16.5",
+        ];
+        let mut versions = releases.to_vec();
+        versions.extend(["24w14a", "1.21.6-rc1"]);
+        let ranked = rank_candidates(&[item("wide", ContentKind::Mod, &["fabric"], &versions)]);
+        let mut offered = ranked
+            .iter()
+            .map(|candidate| candidate.game_version.as_str())
+            .collect::<Vec<_>>();
+        offered.sort_unstable();
+        let mut expected = releases.to_vec();
+        expected.sort_unstable();
+        assert_eq!(offered, expected);
     }
 
     #[test]
-    fn loader_and_game_version_must_exist_on_the_same_published_version() {
-        let items = vec![CompatItem {
-            canonical_id: CanonicalId("modrinth:split-support".to_string()),
-            title: "split-support".to_string(),
+    fn a_candidate_needs_one_installable_version_with_both_loader_and_game_version() {
+        let version = |loader, game: &str, installable| CompatVersion {
+            loaders: vec![loader],
+            game_versions: vec![game.to_string()],
+            installable,
+        };
+        let items = [CompatItem {
+            canonical_id: CanonicalId("modrinth:split".to_string()),
+            title: "split".to_string(),
             kind: ContentKind::Mod,
             versions: vec![
-                CompatVersion {
-                    loaders: vec![LoaderComponentId::Fabric],
-                    game_versions: vec!["26.2".to_string()],
-                    installable: true,
-                },
-                CompatVersion {
-                    loaders: vec![LoaderComponentId::Forge],
-                    game_versions: vec!["1.20.1".to_string()],
-                    installable: true,
-                },
+                version(LoaderComponentId::Fabric, "26.2", true),
+                version(LoaderComponentId::Forge, "1.20.1", true),
+                version(LoaderComponentId::NeoForge, "26.2", false),
             ],
         }];
-
-        let ranked = rank_candidates(&items);
-
-        assert!(
-            ranked.iter().any(|candidate| {
-                candidate.loader == "fabric" && candidate.game_version == "26.2"
-            })
-        );
-        assert!(ranked.iter().any(|candidate| {
-            candidate.loader == "forge" && candidate.game_version == "1.20.1"
-        }));
-        assert!(
-            !ranked.iter().any(|candidate| {
-                candidate.loader == "forge" && candidate.game_version == "26.2"
-            })
-        );
-        assert!(!ranked.iter().any(|candidate| {
-            candidate.loader == "fabric" && candidate.game_version == "1.20.1"
-        }));
-    }
-
-    #[test]
-    fn versions_without_downloadable_files_are_not_compatible() {
-        let items = vec![CompatItem {
-            canonical_id: CanonicalId("modrinth:no-file".to_string()),
-            title: "no-file".to_string(),
-            kind: ContentKind::Mod,
-            versions: vec![CompatVersion {
-                loaders: vec![LoaderComponentId::Forge],
-                game_versions: vec!["26.2".to_string()],
-                installable: false,
-            }],
-        }];
-
-        assert!(rank_candidates(&items).is_empty());
-    }
-
-    #[test]
-    fn every_compatible_release_is_returned_for_the_create_picker() {
-        let items = vec![item(
-            "wide-support",
-            ContentKind::Mod,
-            &["fabric"],
-            &[
-                "26.1", "1.21.11", "1.21.10", "1.21.9", "1.21.8", "1.21.7", "1.21.6", "1.21.5",
-                "1.21.4", "1.20.1", "1.19.4", "1.16.5",
-            ],
-        )];
-
-        let ranked = rank_candidates(&items);
-
-        assert_eq!(ranked.len(), 12);
-        assert!(
-            ranked
-                .iter()
-                .any(|candidate| candidate.game_version == "1.16.5")
+        let mut pairs = rank_candidates(&items)
+            .into_iter()
+            .map(|candidate| (candidate.loader, candidate.game_version))
+            .collect::<Vec<_>>();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                ("fabric".to_string(), "26.2".to_string()),
+                ("forge".to_string(), "1.20.1".to_string()),
+            ]
         );
     }
 
@@ -557,5 +492,4 @@ mod tests {
         );
         assert_eq!(ranked[0].loader, "fabric", "fabric outranks forge on a tie");
     }
-
 }

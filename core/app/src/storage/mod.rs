@@ -30,6 +30,24 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
+/// The application schema in dependency order. Composition and test fixtures
+/// apply this one list; feature constructors may re-apply their own entries.
+pub const SCHEMA: &[Migration] = &[
+    crate::settings::SETTINGS_MIGRATION,
+    crate::accounts::directory::MIGRATION,
+    crate::instances::directory::MIGRATION,
+    crate::instances::delete::MIGRATION,
+    crate::instances::create::MIGRATION,
+    crate::install::queue::MIGRATION,
+    crate::content::install::MIGRATION,
+    crate::performance::rules::MIGRATION,
+    crate::performance::mutation::MIGRATION,
+    crate::performance::benchmarks::MIGRATION,
+    crate::skins::store::MIGRATION,
+    crate::launch::coordinator::INTENT_MIGRATION,
+    crate::launch::reports::REPORT_MIGRATION,
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("metadata is corrupt; the existing files were preserved")]

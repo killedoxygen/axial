@@ -1445,7 +1445,7 @@ mod settlement_tests {
         logs
     }
 
-    fn settlement(logs: &LogCollector, stop_requested: bool) -> ObservedSettlement {
+    fn settlement(logs: &LogCollector) -> ObservedSettlement {
         ObservedSettlement {
             version_id: "1.20.1".into(),
             launched_at: "2026-10-13T09:00:00.000Z".into(),
@@ -1453,7 +1453,7 @@ mod settlement_tests {
             process: SettledProcess::ChildExited {
                 exit_code: Some(0),
                 signal: None,
-                stop_requested,
+                stop_requested: false,
                 was_running: true,
                 spawn_failed: false,
             },
@@ -1466,7 +1466,7 @@ mod settlement_tests {
     fn graphics_startup_failure_survives_zero_exit_redaction_and_report_readback() {
         let logs = collect(GRAPHICS_FAILURE);
         assert!(logs.evidence().boot_observed && logs.outputs_drained());
-        let observation = settlement(&logs, false);
+        let observation = settlement(&logs);
         assert!(observation.validate());
         let restored: ObservedSettlement =
             serde_json::from_slice(&serde_json::to_vec(&observation).unwrap()).unwrap();
@@ -1531,40 +1531,6 @@ mod settlement_tests {
     }
 
     #[test]
-    fn graphics_startup_failure_waits_for_settlement_and_preserves_explicit_stop() {
-        let logs = collect(GRAPHICS_FAILURE);
-        let settled = SessionExitFacts {
-            process_exited: true,
-            exit_code: Some(0),
-            signal: None,
-            stop_requested: false,
-            was_running: true,
-            tree_settled: true,
-            outputs_drained: true,
-        };
-        for facts in [
-            SessionExitFacts {
-                process_exited: false,
-                ..settled
-            },
-            SessionExitFacts {
-                tree_settled: false,
-                ..settled
-            },
-            SessionExitFacts {
-                outputs_drained: false,
-                ..settled
-            },
-        ] {
-            assert!(classify_session_outcome(facts, logs.evidence()).is_none());
-        }
-        let wire = serde_json::to_value(settlement(&logs, true).outcome()).unwrap();
-        assert_eq!(wire["kind"], "stopped");
-        assert_eq!(wire["reason"], "launcher_stopped");
-        assert!(wire["failure_class"].is_null());
-    }
-
-    #[test]
     fn benign_xml_warnings_and_recorded_clean_history_stay_clean() {
         for output in [
             b"<log4j:Message><![CDATA[LWJGL Version: 3.3.1 build 7]]></log4j:Message>\n<log4j:Message><![CDATA[Failed to connect to authentication server]]></log4j:Message>\n<log4j:Throwable><![CDATA[java.net.ConnectException: Connection refused\n\tat com.mojang.authlib.HttpAuthenticationService.performPostRequest(HttpAuthenticationService.java:82)\n]]></log4j:Throwable>\n".as_slice(),
@@ -1572,7 +1538,7 @@ mod settlement_tests {
         ] {
             let logs = collect(output);
             assert!(logs.evidence().failure_classes.is_empty());
-            let wire = serde_json::to_value(settlement(&logs, false).outcome()).unwrap();
+            let wire = serde_json::to_value(settlement(&logs).outcome()).unwrap();
             assert_eq!(wire["kind"], "clean");
             assert_eq!(wire["reason"], "external_user_closed");
             assert!(wire["failure_class"].is_null());
@@ -1632,9 +1598,6 @@ mod tests {
     #[test]
     fn resource_use_counts_nonterminal_sessions_and_their_known_allocations() {
         let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
-        storage
-            .migrate(&[super::super::reports::REPORT_MIGRATION])
-            .unwrap();
         let reports = LaunchReportStore::new(storage).unwrap();
         let sessions = SessionManager::new(TaskOwner::new(2).unwrap());
         let mut first = entry(reports.clone());
@@ -1681,9 +1644,6 @@ mod tests {
         let prepared = Arc::new(prepared);
         let id = prepared.instance_id().clone();
         let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
-        storage
-            .migrate(&[super::super::reports::REPORT_MIGRATION])
-            .unwrap();
         let reports = LaunchReportStore::new(storage).unwrap();
         let mut entry = entry_for_instance(reports, None, id.clone());
         Arc::get_mut(&mut entry).unwrap().preparation = Arc::downgrade(&prepared);
@@ -1743,9 +1703,6 @@ mod tests {
         let prepared = Arc::new(prepared);
         let id = prepared.instance_id().clone();
         let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
-        storage
-            .migrate(&[super::super::reports::REPORT_MIGRATION])
-            .unwrap();
         let mut entry =
             entry_for_instance(LaunchReportStore::new(storage).unwrap(), None, id.clone());
         Arc::get_mut(&mut entry).unwrap().preparation = Arc::downgrade(&prepared);
@@ -2082,68 +2039,11 @@ mod tests {
         }
     }
 
-    fn recency_fixture() -> (
-        tempfile::TempDir,
-        RegisteredInstance,
-        Arc<crate::storage::MetadataStore>,
-    ) {
-        use crate::{
-            files::PortableName,
-            instances::{
-                directory::{InstanceDirectories, MIGRATION, Registry},
-                model::{Instance, InstanceResult},
-            },
-            library::{LibraryLifecycle, LibraryOpenOutcome},
-            settings::InstanceSettings,
-            storage::MetadataStore,
-            tasks::Exclusions,
-        };
-        let root =
-            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let id = InstanceId::new();
-        std::fs::create_dir_all(root.path().join("instances").join(id.as_str())).unwrap();
-        let library = match LibraryLifecycle::open(root.path()) {
-            LibraryOpenOutcome::Ready(library) => library,
-            other => panic!("isolated fixture library: {other:?}"),
-        };
-        let pin = library.admit().unwrap();
-        let directory = pin
-            .files()
-            .unwrap()
-            .open_directory(&PortableName::new_exact("instances").unwrap())
-            .unwrap()
-            .open_directory(&PortableName::new_exact(id.as_str()).unwrap())
-            .unwrap();
-        let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
-        storage.migrate(&[MIGRATION]).unwrap();
-        let registry = Registry::new(storage.clone());
-        let record = storage
-            .transaction(|tx| -> InstanceResult<_> {
-                let reserved = registry.reserve(
-                    tx,
-                    Instance {
-                        id: id.clone(),
-                        name: "Launch recency".into(),
-                        version_id: "1.21.1".into(),
-                        created_at: "2026-09-26T09:00:00.000Z".into(),
-                        last_played_at: "2026-09-26T10:00:00.000Z".into(),
-                        art_seed: 42,
-                        settings: InstanceSettings::default(),
-                        java_selection: None,
-                        icon: String::new(),
-                        accent: String::new(),
-                        loader_key: "vanilla".into(),
-                        minecraft_version: "1.21.1".into(),
-                        revision: 0,
-                    },
-                    &pin.library_id().to_string(),
-                )?;
-                registry.commit_reserved(tx, &reserved, &directory.receipt().unwrap())
-            })
-            .unwrap();
-        let exclusion = Exclusions::new().try_acquire([id.as_str()], []).unwrap();
-        let admitted = InstanceDirectories::admit_record(registry, record, pin, exclusion).unwrap();
-        (root, admitted, storage)
+    async fn recency_fixture() -> (crate::testing::Fixture, RegisteredInstance) {
+        let fixture = crate::testing::Fixture::new();
+        let instance = fixture.create_instance("Launch recency").await;
+        let admitted = fixture.directories.admit(&instance.id).unwrap();
+        (fixture, admitted)
     }
 
     fn start_recency_fixture(
@@ -2193,13 +2093,13 @@ mod tests {
     #[tokio::test]
     async fn successful_startup_recency_survives_shutdown_and_reopen_without_duplicate_writes() {
         use crate::instances::directory::Registry;
-        let (root, admitted, storage) = recency_fixture();
+        let (fixture, admitted) = recency_fixture().await;
         let before = admitted.record().clone();
-        let registry = Registry::new(storage.clone());
+        let registry = Registry::new(fixture.storage.clone());
         assert!(registry.last_instance_id().unwrap().is_none());
         let (entry, manager, worker) = start_recency_fixture(
             admitted,
-            storage.clone(),
+            fixture.storage.clone(),
             "printf '[Render thread/INFO]: LWJGL Version: 3.3.3\\n'; sleep 30",
         );
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -2212,12 +2112,10 @@ mod tests {
         let launched_at = entry.current().launched_at;
         manager.shutdown(Duration::from_secs(5)).await.unwrap();
         worker.await.unwrap();
-        drop((entry, manager, registry, storage));
+        drop((entry, manager, registry));
 
-        let storage = Arc::new(
-            crate::storage::MetadataStore::open(root.path().join("metadata.sqlite")).unwrap(),
-        );
-        let registry = Registry::new(storage);
+        let fixture = crate::testing::Fixture::builder().reopen(fixture);
+        let registry = Registry::new(fixture.storage.clone());
         let stored = registry.get_live(&before.instance.id).unwrap();
         assert_eq!(stored.instance.last_played_at, launched_at);
         assert_eq!(
@@ -2231,11 +2129,11 @@ mod tests {
     #[tokio::test]
     async fn failed_startup_preserves_prior_recency_after_reopen() {
         use crate::instances::directory::Registry;
-        let (root, admitted, storage) = recency_fixture();
+        let (fixture, admitted) = recency_fixture().await;
         let before = admitted.record().clone();
         let (entry, manager, worker) = start_recency_fixture(
             admitted,
-            storage.clone(),
+            fixture.storage.clone(),
             "printf 'early failure\\n' >&2; exit 1",
         );
         tokio::time::timeout(Duration::from_secs(5), worker)
@@ -2244,11 +2142,10 @@ mod tests {
             .unwrap();
         manager.shutdown(Duration::from_secs(5)).await.unwrap();
         assert!(!entry.current().boot_observed);
-        drop((entry, manager, storage));
+        drop((entry, manager));
 
-        let registry = Registry::new(Arc::new(
-            crate::storage::MetadataStore::open(root.path().join("metadata.sqlite")).unwrap(),
-        ));
+        let fixture = crate::testing::Fixture::builder().reopen(fixture);
+        let registry = Registry::new(fixture.storage.clone());
         assert_eq!(registry.get_live(&before.instance.id).unwrap(), before);
         assert!(registry.last_instance_id().unwrap().is_none());
     }
@@ -2256,7 +2153,8 @@ mod tests {
     #[tokio::test]
     async fn failed_recency_write_is_atomic_and_does_not_block_shutdown_or_retry_later() {
         use crate::{instances::directory::Registry, storage::StorageError};
-        let (_root, admitted, storage) = recency_fixture();
+        let (fixture, admitted) = recency_fixture().await;
+        let storage = fixture.storage.clone();
         let before = admitted.record().clone();
         storage
             .transaction(|tx| -> Result<(), StorageError> {

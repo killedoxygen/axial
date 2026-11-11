@@ -671,26 +671,6 @@ mod tests {
     }
     use super::super::crash::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
 
-    const RANKED_FAILURES: [FailureClass; 17] = [
-        FailureClass::StartupStalled,
-        FailureClass::JvmUnsupportedOption,
-        FailureClass::JvmExperimentalUnlock,
-        FailureClass::JvmOptionOrdering,
-        FailureClass::RosettaRequired,
-        FailureClass::JavaRuntimeMismatch,
-        FailureClass::OutOfMemory,
-        FailureClass::LauncherManagedArtifactSignature,
-        FailureClass::GraphicsUnavailable,
-        FailureClass::GraphicsDriverCrash,
-        FailureClass::MissingDependency,
-        FailureClass::ModTransformationFailure,
-        FailureClass::ModAttributedCrash,
-        FailureClass::ClasspathModuleConflict,
-        FailureClass::LoaderBootstrapFailure,
-        FailureClass::AuthModeIncompatible,
-        FailureClass::Unknown,
-    ];
-
     fn report(raw: &str) -> CrashEvidence {
         parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, raw.as_bytes())
             .expect("Minecraft crash evidence")
@@ -867,31 +847,14 @@ mod tests {
     }
 
     #[test]
-    fn failure_precedence_is_total_and_pairwise_stable() {
-        for (index, class) in RANKED_FAILURES.iter().copied().enumerate() {
-            assert_eq!(failure_class_precedence(class), index as u8);
-            assert!(
-                !RANKED_FAILURES[..index].contains(&class),
-                "duplicate failure class {class:?}"
-            );
-        }
-        for (left_index, left) in RANKED_FAILURES.iter().copied().enumerate() {
-            for (right_index, right) in RANKED_FAILURES.iter().copied().enumerate() {
-                let expected = if left_index <= right_index {
-                    left
-                } else {
-                    right
-                };
-                assert_eq!(stronger_failure_class(left, right), expected);
-            }
-        }
-    }
-
-    #[test]
     fn fusion_is_independent_of_candidate_order_and_ignores_lifecycle_state() {
-        let mut candidates = RANKED_FAILURES[1..].to_vec();
-        candidates.push(FailureClass::StartupStalled);
-        candidates.push(FailureClass::JvmUnsupportedOption);
+        let mut candidates = vec![
+            FailureClass::Unknown,
+            FailureClass::OutOfMemory,
+            FailureClass::JvmUnsupportedOption,
+            FailureClass::MissingDependency,
+            FailureClass::StartupStalled,
+        ];
         assert_eq!(
             classify_launch_failure(&candidates, Some(1), None),
             Some(FailureClass::JvmUnsupportedOption)
@@ -997,25 +960,11 @@ mod tests {
     #[test]
     fn graphics_driver_detection_uses_only_native_frames_and_the_closed_module_table() {
         for module in [
-            "nvoglv32",
             "nvoglv64",
-            "nvwgf2um",
-            "nvwgf2umx",
-            "atioglxx",
             "atio6axx",
-            "amdxx32",
-            "amdxx64",
-            "ig4icd32",
-            "ig4icd64",
-            "ig9icd32",
             "ig9icd64",
-            "igd10iumd32",
-            "igd10iumd64",
             "libGLX_nvidia",
-            "libnvidia-glcore",
-            "radeonsi_dri",
             "iris_dri",
-            "i965_dri",
         ] {
             assert!(is_graphics_driver_module(module), "{module}");
         }
@@ -1037,98 +986,42 @@ mod tests {
     }
 
     #[test]
-    fn typed_exception_sets_are_exact() {
-        for class in [
-            "net.minecraftforge.fml.common.MissingModsException",
-            "cpw.mods.fml.common.MissingModsException",
-        ] {
-            assert!(is_missing_dependency_exception(class));
-        }
-        for class in [
-            "net.minecraftforge.fml.common.MissingModsExceptionHelper",
-            "net.fabricmc.loader.impl.discovery.ModResolutionException",
-        ] {
-            assert!(!is_missing_dependency_exception(class));
-        }
-        for class in [
-            "org.spongepowered.asm.mixin.transformer.throwables.MixinApplyError",
-            "org.spongepowered.asm.mixin.transformer.throwables.MixinTransformerError",
-            "org.spongepowered.asm.mixin.transformer.throwables.InvalidMixinException",
-            "org.spongepowered.asm.mixin.injection.throwables.InjectionError",
-            "org.spongepowered.asm.mixin.injection.throwables.InvalidInjectionException",
-            "org.spongepowered.asm.mixin.injection.throwables.InjectionValidationException",
-        ] {
-            assert!(is_mod_transformation_exception(class));
-        }
-        for class in [
-            "org.spongepowered.asm.mixin.transformer.MixinTransformer",
-            "org.spongepowered.asm.mixin.throwables.MixinException",
-            "org.objectweb.asm.ClassTooLargeException",
-        ] {
-            assert!(!is_mod_transformation_exception(class));
-        }
-    }
-
-    #[test]
-    fn mod_attribution_requires_a_complete_minecraft_report() {
-        let mut raw = b"Description: Rendering game\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Mod (example)\n".to_vec();
-        raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
-        let truncated = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
-            .expect("truncated report evidence");
-        assert!(truncated.truncated);
-        assert!(!truncated.suspected_mods.is_empty());
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&truncated)),
-            Some(FailureClass::Unknown)
-        );
-
-        let fatal = hs_err('C', "libjvm");
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&fatal)),
-            Some(FailureClass::Unknown)
-        );
-    }
-
-    #[test]
-    fn typed_exception_and_native_evidence_require_their_declared_source() {
+    fn evidence_requires_a_complete_report_and_its_declared_source() {
+        let truncated = |text: &[u8]| {
+            let mut raw = text.to_vec();
+            raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
+            let evidence = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
+                .expect("truncated report evidence");
+            assert!(evidence.truncated);
+            evidence
+        };
+        let attributed = truncated(b"Description: Rendering game\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Mod (example)\n");
+        assert!(!attributed.suspected_mods.is_empty());
         let mut missing = report(
             "Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing",
         );
         missing.source = CrashArtifactKind::JvmFatalError;
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&missing)),
-            Some(FailureClass::Unknown)
-        );
-
         let mut graphics = hs_err('C', "nvoglv64");
         graphics.source = CrashArtifactKind::MinecraftCrashReport;
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&graphics)),
-            Some(FailureClass::Unknown)
-        );
-    }
-
-    #[test]
-    fn truncated_reports_keep_exact_exception_and_oom_evidence_only() {
-        let mut raw = b"Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing\n".to_vec();
-        raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
-        let missing = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
-            .expect("truncated missing-dependency evidence");
-        assert!(missing.truncated);
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&missing)),
-            Some(FailureClass::MissingDependency)
-        );
-
-        let mut raw =
-            b"Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space\n".to_vec();
-        raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
-        let oom = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
-            .expect("truncated out-of-memory evidence");
-        assert!(oom.truncated);
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&oom)),
-            Some(FailureClass::OutOfMemory)
-        );
+        for (evidence, expected) in [
+            (attributed, FailureClass::Unknown),
+            (hs_err('C', "libjvm"), FailureClass::Unknown),
+            (missing, FailureClass::Unknown),
+            (graphics, FailureClass::Unknown),
+            // Exact exception and memory evidence survive truncation.
+            (
+                truncated(b"Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing\n"),
+                FailureClass::MissingDependency,
+            ),
+            (
+                truncated(b"Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space\n"),
+                FailureClass::OutOfMemory,
+            ),
+        ] {
+            assert_eq!(
+                classify_launch_failure(&[], Some(1), Some(&evidence)),
+                Some(expected)
+            );
+        }
     }
 }

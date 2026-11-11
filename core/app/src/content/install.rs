@@ -3405,47 +3405,23 @@ pub(crate) mod tests {
         metadata_provider(responses).await
     }
 
+    /// Answers each response in order. The handle joins the scripted server.
     pub(crate) async fn metadata_provider(
         responses: Vec<String>,
     ) -> (ContentService, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = crate::testing::Server::start(
+            responses.into_iter().map(crate::testing::Reply::ok).collect(),
+        );
         let service = ContentService::with_base_url(
             ProviderClient::new(ClientConfig::default()).unwrap(),
-            &origin,
-            crate::network::OriginPolicy::loopback_for_tests([&origin], 0).unwrap(),
+            &server.origin,
+            server.origins(),
         )
         .unwrap();
-        let task = tokio::spawn(async move {
-            for body in responses {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut chunk = [0u8; 4096];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert_ne!(count, 0);
-                    request.extend_from_slice(&chunk[..count]);
-                    assert!(request.len() <= 64 * 1024);
-                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                        let header = String::from_utf8_lossy(&request[..end]);
-                        let length = header
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
+        let joined = tokio::task::spawn_blocking(move || {
+            server.finish();
         });
-        (service, task)
+        (service, joined)
     }
 
     fn pack(indexed: &[(&str, &[u8])], overrides: &[(&str, &[u8])]) -> ResolvedPack {
@@ -3581,28 +3557,11 @@ pub(crate) mod tests {
         receipt
     }
 
-    fn open_crash_fixture(
-        root: &std::path::Path,
-        library_id: crate::library::LibraryId,
+    fn mutations(
+        storage: Arc<MetadataStore>,
+        directories: InstanceDirectories,
+        tasks: TaskOwner,
     ) -> ContentMutations {
-        let library = match LibraryLifecycle::open_with_id(root, library_id) {
-            LibraryOpenOutcome::Ready(library) => library,
-            other => panic!("content crash fixture root: {other:?}"),
-        };
-        let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
-        storage
-            .migrate(&[
-                crate::instances::directory::MIGRATION,
-                crate::instances::create::MIGRATION,
-                crate::instances::delete::MIGRATION,
-                MIGRATION,
-                crate::performance::mutation::MIGRATION,
-                crate::performance::rules::MIGRATION,
-            ])
-            .unwrap();
-        let directories =
-            InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
-        let tasks = TaskOwner::new(8).unwrap();
         let client = ProviderClient::new(ClientConfig::default()).unwrap();
         let performance = crate::performance::PerformanceService::new(
             storage,
@@ -3616,39 +3575,30 @@ pub(crate) mod tests {
         ContentMutations::new(directories, client, tasks).with_performance(performance)
     }
 
+    fn open_crash_fixture(
+        root: &std::path::Path,
+        library_id: crate::library::LibraryId,
+    ) -> ContentMutations {
+        let library = match LibraryLifecycle::open_with_id(root, library_id) {
+            LibraryOpenOutcome::Ready(library) => library,
+            other => panic!("content crash fixture root: {other:?}"),
+        };
+        let storage = Arc::new(MetadataStore::open(root.join("metadata.sqlite")).unwrap());
+        storage.migrate(crate::storage::SCHEMA).unwrap();
+        let directories =
+            InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
+        mutations(storage, directories, TaskOwner::new(8).unwrap())
+    }
+
     async fn fixture() -> (tempfile::TempDir, ContentMutations, InstanceId) {
-        fixture_for(CreateTarget {
-            selection_id: "vanilla|1.21.4".into(),
-            version_id: "1.21.4".into(),
-            minecraft_version: "1.21.4".into(),
-            loader_key: "vanilla".into(),
-        })
-        .await
+        fixture_for(crate::instances::create::tests::target()).await
     }
 
     async fn fixture_for(
         target: CreateTarget,
     ) -> (tempfile::TempDir, ContentMutations, InstanceId) {
-        let root = tempfile::tempdir().unwrap();
-        let library = match LibraryLifecycle::open(&root.path().canonicalize().unwrap()) {
-            LibraryOpenOutcome::Ready(library) => library,
-            other => panic!("fixture root: {other:?}"),
-        };
-        let storage = Arc::new(MetadataStore::in_memory().unwrap());
-        storage
-            .migrate(&[
-                crate::instances::directory::MIGRATION,
-                crate::instances::create::MIGRATION,
-                crate::instances::delete::MIGRATION,
-                MIGRATION,
-                crate::performance::mutation::MIGRATION,
-                crate::performance::rules::MIGRATION,
-            ])
-            .unwrap();
-        let directories =
-            InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
-        let tasks = TaskOwner::new(16).unwrap();
-        let instances = InstanceService::new(directories.clone(), tasks.clone());
+        let fixture = crate::testing::Fixture::builder().in_memory().build();
+        let instances = fixture.instances();
         let instance = instances
             .create(
                 CreateInstanceRequest {
@@ -3664,18 +3614,8 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .unwrap();
-        let client = ProviderClient::new(ClientConfig::default()).unwrap();
-        let performance = crate::performance::PerformanceService::new(
-            storage,
-            directories.clone(),
-            tasks.clone(),
-            Arc::new(ContentService::new(client.clone()).unwrap()),
-            crate::performance::public_transfer_resolver(),
-            crate::performance::rules::RulesSettings::default(),
-        )
-        .unwrap();
-        let owner = ContentMutations::new(directories, client, tasks).with_performance(performance);
-        (root, owner, instance.id)
+        let owner = mutations(fixture.storage, fixture.directories, fixture.tasks);
+        (fixture.root, owner, instance.id)
     }
 
     fn entry(bytes: &[u8]) -> ManifestEntry {
@@ -4460,7 +4400,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn staged_mods_needing_a_newer_loader_or_a_missing_mod_are_refused_before_publication() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (root, mut owner, id) = fixture_for(
             CreateTarget::loader_for_tests(
                 axial_minecraft::LoaderComponentId::Fabric,
@@ -4502,36 +4441,10 @@ pub(crate) mod tests {
             .map(|(bytes, _)| bytes.clone())
             .chain([accepted.clone()])
             .collect();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = reqwest::Url::parse(&format!(
-            "http://{}/extra.jar",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let served = payloads.clone();
-        let transport = tokio::spawn(async move {
-            for bytes in served {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    let mut chunk = [0; 1024];
-                    let count = socket.read(&mut chunk).await.unwrap();
-                    assert!(count > 0);
-                    request.extend_from_slice(&chunk[..count]);
-                }
-                socket
-                    .write_all(
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            bytes.len()
-                        )
-                        .as_bytes(),
-                    )
-                    .await
-                    .unwrap();
-                socket.write_all(&bytes).await.unwrap();
-            }
-        });
+        let server = crate::testing::Server::start(
+            payloads.iter().cloned().map(crate::testing::Reply::ok).collect(),
+        );
+        let url = reqwest::Url::parse(&server.url("/extra.jar")).unwrap();
         let client = axial_minecraft::download::TransferClient::build(
             axial_minecraft::download::TransferClientConfig::bounded(
                 std::time::Duration::from_secs(5),
@@ -4589,7 +4502,7 @@ pub(crate) mod tests {
             assert!(!owner.has_unsettled_effects());
             assert!(!has_pending(owner.directories.registry().storage(), &id).unwrap());
         }
-        transport.await.unwrap();
+        server.finish();
     }
 
     #[tokio::test]
@@ -5712,7 +5625,6 @@ pub(crate) mod tests {
         use crate::library::LibraryId;
         use axial_minecraft::download::{TransferClient, TransferClientConfig};
         use std::{io::Read, path::Path, process::Command, sync::mpsc, time::Duration};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const ROOT: &str = "AXIAL_CONTENT_REPLACEMENT_CRASH_ROOT";
         const LIBRARY: &str = "AXIAL_CONTENT_REPLACEMENT_CRASH_LIBRARY";
@@ -5850,35 +5762,15 @@ pub(crate) mod tests {
                 .unwrap();
             let game = root.join("instances").join(instance.id.as_str());
             std::fs::write(game.join("config/user.txt"), b"unrelated payload").unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = reqwest::Url::parse(&format!(
-                "http://{}/replacement.zip",
-                listener.local_addr().unwrap()
-            ))
-            .unwrap();
-            let transport = tokio::spawn(async move {
-                let payloads: &[&[u8]] = if removal {
-                    &[ORIGINAL]
-                } else {
-                    &[ORIGINAL, REPLACEMENT]
-                };
-                for bytes in payloads {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut request = Vec::new();
-                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                        let mut chunk = [0; 1024];
-                        let count = socket.read(&mut chunk).await.unwrap();
-                        assert!(count > 0 && request.len() + count <= 8192);
-                        request.extend_from_slice(&chunk[..count]);
-                    }
-                    assert!(request.starts_with(b"GET /replacement.zip HTTP/1.1\r\n"));
-                    socket
-                        .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes())
-                        .await
-                        .unwrap();
-                    socket.write_all(bytes).await.unwrap();
-                }
-            });
+            let payloads: &[&[u8]] = if removal {
+                &[ORIGINAL]
+            } else {
+                &[ORIGINAL, REPLACEMENT]
+            };
+            let server = crate::testing::Server::start(
+                payloads.iter().map(|bytes| crate::testing::Reply::ok(*bytes)).collect(),
+            );
+            let url = reqwest::Url::parse(&server.url("/replacement.zip")).unwrap();
             let client = TransferClient::build(
                 TransferClientConfig::bounded(
                     Duration::from_secs(5),
@@ -6056,7 +5948,8 @@ pub(crate) mod tests {
             .unwrap()
             .join()
             .await;
-            transport.await.unwrap();
+            let served = server.finish();
+            assert!(served.requests.iter().all(|request| request.path() == "/replacement.zip"));
             if let Some(observer) = observer {
                 observer.join().unwrap();
             }

@@ -1306,38 +1306,14 @@ pub(crate) mod tests {
         duplicate::DuplicateRequest,
     };
     use super::*;
-    use crate::{
-        library::{LibraryLifecycle, LibraryOpenOutcome},
-        storage::MetadataStore,
-        tasks::Exclusions,
-    };
+    use crate::tasks::Exclusions;
 
     pub(crate) fn fixture() -> (tempfile::TempDir, InstanceService) {
-        let root = tempfile::Builder::new()
-            .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
-            .unwrap();
-        let library = match LibraryLifecycle::open(root.path()) {
-            LibraryOpenOutcome::Ready(library) => library,
-            other => panic!("isolated test library did not open: {other:?}"),
-        };
-        let storage = Arc::new(MetadataStore::open(&root.path().join("metadata.sqlite")).unwrap());
-        storage
-            .migrate(&[
-                super::super::directory::MIGRATION,
-                MIGRATION,
-                super::super::delete::MIGRATION,
-                crate::content::install::MIGRATION,
-                crate::performance::mutation::MIGRATION,
-                crate::launch::reports::REPORT_MIGRATION,
-                crate::performance::benchmarks::MIGRATION,
-            ])
-            .unwrap();
-        crate::settings::SettingsStore::new(storage.clone()).unwrap();
-        let service = InstanceService::new(
-            InstanceDirectories::new(Registry::new(storage), library, Exclusions::new()),
-            TaskOwner::new(16).unwrap(),
-        );
-        (root, service)
+        let fixture = crate::testing::Fixture::new();
+        (
+            fixture.root,
+            InstanceService::new(fixture.directories, fixture.tasks),
+        )
     }
 
     pub(crate) fn target() -> CreateTarget {

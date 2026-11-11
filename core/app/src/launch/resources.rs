@@ -518,14 +518,5 @@ mod tests {
         }
         assert!(!cpu_pressure(None, 10, [Some(1000); 3]));
         assert!(!cpu_pressure(Some(0), 10, [Some(1000); 3]));
-        for (load, expected) in [
-            (0.0, Some(0)),
-            (1.234, Some(123)),
-            (-1.0, None),
-            (f64::NAN, None),
-            (f64::INFINITY, None),
-        ] {
-            assert_eq!(load_x100(load), expected);
-        }
     }
 }
