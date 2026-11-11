@@ -4182,6 +4182,34 @@ async fn unavailable_install_metadata_does_not_offer_reinstall() {
     }
 }
 
+/// Unreadable setup metadata blocks launch and never offers an install.
+async fn assert_setup_unreadable(
+    service: &SetupService,
+    instance: &super::super::model::Instance,
+    versions: &[VersionEntry],
+) {
+    let preflight = service.launch.preflight(instance.id.clone()).await;
+    assert!(!preflight.launchable);
+    assert_eq!(preflight.error.unwrap().code, LaunchError::InstanceChanged);
+    for catalog in std::iter::once(versions.to_vec()).chain(unready_catalogs(versions)) {
+        let blocked = service.enrich(instance.clone(), &catalog).await;
+        assert!(!blocked.launchable);
+        assert!(!blocked.launch_action.launchable);
+        assert_eq!(blocked.launch_action.state_id, "blocked");
+        assert_eq!(blocked.launch_action.primary_action, "blocked");
+        assert_eq!(blocked.launch_action.label, "Unavailable");
+        assert!(blocked.needs_install.is_empty());
+        assert_eq!(
+            blocked.status_detail,
+            "Instance setup status could not be read. Refresh and try again."
+        );
+        assert_eq!(
+            blocked.launch_action.disabled_reason.as_deref(),
+            Some(blocked.status_detail.as_str())
+        );
+    }
+}
+
 #[tokio::test]
 async fn unavailable_setup_metadata_does_not_fabricate_resume_or_install_permission() {
     let (_root, service, _accounts) = fixture();
@@ -4212,26 +4240,7 @@ async fn unavailable_setup_metadata_does_not_fabricate_resume_or_install_permiss
         })
         .unwrap();
     assert!(has_pending(service.instances.registry().storage(), &instance.id).is_err());
-    let preflight = service.launch.preflight(instance.id.clone()).await;
-    assert!(!preflight.launchable);
-    assert_eq!(preflight.error.unwrap().code, LaunchError::InstanceChanged);
-    for catalog in std::iter::once(versions.clone()).chain(unready_catalogs(&versions)) {
-        let blocked = service.enrich(instance.clone(), &catalog).await;
-        assert!(!blocked.launchable);
-        assert!(!blocked.launch_action.launchable);
-        assert_eq!(blocked.launch_action.state_id, "blocked");
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
-        assert_eq!(blocked.launch_action.label, "Unavailable");
-        assert!(blocked.needs_install.is_empty());
-        assert_eq!(
-            blocked.status_detail,
-            "Instance setup status could not be read. Refresh and try again."
-        );
-        assert_eq!(
-            blocked.launch_action.disabled_reason.as_deref(),
-            Some(blocked.status_detail.as_str())
-        );
-    }
+    assert_setup_unreadable(&service, &instance, &versions).await;
 }
 
 #[cfg(unix)]
@@ -4836,26 +4845,7 @@ async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
             Ok(())
         })
         .unwrap();
-    let preflight = service.launch.preflight(instance.id.clone()).await;
-    assert!(!preflight.launchable);
-    assert_eq!(preflight.error.unwrap().code, LaunchError::InstanceChanged);
-    for catalog in std::iter::once(versions.clone()).chain(unready_catalogs(&versions)) {
-        let blocked = service.enrich(instance.clone(), &catalog).await;
-        assert!(!blocked.launchable);
-        assert!(!blocked.launch_action.launchable);
-        assert_eq!(blocked.launch_action.state_id, "blocked");
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
-        assert_eq!(blocked.launch_action.label, "Unavailable");
-        assert!(blocked.needs_install.is_empty());
-        assert_eq!(
-            blocked.status_detail,
-            "Instance setup status could not be read. Refresh and try again."
-        );
-        assert_eq!(
-            blocked.launch_action.disabled_reason.as_deref(),
-            Some(blocked.status_detail.as_str())
-        );
-    }
+    assert_setup_unreadable(&service, &instance, &versions).await;
 }
 
 #[cfg(unix)]
