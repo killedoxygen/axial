@@ -96,6 +96,59 @@ pub fn is_native_library(name: &str) -> bool {
     name.to_ascii_lowercase().contains("natives-")
 }
 
+/// Spellings of a legacy natives classifier for an architecture, most preferred first.
+pub fn native_classifier_candidates(base: &str, os_arch: &str) -> Vec<String> {
+    let variants = match os_arch {
+        "x86_64" => vec![
+            base.replace("${arch}", "64"),
+            base.replace("-${arch}", ""),
+            base.replace("${arch}", "x86_64"),
+        ],
+        "x86" => vec![
+            base.replace("${arch}", "32"),
+            base.replace("${arch}", "x86"),
+        ],
+        "arm64" => vec![
+            base.replace("${arch}", "arm64"),
+            base.replace("${arch}", "64"),
+        ],
+        _ => vec![base.replace("${arch}", os_arch)],
+    };
+    let mut candidates = Vec::new();
+    for variant in variants {
+        if !variant.is_empty() && !candidates.contains(&variant) {
+            candidates.push(variant);
+        }
+    }
+    candidates
+}
+
+/// Native name markers and the platform each selects. The first marker found
+/// decides, so architecture-qualified markers precede their unqualified base.
+const NATIVE_PLATFORMS: &[(&[&str], &str, &str)] = &[
+    (&["windows-arm64"], "windows", "arm64"),
+    (&["windows-x86"], "windows", "x86"),
+    (&["natives-windows"], "windows", "x86_64"),
+    (&["macos-arm64", "osx-arm64"], "osx", "arm64"),
+    (&["natives-macos", "natives-osx"], "osx", "x86_64"),
+    (&["linux-arm64"], "linux", "arm64"),
+    (&["linux-x86"], "linux", "x86"),
+    (&["natives-linux"], "linux", "x86_64"),
+];
+
+/// Whether a natives artifact name targets the environment's platform. Names
+/// without a recognized platform marker are not filtered.
+pub fn native_name_matches_env(name: &str, env: &Environment) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if !lower.contains("natives-") {
+        return true;
+    }
+    NATIVE_PLATFORMS
+        .iter()
+        .find(|(markers, _, _)| markers.iter().any(|marker| lower.contains(marker)))
+        .is_none_or(|(_, os, arch)| env.os_name == *os && env.os_arch == *arch)
+}
+
 fn rule_matches(rule: &Rule, env: &Environment) -> bool {
     if let Some(os) = &rule.os {
         if !os.name.is_empty() && os.name != env.os_name {

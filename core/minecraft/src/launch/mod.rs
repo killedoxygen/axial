@@ -1,5 +1,8 @@
 use crate::paths::libraries_dir;
-use crate::rules::{Environment, Rule, evaluate_rules, is_native_library};
+use crate::rules::{
+    Environment, Rule, evaluate_rules, is_native_library, native_classifier_candidates,
+    native_name_matches_env,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -741,66 +744,6 @@ fn resolve_legacy_natives(
         is_native: true,
         name: format!("{}:{classifier_key}", lib.name),
     }]
-}
-
-fn native_classifier_candidates(base_classifier: &str, os_arch: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let variants = match os_arch {
-        "x86_64" => vec![
-            base_classifier.replace("${arch}", "64"),
-            base_classifier.replace("-${arch}", ""),
-            base_classifier.replace("${arch}", "x86_64"),
-        ],
-        "x86" => vec![
-            base_classifier.replace("${arch}", "32"),
-            base_classifier.replace("${arch}", "x86"),
-        ],
-        "arm64" => vec![
-            base_classifier.replace("${arch}", "arm64"),
-            base_classifier.replace("${arch}", "64"),
-        ],
-        _ => vec![base_classifier.replace("${arch}", os_arch)],
-    };
-
-    for variant in variants {
-        if !variant.is_empty() && !candidates.contains(&variant) {
-            candidates.push(variant);
-        }
-    }
-
-    candidates
-}
-
-fn native_name_matches_env(name: &str, env: &Environment) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if !lower.contains("natives-") {
-        return true;
-    }
-    if lower.contains("windows-arm64") {
-        return env.os_name == "windows" && env.os_arch == "arm64";
-    }
-    if lower.contains("windows-x86") {
-        return env.os_name == "windows" && env.os_arch == "x86";
-    }
-    if lower.contains("natives-windows") {
-        return env.os_name == "windows" && env.os_arch == "x86_64";
-    }
-    if lower.contains("macos-arm64") || lower.contains("osx-arm64") {
-        return env.os_name == "osx" && env.os_arch == "arm64";
-    }
-    if lower.contains("natives-macos") || lower.contains("natives-osx") {
-        return env.os_name == "osx" && env.os_arch == "x86_64";
-    }
-    if lower.contains("linux-arm64") {
-        return env.os_name == "linux" && env.os_arch == "arm64";
-    }
-    if lower.contains("linux-x86") {
-        return env.os_name == "linux" && env.os_arch == "x86";
-    }
-    if lower.contains("natives-linux") {
-        return env.os_name == "linux" && env.os_arch == "x86_64";
-    }
-    true
 }
 
 fn resolve_arg_list(

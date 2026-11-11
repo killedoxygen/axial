@@ -22,7 +22,10 @@ use crate::managed::component::table::ManagedComponentKind;
 use crate::managed::fs::ManagedLibraryOperation;
 use crate::paths::libraries_dir;
 use crate::portable_path::PortableRelativePath;
-use crate::rules::{Environment, evaluate_rules};
+use crate::rules::{
+    Environment, evaluate_rules, is_native_library, native_classifier_candidates,
+    native_name_matches_env,
+};
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
 use std::io;
@@ -565,7 +568,11 @@ fn resolve_native_plan(
     os_name: &str,
     os_arch: &str,
 ) -> Result<Option<LibraryArtifactPlan>, LibraryPlanError> {
-    let classifier_candidates = native_classifier_candidates(lib, os_name, os_arch);
+    let classifier_candidates = lib
+        .natives
+        .get(os_name)
+        .map(|base| native_classifier_candidates(base, os_arch))
+        .unwrap_or_default();
     for classifier_key in &classifier_candidates {
         if let Some(artifact) = lib
             .downloads
@@ -688,38 +695,6 @@ fn library_expected_integrity(
     })
 }
 
-fn native_classifier_candidates(lib: &Library, os_name: &str, os_arch: &str) -> Vec<String> {
-    let Some(base) = lib.natives.get(os_name) else {
-        return Vec::new();
-    };
-
-    let mut candidates = Vec::new();
-    let variants = match os_arch {
-        "x86_64" => vec![
-            base.replace("${arch}", "64"),
-            base.replace("-${arch}", ""),
-            base.replace("${arch}", "x86_64"),
-        ],
-        "x86" => vec![
-            base.replace("${arch}", "32"),
-            base.replace("${arch}", "x86"),
-        ],
-        "arm64" => vec![
-            base.replace("${arch}", "arm64"),
-            base.replace("${arch}", "64"),
-        ],
-        _ => vec![base.replace("${arch}", os_arch)],
-    };
-
-    for variant in variants {
-        if !variant.is_empty() && !candidates.contains(&variant) {
-            candidates.push(variant);
-        }
-    }
-
-    candidates
-}
-
 pub(crate) fn library_jobs_for(
     libraries: &[Library],
     env: &Environment,
@@ -752,7 +727,7 @@ pub(crate) fn library_artifact_plans_for(
             continue;
         }
 
-        if crate::rules::is_native_library(&lib.name) && !native_name_matches_env(&lib.name, env) {
+        if is_native_library(&lib.name) && !native_name_matches_env(&lib.name, env) {
             continue;
         }
 
@@ -780,38 +755,6 @@ fn insert_plan(
     }
     plans.insert(plan.relative_path.clone(), plan);
     Ok(())
-}
-
-fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool {
-    let lower = name.to_ascii_lowercase();
-    if !lower.contains("natives-") {
-        return true;
-    }
-    if lower.contains("windows-arm64") {
-        return env.os_name == "windows" && env.os_arch == "arm64";
-    }
-    if lower.contains("windows-x86") {
-        return env.os_name == "windows" && env.os_arch == "x86";
-    }
-    if lower.contains("natives-windows") {
-        return env.os_name == "windows" && env.os_arch == "x86_64";
-    }
-    if lower.contains("macos-arm64") || lower.contains("osx-arm64") {
-        return env.os_name == "osx" && env.os_arch == "arm64";
-    }
-    if lower.contains("natives-macos") || lower.contains("natives-osx") {
-        return env.os_name == "osx" && env.os_arch == "x86_64";
-    }
-    if lower.contains("linux-arm64") {
-        return env.os_name == "linux" && env.os_arch == "arm64";
-    }
-    if lower.contains("linux-x86") {
-        return env.os_name == "linux" && env.os_arch == "x86";
-    }
-    if lower.contains("natives-linux") {
-        return env.os_name == "linux" && env.os_arch == "x86_64";
-    }
-    true
 }
 
 #[cfg(test)]
