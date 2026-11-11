@@ -114,6 +114,53 @@ pub enum Resolution<A, N, O> {
     Indeterminate(O),
 }
 
+/// An unverified effect obligation that reconciles into its outcome's classification.
+pub trait Reconcile<A, N>: Sized {
+    fn reconcile(self) -> Resolution<A, N, Self>;
+}
+
+impl<A, N, O: Reconcile<A, N>> Outcome<A, N, O> {
+    /// Reconciles an unverified attempt once. `NoEffect` keeps the attempt's
+    /// refusal error; a no-effect found by reconciliation carries none.
+    pub fn reconcile(self) -> Resolution<A, (Option<io::Error>, N), O> {
+        match self {
+            Self::Applied(applied) => Resolution::Applied(applied),
+            Self::NoEffect { error, item } => Resolution::NoEffect((Some(error), item)),
+            Self::AppliedUnverified(obligation) => match obligation.reconcile() {
+                Resolution::Applied(applied) => Resolution::Applied(applied),
+                Resolution::NoEffect(item) => Resolution::NoEffect((None, item)),
+                Resolution::Indeterminate(obligation) => Resolution::Indeterminate(obligation),
+            },
+        }
+    }
+}
+
+macro_rules! impl_reconcile {
+    ($($obligation:ty: $applied:ty, $no_effect:ty;)*) => {$(
+        impl Reconcile<$applied, $no_effect> for $obligation {
+            fn reconcile(self) -> Resolution<$applied, $no_effect, Self> {
+                <$obligation>::reconcile(self)
+            }
+        }
+    )*};
+}
+
+impl_reconcile! {
+    FileMoveObligation: FileCapability, FileCapability;
+    DirectoryMoveObligation: Directory, Directory;
+    FileRemovalObligation: (), ParkedFile;
+    FileRestoreObligation: FileCapability, ParkedFile;
+    DirectoryParkObligation: ParkedDirectory, Directory;
+    DirectoryRemovalObligation: (), ParkedDirectory;
+    DirectoryRestoreObligation: Directory, ParkedDirectory;
+}
+
+impl Reconcile<FileCapability, SealedStagedFile> for Box<FilePromotionObligation> {
+    fn reconcile(self) -> FilePromotionResolution {
+        (*self).reconcile()
+    }
+}
+
 fn copy_io_error(error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), error.to_string())
 }

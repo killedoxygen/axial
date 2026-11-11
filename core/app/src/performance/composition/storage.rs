@@ -1,16 +1,13 @@
 use axial_fs::{
     Directory, DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryEntry,
     DirectoryIdentity, DirectoryListing, DirectoryMoveOutcome, DirectoryMoveReceipt,
-    DirectoryMoveReceiptOutcome, DirectoryMoveResolution, DirectoryParkOutcome,
-    DirectoryParkResolution, DirectoryRemovalOutcome, DirectoryRemovalResolution,
-    DurableReplaceObligation, DurableReplaceOutcome, EffectOwner, EffectOwnerRetentionError,
-    EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome, FileCreateResolution,
-    FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome, FileMoveResolution, FileParkOutcome,
-    FileParkRequest, FileParkResolution, FilePromotionOutcome, FilePromotionReceipt,
-    FilePromotionReceiptOutcome, FilePromotionResolution, FileRemovalOutcome,
-    FileRemovalResolution, FileRevision, LeafName, ParkedDirectory, ParkedFile, ReplaceDestination,
-    SealedStagedFile, StageDiscardOutcome, StageDiscardResolution, StagedFile,
-    TransientDestination,
+    DirectoryMoveReceiptOutcome, DirectoryParkOutcome, DurableReplaceObligation,
+    DurableReplaceOutcome, EffectOwner, EffectOwnerRetentionError, EntryKind, ExpectedFileContent,
+    FileCapability, FileCreateOutcome, FileCreateResolution, FileMoveOutcome, FileMoveReceipt,
+    FileMoveReceiptOutcome, FileParkOutcome, FileParkRequest, FileParkResolution,
+    FilePromotionReceipt, FilePromotionReceiptOutcome, FileRevision, LeafName, ParkedDirectory,
+    ParkedFile, ReplaceDestination, Resolution, SealedStagedFile, StageDiscardOutcome,
+    StageDiscardResolution, StagedFile, TransientDestination,
 };
 use axial_minecraft::download::ManagedTransferEffectAuthority;
 use sha2::{Digest, Sha256, Sha512};
@@ -842,23 +839,14 @@ pub(crate) fn settle_parked_file_removal(
     owner: &ManagedStorageDirectory,
     parked: ParkedFile,
 ) -> io::Result<()> {
-    match parked.remove() {
-        FileRemovalOutcome::Applied(()) => Ok(()),
-        FileRemovalOutcome::NoEffect {
-            error: _,
-            item: parked,
-        } => Err(owner
+    match parked.remove().reconcile() {
+        Resolution::Applied(()) => Ok(()),
+        Resolution::NoEffect((_, parked)) => Err(owner
             .effects
             .retain(parked, EffectOwner::retain_parked_file_removal)),
-        FileRemovalOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            FileRemovalResolution::Applied(()) => Ok(()),
-            FileRemovalResolution::NoEffect(parked) => Err(owner
-                .effects
-                .retain(parked, EffectOwner::retain_parked_file_removal)),
-            FileRemovalResolution::Indeterminate(obligation) => Err(owner
-                .effects
-                .retain(obligation, EffectOwner::retain_file_removal)),
-        },
+        Resolution::Indeterminate(obligation) => Err(owner
+            .effects
+            .retain(obligation, EffectOwner::retain_file_removal)),
     }
 }
 
@@ -866,23 +854,14 @@ pub(crate) fn settle_parked_directory_removal(
     owner: &ManagedStorageDirectory,
     parked: ParkedDirectory,
 ) -> io::Result<()> {
-    match parked.remove_empty() {
-        DirectoryRemovalOutcome::Applied(()) => Ok(()),
-        DirectoryRemovalOutcome::NoEffect {
-            error: _,
-            item: parked,
-        } => Err(owner
+    match parked.remove_empty().reconcile() {
+        Resolution::Applied(()) => Ok(()),
+        Resolution::NoEffect((_, parked)) => Err(owner
             .effects
             .retain(parked, EffectOwner::retain_parked_directory_removal)),
-        DirectoryRemovalOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            DirectoryRemovalResolution::Applied(()) => Ok(()),
-            DirectoryRemovalResolution::NoEffect(parked) => Err(owner
-                .effects
-                .retain(parked, EffectOwner::retain_parked_directory_removal)),
-            DirectoryRemovalResolution::Indeterminate(obligation) => Err(owner
-                .effects
-                .retain(obligation, EffectOwner::retain_directory_removal)),
-        },
+        Resolution::Indeterminate(obligation) => Err(owner
+            .effects
+            .retain(obligation, EffectOwner::retain_directory_removal)),
     }
 }
 
@@ -948,25 +927,17 @@ fn promote_stage(
     name: &LeafName,
     effects: &ManagedInstanceEffectAuthority,
 ) -> io::Result<ManagedStorageFile> {
-    match sealed.promote_no_replace(destination.directory(), destination.directory(), name) {
-        FilePromotionOutcome::Applied(file) => ManagedStorageFile::new(file, effects.clone()),
-        FilePromotionOutcome::NoEffect {
-            error,
-            item: staged,
-        } => discard_sealed_after(staged, error, effects),
-        FilePromotionOutcome::AppliedUnverified(obligation) => match (*obligation).reconcile() {
-            FilePromotionResolution::Applied(file) => {
-                ManagedStorageFile::new(file, effects.clone())
-            }
-            FilePromotionResolution::NoEffect(staged) => discard_sealed_after(
-                staged,
-                io::Error::other("managed storage promotion had no effect"),
-                effects,
-            ),
-            FilePromotionResolution::Indeterminate(obligation) => {
-                Err(effects.retain_file_promotion(obligation))
-            }
-        },
+    match sealed
+        .promote_no_replace(destination.directory(), destination.directory(), name)
+        .reconcile()
+    {
+        Resolution::Applied(file) => ManagedStorageFile::new(file, effects.clone()),
+        Resolution::NoEffect((error, staged)) => discard_sealed_after(
+            staged,
+            error.unwrap_or_else(|| io::Error::other("managed storage promotion had no effect")),
+            effects,
+        ),
+        Resolution::Indeterminate(obligation) => Err(effects.retain_file_promotion(obligation)),
     }
 }
 
@@ -974,18 +945,13 @@ fn settle_file_move(
     outcome: FileMoveOutcome,
     effects: &ManagedInstanceEffectAuthority,
 ) -> io::Result<FileCapability> {
-    match outcome {
-        FileMoveOutcome::Applied(file) => Ok(file),
-        FileMoveOutcome::NoEffect { error, item: _ } => Err(error),
-        FileMoveOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            FileMoveResolution::Applied(file) => Ok(file),
-            FileMoveResolution::NoEffect(_) => {
-                Err(io::Error::other("managed storage file move had no effect"))
-            }
-            FileMoveResolution::Indeterminate(obligation) => {
-                Err(effects.retain_file_move(obligation))
-            }
-        },
+    match outcome.reconcile() {
+        Resolution::Applied(file) => Ok(file),
+        Resolution::NoEffect((error, _)) => {
+            Err(error
+                .unwrap_or_else(|| io::Error::other("managed storage file move had no effect")))
+        }
+        Resolution::Indeterminate(obligation) => Err(effects.retain_file_move(obligation)),
     }
 }
 
@@ -993,18 +959,11 @@ fn settle_directory_move(
     outcome: DirectoryMoveOutcome,
     effects: &ManagedInstanceEffectAuthority,
 ) -> io::Result<Directory> {
-    match outcome {
-        DirectoryMoveOutcome::Applied(directory) => Ok(directory),
-        DirectoryMoveOutcome::NoEffect { error, item: _ } => Err(error),
-        DirectoryMoveOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            DirectoryMoveResolution::Applied(directory) => Ok(directory),
-            DirectoryMoveResolution::NoEffect(_) => Err(io::Error::other(
-                "managed storage directory move had no effect",
-            )),
-            DirectoryMoveResolution::Indeterminate(obligation) => {
-                Err(effects.retain_directory_move(obligation))
-            }
-        },
+    match outcome.reconcile() {
+        Resolution::Applied(directory) => Ok(directory),
+        Resolution::NoEffect((error, _)) => Err(error
+            .unwrap_or_else(|| io::Error::other("managed storage directory move had no effect"))),
+        Resolution::Indeterminate(obligation) => Err(effects.retain_directory_move(obligation)),
     }
 }
 
@@ -1037,18 +996,13 @@ fn settle_directory_park(
     outcome: DirectoryParkOutcome,
     effects: &ManagedInstanceEffectAuthority,
 ) -> io::Result<ParkedDirectory> {
-    match outcome {
-        DirectoryParkOutcome::Applied(parked) => Ok(parked),
-        DirectoryParkOutcome::NoEffect { error, item: _ } => Err(error),
-        DirectoryParkOutcome::AppliedUnverified(obligation) => match obligation.reconcile() {
-            DirectoryParkResolution::Applied(parked) => Ok(parked),
-            DirectoryParkResolution::NoEffect(_) => Err(io::Error::other(
-                "managed storage directory park had no effect",
-            )),
-            DirectoryParkResolution::Indeterminate(obligation) => {
-                Err(effects.retain(obligation, EffectOwner::retain_directory_park_removal))
-            }
-        },
+    match outcome.reconcile() {
+        Resolution::Applied(parked) => Ok(parked),
+        Resolution::NoEffect((error, _)) => Err(error
+            .unwrap_or_else(|| io::Error::other("managed storage directory park had no effect"))),
+        Resolution::Indeterminate(obligation) => {
+            Err(effects.retain(obligation, EffectOwner::retain_directory_park_removal))
+        }
     }
 }
 
