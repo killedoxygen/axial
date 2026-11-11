@@ -3,11 +3,11 @@ use super::install::{
     ManagedInstallDurableRecoveryState, ManagedInstallPublicationSeed,
 };
 use crate::known_good::KnownGoodReconstructionReceipt;
+use crate::managed::component::lifecycle::ComponentPublicationRecovery;
 use crate::managed::fs::ManagedLibraryOperation;
 use crate::managed::publication::ManagedRootPublicationLease;
 use crate::portable_path::PortableRelativePath;
 use crate::runtime::RuntimeSourceFailure;
-use crate::version_bundle_publication::VersionBundleTransactionRecovery;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::io;
@@ -504,6 +504,15 @@ impl ManagedInstallActivationContractId {
         &self.value
     }
 
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        let (_, encoded) = self
+            .value
+            .split_once('.')
+            .expect("parsed activation contract has a digest");
+        decode_compact_evidence_field::<32>(encoded)
+            .expect("parsed activation contract digest is canonical")
+    }
+
     pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -849,7 +858,7 @@ impl ManagedInstallAcknowledgementOutcome {
 pub(crate) enum ManagedInstallPublicationRecoveryState {
     Active {
         seed: ManagedInstallPublicationSeed,
-        publication: VersionBundleTransactionRecovery,
+        publication: ComponentPublicationRecovery,
     },
     Recover {
         seed: ManagedInstallPublicationSeed,
@@ -879,7 +888,7 @@ impl std::fmt::Debug for ManagedInstallPublicationRecovery {
 impl ManagedInstallPublicationRecovery {
     pub(crate) fn new(
         seed: ManagedInstallPublicationSeed,
-        publication: VersionBundleTransactionRecovery,
+        publication: ComponentPublicationRecovery,
     ) -> Self {
         Self {
             state: Box::new(ManagedInstallPublicationRecoveryState::Active { seed, publication }),

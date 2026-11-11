@@ -63,30 +63,31 @@ use crate::loaders::{
     VerifiedLoaderInstallBaseCommit,
 };
 use crate::managed::blocking::ManagedBlockingWorkers;
-use crate::managed::component::lifecycle::{
-    ManagedComponentLifecycleOutcome, publish_managed_component_effect,
+use crate::managed::component::effects::{
+    ComponentSettlementEvidence, acknowledge_retained_settlement, read_committed_version_metadata,
+    settlement_root_binding,
 };
-use crate::managed::component::table::ManagedComponentKind;
+use crate::managed::component::lifecycle::{
+    ComponentClassification, ComponentClassificationRecovery, ComponentLifecycleError,
+    ComponentPublicationRecovery, ComponentPublicationSourceIdentity,
+    ManagedComponentLifecycleOutcome, RetainedComponentPublicationSource,
+    StagedComponentPublicationSource, classify_component_settlement, lifecycle_outcome,
+    projection_is_exact, publish_managed_component_effect, publish_version_bundle_component,
+};
+use crate::managed::component::publication::ComponentRollbackEffect;
+use crate::managed::component::table::{ManagedComponentArtifactKind, ManagedComponentKind};
 use crate::managed::fs::{ManagedDir, ManagedLibraryOperation};
 use crate::managed::publication::{
     ManagedRootPublicationLease, open_managed_target_parent, run_publication_blocking,
     validate_existing_managed_target_path,
 };
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
-use crate::portable_path::PortableFileName;
+use crate::portable_path::{PortableFileName, PortableRelativePath};
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
 use crate::runtime::{
     TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
-};
-use crate::version_bundle_publication::{
-    DurableVersionBundleAcknowledgementOutcome, DurableVersionBundleEvidence,
-    DurableVersionBundleOutcome, VersionBundleTransactionError, VersionBundleTransactionRecovery,
-    VersionBundleTransactionSettledOutcome, acknowledge_durable_version_bundle,
-    classify_durable_version_bundle_candidates, durable_version_bundle_root_binding,
-    publish_version_bundle, read_committed_version_metadata, revalidate_settled_version_bundle,
-    settle_version_bundle_publication,
 };
 use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
@@ -318,17 +319,103 @@ pub(crate) struct AuthenticatedVersionBundleMemberSource {
     observed_size: u64,
 }
 
-impl AuthenticatedVersionBundleSource {
-    pub(crate) fn version_id(&self) -> &str {
-        &self.version_id
+/// A version bundle member staged at its row relative to the managed root.
+struct VersionBundleComponentSource {
+    relative_path: PortableRelativePath,
+    kind: ManagedComponentArtifactKind,
+    observed_size: u64,
+    observed_sha1: [u8; 20],
+    bytes: Arc<[u8]>,
+}
+
+impl RetainedComponentPublicationSource for VersionBundleComponentSource {
+    fn relative_path(&self) -> &PortableRelativePath {
+        &self.relative_path
     }
 
+    fn kind(&self) -> ManagedComponentArtifactKind {
+        self.kind
+    }
+
+    fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+
+    fn observed_sha1(&self) -> [u8; 20] {
+        self.observed_sha1
+    }
+
+    async fn stage_create_new(
+        self,
+        staging_bucket: &ManagedDir,
+        slot: &str,
+        lifetime_guard: crate::managed::publication::ManagedPublicationLifetimeGuard,
+    ) -> Result<StagedComponentPublicationSource, crate::loaders::LoaderError> {
+        let file = staging_bucket
+            .import_authenticated_create_new(
+                slot,
+                std::io::Cursor::new(self.bytes),
+                self.observed_size,
+                self.observed_sha1,
+                lifetime_guard,
+            )
+            .await?;
+        Ok(StagedComponentPublicationSource::new(
+            ComponentPublicationSourceIdentity::new(
+                self.relative_path,
+                self.kind,
+                self.observed_size,
+                self.observed_sha1,
+            ),
+            file,
+        ))
+    }
+}
+
+impl AuthenticatedVersionBundleSource {
     pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
         version_bundle_sources_match_projection(&self.version_id, projection, &self.members)
     }
 
-    pub(crate) fn into_sources(self) -> Vec<AuthenticatedVersionBundleMemberSource> {
+    fn into_component_sources(self) -> Result<Vec<VersionBundleComponentSource>, DownloadError> {
+        let version_id = self.version_id;
         self.members
+            .into_iter()
+            .map(|member| {
+                let (path, kind) = match member.kind {
+                    KnownGoodArtifactKind::VersionMetadata => (
+                        format!("versions/{version_id}/{version_id}.json"),
+                        ManagedComponentArtifactKind::VersionMetadata,
+                    ),
+                    KnownGoodArtifactKind::ClientJar => (
+                        format!("versions/{version_id}/{version_id}.jar"),
+                        ManagedComponentArtifactKind::ClientJar,
+                    ),
+                    KnownGoodArtifactKind::LogConfig => (
+                        format!("assets/log_configs/{}", member.logical_identity),
+                        ManagedComponentArtifactKind::LogConfig,
+                    ),
+                    _ => {
+                        return Err(version_bundle_install_error(
+                            "version bundle member kind is invalid",
+                        ));
+                    }
+                };
+                let invalid =
+                    || version_bundle_install_error("version bundle member contract is invalid");
+                let observed_sha1 = <[u8; 20]>::try_from(
+                    hex::decode(&member.observed_sha1).map_err(|_| invalid())?,
+                )
+                .map_err(|_| invalid())?;
+                Ok(VersionBundleComponentSource {
+                    relative_path: PortableRelativePath::new(&path).map_err(|_| invalid())?,
+                    kind,
+                    observed_size: member.observed_size,
+                    observed_sha1,
+                    bytes: member.bytes,
+                })
+            })
+            .collect()
     }
 
     fn from_selected_sources(
@@ -728,8 +815,9 @@ pub(crate) struct ManagedInstallPublicationSeed {
 
 pub(crate) struct ManagedInstallDurableEvidenceState {
     lease: ManagedRootPublicationLease,
-    evidence: DurableVersionBundleEvidence,
+    evidence: ComponentSettlementEvidence,
     id: ManagedInstallPublicationEvidenceId,
+    committed_activation_contract_id: Option<super::model::ManagedInstallActivationContractId>,
 }
 
 pub(crate) enum ManagedInstallDurableRecoveryState {
@@ -738,7 +826,8 @@ pub(crate) enum ManagedInstallDurableRecoveryState {
         candidates: ManagedInstallPublicationCandidates,
     },
     Classify {
-        lease: ManagedRootPublicationLease,
+        managed_root: ManagedLibraryOperation,
+        recovery: ComponentClassificationRecovery,
         candidates: ManagedInstallPublicationCandidates,
     },
     #[cfg(any(test, feature = "test-support"))]
@@ -750,7 +839,7 @@ pub(crate) enum ManagedInstallDurableRecoveryState {
 pub(crate) enum ManagedInstallAcknowledgementRecoveryState {
     Active {
         lease: ManagedRootPublicationLease,
-        evidence: DurableVersionBundleEvidence,
+        evidence: ComponentSettlementEvidence,
     },
     #[cfg(any(test, feature = "test-support"))]
     Fixture {
@@ -765,7 +854,7 @@ struct ManagedInstallPublicationSeedGuard {
 
 struct ManagedInstallPublicationRetryOwner {
     seed: ManagedInstallPublicationSeed,
-    publication: Option<VersionBundleTransactionRecovery>,
+    publication: Option<ComponentPublicationRecovery>,
 }
 
 struct ManagedInstallPublicationRetryGuard {
@@ -2839,23 +2928,6 @@ pub async fn publish_managed_install_fixture_for_test(
     publish_prepared_managed_install(managed_root, prepared).await
 }
 
-#[cfg(test)]
-pub(crate) fn version_bundle_publication_fixture_for_test(
-    version_id: &str,
-) -> Result<
-    (
-        PendingKnownGoodInstallAuthority,
-        AuthenticatedVersionBundleSource,
-    ),
-    DownloadError,
-> {
-    let (authority, version_json, client_jar, log_config) =
-        crate::known_good::managed_version_bundle_fixture_parts_for_test(version_id)?;
-    let prepared =
-        prepare_local_managed_install(authority, version_json, client_jar, log_config, Vec::new())?;
-    Ok((prepared.authority, prepared.version_bundle_source))
-}
-
 #[cfg(any(test, feature = "test-support"))]
 pub async fn publish_managed_install_fixture_with_client_for_test(
     managed_root: ManagedLibraryOperation,
@@ -2937,7 +3009,13 @@ pub async fn verify_registered_known_good_bootstrap(
                     );
                 }
             };
-            if !revalidate_settled_version_bundle(&publication_lease, projection).await {
+            if !projection_is_exact(
+                &publication_lease,
+                projection,
+                ManagedComponentKind::VersionBundle,
+            )
+            .await
+            {
                 drop(publication_lease);
                 return Err(
                     RegisteredKnownGoodBootstrapVerificationFailure {
@@ -2987,8 +3065,9 @@ async fn classify_managed_install_publication_retaining_no_effect(
     candidates: ManagedInstallPublicationCandidates,
 ) -> Result<ManagedRootPublicationLease, ManagedInstallDurableOutcome> {
     let (lease, candidates) =
-        acquire_managed_install_publication_classification(managed_root, candidates).await?;
-    classify_managed_install_publication_lease(lease, candidates).await
+        acquire_managed_install_publication_classification(managed_root.clone(), candidates)
+            .await?;
+    classify_managed_install_publication_lease(lease, managed_root, candidates).await
 }
 
 async fn acquire_managed_install_publication_classification(
@@ -3088,24 +3167,42 @@ pub fn verify_managed_install_publication_evidence_root(
     };
     let (transaction_nonce, settlement_generation, expected_root_binding) =
         evidence_id.binding_parts();
-    durable_version_bundle_root_binding(&root, transaction_nonce, settlement_generation)
+    settlement_root_binding(&root, transaction_nonce, settlement_generation)
         .is_some_and(|observed| observed == expected_root_binding)
 }
 
 async fn classify_managed_install_publication_state(
     state: ManagedInstallDurableRecoveryState,
 ) -> ManagedInstallDurableOutcome {
-    let (lease, candidates) = match state {
+    let classified = match state {
         ManagedInstallDurableRecoveryState::Acquire {
             managed_root,
             candidates,
-        } => match acquire_managed_install_publication_classification(managed_root, candidates)
+        } => {
+            let (lease, candidates) = match acquire_managed_install_publication_classification(
+                managed_root.clone(),
+                candidates,
+            )
             .await
-        {
-            Ok(acquired) => acquired,
-            Err(outcome) => return outcome,
-        },
-        ManagedInstallDurableRecoveryState::Classify { lease, candidates } => (lease, candidates),
+            {
+                Ok(acquired) => acquired,
+                Err(outcome) => return outcome,
+            };
+            classify_managed_install_publication_lease(lease, managed_root, candidates).await
+        }
+        ManagedInstallDurableRecoveryState::Classify {
+            managed_root,
+            recovery,
+            candidates,
+        } => {
+            let classification = recovery
+                .retry(
+                    ManagedComponentKind::VersionBundle,
+                    publication_candidate_filter(&candidates),
+                )
+                .await;
+            managed_install_durable_classification(classification, managed_root, candidates)
+        }
         #[cfg(any(test, feature = "test-support"))]
         ManagedInstallDurableRecoveryState::Fixture {
             remaining_indeterminate_retries,
@@ -3129,7 +3226,7 @@ async fn classify_managed_install_publication_state(
             };
         }
     };
-    match classify_managed_install_publication_lease(lease, candidates).await {
+    match classified {
         Ok(lease) => {
             drop(lease);
             ManagedInstallDurableOutcome::NoEffect
@@ -3140,61 +3237,98 @@ async fn classify_managed_install_publication_state(
 
 async fn classify_managed_install_publication_lease(
     lease: ManagedRootPublicationLease,
+    managed_root: ManagedLibraryOperation,
     candidates: ManagedInstallPublicationCandidates,
 ) -> Result<ManagedRootPublicationLease, ManagedInstallDurableOutcome> {
-    match classify_durable_version_bundle_candidates(lease, candidates.clone()).await {
-        DurableVersionBundleOutcome::NoEffect(lease) => Ok(lease),
-        DurableVersionBundleOutcome::Committed { lease, evidence } => Err(
-            ManagedInstallDurableOutcome::Committed(ManagedInstallCommittedEvidence {
-                state: managed_install_durable_evidence_state(lease, evidence),
-            }),
-        ),
-        DurableVersionBundleOutcome::RolledBack {
-            lease,
-            evidence,
-            effect,
-        } => Err(ManagedInstallDurableOutcome::RolledBack {
-            evidence: ManagedInstallRolledBackEvidence {
-                state: managed_install_durable_evidence_state(lease, evidence),
-            },
-            effect: managed_install_rollback_effect(effect),
-        }),
-        DurableVersionBundleOutcome::Mismatch(lease) => {
+    let classification = classify_component_settlement(
+        lease,
+        ManagedComponentKind::VersionBundle,
+        publication_candidate_filter(&candidates),
+    )
+    .await;
+    managed_install_durable_classification(classification, managed_root, candidates)
+}
+
+fn publication_candidate_filter(
+    candidates: &ManagedInstallPublicationCandidates,
+) -> impl Fn(&str) -> bool + Send + 'static {
+    let candidates = candidates.clone();
+    move |version_id| candidates.contains(version_id)
+}
+
+fn managed_install_durable_classification(
+    classification: ComponentClassification,
+    managed_root: ManagedLibraryOperation,
+    candidates: ManagedInstallPublicationCandidates,
+) -> Result<ManagedRootPublicationLease, ManagedInstallDurableOutcome> {
+    match classification {
+        ComponentClassification::NoEffect(lease) => Ok(lease),
+        ComponentClassification::Settled { lease, evidence } => {
+            Err(match evidence.rollback_effect() {
+                None => ManagedInstallDurableOutcome::Committed(ManagedInstallCommittedEvidence {
+                    state: managed_install_durable_evidence_state(lease, evidence),
+                }),
+                Some(effect) => ManagedInstallDurableOutcome::RolledBack {
+                    evidence: ManagedInstallRolledBackEvidence {
+                        state: managed_install_durable_evidence_state(lease, evidence),
+                    },
+                    effect: managed_install_rollback_effect(effect),
+                },
+            })
+        }
+        ComponentClassification::Mismatch(lease) => {
             drop(lease);
             drop(candidates);
             Err(ManagedInstallDurableOutcome::Mismatch)
         }
-        DurableVersionBundleOutcome::Indeterminate(lease) => Err(
+        ComponentClassification::Indeterminate(recovery) => Err(
             ManagedInstallDurableOutcome::Indeterminate(ManagedInstallDurableRecovery {
-                state: ManagedInstallDurableRecoveryState::Classify { lease, candidates },
+                state: ManagedInstallDurableRecoveryState::Classify {
+                    managed_root,
+                    recovery,
+                    candidates,
+                },
             }),
         ),
+        ComponentClassification::Released => Err(ManagedInstallDurableOutcome::Indeterminate(
+            ManagedInstallDurableRecovery {
+                state: ManagedInstallDurableRecoveryState::Acquire {
+                    managed_root,
+                    candidates,
+                },
+            },
+        )),
     }
 }
 
 fn managed_install_durable_evidence_state(
     lease: ManagedRootPublicationLease,
-    evidence: DurableVersionBundleEvidence,
+    evidence: ComponentSettlementEvidence,
 ) -> ManagedInstallDurableEvidenceState {
-    let id = evidence.evidence_id();
+    let id = ManagedInstallPublicationEvidenceId::from_parts(
+        evidence.version_id(),
+        &evidence.transaction_nonce(),
+        &evidence.settlement_generation(),
+        evidence.root_binding(),
+        evidence.fingerprint(),
+    );
+    let committed_activation_contract_id = evidence
+        .committed_activation_contract()
+        .map(super::model::ManagedInstallActivationContractId::from_digest);
     ManagedInstallDurableEvidenceState {
         lease,
         evidence,
         id,
+        committed_activation_contract_id,
     }
 }
 
 fn managed_install_rollback_effect(
-    effect: crate::version_bundle_publication::VersionBundleTransactionEffect,
+    effect: ComponentRollbackEffect,
 ) -> ManagedInstallRollbackEffect {
     match effect {
-        crate::version_bundle_publication::VersionBundleTransactionEffect::Promotion => {
-            ManagedInstallRollbackEffect::Promotion
-        }
-        crate::version_bundle_publication::VersionBundleTransactionEffect::Postcheck => {
-            ManagedInstallRollbackEffect::Postcheck
-        }
-        crate::version_bundle_publication::VersionBundleTransactionEffect::Rollback => {
+        ComponentRollbackEffect::Execution => ManagedInstallRollbackEffect::Promotion,
+        ComponentRollbackEffect::None | ComponentRollbackEffect::Reconciliation => {
             ManagedInstallRollbackEffect::Rollback
         }
     }
@@ -3233,7 +3367,7 @@ impl ManagedInstallCommittedEvidence {
     pub fn committed_activation_contract_id(
         &self,
     ) -> Option<&super::model::ManagedInstallActivationContractId> {
-        self.state.evidence.committed_activation_contract_id()
+        self.state.committed_activation_contract_id.as_ref()
     }
 
     pub fn verify_install_receipt(
@@ -3262,11 +3396,7 @@ impl ManagedInstallCommittedEvidence {
         self,
         commit: LoaderInstallBaseCommit,
     ) -> Result<VerifiedLoaderInstallBaseCommit, LoaderInstallBaseCommitVerificationFailure> {
-        let expected = self
-            .state
-            .evidence
-            .committed_activation_contract_id()
-            .cloned();
+        let expected = self.state.committed_activation_contract_id.clone();
         let observed = commit.activation_contract_id().ok();
         match (expected, observed) {
             (Some(activation_contract_id), Some(observed))
@@ -3291,11 +3421,7 @@ fn verify_managed_install_receipt_contract<R>(
     receipt: R,
     observed: Option<super::model::ManagedInstallActivationContractId>,
 ) -> Result<VerifiedManagedInstallReceipt<R>, ManagedInstallReceiptVerificationFailure<R>> {
-    let expected = evidence
-        .state
-        .evidence
-        .committed_activation_contract_id()
-        .cloned();
+    let expected = evidence.state.committed_activation_contract_id.clone();
     match (expected, observed) {
         (Some(activation_contract_id), Some(observed)) if activation_contract_id == observed => {
             Ok(VerifiedManagedInstallReceipt {
@@ -3451,18 +3577,16 @@ async fn acknowledge_managed_install_publication(
     let ManagedInstallDurableEvidenceState {
         lease, evidence, ..
     } = state;
-    match acknowledge_durable_version_bundle(lease, evidence).await {
-        DurableVersionBundleAcknowledgementOutcome::Acknowledged(lease) => {
+    match acknowledge_retained_settlement(lease, evidence).await {
+        Ok(lease) => {
             drop(lease);
             ManagedInstallAcknowledgementOutcome::Acknowledged
         }
-        DurableVersionBundleAcknowledgementOutcome::Indeterminate { lease, evidence } => {
-            ManagedInstallAcknowledgementOutcome::Indeterminate(
-                ManagedInstallAcknowledgementRecovery {
-                    state: ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence },
-                },
-            )
-        }
+        Err((lease, evidence)) => ManagedInstallAcknowledgementOutcome::Indeterminate(
+            ManagedInstallAcknowledgementRecovery {
+                state: ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence },
+            },
+        ),
     }
 }
 
@@ -3491,16 +3615,14 @@ impl ManagedInstallAcknowledgementRecovery {
                 };
             }
         };
-        match acknowledge_durable_version_bundle(lease, evidence).await {
-            DurableVersionBundleAcknowledgementOutcome::Acknowledged(lease) => {
+        match acknowledge_retained_settlement(lease, evidence).await {
+            Ok(lease) => {
                 drop(lease);
                 ManagedInstallAcknowledgementOutcome::Acknowledged
             }
-            DurableVersionBundleAcknowledgementOutcome::Indeterminate { lease, evidence } => {
-                ManagedInstallAcknowledgementOutcome::Indeterminate(Self {
-                    state: ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence },
-                })
-            }
+            Err((lease, evidence)) => ManagedInstallAcknowledgementOutcome::Indeterminate(Self {
+                state: ManagedInstallAcknowledgementRecoveryState::Active { lease, evidence },
+            }),
         }
     }
 }
@@ -3602,7 +3724,7 @@ enum ManagedProjectionSequenceError {
     Projection(ManagedKnownGoodComponent),
     Component(ManagedKnownGoodComponent),
     VersionBundle,
-    Indeterminate(VersionBundleTransactionRecovery),
+    Indeterminate(ComponentPublicationRecovery),
 }
 
 impl ManagedProjectionSequenceError {
@@ -3666,47 +3788,32 @@ async fn publish_managed_projection_sequence(
             ));
         }
     };
-    let publication = {
-        let activation_contract_id = authority.activation_contract_id().map_err(|_| {
-            ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::VersionBundle)
-        })?;
-        let projection = authority
-            .component_projection(ManagedKnownGoodComponent::VersionBundle)
-            .map_err(|_| {
-                ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::VersionBundle)
-            })?;
-        publish_version_bundle(
-            lease,
-            version_bundle_source,
-            activation_contract_id,
-            projection,
-        )
-        .await
-    };
-    let settlement = settle_version_bundle_publication(publication)
-        .await
-        .map_err(managed_projection_sequence_error)?;
-    match settlement {
-        VersionBundleTransactionSettledOutcome::Committed { lease } => {
-            Ok(ManagedProjectionSequenceOutcome::Committed(lease))
-        }
-        VersionBundleTransactionSettledOutcome::RolledBack { lease } => {
-            drop(lease);
-            Ok(ManagedProjectionSequenceOutcome::RolledBack(
-                ManagedKnownGoodComponent::VersionBundle,
-            ))
-        }
+    let projection_error =
+        || ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::VersionBundle);
+    let activation_contract = authority
+        .activation_contract_id()
+        .map_err(|_| projection_error())?
+        .digest();
+    let projection = authority
+        .component_projection(ManagedKnownGoodComponent::VersionBundle)
+        .map_err(|_| projection_error())?;
+    if !version_bundle_source.matches_projection(&projection) {
+        return Err(projection_error());
     }
-}
-
-fn managed_projection_sequence_error(
-    error: VersionBundleTransactionError,
-) -> ManagedProjectionSequenceError {
-    match error {
-        VersionBundleTransactionError::Indeterminate(recovery) => {
-            ManagedProjectionSequenceError::Indeterminate(recovery)
+    let sources = version_bundle_source
+        .into_component_sources()
+        .map_err(|_| projection_error())?;
+    match publish_version_bundle_component(lease, projection, activation_contract, sources).await {
+        Ok(ManagedComponentLifecycleOutcome::Committed(receipt)) => Ok(
+            ManagedProjectionSequenceOutcome::Committed(receipt.into_lease()),
+        ),
+        Ok(ManagedComponentLifecycleOutcome::RolledBack) => Ok(
+            ManagedProjectionSequenceOutcome::RolledBack(ManagedKnownGoodComponent::VersionBundle),
+        ),
+        Err(ComponentLifecycleError::Indeterminate(recovery)) => {
+            Err(ManagedProjectionSequenceError::Indeterminate(recovery))
         }
-        _ => ManagedProjectionSequenceError::VersionBundle,
+        Err(_) => Err(ManagedProjectionSequenceError::VersionBundle),
     }
 }
 
@@ -3742,7 +3849,7 @@ impl ManagedInstallPublicationRecovery {
 
 async fn retry_active_managed_install_publication(
     seed: ManagedInstallPublicationSeed,
-    publication: VersionBundleTransactionRecovery,
+    publication: ComponentPublicationRecovery,
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
     let holder = Arc::new(Mutex::new(Some(ManagedInstallPublicationRetryOwner {
         seed,
@@ -3758,19 +3865,19 @@ async fn retry_active_managed_install_publication(
         maybe_panic_managed_install_active_retry_owner_for_test(
             guard.owner_mut()?.seed.authority.version_id(),
         );
-        let outcome = publication.retry().await;
+        let outcome = publication.retry().await.map(lifecycle_outcome);
         match outcome {
-            Ok(VersionBundleTransactionSettledOutcome::Committed { .. }) => {
+            Ok(ManagedComponentLifecycleOutcome::Committed(_)) => {
                 let owner = guard.take_owner()?;
                 Ok(owner.seed.authority.seal_after_version_bundle_commit())
             }
-            Ok(VersionBundleTransactionSettledOutcome::RolledBack { .. }) => {
+            Ok(ManagedComponentLifecycleOutcome::RolledBack) => {
                 guard.discard();
                 Err(managed_projection_sequence_rolled_back_install_error(
                     ManagedKnownGoodComponent::VersionBundle,
                 ))
             }
-            Err(VersionBundleTransactionError::Indeterminate(publication)) => {
+            Err(ComponentLifecycleError::Indeterminate(publication)) => {
                 guard.owner_mut()?.publication = Some(publication);
                 let mut owner = guard.take_owner()?;
                 Err(DownloadError::PublicationIndeterminate(
@@ -4367,7 +4474,7 @@ mod tests {
     fn publication_recovery_carriers_are_send_and_static() {
         fn assert_send_static<T: Send + 'static>() {}
 
-        assert_send_static::<VersionBundleTransactionRecovery>();
+        assert_send_static::<ComponentPublicationRecovery>();
         assert_send_static::<ManagedInstallPublicationRecovery>();
         assert_send_static::<crate::loaders::LoaderInstallPublicationRecovery>();
         assert_send_static::<crate::loaders::LoaderInstallPublicationOutcome>();
@@ -4458,9 +4565,8 @@ mod tests {
         let first_directory = first_operation
             .managed_directory()
             .expect("bind first managed directory");
-        let binding =
-            durable_version_bundle_root_binding(&first_directory, TRANSACTION, GENERATION)
-                .expect("derive first root binding");
+        let binding = settlement_root_binding(&first_directory, TRANSACTION, GENERATION)
+            .expect("derive first root binding");
         let id = ManagedInstallPublicationEvidenceId::from_parts(
             "1.21.5",
             TRANSACTION,

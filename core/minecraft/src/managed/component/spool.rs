@@ -294,6 +294,7 @@ mod tests {
             transaction_nonce: [0x11; 16],
             logical_rows_sha256: [0x33; 32],
             projection_sha256: [0x44; 32],
+            activation_contract: None,
             shards: descriptors,
         }
     }

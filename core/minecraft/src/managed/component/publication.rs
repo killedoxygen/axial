@@ -1,9 +1,9 @@
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::managed::component::bytes::{ByteCursor, put_u16, put_u32, put_u64};
 use crate::managed::component::table::{
-    ComponentIntentManifest, ComponentTableError, ComponentTableRow, MAX_COMPONENT_INTENT_BYTES,
-    MAX_COMPONENT_TABLE_ROWS, ManagedComponentKind, decode_component_intent_manifest,
-    expected_shard_count,
+    ComponentIntentManifest, ComponentTableError, ComponentTableParser, ComponentTableRow,
+    MAX_COMPONENT_INTENT_BYTES, MAX_COMPONENT_TABLE_ROWS, MAX_COMPONENT_TABLE_SHARD_BYTES,
+    ManagedComponentKind, decode_component_intent_manifest, expected_shard_count,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -16,14 +16,16 @@ pub(crate) const COMPONENT_SETTLEMENT_FILE: &str = "settlement.bin";
 
 const COMPONENT_OUTCOME_BODY_BYTES: usize = 152;
 pub(crate) const COMPONENT_OUTCOME_BYTES: usize = COMPONENT_OUTCOME_BODY_BYTES + 32;
-pub(crate) const COMPONENT_SETTLEMENT_HEADER_BYTES: usize = 96;
-pub(crate) const MAX_COMPONENT_SETTLEMENT_BYTES: usize =
-    COMPONENT_SETTLEMENT_HEADER_BYTES + COMPONENT_OUTCOME_BYTES + MAX_COMPONENT_INTENT_BYTES;
+pub(crate) const COMPONENT_SETTLEMENT_HEADER_BYTES: usize = 112;
+pub(crate) const MAX_COMPONENT_SETTLEMENT_BYTES: usize = COMPONENT_SETTLEMENT_HEADER_BYTES
+    + COMPONENT_OUTCOME_BYTES
+    + MAX_COMPONENT_INTENT_BYTES
+    + MAX_COMPONENT_TABLE_SHARD_BYTES;
 
 const OUTCOME_MAGIC: &[u8; 8] = b"AXCPOUT\0";
 const SETTLEMENT_MAGIC: &[u8; 8] = b"AXCPSET\0";
-const FORMAT_VERSION: u16 = 2;
-const OUTCOME_CHECKSUM_DOMAIN: &[u8] = b"axial.component.outcome.v2\0";
+const FORMAT_VERSION: u16 = 3;
+const OUTCOME_CHECKSUM_DOMAIN: &[u8] = b"axial.component.outcome.v3\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -60,6 +62,12 @@ pub(crate) struct ComponentSettlementRecord {
     pub(crate) outcome: ComponentOutcomeRecord,
     pub(crate) intent: ComponentIntentManifest,
     pub(crate) encoded_intent: Vec<u8>,
+    /// Fresh for each written settlement, so retained evidence names one write.
+    pub(crate) generation: [u8; 16],
+    /// A retained settlement's copy of its single table shard; empty otherwise.
+    pub(crate) encoded_table: Vec<u8>,
+    /// The rows `encoded_table` authenticates.
+    pub(crate) rows: Vec<ComponentTableRow>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -97,7 +105,24 @@ pub(crate) fn component_lane_name(component: ManagedComponentKind) -> &'static s
     match component {
         ManagedComponentKind::Libraries => "libraries",
         ManagedComponentKind::Assets => "assets",
+        ManagedComponentKind::VersionBundle => "version-bundle",
     }
+}
+
+/// The managed-root child a component's rows are relative to. Version bundle rows are
+/// relative to the managed root itself and name their `versions/` or `assets/` root.
+pub(crate) fn component_canonical_root(component: ManagedComponentKind) -> Option<&'static str> {
+    match component {
+        ManagedComponentKind::Libraries => Some("libraries"),
+        ManagedComponentKind::Assets => Some("assets"),
+        ManagedComponentKind::VersionBundle => None,
+    }
+}
+
+/// A retained settlement stays durable after cleanup until its owner acknowledges it; the
+/// install record depends on a version bundle's settlement.
+pub(crate) fn component_retains_settlement(component: ManagedComponentKind) -> bool {
+    component == ManagedComponentKind::VersionBundle
 }
 
 impl ComponentOutcomeRecord {
@@ -254,13 +279,17 @@ pub(crate) fn decode_component_outcome(
 pub(crate) fn encode_component_settlement(
     outcome: &ComponentOutcomeRecord,
     encoded_intent: &[u8],
+    generation: [u8; 16],
+    encoded_table: &[u8],
 ) -> Result<Vec<u8>, ComponentPublicationRecordError> {
     let intent = decode_component_intent_manifest(encoded_intent)?;
     outcome.binds_intent(&intent, encoded_intent)?;
+    settlement_rows(&intent, encoded_table)?;
     let encoded_outcome = encode_component_outcome(outcome)?;
     let total_bytes = COMPONENT_SETTLEMENT_HEADER_BYTES
         .checked_add(encoded_outcome.len())
         .and_then(|length| length.checked_add(encoded_intent.len()))
+        .and_then(|length| length.checked_add(encoded_table.len()))
         .filter(|length| *length <= MAX_COMPONENT_SETTLEMENT_BYTES)
         .ok_or(ComponentPublicationRecordError)?;
     let mut bytes = Vec::new();
@@ -271,28 +300,50 @@ pub(crate) fn encode_component_settlement(
     put_u16(&mut bytes, FORMAT_VERSION);
     bytes.push(outcome.component as u8);
     bytes.push(0);
-    put_u32(
-        &mut bytes,
-        u32::try_from(encoded_outcome.len()).map_err(|_| ComponentPublicationRecordError)?,
-    );
-    put_u32(
-        &mut bytes,
-        u32::try_from(encoded_intent.len()).map_err(|_| ComponentPublicationRecordError)?,
-    );
+    for length in [
+        encoded_outcome.len(),
+        encoded_intent.len(),
+        encoded_table.len(),
+        total_bytes,
+    ] {
+        put_u32(
+            &mut bytes,
+            u32::try_from(length).map_err(|_| ComponentPublicationRecordError)?,
+        );
+    }
     bytes.extend_from_slice(&<[u8; 32]>::from(Sha256::digest(&encoded_outcome)));
     bytes.extend_from_slice(&<[u8; 32]>::from(Sha256::digest(encoded_intent)));
-    put_u32(
-        &mut bytes,
-        u32::try_from(total_bytes).map_err(|_| ComponentPublicationRecordError)?,
-    );
-    put_u32(&mut bytes, 0);
+    bytes.extend_from_slice(&generation);
     put_u32(&mut bytes, 0);
     if bytes.len() != COMPONENT_SETTLEMENT_HEADER_BYTES {
         return Err(ComponentPublicationRecordError);
     }
     bytes.extend_from_slice(&encoded_outcome);
     bytes.extend_from_slice(encoded_intent);
+    bytes.extend_from_slice(encoded_table);
     Ok(bytes)
+}
+
+/// A retained settlement carries its whole single-shard table, authenticated by the intent;
+/// any other settlement carries none.
+fn settlement_rows(
+    intent: &ComponentIntentManifest,
+    encoded_table: &[u8],
+) -> Result<Vec<ComponentTableRow>, ComponentPublicationRecordError> {
+    if !component_retains_settlement(intent.component) {
+        return if encoded_table.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(ComponentPublicationRecordError)
+        };
+    }
+    if intent.shards.len() != 1 || encoded_table.len() > MAX_COMPONENT_TABLE_SHARD_BYTES {
+        return Err(ComponentPublicationRecordError);
+    }
+    let mut parser = ComponentTableParser::new(intent.clone())?;
+    let shard = parser.parse_next(encoded_table)?;
+    parser.finish()?;
+    Ok(shard.rows)
 }
 
 pub(crate) fn decode_component_settlement(
@@ -315,24 +366,28 @@ pub(crate) fn decode_component_settlement(
     let outcome_len =
         usize::try_from(cursor.u32()?).map_err(|_| ComponentPublicationRecordError)?;
     let intent_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentPublicationRecordError)?;
+    let table_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentPublicationRecordError)?;
+    let total_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentPublicationRecordError)?;
     let outcome_sha256 = cursor.array::<32>()?;
     let intent_sha256 = cursor.array::<32>()?;
-    let total_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentPublicationRecordError)?;
+    let generation = cursor.array::<16>()?;
     if cursor.u32()? != 0
-        || cursor.u32()? != 0
         || cursor.position() != COMPONENT_SETTLEMENT_HEADER_BYTES
         || outcome_len != COMPONENT_OUTCOME_BYTES
         || intent_len > MAX_COMPONENT_INTENT_BYTES
+        || table_len > MAX_COMPONENT_TABLE_SHARD_BYTES
         || total_len != bytes.len()
         || COMPONENT_SETTLEMENT_HEADER_BYTES
             .checked_add(outcome_len)
             .and_then(|length| length.checked_add(intent_len))
+            .and_then(|length| length.checked_add(table_len))
             != Some(bytes.len())
     {
         return Err(ComponentPublicationRecordError);
     }
     let encoded_outcome = cursor.take(outcome_len)?;
     let encoded_intent_slice = cursor.take(intent_len)?;
+    let encoded_table_slice = cursor.take(table_len)?;
     if !cursor.finished()
         || outcome_sha256 != <[u8; 32]>::from(Sha256::digest(encoded_outcome))
         || intent_sha256 != <[u8; 32]>::from(Sha256::digest(encoded_intent_slice))
@@ -345,17 +400,32 @@ pub(crate) fn decode_component_settlement(
     }
     let intent = decode_component_intent_manifest(encoded_intent_slice)?;
     outcome.binds_intent(&intent, encoded_intent_slice)?;
+    let rows = settlement_rows(&intent, encoded_table_slice)?;
     let mut encoded_intent = Vec::new();
     encoded_intent
         .try_reserve_exact(intent_len)
         .map_err(|_| ComponentPublicationRecordError)?;
     encoded_intent.extend_from_slice(encoded_intent_slice);
+    let mut encoded_table = Vec::new();
+    encoded_table
+        .try_reserve_exact(table_len)
+        .map_err(|_| ComponentPublicationRecordError)?;
+    encoded_table.extend_from_slice(encoded_table_slice);
     let record = ComponentSettlementRecord {
         outcome,
         intent,
         encoded_intent,
+        generation,
+        encoded_table,
+        rows,
     };
-    if encode_component_settlement(&record.outcome, &record.encoded_intent)? != bytes {
+    if encode_component_settlement(
+        &record.outcome,
+        &record.encoded_intent,
+        record.generation,
+        &record.encoded_table,
+    )? != bytes
+    {
         return Err(ComponentPublicationRecordError);
     }
     Ok(record)
@@ -625,6 +695,7 @@ mod tests {
             transaction_nonce: [0x55; 16],
             logical_rows_sha256: [0x77; 32],
             projection_sha256: [0x88; 32],
+            activation_contract: None,
             shards,
         })
         .unwrap()
@@ -655,7 +726,7 @@ mod tests {
         assert_eq!(encoded_outcome.len(), COMPONENT_OUTCOME_BYTES);
         assert_eq!(decode_component_outcome(&encoded_outcome).unwrap(), outcome);
 
-        let settlement = encode_component_settlement(&outcome, &intent).unwrap();
+        let settlement = encode_component_settlement(&outcome, &intent, [0x5e; 16], &[]).unwrap();
         let decoded = decode_component_settlement(&settlement).unwrap();
         assert_eq!(decoded.outcome, outcome);
         assert_eq!(decoded.encoded_intent, intent);
@@ -726,8 +797,12 @@ mod tests {
             ComponentRollbackEffect::Reconciliation,
         )
         .unwrap();
-        let settlement = encode_component_settlement(&outcome, &intent).unwrap();
-        assert_eq!(settlement.len(), MAX_COMPONENT_SETTLEMENT_BYTES);
+        let settlement = encode_component_settlement(&outcome, &intent, [0x5e; 16], &[]).unwrap();
+        // Only a retained settlement carries its table shard.
+        assert_eq!(
+            settlement.len(),
+            MAX_COMPONENT_SETTLEMENT_BYTES - MAX_COMPONENT_TABLE_SHARD_BYTES
+        );
         assert_eq!(
             decode_component_settlement(&settlement)
                 .unwrap()
@@ -763,7 +838,7 @@ mod tests {
             Err(ComponentPublicationRecordError)
         );
 
-        let settlement = encode_component_settlement(&outcome, &intent).unwrap();
+        let settlement = encode_component_settlement(&outcome, &intent, [0x5e; 16], &[]).unwrap();
         for length in 0..settlement.len() {
             assert_eq!(
                 decode_component_settlement(&settlement[..length]),
@@ -788,8 +863,8 @@ mod tests {
             ComponentRollbackEffect::None,
         )
         .unwrap();
-        let original = encode_component_settlement(&outcome, &intent).unwrap();
-        for offset in [11, 92, COMPONENT_SETTLEMENT_HEADER_BYTES + 20] {
+        let original = encode_component_settlement(&outcome, &intent, [0x5e; 16], &[]).unwrap();
+        for offset in [11, 108, COMPONENT_SETTLEMENT_HEADER_BYTES + 20] {
             let mut corrupted = original.clone();
             corrupted[offset] ^= 1;
             assert_eq!(

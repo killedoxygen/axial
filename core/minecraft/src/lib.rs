@@ -49,7 +49,6 @@ pub mod rules;
 pub mod runtime;
 pub mod types;
 pub mod version;
-mod version_bundle_publication;
 pub mod version_meta;
 
 pub use asset_index::{

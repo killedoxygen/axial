@@ -11,12 +11,14 @@ use crate::managed::component::effects::{
     ComponentCanonicalObservation, ComponentCanonicalParents, ComponentEffectsError,
     ComponentExecutionResult, ComponentIntentCandidate, ComponentIntentPublicationRecovery,
     ComponentIntentPublishFailure, ComponentLane, ComponentPreparedCanonicalAuthority,
-    ComponentPriorRecoveryRetryResult, ComponentRecoveryRetryResult, ComponentSettledOutcome,
-    ComponentSettlementResult, ComponentStartupRecoveryResult, component_slot_name,
-    execute_component_intent, recover_component_intent_publication, recover_component_transaction,
-    retry_component_recovery, retry_component_settlement, retry_prior_component_recovery,
-    settle_component_transaction,
+    ComponentPriorRecoveryRetryResult, ComponentRecoveryRequired, ComponentRecoveryRetryResult,
+    ComponentSettledOutcome, ComponentSettlementClassification, ComponentSettlementEvidence,
+    ComponentSettlementResult, ComponentStartupRecoveryResult, classify_retained_settlement,
+    component_slot_name, execute_component_intent, has_retained_settlement,
+    recover_component_intent_publication, recover_component_transaction, retry_component_recovery,
+    retry_component_settlement, retry_prior_component_recovery, settle_component_transaction,
 };
+use crate::managed::component::publication::component_retains_settlement;
 use crate::managed::component::spool::{ComponentTableSpool, ComponentTableSpoolError};
 use crate::managed::component::table::{
     COMPONENT_TABLE_ROWS_PER_SHARD, ComponentIntentManifest, ComponentPriorFile,
@@ -37,6 +39,9 @@ use std::time::Duration;
 
 const COMPONENT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const COMPONENT_RETRY_MAXIMUM_DELAY: Duration = Duration::from_secs(1);
+/// A version bundle surfaces an unsettled publication to its install owner after this many
+/// attempts instead of retrying in the background indefinitely.
+const BOUNDED_COMPONENT_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ComponentPublicationSourceIdentity {
@@ -97,6 +102,44 @@ pub(crate) enum ComponentLifecycleError {
     Prepare(#[from] PrepareComponentIntentError),
     #[error("managed component intent failed before canonical effects")]
     BeforeEffects(#[source] ComponentEffectsError),
+    /// The lane still holds another owner's transaction or unacknowledged settlement.
+    #[error("managed component lane holds an unacknowledged settlement")]
+    UnacknowledgedSettlement,
+    #[error("managed component publication remains indeterminate")]
+    Indeterminate(ComponentPublicationRecovery),
+}
+
+/// Exclusive authority over an unsettled component publication; retrying resumes the
+/// retained progress with a fresh attempt budget.
+#[must_use = "dropping recovery releases the exclusive publication authority"]
+pub(crate) struct ComponentPublicationRecovery {
+    progress: ComponentProgress,
+    prior: bool,
+}
+
+pub(crate) enum ComponentDriven {
+    NoTransaction(ManagedRootPublicationLease),
+    Settled(ComponentSettledOutcome),
+}
+
+impl std::fmt::Debug for ComponentPublicationRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ComponentPublicationRecovery")
+            .field("prior", &self.prior)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ComponentPublicationRecovery {
+    pub(crate) async fn retry(self) -> Result<ComponentDriven, ComponentLifecycleError> {
+        drive_component(
+            self.progress,
+            self.prior,
+            &mut ComponentRetryBackoff::bounded(),
+        )
+        .await
+    }
 }
 
 impl ComponentPublicationSourceIdentity {
@@ -188,27 +231,54 @@ struct PlannedComponentProjection {
 
 struct ComponentRetryBackoff {
     delay: Duration,
+    remaining_retries: Option<usize>,
 }
 
 enum ComponentProgress {
+    Intent(Box<ComponentIntentCandidate>),
+    IntentRecovery(ComponentIntentPublishFailure),
     Execution(ComponentExecutionResult),
-    Recovery(crate::managed::component::effects::ComponentRecoveryRequired),
+    Recovery(ComponentRecoveryRequired),
     Settlement(ComponentSettlementResult),
 }
 
 impl ComponentRetryBackoff {
-    fn new() -> Self {
+    fn unbounded() -> Self {
         Self {
             delay: COMPONENT_RETRY_INITIAL_DELAY,
+            remaining_retries: None,
         }
     }
 
-    async fn wait(&mut self) {
+    fn bounded() -> Self {
+        Self {
+            delay: COMPONENT_RETRY_INITIAL_DELAY,
+            remaining_retries: Some(BOUNDED_COMPONENT_ATTEMPTS - 1),
+        }
+    }
+
+    fn for_component(component: ManagedComponentKind) -> Self {
+        if component_retains_settlement(component) {
+            Self::bounded()
+        } else {
+            Self::unbounded()
+        }
+    }
+
+    /// Waits before the next attempt, or reports that the attempt budget is spent.
+    async fn wait(&mut self) -> bool {
+        if let Some(remaining) = self.remaining_retries.as_mut() {
+            let Some(next) = remaining.checked_sub(1) else {
+                return false;
+            };
+            *remaining = next;
+        }
         tokio::time::sleep(self.delay).await;
         self.delay = self
             .delay
             .saturating_mul(2)
             .min(COMPONENT_RETRY_MAXIMUM_DELAY);
+        true
     }
 }
 
@@ -222,9 +292,8 @@ async fn publish_managed_component<S>(
 where
     S: RetainedComponentPublicationSource + 'static,
 {
-    let (known_good_component, _) = component_projection_contract(component);
     let projection = authority
-        .component_projection(known_good_component)
+        .component_projection(component_projection_contract(component))
         .map_err(|_| PrepareComponentIntentError::Projection)?;
     publish_managed_component_effect(lease, projection, component, sources).await
 }
@@ -238,10 +307,62 @@ pub(crate) async fn publish_managed_component_effect<S>(
 where
     S: RetainedComponentPublicationSource + 'static,
 {
-    let lease = settle_prior_component_transaction(lease, component).await?;
+    publish_component(lease, projection, component, None, sources).await
+}
+
+/// Publishes a version bundle for `activation_contract`, leaving its settlement retained for
+/// the install record to classify and acknowledge.
+pub(crate) async fn publish_version_bundle_component<S>(
+    lease: ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
+    activation_contract: [u8; 32],
+    sources: Vec<S>,
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    publish_component(
+        lease,
+        projection,
+        ManagedComponentKind::VersionBundle,
+        Some(activation_contract),
+        sources,
+    )
+    .await
+}
+
+async fn publish_component<S>(
+    lease: ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+    activation_contract: Option<[u8; 32]>,
+    sources: Vec<S>,
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    let retained = component_retains_settlement(component);
+    if retained != activation_contract.is_some() {
+        return Err(PrepareComponentIntentError::Projection.into());
+    }
+    let lease = match settle_prior_component_transaction(lease, component).await {
+        Ok(lease) => lease,
+        // A prior owner's unsettled transaction stays for its own durable classification.
+        Err(ComponentLifecycleError::Indeterminate(_)) if retained => {
+            return Err(ComponentLifecycleError::UnacknowledgedSettlement);
+        }
+        Err(error) => return Err(error),
+    };
+    let lease = if retained {
+        refuse_retained_settlement(lease, component).await?
+    } else {
+        lease
+    };
     let (lease, _, planned, sources, source_counts) =
         plan_component_publication(lease, projection, component, sources).await?;
-    if planned.all_exact {
+    // A retained settlement is the install record's witness, so even an exact projection
+    // publishes one.
+    if planned.all_exact && !retained {
         if source_counts.required != 0 || sources.len() != source_counts.supplied_exact {
             return Err(PrepareComponentIntentError::SourceSet.into());
         }
@@ -256,176 +377,309 @@ where
     let candidate = prepare_component_intent_from_plan(
         lease,
         component,
+        activation_contract,
         planned.table_rows,
         planned.authority,
         sources,
         source_counts,
     )
     .await?;
-    let mut backoff = ComponentRetryBackoff::new();
-    let execution = publish_current_component_intent(candidate, &mut backoff).await?;
-    let settled = normalize_current_component_transaction(execution, &mut backoff).await?;
-    match settled {
-        ComponentSettledOutcome::Committed(lease) => Ok(
-            ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt { lease }),
-        ),
-        ComponentSettledOutcome::RolledBack { .. } => {
-            Ok(ManagedComponentLifecycleOutcome::RolledBack)
+    let driven = drive_component(
+        ComponentProgress::Intent(Box::new(candidate)),
+        false,
+        &mut ComponentRetryBackoff::for_component(component),
+    )
+    .await?;
+    Ok(lifecycle_outcome(driven))
+}
+
+pub(crate) fn lifecycle_outcome(driven: ComponentDriven) -> ManagedComponentLifecycleOutcome {
+    match driven {
+        ComponentDriven::NoTransaction(lease)
+        | ComponentDriven::Settled(ComponentSettledOutcome::Committed(lease)) => {
+            ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt { lease })
+        }
+        ComponentDriven::Settled(ComponentSettledOutcome::RolledBack { .. }) => {
+            ManagedComponentLifecycleOutcome::RolledBack
         }
     }
 }
 
-async fn settle_prior_component_transaction(
+async fn refuse_retained_settlement(
     lease: ManagedRootPublicationLease,
     component: ManagedComponentKind,
 ) -> Result<ManagedRootPublicationLease, ComponentLifecycleError> {
-    let recovered = recover_component_transaction(lease, component).await;
-    let mut backoff = ComponentRetryBackoff::new();
-    let normalized = match recovered {
+    let (lease, retained) = run_publication_blocking(move || {
+        let retained = has_retained_settlement(&lease, component);
+        (lease, retained)
+    })
+    .await
+    .map_err(PrepareComponentIntentError::from)?;
+    match retained.map_err(PrepareComponentIntentError::from)? {
+        false => Ok(lease),
+        true => Err(ComponentLifecycleError::UnacknowledgedSettlement),
+    }
+}
+
+/// Settles any transaction a previous owner left in `component`'s lane.
+pub(crate) async fn settle_prior_component_transaction(
+    lease: ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+) -> Result<ManagedRootPublicationLease, ComponentLifecycleError> {
+    let mut backoff = ComponentRetryBackoff::for_component(component);
+    let driven = match recover_component_transaction(lease, component).await {
         ComponentStartupRecoveryResult::NoTransaction(lease) => return Ok(lease),
-        ComponentStartupRecoveryResult::Settled(outcome) => outcome,
+        ComponentStartupRecoveryResult::Settled(outcome) => ComponentDriven::Settled(outcome),
         ComponentStartupRecoveryResult::Transaction(execution) => {
-            return normalize_prior_component_transaction(execution, &mut backoff).await;
+            drive_component(ComponentProgress::Execution(execution), true, &mut backoff).await?
         }
     };
-    Ok(match normalized {
-        ComponentSettledOutcome::Committed(lease)
-        | ComponentSettledOutcome::RolledBack { lease, .. } => lease,
-    })
+    Ok(driven_lease(driven))
 }
 
-async fn publish_current_component_intent(
-    mut candidate: ComponentIntentCandidate,
+pub(crate) fn driven_lease(driven: ComponentDriven) -> ManagedRootPublicationLease {
+    match driven {
+        ComponentDriven::NoTransaction(lease)
+        | ComponentDriven::Settled(
+            ComponentSettledOutcome::Committed(lease)
+            | ComponentSettledOutcome::RolledBack { lease, .. },
+        ) => lease,
+    }
+}
+
+/// Drives a transaction to its settlement. `prior` recovers a previous owner's transaction,
+/// which may prove that none remains.
+async fn drive_component(
+    mut progress: ComponentProgress,
+    prior: bool,
     backoff: &mut ComponentRetryBackoff,
-) -> Result<ComponentExecutionResult, ComponentLifecycleError> {
-    loop {
-        match candidate.publish_intent() {
-            Ok(published) => return Ok(execute_component_intent(published).await),
-            Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
-                drop(candidate);
-                return Err(ComponentLifecycleError::BeforeEffects(cause));
+) -> Result<ComponentDriven, ComponentLifecycleError> {
+    macro_rules! wait_or_suspend {
+        ($progress:expr) => {
+            if !backoff.wait().await {
+                return Err(ComponentLifecycleError::Indeterminate(
+                    ComponentPublicationRecovery {
+                        progress: $progress,
+                        prior,
+                    },
+                ));
             }
-            Err(failure @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
-                let mut recovery = failure;
-                loop {
-                    match recover_component_intent_publication(recovery).await {
-                        Ok(ComponentIntentPublicationRecovery::Retry(retry)) => {
-                            candidate = *retry;
-                            backoff.wait().await;
-                            break;
+        };
+    }
+    loop {
+        progress = match progress {
+            ComponentProgress::Intent(candidate) => match candidate.publish_intent() {
+                Ok(published) => {
+                    ComponentProgress::Execution(execute_component_intent(published).await)
+                }
+                Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
+                    return before_effects(*candidate, cause, prior);
+                }
+                Err(failure @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
+                    ComponentProgress::IntentRecovery(failure)
+                }
+            },
+            ComponentProgress::IntentRecovery(failure) => {
+                match recover_component_intent_publication(failure).await {
+                    Ok(ComponentIntentPublicationRecovery::Retry(candidate)) => {
+                        wait_or_suspend!(ComponentProgress::Intent(candidate));
+                        ComponentProgress::Intent(candidate)
+                    }
+                    Ok(ComponentIntentPublicationRecovery::Transaction(execution)) => {
+                        ComponentProgress::Execution(execution)
+                    }
+                    Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
+                        return before_effects(*candidate, cause, prior);
+                    }
+                    Err(next @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
+                        wait_or_suspend!(ComponentProgress::IntentRecovery(next));
+                        ComponentProgress::IntentRecovery(next)
+                    }
+                }
+            }
+            ComponentProgress::Execution(ComponentExecutionResult::Committed(receipt))
+            | ComponentProgress::Execution(ComponentExecutionResult::RolledBack(receipt)) => {
+                ComponentProgress::Settlement(settle_component_transaction(receipt).await)
+            }
+            ComponentProgress::Execution(ComponentExecutionResult::RecoveryRequired(recovery)) => {
+                ComponentProgress::Recovery(recovery)
+            }
+            ComponentProgress::Recovery(recovery) => {
+                wait_or_suspend!(ComponentProgress::Recovery(recovery));
+                if prior {
+                    match retry_prior_component_recovery(recovery).await {
+                        ComponentPriorRecoveryRetryResult::NoTransaction(lease) => {
+                            return Ok(ComponentDriven::NoTransaction(lease));
                         }
-                        Ok(ComponentIntentPublicationRecovery::Transaction(execution)) => {
-                            return Ok(execution);
+                        ComponentPriorRecoveryRetryResult::Settled(outcome) => {
+                            return Ok(ComponentDriven::Settled(outcome));
                         }
-                        Err(ComponentIntentPublishFailure::BeforePromotion {
-                            candidate,
-                            cause,
-                        }) => {
-                            drop(candidate);
-                            return Err(ComponentLifecycleError::BeforeEffects(cause));
+                        ComponentPriorRecoveryRetryResult::RetryIntent(candidate) => {
+                            ComponentProgress::Intent(candidate)
                         }
-                        Err(next @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
-                            recovery = next;
-                            backoff.wait().await;
+                        ComponentPriorRecoveryRetryResult::Transaction(execution) => {
+                            ComponentProgress::Execution(execution)
+                        }
+                    }
+                } else {
+                    match retry_component_recovery(recovery).await {
+                        ComponentRecoveryRetryResult::Settled(outcome) => {
+                            return Ok(ComponentDriven::Settled(outcome));
+                        }
+                        ComponentRecoveryRetryResult::RetryIntent(candidate) => {
+                            ComponentProgress::Intent(candidate)
+                        }
+                        ComponentRecoveryRetryResult::Transaction(execution) => {
+                            ComponentProgress::Execution(execution)
+                        }
+                        ComponentRecoveryRetryResult::Retry(recovery) => {
+                            ComponentProgress::Recovery(recovery)
                         }
                     }
                 }
             }
+            ComponentProgress::Settlement(ComponentSettlementResult::Settled(outcome)) => {
+                return Ok(ComponentDriven::Settled(outcome));
+            }
+            ComponentProgress::Settlement(ComponentSettlementResult::Retry(retry)) => {
+                wait_or_suspend!(ComponentProgress::Settlement(
+                    ComponentSettlementResult::Retry(retry)
+                ));
+                ComponentProgress::Settlement(retry_component_settlement(retry).await)
+            }
+        };
+    }
+}
+
+/// An intent that never reached its marker left no canonical effect, so a prior owner's
+/// transaction ends there with its lease.
+fn before_effects(
+    candidate: ComponentIntentCandidate,
+    cause: ComponentEffectsError,
+    prior: bool,
+) -> Result<ComponentDriven, ComponentLifecycleError> {
+    if prior {
+        return Ok(ComponentDriven::NoTransaction(candidate.into_lease()));
+    }
+    drop(candidate);
+    Err(ComponentLifecycleError::BeforeEffects(cause))
+}
+
+pub(crate) enum ComponentClassification {
+    NoEffect(ManagedRootPublicationLease),
+    Mismatch(ManagedRootPublicationLease),
+    Settled {
+        lease: ManagedRootPublicationLease,
+        evidence: ComponentSettlementEvidence,
+    },
+    Indeterminate(ComponentClassificationRecovery),
+    /// Settling the prior transaction released its lease; classification starts over.
+    Released,
+}
+
+#[must_use = "dropping recovery releases the exclusive publication authority"]
+pub(crate) enum ComponentClassificationRecovery {
+    Classify(ManagedRootPublicationLease),
+    Prior(ComponentPublicationRecovery),
+}
+
+impl ComponentClassificationRecovery {
+    pub(crate) async fn retry(
+        self,
+        component: ManagedComponentKind,
+        is_candidate: impl Fn(&str) -> bool + Send + 'static,
+    ) -> ComponentClassification {
+        let driven = match self {
+            Self::Classify(lease) => {
+                return classify_settled_component(lease, component, is_candidate).await;
+            }
+            Self::Prior(recovery) => recovery.retry().await,
+        };
+        match driven {
+            Ok(driven) => {
+                classify_settled_component(driven_lease(driven), component, is_candidate).await
+            }
+            Err(ComponentLifecycleError::Indeterminate(recovery)) => {
+                ComponentClassification::Indeterminate(Self::Prior(recovery))
+            }
+            Err(_) => ComponentClassification::Released,
         }
     }
 }
 
-async fn normalize_current_component_transaction(
-    execution: ComponentExecutionResult,
-    backoff: &mut ComponentRetryBackoff,
-) -> Result<ComponentSettledOutcome, ComponentLifecycleError> {
-    let mut progress = ComponentProgress::Execution(execution);
-    loop {
-        progress = match progress {
-            ComponentProgress::Execution(ComponentExecutionResult::Committed(receipt))
-            | ComponentProgress::Execution(ComponentExecutionResult::RolledBack(receipt)) => {
-                ComponentProgress::Settlement(settle_component_transaction(receipt).await)
-            }
-            ComponentProgress::Execution(ComponentExecutionResult::RecoveryRequired(recovery)) => {
-                ComponentProgress::Recovery(recovery)
-            }
-            ComponentProgress::Recovery(recovery) => {
-                backoff.wait().await;
-                match retry_component_recovery(recovery).await {
-                    ComponentRecoveryRetryResult::Settled(outcome) => {
-                        return Ok(outcome);
-                    }
-                    ComponentRecoveryRetryResult::RetryIntent(candidate) => {
-                        ComponentProgress::Execution(
-                            publish_current_component_intent(*candidate, backoff).await?,
-                        )
-                    }
-                    ComponentRecoveryRetryResult::Transaction(execution) => {
-                        ComponentProgress::Execution(execution)
-                    }
-                    ComponentRecoveryRetryResult::Retry(recovery) => {
-                        ComponentProgress::Recovery(recovery)
-                    }
-                }
-            }
-            ComponentProgress::Settlement(ComponentSettlementResult::Settled(outcome)) => {
-                return Ok(outcome);
-            }
-            ComponentProgress::Settlement(ComponentSettlementResult::Retry(retry)) => {
-                backoff.wait().await;
-                ComponentProgress::Settlement(retry_component_settlement(retry).await)
-            }
-        };
+/// Settles any prior transaction in `component`'s lane, then classifies its retained
+/// settlement for the install record.
+pub(crate) async fn classify_component_settlement(
+    lease: ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    is_candidate: impl Fn(&str) -> bool + Send + 'static,
+) -> ComponentClassification {
+    match settle_prior_component_transaction(lease, component).await {
+        Ok(lease) => classify_settled_component(lease, component, is_candidate).await,
+        Err(ComponentLifecycleError::Indeterminate(recovery)) => {
+            ComponentClassification::Indeterminate(ComponentClassificationRecovery::Prior(recovery))
+        }
+        Err(_) => ComponentClassification::Released,
     }
 }
 
-async fn normalize_prior_component_transaction(
-    execution: ComponentExecutionResult,
-    backoff: &mut ComponentRetryBackoff,
-) -> Result<ManagedRootPublicationLease, ComponentLifecycleError> {
-    let mut progress = ComponentProgress::Execution(execution);
-    loop {
-        progress = match progress {
-            ComponentProgress::Execution(ComponentExecutionResult::Committed(receipt))
-            | ComponentProgress::Execution(ComponentExecutionResult::RolledBack(receipt)) => {
-                ComponentProgress::Settlement(settle_component_transaction(receipt).await)
-            }
-            ComponentProgress::Execution(ComponentExecutionResult::RecoveryRequired(recovery)) => {
-                ComponentProgress::Recovery(recovery)
-            }
-            ComponentProgress::Recovery(recovery) => {
-                backoff.wait().await;
-                match retry_prior_component_recovery(recovery).await {
-                    ComponentPriorRecoveryRetryResult::NoTransaction(lease) => return Ok(lease),
-                    ComponentPriorRecoveryRetryResult::Settled(outcome) => {
-                        return Ok(settled_component_lease(outcome));
-                    }
-                    ComponentPriorRecoveryRetryResult::RetryIntent(candidate) => {
-                        ComponentProgress::Execution(
-                            publish_current_component_intent(*candidate, backoff).await?,
-                        )
-                    }
-                    ComponentPriorRecoveryRetryResult::Transaction(execution) => {
-                        ComponentProgress::Execution(execution)
-                    }
-                }
-            }
-            ComponentProgress::Settlement(ComponentSettlementResult::Settled(outcome)) => {
-                return Ok(settled_component_lease(outcome));
-            }
-            ComponentProgress::Settlement(ComponentSettlementResult::Retry(retry)) => {
-                backoff.wait().await;
-                ComponentProgress::Settlement(retry_component_settlement(retry).await)
-            }
-        };
+async fn classify_settled_component(
+    lease: ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    is_candidate: impl Fn(&str) -> bool + Send + 'static,
+) -> ComponentClassification {
+    match classify_retained_settlement(lease, component, is_candidate).await {
+        ComponentSettlementClassification::NoEffect(lease) => {
+            ComponentClassification::NoEffect(lease)
+        }
+        ComponentSettlementClassification::Mismatch(lease) => {
+            ComponentClassification::Mismatch(lease)
+        }
+        ComponentSettlementClassification::Settled { lease, evidence } => {
+            ComponentClassification::Settled { lease, evidence }
+        }
+        ComponentSettlementClassification::Indeterminate(lease) => {
+            ComponentClassification::Indeterminate(ComponentClassificationRecovery::Classify(lease))
+        }
     }
 }
 
-fn settled_component_lease(outcome: ComponentSettledOutcome) -> ManagedRootPublicationLease {
-    match outcome {
-        ComponentSettledOutcome::Committed(lease)
-        | ComponentSettledOutcome::RolledBack { lease, .. } => lease,
+/// Whether every canonical file in `projection` already holds its exact projected bytes.
+pub(crate) async fn projection_is_exact(
+    lease: &ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+) -> bool {
+    let Ok(rows) = projection_rows(component, &projection) else {
+        return false;
+    };
+    if lease.revalidate().is_err() {
+        return false;
     }
+    let root = lease.root().clone();
+    let exact = run_publication_blocking(move || {
+        root.observe_validated(
+            || {
+                root.revalidate()?;
+                let mut parents = ComponentCanonicalParents::default();
+                for row in rows {
+                    let planned = parents.plan(&root, component, &row.path)?;
+                    let ComponentCanonicalObservation::Regular(observed) = planned.observe()?
+                    else {
+                        return Ok(false);
+                    };
+                    if observed.size() != row.size || observed.sha1() != row.sha1 {
+                        return Ok(false);
+                    }
+                }
+                root.revalidate()?;
+                Ok(true)
+            },
+            ComponentEffectsError::from,
+        )
+    })
+    .await;
+    matches!(exact, Ok(Ok(true))) && lease.revalidate().is_ok()
 }
 
 #[cfg(test)]
@@ -443,6 +697,7 @@ where
     let candidate = prepare_component_intent_from_plan(
         lease,
         component,
+        None,
         planned.table_rows,
         planned.authority,
         sources,
@@ -493,6 +748,7 @@ const COMPONENT_STAGING_CONCURRENCY: usize = 4;
 async fn prepare_component_intent_from_plan<S>(
     lease: ManagedRootPublicationLease,
     component: ManagedComponentKind,
+    activation_contract: Option<[u8; 32]>,
     planned_rows: Vec<ComponentTableRow>,
     planned_authority: Vec<ComponentPreparedCanonicalAuthority>,
     sources: BTreeMap<PortableRelativePath, S>,
@@ -507,6 +763,10 @@ where
             let lane = ComponentLane::prepare_fresh(&lease, component)?;
             let transaction_nonce = *uuid::Uuid::new_v4().as_bytes();
             let builder = ComponentTableBuilder::new(component, total_rows, transaction_nonce)?;
+            let builder = match activation_contract {
+                Some(activation_contract) => builder.with_activation_contract(activation_contract),
+                None => builder,
+            };
             let spool = ComponentTableSpool::new(total_rows)?;
             Ok::<_, PrepareComponentIntentError>((lease, lane, builder, spool, sources))
         })
@@ -687,9 +947,8 @@ async fn prepare_component_intent<S>(
 where
     S: RetainedComponentPublicationSource + 'static,
 {
-    let (known_good_component, _) = component_projection_contract(component);
     let projection = authority
-        .component_projection(known_good_component)
+        .component_projection(component_projection_contract(component))
         .map_err(|_| PrepareComponentIntentError::Projection)?;
     prepare_component_intent_projection(lease, projection, component, sources)
         .await
@@ -700,8 +959,7 @@ fn projection_rows(
     component: ManagedComponentKind,
     projection: &crate::known_good::ManagedComponentProjection<'_>,
 ) -> Result<Vec<ComponentProjectionRow>, PrepareComponentIntentError> {
-    let (known_good_component, expected_root) = component_projection_contract(component);
-    if projection.component() != known_good_component {
+    if projection.component() != component_projection_contract(component) {
         return Err(PrepareComponentIntentError::Projection);
     }
     let mut rows = Vec::new();
@@ -710,11 +968,7 @@ fn projection_rows(
         .map_err(|_| PrepareComponentIntentError::SourceSet)?;
     for projected in projection.entries().iter().copied() {
         let entry = projected.entry();
-        if entry.root() != &expected_root {
-            return Err(PrepareComponentIntentError::Projection);
-        }
-        let relative_path = PortableRelativePath::new(entry.path().as_str())
-            .map_err(|_| PrepareComponentIntentError::Projection)?;
+        let relative_path = component_row_path(component, entry)?;
         let portable_path = relative_path.key();
         if portable_paths
             .insert(portable_path, relative_path.clone())
@@ -723,7 +977,7 @@ fn projection_rows(
             return Err(PrepareComponentIntentError::Projection);
         }
         let kind = component_artifact_kind(component, entry.kind())?;
-        let (sha1, size) = sha1_integrity(entry.integrity())?;
+        let (sha1, size) = sha1_integrity(component, entry.integrity())?;
         rows.push(ComponentProjectionRow {
             inventory_ordinal: u32::try_from(projected.inventory_ordinal())
                 .map_err(|_| PrepareComponentIntentError::Projection)?,
@@ -732,6 +986,10 @@ fn projection_rows(
             size,
             sha1,
         });
+    }
+    if component == ManagedComponentKind::VersionBundle {
+        // Version bundle entries come from two physical roots.
+        rows.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     }
     Ok(rows)
 }
@@ -889,16 +1147,43 @@ where
     Ok(counts)
 }
 
-fn component_projection_contract(
-    component: ManagedComponentKind,
-) -> (ManagedKnownGoodComponent, KnownGoodRoot) {
+fn component_projection_contract(component: ManagedComponentKind) -> ManagedKnownGoodComponent {
     match component {
-        ManagedComponentKind::Libraries => (
-            ManagedKnownGoodComponent::Libraries,
-            KnownGoodRoot::Libraries,
-        ),
-        ManagedComponentKind::Assets => (ManagedKnownGoodComponent::Assets, KnownGoodRoot::Assets),
+        ManagedComponentKind::Libraries => ManagedKnownGoodComponent::Libraries,
+        ManagedComponentKind::Assets => ManagedKnownGoodComponent::Assets,
+        ManagedComponentKind::VersionBundle => ManagedKnownGoodComponent::VersionBundle,
     }
+}
+
+/// A projected entry's path relative to the component's canonical root. Version bundle
+/// rows are relative to the managed root: log configs under `assets/`, the rest under
+/// `versions/`.
+fn component_row_path(
+    component: ManagedComponentKind,
+    entry: &crate::known_good::KnownGoodEntry,
+) -> Result<PortableRelativePath, PrepareComponentIntentError> {
+    let physical_root = match (component, entry.root(), entry.kind()) {
+        (ManagedComponentKind::Libraries, KnownGoodRoot::Libraries, _)
+        | (ManagedComponentKind::Assets, KnownGoodRoot::Assets, _) => None,
+        (
+            ManagedComponentKind::VersionBundle,
+            KnownGoodRoot::Versions,
+            KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar,
+        ) => Some("versions"),
+        (
+            ManagedComponentKind::VersionBundle,
+            KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::LogConfig,
+        ) => Some("assets"),
+        _ => return Err(PrepareComponentIntentError::Projection),
+    };
+    let path = match physical_root {
+        Some(physical_root) => {
+            PortableRelativePath::new(&format!("{physical_root}/{}", entry.path().as_str()))
+        }
+        None => PortableRelativePath::new(entry.path().as_str()),
+    };
+    path.map_err(|_| PrepareComponentIntentError::Projection)
 }
 
 fn component_artifact_kind(
@@ -918,17 +1203,35 @@ fn component_artifact_kind(
         (ManagedComponentKind::Assets, KnownGoodArtifactKind::AssetObject) => {
             Ok(ManagedComponentArtifactKind::AssetObject)
         }
-        (ManagedComponentKind::Libraries | ManagedComponentKind::Assets, _) => {
-            Err(PrepareComponentIntentError::Projection)
+        (ManagedComponentKind::VersionBundle, KnownGoodArtifactKind::VersionMetadata) => {
+            Ok(ManagedComponentArtifactKind::VersionMetadata)
         }
+        (ManagedComponentKind::VersionBundle, KnownGoodArtifactKind::ClientJar) => {
+            Ok(ManagedComponentArtifactKind::ClientJar)
+        }
+        (ManagedComponentKind::VersionBundle, KnownGoodArtifactKind::LogConfig) => {
+            Ok(ManagedComponentArtifactKind::LogConfig)
+        }
+        (
+            ManagedComponentKind::Libraries
+            | ManagedComponentKind::Assets
+            | ManagedComponentKind::VersionBundle,
+            _,
+        ) => Err(PrepareComponentIntentError::Projection),
     }
 }
 
 fn sha1_integrity(
+    component: ManagedComponentKind,
     integrity: &KnownGoodIntegrity,
 ) -> Result<([u8; 20], u64), PrepareComponentIntentError> {
     match integrity {
         KnownGoodIntegrity::Sha1 { digest, size } => Ok((digest.to_bytes(), *size)),
+        KnownGoodIntegrity::ExactBytes { digest, size }
+            if component == ManagedComponentKind::VersionBundle =>
+        {
+            Ok((digest.to_bytes(), *size))
+        }
         KnownGoodIntegrity::ExactBytes { .. }
         | KnownGoodIntegrity::Directory
         | KnownGoodIntegrity::LinkTarget(_) => Err(PrepareComponentIntentError::Projection),
@@ -1056,6 +1359,9 @@ mod tests {
         let root = match component {
             ManagedComponentKind::Libraries => KnownGoodRoot::Libraries,
             ManagedComponentKind::Assets => KnownGoodRoot::Assets,
+            ManagedComponentKind::VersionBundle => {
+                unreachable!("component tests cover libraries and assets")
+            }
         };
         PendingKnownGoodInstallAuthority::component_for_test(sources.iter().map(|source| {
             (
@@ -1068,6 +1374,11 @@ mod tests {
                     }
                     ManagedComponentArtifactKind::AssetIndex => KnownGoodArtifactKind::AssetIndex,
                     ManagedComponentArtifactKind::AssetObject => KnownGoodArtifactKind::AssetObject,
+                    ManagedComponentArtifactKind::VersionMetadata => {
+                        KnownGoodArtifactKind::VersionMetadata
+                    }
+                    ManagedComponentArtifactKind::ClientJar => KnownGoodArtifactKind::ClientJar,
+                    ManagedComponentArtifactKind::LogConfig => KnownGoodArtifactKind::LogConfig,
                 },
                 source.identity.sha1,
                 source.identity.size,
@@ -1135,6 +1446,9 @@ mod tests {
         match component {
             ManagedComponentKind::Libraries => "libraries",
             ManagedComponentKind::Assets => "assets",
+            ManagedComponentKind::VersionBundle => {
+                unreachable!("component tests cover libraries and assets")
+            }
         }
     }
 
@@ -1150,6 +1464,9 @@ mod tests {
                 ManagedComponentArtifactKind::AssetIndex,
                 ManagedComponentArtifactKind::AssetObject,
             ),
+            ManagedComponentKind::VersionBundle => {
+                unreachable!("component tests cover libraries and assets")
+            }
         }
     }
 
@@ -1228,6 +1545,9 @@ mod tests {
             let path = match component {
                 ManagedComponentKind::Libraries => "org/example/exact.jar",
                 ManagedComponentKind::Assets => "indexes/exact.json",
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let bytes = format!("exact-{}", component_root_name(component)).into_bytes();
             let (source, events) = tracked_test_source(path, kind, bytes.clone());
@@ -1309,12 +1629,18 @@ mod tests {
             let other_component = match component {
                 ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
                 ManagedComponentKind::Assets => ManagedComponentKind::Libraries,
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let (other_kind, _) = component_test_kinds(other_component);
             let other_source = test_source(
                 match other_component {
                     ManagedComponentKind::Libraries => "org/example/other.jar",
                     ManagedComponentKind::Assets => "indexes/other.json",
+                    ManagedComponentKind::VersionBundle => {
+                        unreachable!("component tests cover libraries and assets")
+                    }
                 },
                 other_kind,
                 b"other-component".to_vec(),
@@ -1458,6 +1784,9 @@ mod tests {
             let path = match component {
                 ManagedComponentKind::Libraries => "org/example/current.jar",
                 ManagedComponentKind::Assets => "indexes/current.json",
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let bytes = format!("current-{}", component_root_name(component)).into_bytes();
             let source = test_source(path, kind, bytes.clone());
@@ -1494,6 +1823,9 @@ mod tests {
             let other = match component {
                 ManagedComponentKind::Libraries => "assets",
                 ManagedComponentKind::Assets => "libraries",
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             assert!(!temporary.path().join(other).exists());
         }
@@ -1615,6 +1947,9 @@ mod tests {
             let path = match component {
                 ManagedComponentKind::Libraries => "org/example/replaced.jar",
                 ManagedComponentKind::Assets => "indexes/replaced.json",
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let prior = test_source(path, kind, b"prior-component".to_vec());
             let prior_authority = test_authority(component, std::slice::from_ref(&prior));
@@ -1639,9 +1974,8 @@ mod tests {
 
             let current = test_source(path, kind, b"current-component".to_vec());
             let current_authority = test_authority(component, std::slice::from_ref(&current));
-            let (known_good_component, _) = component_projection_contract(component);
             let projection = current_authority
-                .component_projection(known_good_component)
+                .component_projection(component_projection_contract(component))
                 .expect("current component projection");
             let outcome =
                 publish_managed_component_effect(lease, projection, component, vec![current])
@@ -1962,6 +2296,9 @@ mod tests {
                 ManagedComponentKind::Assets => {
                     ["indexes/a.json", "objects/ab/ab01", "objects/cd/cd02"]
                 }
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let expected = vec![
                 test_source(paths[0], first_kind, b"exact-a".to_vec()),
@@ -2165,12 +2502,18 @@ mod tests {
             let other_component = match component {
                 ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
                 ManagedComponentKind::Assets => ManagedComponentKind::Libraries,
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let (other_kind, _) = component_test_kinds(other_component);
             let other_source = test_source(
                 match other_component {
                     ManagedComponentKind::Libraries => "org/example/other.jar",
                     ManagedComponentKind::Assets => "indexes/other.json",
+                    ManagedComponentKind::VersionBundle => {
+                        unreachable!("component tests cover libraries and assets")
+                    }
                 },
                 other_kind,
                 b"other-component".to_vec(),
@@ -2243,6 +2586,9 @@ mod tests {
                     ManagedComponentKind::Assets => {
                         ["indexes/a.json", "objects/ab/ab01", "objects/cd/cd02"]
                     }
+                    ManagedComponentKind::VersionBundle => {
+                        unreachable!("component tests cover libraries and assets")
+                    }
                 };
                 let expected = vec![
                     test_source(paths[0], first_kind, b"source-a".to_vec()),
@@ -2264,6 +2610,9 @@ mod tests {
                         let alias = match component {
                             ManagedComponentKind::Libraries => "Org/example/a.jar",
                             ManagedComponentKind::Assets => "Indexes/a.json",
+                            ManagedComponentKind::VersionBundle => {
+                                unreachable!("component tests cover libraries and assets")
+                            }
                         };
                         sources[0].identity.relative_path =
                             PortableRelativePath::new(alias).expect("portable alias source path");
@@ -2274,6 +2623,9 @@ mod tests {
                                 ManagedComponentArtifactKind::AssetIndex
                             }
                             ManagedComponentKind::Assets => ManagedComponentArtifactKind::Library,
+                            ManagedComponentKind::VersionBundle => {
+                                unreachable!("component tests cover libraries and assets")
+                            }
                         };
                     }
                     Mutation::Size => {
@@ -2329,6 +2681,11 @@ mod tests {
                 ManagedComponentArtifactKind::NativeLibrary => KnownGoodArtifactKind::NativeLibrary,
                 ManagedComponentArtifactKind::AssetIndex => KnownGoodArtifactKind::AssetIndex,
                 ManagedComponentArtifactKind::AssetObject => KnownGoodArtifactKind::AssetObject,
+                ManagedComponentArtifactKind::VersionMetadata => {
+                    KnownGoodArtifactKind::VersionMetadata
+                }
+                ManagedComponentArtifactKind::ClientJar => KnownGoodArtifactKind::ClientJar,
+                ManagedComponentArtifactKind::LogConfig => KnownGoodArtifactKind::LogConfig,
             };
             let authority = PendingKnownGoodInstallAuthority::component_for_test([(
                 wrong_root,
@@ -2376,6 +2733,9 @@ mod tests {
             let other = match component {
                 ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
                 ManagedComponentKind::Assets => ManagedComponentKind::Libraries,
+                ManagedComponentKind::VersionBundle => {
+                    unreachable!("component tests cover libraries and assets")
+                }
             };
             let authority = test_authority(other, std::slice::from_ref(&source));
             let error = match prepare_component_intent(

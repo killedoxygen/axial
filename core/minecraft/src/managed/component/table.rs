@@ -19,14 +19,14 @@ pub(crate) const COMPONENT_TABLE_ROW_PREFIX_BYTES: usize = 44;
 pub(crate) const MAX_COMPONENT_TABLE_SHARD_BYTES: usize = COMPONENT_TABLE_HEADER_BYTES
     + COMPONENT_TABLE_ROWS_PER_SHARD
         * (COMPONENT_TABLE_ROW_PREFIX_BYTES + MAX_COMPONENT_PATH_BYTES + 28);
-pub(crate) const COMPONENT_INTENT_HEADER_BYTES: usize = 128;
+pub(crate) const COMPONENT_INTENT_HEADER_BYTES: usize = 160;
 pub(crate) const COMPONENT_INTENT_DESCRIPTOR_BYTES: usize = 64;
 pub(crate) const MAX_COMPONENT_INTENT_BYTES: usize =
     COMPONENT_INTENT_HEADER_BYTES + MAX_COMPONENT_TABLE_SHARDS * COMPONENT_INTENT_DESCRIPTOR_BYTES;
 
 const TABLE_MAGIC: &[u8; 8] = b"AXCPTBL\0";
 const INTENT_MAGIC: &[u8; 8] = b"AXCPINT\0";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 const PRIOR_PRESENT: u8 = 1;
 const NO_CREATED_ANCESTOR: u16 = u16::MAX;
 
@@ -35,6 +35,7 @@ const NO_CREATED_ANCESTOR: u16 = u16::MAX;
 pub(crate) enum ManagedComponentKind {
     Libraries = 1,
     Assets = 2,
+    VersionBundle = 3,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -44,6 +45,9 @@ pub(crate) enum ManagedComponentArtifactKind {
     NativeLibrary = 2,
     AssetIndex = 3,
     AssetObject = 4,
+    VersionMetadata = 5,
+    ClientJar = 6,
+    LogConfig = 7,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +98,8 @@ pub(crate) struct ComponentIntentManifest {
     pub(crate) transaction_nonce: [u8; 16],
     pub(crate) logical_rows_sha256: [u8; 32],
     pub(crate) projection_sha256: [u8; 32],
+    /// The install activation contract a version bundle publishes for; absent otherwise.
+    pub(crate) activation_contract: Option<[u8; 32]>,
     pub(crate) shards: Vec<ComponentShardDescriptor>,
 }
 
@@ -106,6 +112,7 @@ impl ManagedComponentKind {
         match value {
             1 => Ok(Self::Libraries),
             2 => Ok(Self::Assets),
+            3 => Ok(Self::VersionBundle),
             _ => Err(ComponentTableError),
         }
     }
@@ -120,6 +127,11 @@ impl ManagedComponentKind {
                 Self::Assets,
                 ManagedComponentArtifactKind::AssetIndex
                     | ManagedComponentArtifactKind::AssetObject,
+            ) | (
+                Self::VersionBundle,
+                ManagedComponentArtifactKind::VersionMetadata
+                    | ManagedComponentArtifactKind::ClientJar
+                    | ManagedComponentArtifactKind::LogConfig,
             )
         )
     }
@@ -132,6 +144,9 @@ impl ManagedComponentArtifactKind {
             2 => Ok(Self::NativeLibrary),
             3 => Ok(Self::AssetIndex),
             4 => Ok(Self::AssetObject),
+            5 => Ok(Self::VersionMetadata),
+            6 => Ok(Self::ClientJar),
+            7 => Ok(Self::LogConfig),
             _ => Err(ComponentTableError),
         }
     }
@@ -208,6 +223,94 @@ const MAX_CREATED_ANCESTOR_ALLOCATION_BYTES: usize = MAX_CREATED_ANCESTOR_PATH_B
 const MAX_PROJECTED_PATH_PREFIXES: usize = MAX_CREATED_ANCESTORS + MAX_COMPONENT_TABLE_ROWS;
 const MAX_PROJECTED_PREFIX_PATH_BYTES: usize = MAX_CREATED_ANCESTOR_PATH_BYTES;
 const MAX_PROJECTED_PREFIX_ALLOCATION_BYTES: usize = MAX_PROJECTED_PREFIX_PATH_BYTES * 2;
+/// A version bundle publishes its metadata and client jar, and at most one log config.
+pub(crate) const MAX_VERSION_BUNDLE_ROWS: usize = 3;
+const MIN_VERSION_BUNDLE_ROWS: usize = 2;
+
+/// Version bundle rows are relative to the managed root: `versions/<id>/<id>.json`,
+/// `versions/<id>/<id>.jar` and `assets/log_configs/<name>`.
+#[derive(Default)]
+struct VersionBundleShape {
+    version_id: Option<String>,
+    metadata: bool,
+    client: bool,
+    log_config: bool,
+}
+
+impl VersionBundleShape {
+    fn push(&mut self, row: &ComponentTableRow) -> Result<(), ComponentTableError> {
+        if row.first_created_depth == Some(0) {
+            return Err(ComponentTableError);
+        }
+        let mut segments = row.path.as_str().split('/');
+        let (first, second, third) = (segments.next(), segments.next(), segments.next());
+        if segments.next().is_some() {
+            return Err(ComponentTableError);
+        }
+        let (version_id, stem) = match (row.kind, first, second, third) {
+            (
+                ManagedComponentArtifactKind::LogConfig,
+                Some("assets"),
+                Some("log_configs"),
+                Some(_),
+            ) => {
+                if std::mem::replace(&mut self.log_config, true) {
+                    return Err(ComponentTableError);
+                }
+                return Ok(());
+            }
+            (
+                ManagedComponentArtifactKind::VersionMetadata,
+                Some("versions"),
+                Some(id),
+                Some(file),
+            ) => {
+                if std::mem::replace(&mut self.metadata, true) {
+                    return Err(ComponentTableError);
+                }
+                (id, file.strip_suffix(".json"))
+            }
+            (ManagedComponentArtifactKind::ClientJar, Some("versions"), Some(id), Some(file)) => {
+                if std::mem::replace(&mut self.client, true) {
+                    return Err(ComponentTableError);
+                }
+                (id, file.strip_suffix(".jar"))
+            }
+            _ => return Err(ComponentTableError),
+        };
+        if stem != Some(version_id)
+            || self
+                .version_id
+                .as_deref()
+                .is_some_and(|known| known != version_id)
+        {
+            return Err(ComponentTableError);
+        }
+        if self.version_id.is_none() {
+            let mut owned = String::new();
+            owned
+                .try_reserve_exact(version_id.len())
+                .map_err(|_| ComponentTableError)?;
+            owned.push_str(version_id);
+            self.version_id = Some(owned);
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), ComponentTableError> {
+        if !self.metadata || !self.client {
+            return Err(ComponentTableError);
+        }
+        Ok(())
+    }
+}
+
+/// The version a validated version bundle row set publishes.
+pub(crate) fn version_bundle_version_id(rows: &[ComponentTableRow]) -> Option<&str> {
+    rows.iter()
+        .find(|row| row.kind == ManagedComponentArtifactKind::VersionMetadata)
+        .and_then(|row| row.path.as_str().split('/').nth(1))
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ComponentCreatedAncestor {
@@ -236,6 +339,7 @@ struct ComponentRowValidator {
     created_ancestor_path_bytes: usize,
     created_ancestor_allocation_bytes: usize,
     fanout_counts: Vec<usize>,
+    version_bundle: VersionBundleShape,
 }
 
 impl ComponentRowValidator {
@@ -277,6 +381,7 @@ impl ComponentRowValidator {
             created_ancestor_path_bytes: 0,
             created_ancestor_allocation_bytes: 0,
             fanout_counts,
+            version_bundle: VersionBundleShape::default(),
         })
     }
 
@@ -297,6 +402,12 @@ impl ComponentRowValidator {
             || row.path.as_str().len() > MAX_COMPONENT_PATH_BYTES
         {
             return Err(ComponentTableError);
+        }
+        if component == ManagedComponentKind::VersionBundle {
+            if self.row_count >= MAX_VERSION_BUNDLE_ROWS {
+                return Err(ComponentTableError);
+            }
+            self.version_bundle.push(row)?;
         }
         let portable_path = row.path.key();
         self.created_depth_path_bytes = self
@@ -801,6 +912,7 @@ pub(crate) fn encode_component_intent_manifest(
     bytes.extend_from_slice(&manifest.transaction_nonce);
     bytes.extend_from_slice(&manifest.logical_rows_sha256);
     bytes.extend_from_slice(&manifest.projection_sha256);
+    bytes.extend_from_slice(&manifest.activation_contract.unwrap_or([0; 32]));
     put_u32(
         &mut bytes,
         u32::try_from(descriptor_bytes).map_err(|_| ComponentTableError)?,
@@ -852,6 +964,18 @@ pub(crate) fn decode_component_intent_manifest(
     let transaction_nonce = cursor.array::<16>()?;
     let logical_rows_sha256 = cursor.array::<32>()?;
     let projection_sha256 = cursor.array::<32>()?;
+    let activation_contract = cursor.array::<32>()?;
+    let activation_contract = match component {
+        ManagedComponentKind::VersionBundle => Some(activation_contract),
+        ManagedComponentKind::Libraries | ManagedComponentKind::Assets
+            if activation_contract == [0; 32] =>
+        {
+            None
+        }
+        ManagedComponentKind::Libraries | ManagedComponentKind::Assets => {
+            return Err(ComponentTableError);
+        }
+    };
     let descriptors_len = usize::try_from(cursor.u32()?).map_err(|_| ComponentTableError)?;
     if cursor.u32()? != 0
         || cursor.position() != COMPONENT_INTENT_HEADER_BYTES
@@ -890,6 +1014,7 @@ pub(crate) fn decode_component_intent_manifest(
         transaction_nonce,
         logical_rows_sha256,
         projection_sha256,
+        activation_contract,
         shards,
     };
     validate_manifest(&manifest)?;
@@ -902,9 +1027,13 @@ pub(crate) fn decode_component_intent_manifest(
 fn validate_manifest(manifest: &ComponentIntentManifest) -> Result<(), ComponentTableError> {
     let total_rows = usize::try_from(manifest.total_rows).map_err(|_| ComponentTableError)?;
     let expected_count = expected_shard_count(total_rows)?;
+    let version_bundle = manifest.component == ManagedComponentKind::VersionBundle;
     if manifest.shards.len() != expected_count
         || manifest.final_bytes > MAX_TIER2_AGGREGATE_BYTES
         || manifest.prior_bytes > MAX_TIER2_AGGREGATE_BYTES
+        || manifest.activation_contract.is_some() != version_bundle
+        || version_bundle
+            && !(MIN_VERSION_BUNDLE_ROWS..=MAX_VERSION_BUNDLE_ROWS).contains(&total_rows)
     {
         return Err(ComponentTableError);
     }
@@ -1013,6 +1142,9 @@ impl ComponentTableSequenceValidator {
             return Err(ComponentTableError);
         }
         self.rows.validate_created_depths()?;
+        if self.component == ManagedComponentKind::VersionBundle {
+            self.rows.version_bundle.finish()?;
+        }
         let mut created_ancestors = self
             .rows
             .created_ancestors
@@ -1063,6 +1195,7 @@ pub(crate) struct ComponentTableSummary {
 pub(crate) struct ComponentTableBuilder {
     sequence: ComponentTableSequenceValidator,
     descriptors: Vec<ComponentShardDescriptor>,
+    activation_contract: Option<[u8; 32]>,
     poisoned: bool,
 }
 
@@ -1082,8 +1215,14 @@ impl ComponentTableBuilder {
         Ok(Self {
             sequence,
             descriptors,
+            activation_contract: None,
             poisoned: false,
         })
+    }
+
+    pub(crate) fn with_activation_contract(mut self, activation_contract: [u8; 32]) -> Self {
+        self.activation_contract = Some(activation_contract);
+        self
     }
 
     pub(crate) fn push_shard(
@@ -1153,6 +1292,7 @@ impl ComponentTableBuilder {
             transaction_nonce,
             logical_rows_sha256: summary.logical_rows_sha256,
             projection_sha256: summary.projection_sha256,
+            activation_contract: self.activation_contract,
             shards: self.descriptors,
         };
         validate_manifest(&manifest)?;
@@ -1383,6 +1523,69 @@ mod tests {
     }
 
     #[test]
+    fn version_bundle_tables_require_one_exact_bundle_and_its_activation_contract() {
+        use ManagedComponentArtifactKind::{ClientJar, LogConfig, VersionMetadata};
+        let build = |rows: Vec<ComponentTableRow>, contract: Option<[u8; 32]>| {
+            let builder = ComponentTableBuilder::new(
+                ManagedComponentKind::VersionBundle,
+                rows.len(),
+                [7; 16],
+            )?;
+            let mut builder = match contract {
+                Some(contract) => builder.with_activation_contract(contract),
+                None => builder,
+            };
+            builder.push_shard(rows)?;
+            builder.finish()
+        };
+        let log = row(0, "assets/log_configs/client.xml", LogConfig, 1);
+        let jar = row(1, "versions/1.21/1.21.jar", ClientJar, 2);
+        let json = row(2, "versions/1.21/1.21.json", VersionMetadata, 3);
+
+        let (manifest, _) = build(vec![log.clone(), jar.clone(), json.clone()], Some([9; 32]))
+            .expect("exact bundle");
+        let encoded = encode_component_intent_manifest(&manifest).unwrap();
+        assert_eq!(
+            decode_component_intent_manifest(&encoded)
+                .unwrap()
+                .activation_contract,
+            Some([9; 32])
+        );
+        assert!(build(vec![jar.clone(), json.clone()], Some([9; 32])).is_ok());
+
+        let mut root_created = json.clone();
+        root_created.first_created_depth = Some(0);
+        let mut other_version = json.clone();
+        other_version.path = path("versions/1.20/1.20.json");
+        let wrong_root = row(0, "versions/log_configs/client.xml", LogConfig, 1);
+        for rows in [
+            vec![jar.clone(), root_created],
+            vec![other_version, jar.clone()],
+            vec![jar.clone(), json.clone(), wrong_root],
+            vec![log.clone(), json.clone()],
+            vec![log.clone(), jar.clone()],
+        ] {
+            assert_eq!(build(rows, Some([9; 32])), Err(ComponentTableError));
+        }
+        assert_eq!(
+            build(vec![jar.clone(), json.clone()], None),
+            Err(ComponentTableError)
+        );
+        let mut library = ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [7; 16])
+            .unwrap()
+            .with_activation_contract([9; 32]);
+        library
+            .push_shard(vec![row(
+                0,
+                "a/b.jar",
+                ManagedComponentArtifactKind::Library,
+                1,
+            )])
+            .unwrap();
+        assert!(library.finish().is_err());
+    }
+
+    #[test]
     fn table_parser_rejects_every_truncation_and_noncanonical_header_fields() {
         let bytes = encoded_three_row_table();
         for length in 0..bytes.len() {
@@ -1392,7 +1595,7 @@ mod tests {
                 "accepted truncation at {length}",
             );
         }
-        for (offset, replacement) in [(8, 3_u8), (11, 1), (68, 1)] {
+        for (offset, replacement) in [(8, 2_u8), (11, 1), (68, 1)] {
             let mut corrupted = bytes.clone();
             corrupted[offset] = replacement;
             assert_eq!(
@@ -1706,7 +1909,7 @@ mod tests {
         assert_eq!(manifest.shards, vec![first_descriptor, second_descriptor]);
         let encoded = [first, second];
         let intent_bytes = encode_component_intent_manifest(&manifest).unwrap();
-        assert_eq!(intent_bytes.len(), 128 + 2 * 64);
+        assert_eq!(intent_bytes.len(), COMPONENT_INTENT_HEADER_BYTES + 2 * 64);
         assert_eq!(
             decode_component_intent_manifest(&intent_bytes).unwrap(),
             manifest

@@ -2692,17 +2692,6 @@ impl ManagedDir {
         })
     }
 
-    pub(crate) fn sha1_guarded_file(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-        max_size: u64,
-    ) -> Result<String, LoaderError> {
-        Ok(hex::encode(
-            &self.sha1_guarded_file_bytes(name, guard, max_size)?,
-        ))
-    }
-
     fn sha256_guarded_file_bytes(
         &self,
         name: &str,
@@ -3950,27 +3939,6 @@ impl ManagedDir {
                     ));
                 }
             }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn verify_authenticated(
-        &self,
-        name: &str,
-        expected_size: u64,
-        expected_sha1: &str,
-    ) -> Result<(), LoaderError> {
-        let guard = self.inspect_regular_file(name)?.ok_or_else(|| {
-            LoaderError::Verify("managed authenticated file is absent".to_string())
-        })?;
-        if guard.size != expected_size
-            || !self
-                .sha1_guarded_file(name, &guard, expected_size)?
-                .eq_ignore_ascii_case(expected_sha1)
-        {
-            return Err(LoaderError::Verify(
-                "managed authenticated file failed integrity verification".to_string(),
-            ));
         }
         Ok(())
     }

@@ -49,10 +49,6 @@ pub(crate) enum Fault {
     OutcomeUnsettled,
     /// The component outcome is promoted without acknowledgement.
     OutcomeUnacknowledged,
-    /// The version bundle intent marker is promoted without acknowledgement.
-    VersionIntentUnacknowledged,
-    /// The version bundle settlement marker is promoted without acknowledgement.
-    VersionSettlementUnacknowledged,
     /// Receipt settlement fails before promoting its settlement marker.
     BeforeSettlementPromotion,
     /// Component settlement stops after each durable frontier.

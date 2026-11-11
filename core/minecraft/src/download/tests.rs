@@ -712,6 +712,284 @@ async fn managed_install_fixture_leaves_exact_committed_witness_for_app_recovery
     let _ = fs::remove_dir_all(root);
 }
 
+fn fixture_bundle_files(root: &Path, version_id: &str) -> [PathBuf; 3] {
+    [
+        versions_dir(root)
+            .join(version_id)
+            .join(format!("{version_id}.json")),
+        versions_dir(root)
+            .join(version_id)
+            .join(format!("{version_id}.jar")),
+        assets_dir(root).join("log_configs/guardian-version-bundle.xml"),
+    ]
+}
+
+async fn acknowledge_committed_fixture(
+    evidence: ManagedInstallCommittedEvidence,
+    version_id: &str,
+) -> ManagedInstallAcknowledgementOutcome {
+    let receipt =
+        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
+            .expect("reconstruction receipt");
+    evidence
+        .verify_reconstruction_receipt(receipt)
+        .expect("committed evidence binds its activation contract")
+        .activate_with(|_| async { Ok::<_, KnownGoodActivationRejected>(()) })
+        .await
+        .expect("activation callback succeeds")
+        .acknowledge()
+        .await
+}
+
+async fn classify_committed(
+    operation: &ManagedLibraryOperation,
+    version_id: &str,
+) -> ManagedInstallCommittedEvidence {
+    match classify_managed_install_publication(operation.clone(), version_id.to_string()).await {
+        ManagedInstallDurableOutcome::Committed(evidence) => evidence,
+        _ => panic!("{version_id} must classify as committed"),
+    }
+}
+
+#[tokio::test]
+async fn version_bundle_settlement_frontier_failures_retry_to_a_retained_witness() {
+    for (index, frontier) in [
+        Fault::BeforeSettlementPromotion,
+        Fault::AfterSettlementPromotion,
+        Fault::AfterStagingBucket,
+        Fault::AfterQuarantineBucket,
+        Fault::AfterTableShard,
+        Fault::AfterOutcomeRemoval,
+        Fault::AfterIntentRemoval,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let version_id = format!("bundle-settlement-frontier-{index}");
+        let root = temp_dir(&version_id);
+        let authority = ManagedLibraryTestAuthority::open(&root).expect("open frontier root");
+        fault::arm(&version_bundle_lane(&root), frontier, None);
+
+        publish_managed_install_fixture_for_test(authority.operation().clone(), &version_id)
+            .await
+            .unwrap_or_else(|error| panic!("{frontier:?} retry must commit: {error}"));
+
+        assert!(!fault::pending(&version_bundle_lane(&root)), "{frontier:?}");
+        assert!(
+            version_bundle_lane_has_durable_witness(&root),
+            "{frontier:?}"
+        );
+        assert_eq!(
+            checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), &version_id)
+                .await,
+            Ok(ManagedInstallSettlementForTest::Committed)
+        );
+        assert_settled_version_bundle_lane(&root);
+        drop(authority);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
+async fn released_unsettled_version_bundle_settles_through_durable_classification() {
+    for (index, frontier) in [Fault::BeforeSettlementPromotion, Fault::AfterStagingBucket]
+        .into_iter()
+        .enumerate()
+    {
+        let version_id = format!("bundle-released-settlement-{index}");
+        let root = temp_dir(&version_id);
+        let authority = ManagedLibraryTestAuthority::open(&root).expect("open released root");
+        // Every bounded in-process attempt stops at the frontier.
+        for _ in 0..8 {
+            fault::arm(&version_bundle_lane(&root), frontier, None);
+        }
+
+        let error =
+            publish_managed_install_fixture_for_test(authority.operation().clone(), &version_id)
+                .await
+                .expect_err("an unsettled bundle must not return a receipt");
+        let DownloadError::PublicationIndeterminate(recovery) = error else {
+            panic!("{frontier:?} must surface its retained recovery: {error}");
+        };
+        assert!(!fault::pending(&version_bundle_lane(&root)), "{frontier:?}");
+        drop(recovery);
+
+        let receipt =
+            crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(&version_id)
+                .expect("reconstruction receipt");
+        let evidence = classify_committed(authority.operation(), &version_id).await;
+        assert!(
+            version_bundle_lane_has_durable_witness(&root),
+            "{frontier:?}"
+        );
+        drop(
+            evidence
+                .verify_reconstruction_receipt(receipt)
+                .expect("released publication binds its activation contract"),
+        );
+        assert_eq!(
+            checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), &version_id)
+                .await,
+            Ok(ManagedInstallSettlementForTest::Committed)
+        );
+        assert_settled_version_bundle_lane(&root);
+        for file in fixture_bundle_files(&root, &version_id) {
+            assert!(file.is_file(), "{frontier:?} must keep {}", file.display());
+        }
+        drop(authority);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[tokio::test]
+async fn unsettled_version_bundle_move_reconciles_to_a_rolled_back_witness() {
+    let version_id = "bundle-unsettled-move";
+    let root = temp_dir(version_id);
+    let authority = ManagedLibraryTestAuthority::open(&root).expect("open unsettled move root");
+    fault::arm(&version_bundle_lane(&root), Fault::RowUnsettled, None);
+
+    let error = publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect_err("an unsettled move must reconcile to rollback");
+
+    assert!(error.to_string().contains("rolled back"), "{error}");
+    for file in fixture_bundle_files(&root, version_id) {
+        assert!(!file.exists(), "rollback retained {}", file.display());
+    }
+    assert!(!versions_dir(&root).join(version_id).exists());
+    match classify_managed_install_publication(
+        authority.operation().clone(),
+        version_id.to_string(),
+    )
+    .await
+    {
+        ManagedInstallDurableOutcome::RolledBack { evidence, effect } => {
+            assert_eq!(effect, ManagedInstallRollbackEffect::Rollback);
+            assert!(matches!(
+                evidence.acknowledge().await,
+                ManagedInstallAcknowledgementOutcome::Acknowledged
+            ));
+        }
+        _ => panic!("unsettled move must classify as rolled back"),
+    }
+    assert_settled_version_bundle_lane(&root);
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn retained_version_bundle_witness_refuses_another_publication_until_acknowledged() {
+    let first = "bundle-retained-first";
+    let second = "bundle-retained-second";
+    let root = temp_dir(first);
+    let authority = ManagedLibraryTestAuthority::open(&root).expect("open retained root");
+    publish_managed_install_fixture_for_test(authority.operation().clone(), first)
+        .await
+        .expect("publish first bundle");
+
+    publish_managed_install_fixture_for_test(authority.operation().clone(), second)
+        .await
+        .expect_err("an unacknowledged witness must refuse another bundle");
+    assert!(version_bundle_lane_has_durable_witness(&root));
+    assert!(!versions_dir(&root).join(second).exists());
+    assert!(matches!(
+        classify_managed_install_publication(authority.operation().clone(), second.to_string())
+            .await,
+        ManagedInstallDurableOutcome::Mismatch
+    ));
+    assert!(matches!(
+        classify_managed_install_publication_candidates(
+            authority.operation().clone(),
+            ManagedInstallPublicationCandidates::pair(second, first).expect("candidates"),
+        )
+        .await,
+        ManagedInstallDurableOutcome::Committed(_)
+    ));
+
+    let evidence = classify_committed(authority.operation(), first).await;
+    assert!(matches!(
+        acknowledge_committed_fixture(evidence, first).await,
+        ManagedInstallAcknowledgementOutcome::Acknowledged
+    ));
+    publish_managed_install_fixture_for_test(authority.operation().clone(), second)
+        .await
+        .expect("an acknowledged witness admits the next bundle");
+    assert_eq!(
+        checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), second).await,
+        Ok(ManagedInstallSettlementForTest::Committed)
+    );
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn retained_evidence_refuses_metadata_drift_and_settlement_replacement() {
+    let version_id = "bundle-retained-drift";
+    let root = temp_dir(version_id);
+    let authority = ManagedLibraryTestAuthority::open(&root).expect("open drift root");
+    publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect("publish drift bundle");
+    let [metadata, _, _] = fixture_bundle_files(&root, version_id);
+    let committed = fs::read(&metadata).expect("read committed metadata");
+
+    let evidence = classify_committed(authority.operation(), version_id).await;
+    let recorded = evidence
+        .read_recorded_metadata()
+        .await
+        .expect("read recorded metadata");
+    assert!(
+        recorded.matches(
+            version_id,
+            evidence
+                .committed_activation_contract_id()
+                .expect("contract")
+        )
+    );
+    fs::write(&metadata, b"drifted metadata").expect("drift metadata");
+    assert!(evidence.read_recorded_metadata().await.is_err());
+    let ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) =
+        acknowledge_committed_fixture(evidence, version_id).await
+    else {
+        panic!("drifted canonical metadata must not acknowledge");
+    };
+    assert!(version_bundle_lane_has_durable_witness(&root));
+    fs::write(&metadata, &committed).expect("restore metadata");
+    assert!(matches!(
+        recovery.retry().await,
+        ManagedInstallAcknowledgementOutcome::Acknowledged
+    ));
+    assert_settled_version_bundle_lane(&root);
+
+    let version_id = "bundle-retained-replacement";
+    publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
+        .await
+        .expect("publish replacement bundle");
+    let evidence = classify_committed(authority.operation(), version_id).await;
+    let settlement = version_bundle_lane(&root).join("settlement.bin");
+    let bytes = fs::read(&settlement).expect("read retained settlement");
+    fs::remove_file(&settlement).expect("remove retained settlement");
+    fs::write(&settlement, &bytes).expect("replace retained settlement");
+    let ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) =
+        acknowledge_committed_fixture(evidence, version_id).await
+    else {
+        panic!("a replaced settlement must not acknowledge stale evidence");
+    };
+    assert!(matches!(
+        recovery.retry().await,
+        ManagedInstallAcknowledgementOutcome::Indeterminate(_)
+    ));
+    assert!(version_bundle_lane_has_durable_witness(&root));
+    let evidence = classify_committed(authority.operation(), version_id).await;
+    assert!(matches!(
+        acknowledge_committed_fixture(evidence, version_id).await,
+        ManagedInstallAcknowledgementOutcome::Acknowledged
+    ));
+    assert_settled_version_bundle_lane(&root);
+    drop(authority);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn registered_known_good_bootstrap_activates_only_after_exact_no_effect() {
     let version_id = "registered-reconstruction-no-effect";
@@ -1776,7 +2054,11 @@ async fn normal_install_accepts_effect_failure_that_settles_committed() {
     let version_id = "normal-effect-committed";
     let root = temp_dir(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
-    fault::arm(&version_bundle_lane(&root), Fault::OutcomeUnacknowledged, None);
+    fault::arm(
+        &version_bundle_lane(&root),
+        Fault::OutcomeUnacknowledged,
+        None,
+    );
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
     let receipt = timeout(
@@ -1805,7 +2087,9 @@ async fn normal_install_settles_crash_after_artifact_promotion_before_returning(
         &version_bundle_lane(&root),
         Fault::AfterRow,
         1,
-        Some(Box::new(|| panic!("injected crash after client jar promotion"))),
+        Some(Box::new(|| {
+            panic!("injected crash after client jar promotion")
+        })),
     );
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
@@ -3208,8 +3492,12 @@ fn libraries_lane_is_settled(root: &Path) -> bool {
 }
 
 fn component_lane_is_settled(root: &Path, name: &str) -> bool {
-    let lane = root.join(".axial-publication").join(name);
-    let Ok(entries) = fs::read_dir(&lane) else {
+    lane_holds_empty_scaffold(&root.join(".axial-publication").join(name), &[])
+}
+
+/// A cleaned component lane: the empty data scaffold plus `markers`.
+fn lane_holds_empty_scaffold(lane: &Path, markers: &[&str]) -> bool {
+    let Ok(entries) = fs::read_dir(lane) else {
         return false;
     };
     let mut names = entries
@@ -3217,13 +3505,13 @@ fn component_lane_is_settled(root: &Path, name: &str) -> bool {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     names.sort();
-    names
-        == vec![
-            "ancestors".to_string(),
-            "quarantine".to_string(),
-            "staging".to_string(),
-            "table".to_string(),
-        ]
+    let mut expected = ["ancestors", "quarantine", "staging", "table"]
+        .into_iter()
+        .chain(markers.iter().copied())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    expected.sort();
+    names == expected
         && ["quarantine", "staging", "table"].into_iter().all(|name| {
             fs::read_dir(lane.join(name)).is_ok_and(|mut entries| entries.next().is_none())
         })
@@ -3234,18 +3522,7 @@ fn component_lane_is_settled(root: &Path, name: &str) -> bool {
 }
 
 fn version_bundle_lane_is_settled(root: &Path) -> bool {
-    let lane = root.join(".axial-publication/version-bundle");
-    let Ok(entries) = fs::read_dir(&lane) else {
-        return false;
-    };
-    let mut names = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    names.sort();
-    names == vec!["quarantine".to_string(), "staging".to_string()]
-        && fs::read_dir(lane.join("quarantine")).is_ok_and(|mut entries| entries.next().is_none())
-        && fs::read_dir(lane.join("staging")).is_ok_and(|mut entries| entries.next().is_none())
+    component_lane_is_settled(root, "version-bundle")
 }
 
 fn version_bundle_lane(root: &Path) -> PathBuf {
@@ -3253,23 +3530,7 @@ fn version_bundle_lane(root: &Path) -> PathBuf {
 }
 
 fn version_bundle_lane_has_durable_witness(root: &Path) -> bool {
-    let lane = version_bundle_lane(root);
-    let Ok(entries) = fs::read_dir(&lane) else {
-        return false;
-    };
-    let mut names = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    names.sort();
-    names
-        == vec![
-            "quarantine".to_string(),
-            "settlement.json".to_string(),
-            "staging".to_string(),
-        ]
-        && fs::read_dir(lane.join("quarantine")).is_ok_and(|mut entries| entries.next().is_none())
-        && fs::read_dir(lane.join("staging")).is_ok_and(|mut entries| entries.next().is_none())
+    lane_holds_empty_scaffold(&version_bundle_lane(root), &["settlement.bin"])
 }
 
 async fn spawn_download_response_server(

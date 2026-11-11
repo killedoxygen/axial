@@ -3,7 +3,8 @@ use crate::loaders::types::LoaderError;
 use crate::managed::component::ancestor_journal::COMPONENT_ANCESTOR_RECORDS_PER_SHARD;
 use crate::managed::component::publication::{
     COMPONENT_INTENT_FILE, COMPONENT_QUARANTINE_DIRECTORY, COMPONENT_STAGING_DIRECTORY,
-    COMPONENT_TABLE_DIRECTORY, component_lane_name,
+    COMPONENT_TABLE_DIRECTORY, component_canonical_root, component_lane_name,
+    component_retains_settlement,
 };
 use crate::managed::component::spool::{ComponentTableReplay, ComponentTableSpoolError};
 use crate::managed::component::table::{
@@ -27,10 +28,12 @@ mod transaction;
 pub(crate) use transaction::{
     ComponentExecutionResult, ComponentIntentPublicationRecovery,
     ComponentPriorRecoveryRetryResult, ComponentRecoveryRequired, ComponentRecoveryRetryResult,
-    ComponentSettledOutcome, ComponentSettlementResult, ComponentStartupRecoveryResult,
-    execute_component_intent, recover_component_intent_publication, recover_component_transaction,
-    retry_component_recovery, retry_component_settlement, retry_prior_component_recovery,
-    settle_component_transaction,
+    ComponentSettledOutcome, ComponentSettlementClassification, ComponentSettlementEvidence,
+    ComponentSettlementResult, ComponentStartupRecoveryResult, acknowledge_retained_settlement,
+    classify_retained_settlement, execute_component_intent, has_retained_settlement,
+    read_committed_version_metadata, recover_component_intent_publication,
+    recover_component_transaction, retry_component_recovery, retry_component_settlement,
+    retry_prior_component_recovery, settle_component_transaction, settlement_root_binding,
 };
 
 const MAX_COMPONENT_LANE_ENTRIES: usize = 7;
@@ -494,6 +497,11 @@ impl ComponentShardBuckets {
 }
 
 impl ComponentIntentCandidate {
+    /// Releases a candidate whose intent was never promoted, keeping the publication lease.
+    pub(crate) fn into_lease(self) -> ManagedRootPublicationLease {
+        self.lease
+    }
+
     pub(crate) fn publish_intent(
         self,
     ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
@@ -794,7 +802,9 @@ pub(crate) fn plan_component_canonical_path(
             segments.extend(relative.as_str().split('/'));
             let file_name =
                 copy_bounded_string(segments.pop().ok_or(ComponentEffectsError::Topology)?)?;
-            let component_root_name = component_lane_name(component);
+            let Some(component_root_name) = component_canonical_root(component) else {
+                return plan_component_canonical_descendant(root.clone(), &segments, file_name);
+            };
             if !root.has_portably_exact_child_name(component_root_name)? {
                 let parent_count = segments
                     .len()
@@ -816,39 +826,51 @@ pub(crate) fn plan_component_canonical_path(
                 });
             }
 
-            let mut parent = root.open_child(component_root_name)?;
-            for (index, segment) in segments.iter().copied().enumerate() {
-                if !parent.has_portably_exact_child_name(segment)? {
-                    let mut remaining_parent_segments = Vec::new();
-                    remaining_parent_segments
-                        .try_reserve_exact(segments.len() - index)
-                        .map_err(|_| ComponentEffectsError::Topology)?;
-                    for missing in &segments[index..] {
-                        remaining_parent_segments.push(copy_bounded_string(missing)?);
-                    }
-                    return Ok(ComponentCanonicalPathPlan {
-                        creation_anchor: parent,
-                        remaining_parent_segments,
-                        file_name,
-                        first_created_depth: Some(
-                            u16::try_from(index + 1)
-                                .map_err(|_| ComponentEffectsError::Topology)?,
-                        ),
-                    });
-                }
-                parent = parent.open_child(segment)?;
-            }
-            // Reject a portable alias during planning; observation repeats the check.
-            let _ = parent.has_portably_exact_child_name(&file_name)?;
-            Ok(ComponentCanonicalPathPlan {
-                creation_anchor: parent,
-                remaining_parent_segments: Vec::new(),
+            plan_component_canonical_descendant(
+                root.open_child(component_root_name)?,
+                &segments,
                 file_name,
-                first_created_depth: None,
-            })
+            )
         },
         ComponentEffectsError::from,
     )
+}
+
+/// Plans `segments/file_name` below the existing directory rows are relative to; a missing
+/// segment at `index` is created at depth `index + 1`.
+fn plan_component_canonical_descendant(
+    mut parent: ManagedDir,
+    segments: &[&str],
+    file_name: String,
+) -> Result<ComponentCanonicalPathPlan, ComponentEffectsError> {
+    for (index, segment) in segments.iter().copied().enumerate() {
+        if !parent.has_portably_exact_child_name(segment)? {
+            let mut remaining_parent_segments = Vec::new();
+            remaining_parent_segments
+                .try_reserve_exact(segments.len() - index)
+                .map_err(|_| ComponentEffectsError::Topology)?;
+            for missing in &segments[index..] {
+                remaining_parent_segments.push(copy_bounded_string(missing)?);
+            }
+            return Ok(ComponentCanonicalPathPlan {
+                creation_anchor: parent,
+                remaining_parent_segments,
+                file_name,
+                first_created_depth: Some(
+                    u16::try_from(index + 1).map_err(|_| ComponentEffectsError::Topology)?,
+                ),
+            });
+        }
+        parent = parent.open_child(segment)?;
+    }
+    // Reject a portable alias during planning; observation repeats the check.
+    let _ = parent.has_portably_exact_child_name(&file_name)?;
+    Ok(ComponentCanonicalPathPlan {
+        creation_anchor: parent,
+        remaining_parent_segments: Vec::new(),
+        file_name,
+        first_created_depth: None,
+    })
 }
 
 fn admit_component_preintent(
@@ -4135,6 +4157,7 @@ mod tests {
             transaction_nonce: [0x11; 16],
             logical_rows_sha256: [0x33; 32],
             projection_sha256: [0x44; 32],
+            activation_contract: None,
             shards: vec![descriptor.clone()],
         };
         let mut spool = ComponentTableSpool::new(1).unwrap();

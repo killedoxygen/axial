@@ -27,6 +27,14 @@ use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
+mod retained;
+
+pub(crate) use retained::{
+    ComponentSettlementClassification, ComponentSettlementEvidence,
+    acknowledge_retained_settlement, classify_retained_settlement, has_retained_settlement,
+    read_committed_version_metadata, settlement_root_binding,
+};
+
 const ANCESTOR_SLOT_PARK_A: &str = "slot-park-a";
 const ANCESTOR_SLOT_PARK_B: &str = "slot-park-b";
 
@@ -1567,6 +1575,7 @@ fn execute_rows_forward(
                 _ => return Err(ComponentTransactionError.into()),
             }
             let lane = published.lane.lane.path();
+            fault::hit(lane, Fault::AfterRow);
             if fault::hit(lane, Fault::RowUnsettled) {
                 return Err(ComponentForwardFailure::EffectUnsettled);
             }
@@ -2170,19 +2179,17 @@ fn canonical_ancestor_is_present(
 ) -> Result<bool, ComponentTransactionError> {
     published.lease.revalidate().map_err(tx)?;
     let root = published.lease.root();
-    let component_root = component_lane_name(published.lane.component);
+    let component = published.lane.component;
     let present = (|| match target {
         ComponentCreatedAncestor::ComponentRoot => root
-            .has_portably_exact_child_name(component_root)
+            .has_portably_exact_child_name(
+                component_canonical_root(component).ok_or(ComponentTransactionError)?,
+            )
             .map_err(tx),
         ComponentCreatedAncestor::Relative(path) => {
-            if !root
-                .has_portably_exact_child_name(component_root)
-                .map_err(tx)?
-            {
+            let Some(mut parent) = open_component_root(root, component)? else {
                 return Ok(false);
-            }
-            let mut parent = root.open_child(component_root).map_err(tx)?;
+            };
             let segments = path.as_str().split('/').collect::<Vec<_>>();
             for (index, segment) in segments.iter().enumerate() {
                 if !parent.has_portably_exact_child_name(segment).map_err(tx)? {
@@ -2504,27 +2511,17 @@ fn open_canonical_ancestor(
     observe_validated(published.lease.root(), || {
         published.lease.revalidate().map_err(tx)?;
         let root = published.lease.root();
-        let component_root = component_lane_name(published.lane.component);
+        let component = published.lane.component;
         let result = (|| -> Result<Option<ManagedDir>, ComponentTransactionError> {
             match target {
                 ComponentCreatedAncestor::ComponentRoot => {
-                    if root
-                        .has_portably_exact_child_name(component_root)
-                        .map_err(tx)?
-                    {
-                        Ok(Some(root.open_child(component_root).map_err(tx)?))
-                    } else {
-                        Ok(None)
-                    }
+                    component_canonical_root(component).ok_or(ComponentTransactionError)?;
+                    open_component_root(root, component)
                 }
                 ComponentCreatedAncestor::Relative(path) => {
-                    if !root
-                        .has_portably_exact_child_name(component_root)
-                        .map_err(tx)?
-                    {
+                    let Some(mut current) = open_component_root(root, component)? else {
                         return Ok(None);
-                    }
-                    let mut current = root.open_child(component_root).map_err(tx)?;
+                    };
                     for segment in path.as_str().split('/') {
                         if !current.has_portably_exact_child_name(segment).map_err(tx)? {
                             return Ok(None);
@@ -2538,6 +2535,20 @@ fn open_canonical_ancestor(
         published.lease.revalidate().map_err(tx)?;
         Ok(result)
     })
+}
+
+/// Opens the directory a component's relative paths resolve from, if it exists.
+fn open_component_root(
+    root: &ManagedDir,
+    component: ManagedComponentKind,
+) -> Result<Option<ManagedDir>, ComponentTransactionError> {
+    let Some(name) = component_canonical_root(component) else {
+        return Ok(Some(root.clone()));
+    };
+    if !root.has_portably_exact_child_name(name).map_err(tx)? {
+        return Ok(None);
+    }
+    root.open_child(name).map(Some).map_err(tx)
 }
 
 fn read_ancestor_journal(
@@ -2580,18 +2591,18 @@ fn canonical_ancestor_parent(
         let result = match target {
             ComponentCreatedAncestor::ComponentRoot => {
                 let root = published.lease.root();
-                let name = component_lane_name(published.lane.component).to_string();
+                let name = component_canonical_root(published.lane.component)
+                    .ok_or(ComponentTransactionError)?
+                    .to_string();
                 let _ = root.has_portably_exact_child_name(&name).map_err(tx)?;
                 Ok((root.clone(), name))
             }
             ComponentCreatedAncestor::Relative(path) => {
                 let mut segments = path.as_str().split('/').collect::<Vec<_>>();
                 let name = segments.pop().ok_or(ComponentTransactionError)?.to_string();
-                let mut parent = published
-                    .lease
-                    .root()
-                    .open_child(component_lane_name(published.lane.component))
-                    .map_err(tx)?;
+                let mut parent =
+                    open_component_root(published.lease.root(), published.lane.component)?
+                        .ok_or(ComponentTransactionError)?;
                 for segment in segments {
                     if !parent.has_portably_exact_child_name(segment).map_err(tx)? {
                         return Err(ComponentTransactionError);
@@ -2962,8 +2973,24 @@ fn settle_component_transaction_rows(
     }
     prove_terminal_for_settlement(&authority.context, &outcome)?;
     authority.outcome = Some(outcome.clone());
-    let encoded =
-        encode_component_settlement(&outcome, &authority.context.encoded_intent).map_err(tx)?;
+    let retained_table = if component_retains_settlement(authority.context.lane.component) {
+        read_table_shard_bytes(&authority.context, 0)?
+    } else {
+        Vec::new()
+    };
+    if fault::hit(
+        authority.context.lane.lane.path(),
+        Fault::BeforeSettlementPromotion,
+    ) {
+        return Err(ComponentTransactionError);
+    }
+    let encoded = encode_component_settlement(
+        &outcome,
+        &authority.context.encoded_intent,
+        *uuid::Uuid::new_v4().as_bytes(),
+        &retained_table,
+    )
+    .map_err(tx)?;
     let write = authority
         .context
         .lane
@@ -3241,6 +3268,9 @@ fn cleanup_component_settlement(
             return Err(ComponentTransactionError);
         }
     }
+    if component_retains_settlement(lane.component) {
+        return validate_retained_settlement_shape(lane, lease, settlement, settlement_guard);
+    }
     validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
     if !lane
         .lane
@@ -3323,6 +3353,29 @@ fn validate_settlement_marker_shape(
         return Err(ComponentTransactionError);
     }
     require_exact_ancestor_scaffold(lane)?;
+    lease.revalidate().map_err(tx)
+}
+
+/// A cleaned lane that still holds its retained settlement and nothing else.
+fn validate_retained_settlement_shape(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+    settlement_guard: &ManagedFileGuard,
+) -> Result<(), ComponentTransactionError> {
+    validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
+    let names = exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)?;
+    if names.contains(COMPONENT_INTENT_FILE) || names.contains(COMPONENT_OUTCOME_FILE) {
+        return Err(ComponentTransactionError);
+    }
+    validate_settled_data_scaffold(lane, lease)?;
+    if !lane
+        .lane
+        .file_guard_matches(COMPONENT_SETTLEMENT_FILE, settlement_guard)
+        .map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
     lease.revalidate().map_err(tx)
 }
 
@@ -3778,26 +3831,15 @@ fn open_settlement_canonical_ancestor(
     observe_validated(lease.root(), || {
         lease.revalidate().map_err(tx)?;
         let root = lease.root();
-        let component_root = component_lane_name(component);
         let result = (|| match target {
             ComponentCreatedAncestor::ComponentRoot => {
-                if root
-                    .has_portably_exact_child_name(component_root)
-                    .map_err(tx)?
-                {
-                    Ok(Some(root.open_child(component_root).map_err(tx)?))
-                } else {
-                    Ok(None)
-                }
+                component_canonical_root(component).ok_or(ComponentTransactionError)?;
+                open_component_root(root, component)
             }
             ComponentCreatedAncestor::Relative(path) => {
-                if !root
-                    .has_portably_exact_child_name(component_root)
-                    .map_err(tx)?
-                {
+                let Some(mut current) = open_component_root(root, component)? else {
                     return Ok(None);
-                }
-                let mut current = root.open_child(component_root).map_err(tx)?;
+                };
                 for segment in path.as_str().split('/') {
                     if !current.has_portably_exact_child_name(segment).map_err(tx)? {
                         return Ok(None);

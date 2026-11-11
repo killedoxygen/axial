@@ -18,8 +18,7 @@ mod transient_transfer;
 pub(crate) use crate::asset_index::parse_asset_index;
 pub use assets::materialize_virtual_assets;
 pub(crate) use install::{
-    AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
-    AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
+    AuthenticatedVanillaInstallSources, ManagedReconstructionContext, PreparedManagedInstall,
     ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
     prepare_local_managed_install, publish_prepared_managed_install,
 };
@@ -32,7 +31,6 @@ pub use install::{
 #[cfg(test)]
 pub(crate) use install::{
     ManagedInstallSettlementForTest, checkpoint_and_ack_managed_install_for_test,
-    version_bundle_publication_fixture_for_test,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use install::{
