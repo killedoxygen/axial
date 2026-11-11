@@ -10,7 +10,7 @@ use crate::loaders::types::{
     LoaderBuildRecord, LoaderCatalogState, LoaderComponentId, LoaderComponentRecord, LoaderError,
     LoaderGameVersion, LoaderProviderFailureKind, LoaderVersionIndex,
 };
-use crate::managed_fs::ManagedLibraryOperation;
+use crate::managed::fs::ManagedLibraryOperation;
 use crate::manifest::{
     FetchError as ManifestError, VersionManifest, fetch_version_manifest_cached_cancellable,
 };
@@ -425,7 +425,7 @@ mod tests {
         LoaderInstallStrategy, LoaderInstallability, LoaderProviderFailureKind, LoaderVersionIndex,
     };
     use crate::loaders::{build_id_for, installed_version_id_for};
-    use crate::managed_fs::ManagedLibraryRoot;
+    use crate::managed::fs::ManagedLibraryRoot;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -557,7 +557,7 @@ mod tests {
     }
 
     #[cfg(feature = "test-support")]
-    fn seed_manifest(operation: &crate::managed_fs::ManagedLibraryOperation) {
+    fn seed_manifest(operation: &crate::managed::fs::ManagedLibraryOperation) {
         crate::manifest::persist_version_manifest_cache_fixture_for_test(
             operation,
             br#"{"latest":{"release":"1.21.5","snapshot":"1.21.5"},"versions":[{"id":"1.21.5","type":"release","url":"https://piston-meta.mojang.com/version.json","sha1":"0123456789012345678901234567890123456789","releaseTime":"2025-03-25T12:00:00+00:00"}]}"#,

@@ -5,7 +5,7 @@ use crate::known_good::{
     ManagedKnownGoodComponent,
 };
 use crate::loaders::types::LoaderError;
-use crate::managed_component_effects::{
+use crate::managed::component::effects::{
     ComponentCanonicalObservation, ComponentCanonicalParents, ComponentEffectsError,
     ComponentExecutionResult, ComponentIntentCandidate, ComponentIntentPublicationRecovery,
     ComponentIntentPublishFailure, ComponentLane, ComponentPreparedCanonicalAuthority,
@@ -16,19 +16,19 @@ use crate::managed_component_effects::{
     settle_component_transaction,
 };
 #[cfg(test)]
-use crate::managed_component_effects::{
+use crate::managed::component::effects::{
     ComponentExecutionFault, ComponentIntentPublishFault, ComponentSettlementFault,
     execute_component_intent_with_fault, plan_component_canonical_path,
     settle_component_transaction_with_fault,
 };
-use crate::managed_component_spool::{ComponentTableSpool, ComponentTableSpoolError};
-use crate::managed_component_table::{
+use crate::managed::component::spool::{ComponentTableSpool, ComponentTableSpoolError};
+use crate::managed::component::table::{
     COMPONENT_TABLE_ROWS_PER_SHARD, ComponentIntentManifest, ComponentPriorFile,
     ComponentTableBuilder, ComponentTableError, ComponentTableRow, ComponentTableSummary,
     ManagedComponentArtifactKind, ManagedComponentKind,
 };
-use crate::managed_fs::{ManagedDir, ManagedFileIdentity, ManagedPassiveFileRevision};
-use crate::managed_publication::{
+use crate::managed::fs::{ManagedDir, ManagedFileIdentity, ManagedPassiveFileRevision};
+use crate::managed::publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
     run_publication_blocking,
 };
@@ -195,7 +195,7 @@ struct ComponentRetryBackoff {
 
 enum ComponentProgress {
     Execution(ComponentExecutionResult),
-    Recovery(crate::managed_component_effects::ComponentRecoveryRequired),
+    Recovery(crate::managed::component::effects::ComponentRecoveryRequired),
     Settlement(ComponentSettlementResult),
 }
 
@@ -538,7 +538,7 @@ fn settled_component_lease(outcome: ComponentSettledOutcome) -> ManagedRootPubli
 }
 
 async fn execute_current_component_intent(
-    published: crate::managed_component_effects::ComponentIntentPublished,
+    published: crate::managed::component::effects::ComponentIntentPublished,
     #[cfg(test)] faults: Option<&mut ComponentLifecycleTestFaults>,
 ) -> ComponentExecutionResult {
     #[cfg(test)]
@@ -549,7 +549,7 @@ async fn execute_current_component_intent(
 }
 
 async fn settle_current_component_transaction(
-    receipt: crate::managed_component_effects::ComponentTransactionReceipt,
+    receipt: crate::managed::component::effects::ComponentTransactionReceipt,
     #[cfg(test)] faults: Option<&mut ComponentLifecycleTestFaults>,
 ) -> ComponentSettlementResult {
     #[cfg(test)]
@@ -1081,9 +1081,9 @@ fn validate_table_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_component_publication::COMPONENT_INTENT_FILE;
-    use crate::managed_component_table::decode_component_table_shard;
-    use crate::managed_fs::{register_sha1_full_read_counts, take_sha1_full_read_counts};
+    use crate::managed::component::publication::COMPONENT_INTENT_FILE;
+    use crate::managed::component::table::decode_component_table_shard;
+    use crate::managed::fs::{register_sha1_full_read_counts, take_sha1_full_read_counts};
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::sync::Arc;

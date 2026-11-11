@@ -12,23 +12,14 @@ mod known_good_reconstruction;
 pub mod launch;
 pub mod lifecycle;
 pub mod loaders;
-mod managed_blocking;
-mod managed_component_ancestor_journal;
-mod managed_component_cache;
-mod managed_component_effects;
-mod managed_component_lifecycle;
-mod managed_component_publication;
-mod managed_component_source_spool;
-mod managed_component_spool;
-mod managed_component_table;
-mod managed_fs;
+mod managed;
 pub mod portable_path;
 pub mod process;
 
 pub mod managed_path {
     #[cfg(feature = "test-support")]
-    pub use crate::managed_fs::ManagedLibraryTestAuthority;
-    pub use crate::managed_fs::{
+    pub use crate::managed::fs::ManagedLibraryTestAuthority;
+    pub use crate::managed::fs::{
         FileAbsence, FileObservation, ManagedContentCancelReceipt, ManagedContentCheckpointError,
         ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
         ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
@@ -51,7 +42,6 @@ pub mod managed_path {
         ManagedTreeRoot,
     };
 }
-mod managed_publication;
 pub mod manifest;
 pub mod paths;
 pub mod rules;

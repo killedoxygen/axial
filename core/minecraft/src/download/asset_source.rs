@@ -3,18 +3,18 @@ use super::model::SelectedDownloadArtifactKind;
 use super::transfer::AuthenticatedSelectedArtifactSource;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES};
 use crate::loaders::types::LoaderError;
-use crate::managed_blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
-use crate::managed_component_lifecycle::{
+use crate::managed::blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
+use crate::managed::component::lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
     StagedComponentPublicationSource,
 };
-use crate::managed_component_source_spool::{
+use crate::managed::component::source_spool::{
     RetainedComponentSourceAllocation, RetainedComponentSourceAppendError,
     RetainedComponentSourceSpool, RetainedComponentSourceSpoolError,
 };
-use crate::managed_component_table::ManagedComponentArtifactKind;
-use crate::managed_fs::ManagedDir;
-use crate::managed_publication::ManagedPublicationLifetimeGuard;
+use crate::managed::component::table::ManagedComponentArtifactKind;
+use crate::managed::fs::ManagedDir;
+use crate::managed::publication::ManagedPublicationLifetimeGuard;
 use crate::portable_path::{PortablePathKey, PortableRelativePath};
 use axial_resource::{PhysicalScratchPermit, process_physical_work};
 #[cfg(test)]
@@ -399,7 +399,7 @@ fn retained_spool_loader_error(error: RetainedComponentSourceSpoolError) -> Load
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
+    use crate::managed::blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use tokio::sync::oneshot;

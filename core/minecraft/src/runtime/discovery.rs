@@ -282,10 +282,10 @@ impl ManagedRuntimeComponent {
         }
         let guard = match self.root.write_new_exact_retained(".axial-ready", b"ready") {
             Ok(guard) => guard,
-            Err(crate::managed_fs::ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
+            Err(crate::managed::fs::ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
                 return Err(std::io::Error::other(error.to_string()));
             }
-            Err(crate::managed_fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
+            Err(crate::managed::fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
                 final_guard: Some(guard),
             }) => {
                 self.root
@@ -295,7 +295,7 @@ impl ManagedRuntimeComponent {
                     "managed runtime ready marker publication failed verification",
                 ));
             }
-            Err(crate::managed_fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
+            Err(crate::managed::fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
                 final_guard: None,
             }) => {
                 return Err(std::io::Error::other(

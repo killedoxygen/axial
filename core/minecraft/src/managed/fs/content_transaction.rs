@@ -7138,7 +7138,7 @@ mod tests {
         let container = test_tempdir().unwrap();
         for (phase, code) in [("stage", 42), ("cleanup", 43)] {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "managed_fs::content_transaction::tests::staging_checkpoint_parent_cleanup_survives_two_process_exits", "--nocapture"])
+                .args(["--exact", "managed::fs::content_transaction::tests::staging_checkpoint_parent_cleanup_survives_two_process_exits", "--nocapture"])
                 .env(FIXTURE, container.path())
                 .env(PHASE, phase)
                 .stdout(std::process::Stdio::piped())
@@ -7365,7 +7365,7 @@ mod tests {
         for phase in ["omitted", "before-save"] {
             let container = test_tempdir().unwrap();
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "managed_fs::content_transaction::tests::staging_checkpoint_preserves_post_move_pre_manifest_process_exit", "--nocapture"])
+                .args(["--exact", "managed::fs::content_transaction::tests::staging_checkpoint_preserves_post_move_pre_manifest_process_exit", "--nocapture"])
                 .env(FIXTURE, container.path())
                 .env(PHASE, phase)
                 .stdout(std::process::Stdio::piped())
@@ -7584,7 +7584,7 @@ mod tests {
         remove_first: bool,
     ) {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "managed_fs::content_transaction::tests::published_checkpoint_compensates_create_only_process_exit", "--nocapture"])
+            .args(["--exact", "managed::fs::content_transaction::tests::published_checkpoint_compensates_create_only_process_exit", "--nocapture"])
             .env("AXIAL_CONTENT_ADDITIONS_FIXTURE", container)
             .envs(cleanup.then_some(("AXIAL_CONTENT_ADDITIONS_CLEANUP", "1")))
             .envs(replace_existing.then_some(("AXIAL_CONTENT_PUBLICATION_REPLACE_EXISTING", "1")))

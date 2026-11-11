@@ -7,7 +7,7 @@ use super::forge_installer::{
 use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
 use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
 use crate::launch::VersionJson;
-use crate::managed_fs::ManagedTreeSnapshot;
+use crate::managed::fs::ManagedTreeSnapshot;
 use crate::portable_path::PortableRelativePath;
 use crate::process::{OwnedProcess, ProcessOutput, SpawnError};
 use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};

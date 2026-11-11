@@ -2,7 +2,7 @@ use crate::loaders::types::{
     CachedCatalog, LOADER_CATALOG_SCHEMA_VERSION, LoaderAvailability, LoaderCatalogState,
     LoaderError, LoaderProviderFailureKind,
 };
-use crate::managed_fs::{ManagedDir, ManagedDirectoryIdentity, ManagedLibraryOperation};
+use crate::managed::fs::{ManagedDir, ManagedDirectoryIdentity, ManagedLibraryOperation};
 use crate::portable_path::PortableFileName;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -294,7 +294,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryRoot};
+    use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryRoot};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

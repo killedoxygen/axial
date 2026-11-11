@@ -1,5 +1,5 @@
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
-use crate::managed_component_table::{
+use crate::managed::component::table::{
     ComponentIntentManifest, ComponentTableError, ComponentTableRow, MAX_COMPONENT_INTENT_BYTES,
     MAX_COMPONENT_TABLE_ROWS, ManagedComponentKind, decode_component_intent_manifest,
     expected_shard_count,
@@ -627,7 +627,7 @@ impl<'a> ByteCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_component_table::{
+    use crate::managed::component::table::{
         COMPONENT_TABLE_HEADER_BYTES, COMPONENT_TABLE_ROWS_PER_SHARD, ComponentPriorFile,
         ComponentShardDescriptor, ComponentTableShard, ManagedComponentArtifactKind,
         build_component_intent_manifest, encode_component_intent_manifest,

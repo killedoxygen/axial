@@ -1,5 +1,5 @@
 use crate::loaders::types::LoaderError;
-use crate::managed_fs::{ManagedDir, ManagedExecutableGuard};
+use crate::managed::fs::{ManagedDir, ManagedExecutableGuard};
 use crate::portable_path::PortableRelativePath;
 use axial_fs::{Directory, DirectoryRevision, EntryKind};
 use std::collections::HashMap;

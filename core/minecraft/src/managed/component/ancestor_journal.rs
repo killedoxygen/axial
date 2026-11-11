@@ -1,4 +1,4 @@
-use crate::managed_component_table::{
+use crate::managed::component::table::{
     ComponentCreatedAncestor, ComponentTableError, MAX_COMPONENT_PATH_BYTES,
     MAX_CREATED_ANCESTOR_PATH_BYTES, MAX_CREATED_ANCESTORS, ManagedComponentKind,
     decode_component_intent_manifest,
@@ -642,7 +642,7 @@ impl<'a> ByteCursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::managed_component_table::{
+    use crate::managed::component::table::{
         COMPONENT_TABLE_HEADER_BYTES, ComponentIntentManifest, ComponentShardDescriptor,
         encode_component_intent_manifest,
     };

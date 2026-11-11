@@ -1,4 +1,4 @@
-use crate::managed_fs::ManagedTransferEffectSettlement;
+use crate::managed::fs::ManagedTransferEffectSettlement;
 use axial_fs::{
     FileCapability, TransientCreationObligation, TransientDestination,
     TransientDestinationCancelObligation, TransientDestinationCancelOutcome,

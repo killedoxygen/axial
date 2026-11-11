@@ -1,10 +1,10 @@
 use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
 use crate::loaders::{MaterializedLoaderProfile, validate_materialized_loader_profile};
-use crate::managed_fs::{
+use crate::managed::fs::{
     ManagedDir, ManagedDirectoryIdentity, ManagedLibraryOperation, ManagedLibraryWitness,
     ManagedPassiveFileRevision,
 };
-use crate::managed_publication::{ManagedPublicationError, ManagedRootPublicationReadLease};
+use crate::managed::publication::{ManagedPublicationError, ManagedRootPublicationReadLease};
 use crate::portable_path::{PortableFileName, PortablePathKey};
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
@@ -37,7 +37,7 @@ pub struct VersionBundleReadGuard {
 
 #[cfg(feature = "test-support")]
 pub struct VersionBundlePublicationGuardForTest {
-    _guard: crate::managed_publication::ManagedRootPublicationTestGuard,
+    _guard: crate::managed::publication::ManagedRootPublicationTestGuard,
 }
 
 impl VersionBundleReadGuard {
@@ -65,7 +65,7 @@ impl VersionBundlePublicationGuardForTest {
     pub fn acquire(operation: &ManagedLibraryOperation) -> io::Result<Self> {
         operation.revalidate()?;
         let root = operation.managed_directory().map_err(io::Error::other)?;
-        let guard = crate::managed_publication::ManagedRootPublicationTestGuard::acquire(root)
+        let guard = crate::managed::publication::ManagedRootPublicationTestGuard::acquire(root)
             .map_err(io::Error::other)?;
         Ok(Self { _guard: guard })
     }
@@ -700,7 +700,7 @@ impl VersionDirectoryScan {
     fn observe_file(
         &mut self,
         name: &str,
-    ) -> Result<Option<crate::managed_fs::ManagedFileGuard>, crate::loaders::LoaderError> {
+    ) -> Result<Option<crate::managed::fs::ManagedFileGuard>, crate::loaders::LoaderError> {
         match self.entries.get(name) {
             None => return Ok(None),
             Some(EntryKind::File) => {}
@@ -875,7 +875,7 @@ mod tests {
     #[test]
     fn dependency_count_covers_retained_directories_and_inherited_files() {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
-        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let root = crate::managed::fs::ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
         let operation = root.try_acquire().unwrap();
         assert_eq!(
             super::scan_versions_snapshot(&operation)
@@ -977,9 +977,9 @@ mod tests {
         let mc_dir = unique_test_dir("active-publication");
         fs::create_dir_all(&mc_dir).expect("create library root");
         let library_root =
-            crate::managed_fs::ManagedLibraryRoot::open_for_test(&mc_dir).expect("managed root");
+            crate::managed::fs::ManagedLibraryRoot::open_for_test(&mc_dir).expect("managed root");
         let operation = library_root.try_acquire().expect("managed operation");
-        let writer = crate::managed_publication::ManagedRootPublicationLease::acquire(
+        let writer = crate::managed::publication::ManagedRootPublicationLease::acquire(
             operation
                 .managed_directory()
                 .expect("managed publication root"),
@@ -1214,19 +1214,19 @@ mod tests {
     }
 
     fn scan_versions(path: &Path) -> std::io::Result<Vec<crate::types::VersionEntry>> {
-        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
+        let root = crate::managed::fs::ManagedLibraryRoot::open_for_test(path)?;
         let operation = root.try_acquire()?;
         super::scan_versions_snapshot(&operation).map(|snapshot| snapshot.report.versions)
     }
 
     fn scan_versions_report(path: &Path) -> std::io::Result<super::VersionScanReport> {
-        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
+        let root = crate::managed::fs::ManagedLibraryRoot::open_for_test(path)?;
         let operation = root.try_acquire()?;
         super::scan_versions_snapshot(&operation).map(|snapshot| snapshot.report)
     }
 
     fn scan_versions_snapshot(path: &Path) -> std::io::Result<super::VersionScanSnapshot> {
-        let root = crate::managed_fs::ManagedLibraryRoot::open_for_test(path)?;
+        let root = crate::managed::fs::ManagedLibraryRoot::open_for_test(path)?;
         let operation = root.try_acquire()?;
         super::scan_versions_snapshot(&operation)
     }

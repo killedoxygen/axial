@@ -62,15 +62,15 @@ use crate::loaders::{
     LoaderInstallBaseCommitVerificationFailure, VerifiedLoaderInstallBaseCheckpoint,
     VerifiedLoaderInstallBaseCommit,
 };
-use crate::managed_blocking::ManagedBlockingWorkers;
+use crate::managed::blocking::ManagedBlockingWorkers;
 #[cfg(test)]
-use crate::managed_component_lifecycle::publish_managed_component_effect_rolling_back_after_first_row_for_test;
-use crate::managed_component_lifecycle::{
+use crate::managed::component::lifecycle::publish_managed_component_effect_rolling_back_after_first_row_for_test;
+use crate::managed::component::lifecycle::{
     ManagedComponentLifecycleOutcome, publish_managed_component_effect,
 };
-use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
-use crate::managed_publication::{
+use crate::managed::component::table::ManagedComponentKind;
+use crate::managed::fs::{ManagedDir, ManagedLibraryOperation};
+use crate::managed::publication::{
     ManagedRootPublicationLease, open_managed_target_parent, run_publication_blocking,
     validate_existing_managed_target_path,
 };
@@ -259,7 +259,7 @@ impl RecordedVersionMetadata {
         validate_install_version_id(version_id)?;
         if size == 0
             || size > MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64
-            || !crate::managed_publication::valid_publication_sha1(sha1)
+            || !crate::managed::publication::valid_publication_sha1(sha1)
         {
             return Err(version_bundle_install_error(
                 "invalid recorded metadata descriptor",
@@ -1093,7 +1093,7 @@ impl Downloader {
         manifest: VersionManifest,
     ) -> Self {
         let mc_dir = mc_dir.into();
-        let library_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&mc_dir)
+        let library_root = crate::managed::fs::ManagedLibraryRoot::open_for_test(&mc_dir)
             .expect("managed test library root");
         let library_operation = library_root
             .try_acquire()
@@ -4373,20 +4373,20 @@ mod tests {
     fn asset_cache_mapping_preserves_cancellation_and_task_failure() {
         assert!(matches!(
             asset_cache_error(
-                crate::managed_component_cache::ManagedComponentExactCacheError::Admission
+                crate::managed::component::cache::ManagedComponentExactCacheError::Admission
             ),
             DownloadError::Integrity(_)
         ));
         assert!(matches!(
             asset_cache_error(
-                crate::managed_component_cache::ManagedComponentExactCacheError::Cancelled
+                crate::managed::component::cache::ManagedComponentExactCacheError::Cancelled
             ),
             DownloadError::FileOperation(error)
                 if error.kind() == std::io::ErrorKind::Interrupted
         ));
         assert!(matches!(
             asset_cache_error(
-                crate::managed_component_cache::ManagedComponentExactCacheError::TaskStopped
+                crate::managed::component::cache::ManagedComponentExactCacheError::TaskStopped
             ),
             DownloadError::FileOperation(error) if error.kind() == std::io::ErrorKind::Other
         ));
@@ -4474,9 +4474,9 @@ mod tests {
 
         let first = tempfile::tempdir_in(crate::test_temp_root()).expect("first evidence root");
         let second = tempfile::tempdir_in(crate::test_temp_root()).expect("second evidence root");
-        let first_authority = crate::managed_fs::ManagedLibraryRoot::open_for_test(first.path())
+        let first_authority = crate::managed::fs::ManagedLibraryRoot::open_for_test(first.path())
             .expect("open first managed root");
-        let second_authority = crate::managed_fs::ManagedLibraryRoot::open_for_test(second.path())
+        let second_authority = crate::managed::fs::ManagedLibraryRoot::open_for_test(second.path())
             .expect("open second managed root");
         let first_operation = first_authority
             .try_acquire()
@@ -4550,7 +4550,7 @@ mod tests {
         let hook_release = release.shared();
         let workers =
             ManagedBlockingWorkers::new_with_checkpoint_hook(Arc::new(move |checkpoint| {
-                if checkpoint != crate::managed_blocking::ManagedBlockingCheckpoint::SourceSpool {
+                if checkpoint != crate::managed::blocking::ManagedBlockingCheckpoint::SourceSpool {
                     return;
                 }
                 let Some(entered) = entered_tx

@@ -14,10 +14,12 @@ use crate::known_good_libraries::{
     PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
 };
 use crate::launch::{Library, maven_to_path};
-use crate::managed_blocking::ManagedBlockingWorkers;
-use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
-use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::ManagedLibraryOperation;
+use crate::managed::blocking::ManagedBlockingWorkers;
+use crate::managed::component::cache::{
+    ManagedComponentExactCache, ManagedComponentExactCacheError,
+};
+use crate::managed::component::table::ManagedComponentKind;
+use crate::managed::fs::ManagedLibraryOperation;
 use crate::paths::libraries_dir;
 use crate::portable_path::PortableRelativePath;
 use crate::rules::{Environment, evaluate_rules};
@@ -822,7 +824,7 @@ mod tests {
     use crate::download::library_source::{LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool};
     use crate::known_good_libraries::{ClassifiedLibraryDownload, LibraryAcquisition};
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
-    use crate::managed_blocking::ManagedBlockingWorkers;
+    use crate::managed::blocking::ManagedBlockingWorkers;
     use crate::portable_path::PortableRelativePath;
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
@@ -883,7 +885,7 @@ mod tests {
         root: &Path,
         workers: ManagedBlockingWorkers,
     ) -> ExactLibraryCacheAdmission {
-        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(root)
+        let managed_root = crate::managed::fs::ManagedLibraryRoot::open_for_test(root)
             .expect("managed library root");
         let operation = managed_root
             .try_acquire()

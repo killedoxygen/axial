@@ -10,25 +10,25 @@ use crate::http;
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::loaders::types::LoaderError;
 #[cfg(test)]
-use crate::managed_blocking::ManagedBlockingAttemptGuard;
-use crate::managed_blocking::{
+use crate::managed::blocking::ManagedBlockingAttemptGuard;
+use crate::managed::blocking::{
     ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
     ManagedCancellation,
 };
-use crate::managed_component_cache::{
+use crate::managed::component::cache::{
     ManagedBoundedReaderOutcome, ManagedComponentExactCache, ManagedComponentExactCacheError,
 };
-use crate::managed_component_lifecycle::{
+use crate::managed::component::lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
     StagedComponentPublicationSource,
 };
-use crate::managed_component_source_spool::{
+use crate::managed::component::source_spool::{
     RetainedComponentSourceAllocation, RetainedComponentSourceAppendError,
     RetainedComponentSourceReader, RetainedComponentSourceSpool, RetainedComponentSourceSpoolError,
 };
-use crate::managed_component_table::ManagedComponentArtifactKind;
-use crate::managed_fs::ManagedDir;
-use crate::managed_publication::ManagedPublicationLifetimeGuard;
+use crate::managed::component::table::ManagedComponentArtifactKind;
+use crate::managed::fs::ManagedDir;
+use crate::managed::publication::ManagedPublicationLifetimeGuard;
 use crate::portable_path::PortableRelativePath;
 use axial_resource::{PhysicalScratchPermit, PhysicalWorkOwner, process_physical_work};
 use sha1::{Digest as _, Sha1};
@@ -1354,7 +1354,7 @@ mod tests {
     use super::*;
     use crate::download::asset_source::AssetSourcePool;
     use crate::known_good::MAX_TIER2_ARTIFACT_BYTES;
-    use crate::managed_publication::ManagedRootPublicationLease;
+    use crate::managed::publication::ManagedRootPublicationLease;
     use sha1::Sha1;
     use std::collections::VecDeque;
     use std::io::Write;

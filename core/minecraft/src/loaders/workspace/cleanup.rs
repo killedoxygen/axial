@@ -1,6 +1,6 @@
 use crate::loaders::types::LoaderError;
 use crate::loaders::validate_version_id;
-use crate::managed_fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnapshot};
+use crate::managed::fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnapshot};
 use crate::portable_path::PortableRelativePath;
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -471,7 +471,7 @@ mod tests {
         let temporary = create_processor_temporary_in(&alias).unwrap();
         let path = temporary.path().to_path_buf();
         assert_eq!(path.parent(), Some(physical_parent.as_path()));
-        let managed = crate::managed_fs::ManagedDir::open_root(&path)
+        let managed = crate::managed::fs::ManagedDir::open_root(&path)
             .expect("fresh temporary root has strictly admissible physical ancestry");
         managed.revalidate().unwrap();
         drop(managed);

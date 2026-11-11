@@ -14,10 +14,12 @@ use super::transfer::{
 use crate::asset_index::{LegacyAssetLayout, LegacyAssets, parse_asset_index};
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
-use crate::managed_blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
-use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
-use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
+use crate::managed::blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
+use crate::managed::component::cache::{
+    ManagedComponentExactCache, ManagedComponentExactCacheError,
+};
+use crate::managed::component::table::ManagedComponentKind;
+use crate::managed::fs::{ManagedDir, ManagedLibraryOperation};
 use crate::portable_path::{PortableFileName, PortableRelativePath};
 use axial_resource::PhysicalIoClass;
 use futures_util::StreamExt;
@@ -109,7 +111,7 @@ impl<'a, F> AssetSourceAcquisitionRequest<'a, F> {
 }
 
 pub(super) async fn prepare_asset_download_pipeline(
-    library_root: &crate::managed_fs::ManagedLibraryOperation,
+    library_root: &crate::managed::fs::ManagedLibraryOperation,
     workers: ManagedBlockingWorkers,
 ) -> Result<PreparedAssetDownloadPipeline, DownloadError> {
     let source_pool = AssetSourcePool::new_with_workers(workers.clone())?;

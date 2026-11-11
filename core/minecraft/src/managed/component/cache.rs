@@ -1,11 +1,11 @@
 use crate::loaders::types::LoaderError;
-use crate::managed_blocking::{
+use crate::managed::blocking::{
     ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
     ManagedCancellation,
 };
-use crate::managed_component_publication::component_lane_name;
-use crate::managed_component_table::ManagedComponentKind;
-use crate::managed_fs::{
+use crate::managed::component::publication::component_lane_name;
+use crate::managed::component::table::ManagedComponentKind;
+use crate::managed::fs::{
     ManagedBoundedFileReader, ManagedDir, ManagedFileGuard, ManagedLibraryOperation,
 };
 use crate::portable_path::PortableRelativePath;
@@ -252,7 +252,7 @@ mod tests {
         component: ManagedComponentKind,
         workers: &ManagedBlockingWorkers,
     ) -> ManagedComponentExactCache {
-        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(managed_root)
+        let managed_root = crate::managed::fs::ManagedLibraryRoot::open_for_test(managed_root)
             .expect("open managed component cache root");
         let operation = managed_root
             .try_acquire()

@@ -12,7 +12,7 @@ use crate::loaders::types::{
     LoaderError, LoaderInstallBaseCommit, LoaderInstallContinuation, LoaderInstallPlan,
     LoaderInstallStrategy,
 };
-use crate::managed_fs::ManagedLibraryOperation;
+use crate::managed::fs::ManagedLibraryOperation;
 use crate::runtime::ManagedRuntimeCache;
 
 pub async fn install_build<F>(

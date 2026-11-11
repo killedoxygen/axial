@@ -41,8 +41,8 @@ use crate::loaders::types::{
     LoaderInstallContinuation, LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy,
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
-use crate::managed_blocking::ManagedBlockingWorkers;
-use crate::managed_fs::{ManagedLibraryFile, ManagedLibraryOperation};
+use crate::managed::blocking::ManagedBlockingWorkers;
+use crate::managed::fs::{ManagedLibraryFile, ManagedLibraryOperation};
 use crate::portable_path::PortableRelativePath;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
@@ -1795,7 +1795,7 @@ mod tests {
     use crate::loaders::{
         build_id_for, continue_install_build_after_base, installed_version_id_for,
     };
-    use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
+    use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;

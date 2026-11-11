@@ -1,9 +1,9 @@
 use super::*;
-use crate::managed_component_ancestor_journal::{
+use crate::managed::component::ancestor_journal::{
     COMPONENT_ANCESTOR_RECORDS_PER_SHARD, ComponentAncestorJournalAuthority,
     ComponentAncestorJournalRecord, MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES,
 };
-use crate::managed_component_publication::{
+use crate::managed::component::publication::{
     COMPONENT_OUTCOME_BYTES, COMPONENT_OUTCOME_FILE, COMPONENT_SETTLEMENT_FILE,
     ComponentObservedCanonical, ComponentOutcomeRecord, ComponentRecoveryDecision,
     ComponentRecoveryEntryState, ComponentRecoveryObservation, ComponentRecoveryPlan,
@@ -11,16 +11,16 @@ use crate::managed_component_publication::{
     ComponentTerminalOutcome, MAX_COMPONENT_SETTLEMENT_BYTES, decode_component_outcome,
     decode_component_settlement, encode_component_outcome, encode_component_settlement,
 };
-use crate::managed_component_table::{
+use crate::managed::component::table::{
     ComponentCreatedAncestor, ComponentTableParser, ComponentTableRow, ComponentTableShard,
     MAX_COMPONENT_TABLE_SHARD_BYTES, decode_component_intent_manifest,
     decode_component_table_shard,
 };
-use crate::managed_fs::{
+use crate::managed::fs::{
     ManagedCreateOnlyWriteFailure, ManagedDeferredDirectorySyncs, ManagedDirectoryMoveFailure,
     ManagedFileGuard, ManagedGuardedFileMoveFailure,
 };
-use crate::managed_publication::run_publication_blocking;
+use crate::managed::publication::run_publication_blocking;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2651,7 +2651,7 @@ fn read_ancestor_journal(
     authority: &ComponentAncestorJournalAuthority<'_>,
     shard_index: usize,
 ) -> Result<
-    crate::managed_component_ancestor_journal::ComponentAncestorJournalShard,
+    crate::managed::component::ancestor_journal::ComponentAncestorJournalShard,
     ComponentTransactionError,
 > {
     let name = component_ancestor_record_file_name(shard_index).map_err(tx)?;
@@ -2784,7 +2784,7 @@ fn publish_outcome(
         published.lane.lane.write_new_exact_retained_with_fault(
             COMPONENT_OUTCOME_FILE,
             &encoded,
-            crate::managed_fs::ManagedCreateOnlyWriteFault::Promotion,
+            crate::managed::fs::ManagedCreateOnlyWriteFault::Promotion,
         )
     } else {
         published
@@ -3694,7 +3694,7 @@ fn replay_complete_settlement_table(
         let (shard, _) = read_settlement_table_shard(lane, &settlement.intent, shard_index)?;
         parser
             .parse_next(
-                &crate::managed_component_table::encode_component_table_shard(&shard)
+                &crate::managed::component::table::encode_component_table_shard(&shard)
                     .map_err(tx)?,
             )
             .map_err(tx)?;

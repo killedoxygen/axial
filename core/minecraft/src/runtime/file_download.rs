@@ -8,7 +8,7 @@ use crate::download::{
     TransferClient, TransferClientConfig, TransferContract, TransferFailureKind, TransferOrigin,
     TransferOutcome, VerifiedSource, start_source_transfer, transfer_cancellation_channel,
 };
-use crate::managed_fs::ManagedDir;
+use crate::managed::fs::ManagedDir;
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};

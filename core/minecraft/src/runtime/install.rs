@@ -25,7 +25,7 @@ use super::model::{
     JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId, RuntimeRecord, RuntimeSourceFailure,
     RuntimeSourceFailureKind,
 };
-use crate::managed_fs::{ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents};
+use crate::managed::fs::{ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents};
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use futures_util::StreamExt;

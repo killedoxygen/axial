@@ -1,5 +1,5 @@
 use crate::loaders::types::LoaderError;
-use crate::managed_fs::{
+use crate::managed::fs::{
     ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard, ManagedPersistentFile,
 };
 use crate::portable_path::PortableFileName;
@@ -650,7 +650,7 @@ mod tests {
         settled_terminal_shape_is_valid, valid_publication_nonce, valid_publication_sha1,
         validate_existing_managed_target_path,
     };
-    use crate::managed_fs::ManagedDir;
+    use crate::managed::fs::ManagedDir;
     use serde::{Deserialize, Serialize};
     use sha1::{Digest as _, Sha1};
     use std::ffi::OsString;

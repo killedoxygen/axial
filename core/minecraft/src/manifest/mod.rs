@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::http;
-use crate::managed_fs::{ManagedDir, ManagedFileGuard, ManagedLibraryOperation};
+use crate::managed::fs::{ManagedDir, ManagedFileGuard, ManagedLibraryOperation};
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const MANIFEST_CACHE_NAME: &str = "version_manifest_v2.json";
@@ -380,7 +380,7 @@ fn parse_manifest_body(data: &[u8]) -> Result<VersionManifest, String> {
 mod tests {
     use super::*;
     use crate::http::test_server::{response, serve};
-    use crate::managed_fs::ManagedLibraryRoot;
+    use crate::managed::fs::ManagedLibraryRoot;
     use std::fs;
     use std::path::{Path, PathBuf};
 

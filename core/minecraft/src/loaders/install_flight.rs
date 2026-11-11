@@ -1,5 +1,5 @@
 use crate::loaders::types::LoaderError;
-use crate::managed_fs::{ManagedDir, ManagedLibraryOperation};
+use crate::managed::fs::{ManagedDir, ManagedLibraryOperation};
 use crate::portable_path::PortableFileName;
 
 const MAX_LIVE_LOADER_INSTALL_FLIGHTS: usize = 64;
@@ -39,7 +39,7 @@ impl InstallFlightGuard {
 mod tests {
     use super::acquire;
     use crate::loaders::types::LoaderError;
-    use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryRoot};
+    use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryRoot};
     use crate::portable_path::PortableFileName;
     use std::fs;
     use std::sync::Arc;

@@ -59,7 +59,7 @@ pub use types::{
 
 use crate::download::DownloadProgress;
 use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
-use crate::managed_fs::ManagedLibraryOperation;
+use crate::managed::fs::ManagedLibraryOperation;
 use crate::portable_path::{MAX_PORTABLE_FILE_NAME_BYTES, PortableFileName};
 use crate::runtime::ManagedRuntimeCache;
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_PORTABLE_FILE_NAME_BYTES - ".json".len();
@@ -358,7 +358,7 @@ mod tests {
         };
 
         let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
-        let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+        let managed_root = crate::managed::fs::ManagedLibraryRoot::open_for_test(&root)
             .expect("managed library root");
         let operation = managed_root
             .try_acquire()

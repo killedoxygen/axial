@@ -27,9 +27,9 @@ use crate::loaders::{
     LoaderInstallBaseCommit, LoaderInstallContinuation, LoaderInstallPlan, LoaderInstallSource,
     LoaderInstallStrategy, LoaderInstallability,
 };
-use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
-use crate::managed_fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
-use crate::managed_publication::ManagedRootPublicationLease;
+use crate::managed::blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
+use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
+use crate::managed::publication::ManagedRootPublicationLease;
 use crate::manifest::VersionManifest;
 use crate::paths::{assets_dir, versions_dir};
 use crate::rules::Environment;
@@ -1418,7 +1418,7 @@ async fn behavior_contract_normal_install_settles_assets_rollback() {
     .with_test_asset_object_base_url(fixture.object_base_url.clone());
     roll_back_managed_install_component_after_first_row_for_test(
         version_id,
-        crate::managed_component_table::ManagedComponentKind::Assets,
+        crate::managed::component::table::ManagedComponentKind::Assets,
     );
 
     let mut progress_events = Vec::new();
@@ -1465,7 +1465,7 @@ async fn behavior_contract_normal_install_settles_libraries_rollback() {
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
     roll_back_managed_install_component_after_first_row_for_test(
         version_id,
-        crate::managed_component_table::ManagedComponentKind::Libraries,
+        crate::managed::component::table::ManagedComponentKind::Libraries,
     );
 
     let error = timeout(
@@ -2678,7 +2678,7 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
     let root = temp_dir("install-version-future-size");
     let runtime_cache =
         crate::ManagedRuntimeCache::isolated_for_test().expect("isolated downloader runtime cache");
-    let managed_root = crate::managed_fs::ManagedLibraryRoot::open_for_test(&root)
+    let managed_root = crate::managed::fs::ManagedLibraryRoot::open_for_test(&root)
         .expect("managed test library root");
     let operation = managed_root
         .try_acquire()
@@ -2707,7 +2707,7 @@ async fn virtual_asset_tree_replaces_stale_copies_and_publishes_missing_ones() {
         "sounds/hit.ogg": { "hash": second_hash, "size": second.len() }
     }));
     let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+        crate::managed::fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
     let operation = managed_root.try_acquire().expect("managed operation");
 
     materialize_virtual_assets(&operation, "legacy", &assets)
@@ -2729,7 +2729,7 @@ async fn virtual_asset_tree_refuses_a_missing_source_object() {
     }));
     fs::create_dir_all(root.join("assets/objects")).expect("objects root");
     let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+        crate::managed::fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
     let operation = managed_root.try_acquire().expect("managed operation");
 
     let result = materialize_virtual_assets(&operation, "legacy", &assets).await;
@@ -2749,7 +2749,7 @@ fn managed_streamed_copy_rejects_changed_source_without_publishing_destination()
     let root = temp_dir("streamed-copy-source-change");
     fs::create_dir_all(&root).expect("create library root");
     let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+        crate::managed::fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
     let operation = managed_root.try_acquire().expect("managed operation");
     let managed = operation
         .managed_directory()
@@ -2810,7 +2810,7 @@ async fn virtual_asset_tree_preserves_a_wrong_kind_destination() {
     let destination = root.join("assets/virtual/legacy/sounds/step.ogg");
     fs::create_dir_all(&destination).expect("wrong-kind destination");
     let managed_root =
-        crate::managed_fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
+        crate::managed::fs::ManagedLibraryRoot::open_for_test(&root).expect("managed library root");
     let operation = managed_root.try_acquire().expect("managed operation");
 
     assert!(

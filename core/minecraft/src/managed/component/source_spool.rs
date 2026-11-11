@@ -1,4 +1,4 @@
-use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedCancellation};
+use crate::managed::blocking::{ManagedBlockingCheckpoint, ManagedCancellation};
 use sha1::{Digest as _, Sha1};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -449,7 +449,7 @@ mod tests {
         spool: &Arc<RetainedComponentSourceSpool>,
         bytes: &[u8],
     ) -> RetainedComponentSourceAllocation {
-        let cancellation = crate::managed_blocking::ManagedBlockingWorkers::new().cancellation();
+        let cancellation = crate::managed::blocking::ManagedBlockingWorkers::new().cancellation();
         spool
             .append_authenticated(
                 Cursor::new(bytes),
@@ -495,7 +495,7 @@ mod tests {
         let first_allocation = append(&spool, first);
         let available = spool.available_bytes();
 
-        let cancellation = crate::managed_blocking::ManagedBlockingWorkers::new().cancellation();
+        let cancellation = crate::managed::blocking::ManagedBlockingWorkers::new().cancellation();
         assert!(matches!(
             spool.append_authenticated(
                 Cursor::new(tail),
@@ -592,7 +592,7 @@ mod tests {
 
         assert!(first_reader.read(&mut [0]).is_err());
         assert!(second_allocation.into_reader().is_err());
-        let cancellation = crate::managed_blocking::ManagedBlockingWorkers::new().cancellation();
+        let cancellation = crate::managed::blocking::ManagedBlockingWorkers::new().cancellation();
         assert!(matches!(
             spool.append_authenticated(
                 Cursor::new(later),

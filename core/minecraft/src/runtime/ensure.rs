@@ -152,8 +152,8 @@ impl RuntimeMaterializationTaskControl {
 
 pub(crate) struct ProcessorRuntime {
     probe_receipt: JavaProbeReceipt,
-    install_directory: crate::managed_fs::ManagedDir,
-    program_guard: crate::managed_fs::ManagedExecutableGuard,
+    install_directory: crate::managed::fs::ManagedDir,
+    program_guard: crate::managed::fs::ManagedExecutableGuard,
     program_path: PathBuf,
     _source_receipt: RuntimeSourceReceipt,
 }
@@ -203,7 +203,7 @@ impl ProcessorRuntime {
 pub(crate) async fn materialize_ephemeral_processor_runtime(
     java_version: &JavaVersion,
     source_receipt: RuntimeSourceReceipt,
-    install_directory: &crate::managed_fs::ManagedDir,
+    install_directory: &crate::managed::fs::ManagedDir,
     max_entries: usize,
     max_bytes: u64,
 ) -> Result<ProcessorRuntime, JavaRuntimeLookupError> {
@@ -302,9 +302,9 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
 }
 
 fn admit_processor_program(
-    install_directory: &crate::managed_fs::ManagedDir,
+    install_directory: &crate::managed::fs::ManagedDir,
     program: &Path,
-) -> Result<crate::managed_fs::ManagedExecutableGuard, JavaRuntimeLookupError> {
+) -> Result<crate::managed::fs::ManagedExecutableGuard, JavaRuntimeLookupError> {
     let root = install_directory.path();
     install_directory
         .validate_absolute_projection(root)

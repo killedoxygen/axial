@@ -3,8 +3,8 @@ use super::install::{
     ManagedInstallDurableRecoveryState, ManagedInstallPublicationSeed,
 };
 use crate::known_good::KnownGoodReconstructionReceipt;
-use crate::managed_fs::ManagedLibraryOperation;
-use crate::managed_publication::ManagedRootPublicationLease;
+use crate::managed::fs::ManagedLibraryOperation;
+use crate::managed::publication::ManagedRootPublicationLease;
 use crate::portable_path::PortableRelativePath;
 use crate::runtime::RuntimeSourceFailure;
 use crate::version_bundle_publication::VersionBundleTransactionRecovery;

@@ -7030,7 +7030,7 @@ mod library_lifecycle_tests {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "managed_fs::library_lifecycle_tests::guarded_sha1_allows_concurrent_manifest_publication",
+                    "managed::fs::library_lifecycle_tests::guarded_sha1_allows_concurrent_manifest_publication",
                     "--nocapture",
                 ])
                 .env(CHILD_ROOT, temporary.path())

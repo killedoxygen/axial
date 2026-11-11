@@ -1,4 +1,4 @@
-use crate::managed_component_table::{
+use crate::managed::component::table::{
     COMPONENT_TABLE_HEADER_BYTES, COMPONENT_TABLE_ROW_PREFIX_BYTES, COMPONENT_TABLE_ROWS_PER_SHARD,
     ComponentIntentManifest, ComponentShardDescriptor, MAX_COMPONENT_PATH_BYTES,
     encode_component_intent_manifest, expected_shard_count,
@@ -11,8 +11,8 @@ const MAX_COMPONENT_ENCODED_ROW_BYTES: usize =
     COMPONENT_TABLE_ROW_PREFIX_BYTES + MAX_COMPONENT_PATH_BYTES + 28;
 #[cfg(test)]
 pub(crate) const MAX_COMPONENT_TABLE_SPOOL_BYTES: usize =
-    crate::managed_component_table::MAX_COMPONENT_TABLE_SHARDS * COMPONENT_TABLE_HEADER_BYTES
-        + crate::managed_component_table::MAX_COMPONENT_TABLE_ROWS
+    crate::managed::component::table::MAX_COMPONENT_TABLE_SHARDS * COMPONENT_TABLE_HEADER_BYTES
+        + crate::managed::component::table::MAX_COMPONENT_TABLE_ROWS
             * MAX_COMPONENT_ENCODED_ROW_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -281,7 +281,7 @@ mod tests {
 
     fn manifest(descriptors: Vec<ComponentShardDescriptor>) -> ComponentIntentManifest {
         ComponentIntentManifest {
-            component: crate::managed_component_table::ManagedComponentKind::Assets,
+            component: crate::managed::component::table::ManagedComponentKind::Assets,
             total_rows: descriptors
                 .iter()
                 .map(|descriptor| descriptor.row_count)
@@ -405,13 +405,13 @@ mod tests {
 
     #[test]
     fn declared_bounds_are_exact_without_allocating_the_aggregate_maximum() {
-        let unused_tail_rows = crate::managed_component_table::MAX_COMPONENT_TABLE_SHARDS
+        let unused_tail_rows = crate::managed::component::table::MAX_COMPONENT_TABLE_SHARDS
             * COMPONENT_TABLE_ROWS_PER_SHARD
-            - crate::managed_component_table::MAX_COMPONENT_TABLE_ROWS;
+            - crate::managed::component::table::MAX_COMPONENT_TABLE_ROWS;
         assert_eq!(
             MAX_COMPONENT_TABLE_SPOOL_BYTES,
-            crate::managed_component_table::MAX_COMPONENT_TABLE_SHARDS
-                * crate::managed_component_table::MAX_COMPONENT_TABLE_SHARD_BYTES
+            crate::managed::component::table::MAX_COMPONENT_TABLE_SHARDS
+                * crate::managed::component::table::MAX_COMPONENT_TABLE_SHARD_BYTES
                 - unused_tail_rows * MAX_COMPONENT_ENCODED_ROW_BYTES
         );
         assert_eq!(MAX_COMPONENT_TABLE_SPOOL_BYTES, 116_856_304);

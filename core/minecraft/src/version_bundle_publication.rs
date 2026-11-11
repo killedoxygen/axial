@@ -10,12 +10,12 @@ use crate::known_good::{
 };
 use crate::loaders::LoaderError;
 #[cfg(test)]
-use crate::managed_fs::ManagedCreateOnlyWriteFault;
-use crate::managed_fs::{
+use crate::managed::fs::ManagedCreateOnlyWriteFault;
+use crate::managed::fs::{
     ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard,
     ManagedFileIdentity, ManagedGuardedFileMoveFailure,
 };
-use crate::managed_publication::{
+use crate::managed::publication::{
     ManagedCanonicalState, ManagedPriorFingerprint as PriorFingerprint,
     ManagedPublicationDataError, ManagedRootPublicationLease, ManagedTargetPathError,
     authenticate_guarded_publication_file, bounded_marker_bytes, committed_terminal_shape_is_valid,
@@ -1817,7 +1817,7 @@ fn validate_existing_portable_paths(
     fingerprints: &[EntryFingerprint],
 ) -> Result<(), VersionBundleTransactionError> {
     for fingerprint in fingerprints {
-        if let Err(error) = crate::managed_publication::validate_existing_managed_target_path(
+        if let Err(error) = crate::managed::publication::validate_existing_managed_target_path(
             root,
             fingerprint.root.directory_name(),
             fingerprint.path.as_str(),
@@ -4228,7 +4228,7 @@ fn cleanup_settled_lane_contents(
 }
 
 fn publication_as_loader(
-    error: crate::managed_publication::ManagedPublicationError,
+    error: crate::managed::publication::ManagedPublicationError,
 ) -> LoaderError {
     LoaderError::Verify(error.to_string())
 }

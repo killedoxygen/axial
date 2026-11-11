@@ -1,5 +1,5 @@
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
-use crate::managed_fs::MAX_MANAGED_DIRECTORY_ENTRIES;
+use crate::managed::fs::MAX_MANAGED_DIRECTORY_ENTRIES;
 use crate::portable_path::{
     MAX_PORTABLE_RELATIVE_PATH_BYTES, PortablePathKey, PortableRelativePath,
 };
