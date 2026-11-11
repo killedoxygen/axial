@@ -494,12 +494,12 @@ fn instance_intent_evidence(storage: &MetadataStore) -> [Vec<Vec<SqlValue>>; 3] 
 }
 
 #[tokio::test]
-async fn interrupted_external_creation_blocks_reset_but_allows_preserved_exit() {
+async fn interrupted_external_creation_blocks_update_but_allows_preserved_exit() {
     disconnected_instance_intent(false).await;
 }
 
 #[tokio::test]
-async fn interrupted_external_deletion_blocks_reset_but_allows_preserved_exit() {
+async fn interrupted_external_deletion_blocks_update_but_allows_preserved_exit() {
     disconnected_instance_intent(true).await;
 }
 
@@ -611,7 +611,7 @@ async fn disconnected_instance_intent(deletion: bool) {
     assert!(!services.instances.has_unsettled_effects());
     let pending_deletions = services.instances.pending_deletions().unwrap();
     assert_eq!(pending_deletions.len(), usize::from(deletion));
-    assert!(services.server.recovery().ensure_reset_allowed().is_err());
+    assert!(services.server.recovery().ensure_update_allowed().is_err());
     assert!(!services.server.is_shutdown_settled());
     assert!(get(&services, "status").await.status().is_success());
     assert_eq!(
@@ -672,7 +672,7 @@ async fn disconnected_instance_intent(deletion: bool) {
             DeletionStatus::Aborted
         );
     }
-    assert!(recovered.server.recovery().ensure_reset_allowed().is_ok());
+    assert!(recovered.server.recovery().ensure_update_allowed().is_ok());
     let instances: Value = get(&recovered, "instances")
         .await
         .error_for_status()
@@ -820,7 +820,7 @@ async fn pending_external_instance_exit_helper() {
     );
     assert!(services.instances.has_pending_intents());
     assert!(services.instances.has_unsettled_effects());
-    assert!(services.server.recovery().ensure_reset_allowed().is_err());
+    assert!(services.server.recovery().ensure_update_allowed().is_err());
     // The injected database refusal retains the effect; this later exit loses its owner.
     std::process::exit(PENDING_INSTANCE_EXIT);
 }
@@ -919,7 +919,7 @@ fn content_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     tree
 }
 
-async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, bool, bool, bool) {
+async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, bool, bool) {
     let read = get(services, &format!("instances/{id}/content"))
         .await
         .status()
@@ -940,7 +940,6 @@ async fn content_fence(services: &DesktopServices, id: &InstanceId) -> (u16, boo
     (
         read,
         refused,
-        services.server.recovery().ensure_reset_allowed().is_err(),
         services.server.recovery().ensure_update_allowed().is_err(),
     )
 }
@@ -973,12 +972,12 @@ async fn cleanup_refused_content_exit(services: DesktopServices) {
 }
 
 #[tokio::test]
-async fn interrupted_content_blocks_reset_but_allows_preserved_exit() {
+async fn interrupted_content_blocks_update_but_allows_preserved_exit() {
     interrupted_content_exit(ContentExit::Acknowledgement).await;
 }
 
 #[tokio::test]
-async fn interrupted_queued_content_blocks_reset_but_allows_preserved_exit() {
+async fn interrupted_queued_content_blocks_update_but_allows_preserved_exit() {
     interrupted_content_exit(ContentExit::QueuedAcknowledgement).await;
 }
 
@@ -1118,7 +1117,7 @@ async fn interrupted_content_exit(boundary: ContentExit) {
         let shutdown = services.server.shutdown().await;
         let shutdown_settled = services.server.is_shutdown_settled();
         let joined = services.tasks.shutdown_receipt().is_some();
-        let reset_refused = services.server.recovery().ensure_reset_settled().is_err();
+        let update_refused = services.server.recovery().ensure_update_allowed().is_err();
         let queue_after = content_queue_rows(services.instances.registry().storage(), true);
         let queue_after_status = services.installs.snapshot().active.map(|active| {
             (
@@ -1150,7 +1149,7 @@ async fn interrupted_content_exit(boundary: ContentExit) {
                 joined,
                 http_closed,
                 idle,
-                reset_refused,
+                update_refused,
             ),
             (before, after, preserved),
             (before_fence, after_fence),
@@ -1163,7 +1162,7 @@ async fn interrupted_content_exit(boundary: ContentExit) {
     assert_eq!(content_receipt(&storage, &id), receipt);
     assert_eq!(content_tree(&payload), tree);
     for (
-        (shutdown, settled, joined, http_closed, idle, reset_refused),
+        (shutdown, settled, joined, http_closed, idle, update_refused),
         (before, after, preserved),
         (before_fence, after_fence),
         (settle_status, settle_body),
@@ -1196,13 +1195,9 @@ async fn interrupted_content_exit(boundary: ContentExit) {
             "historical Content must permit preserve-only exit"
         );
         assert!(settled && http_closed);
-        assert!(reset_refused, "quiescent reset must retain durable Content");
+        assert!(update_refused, "quiescent update must retain durable Content");
         assert!(
             before_fence.2 && after_fence.2,
-            "destructive reset must retain the Content fence"
-        );
-        assert!(
-            before_fence.3 && after_fence.3,
             "update must retain the Content fence"
         );
     }
@@ -1240,8 +1235,7 @@ async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, o
         .status()
         .is_success();
     let admitted = services.instances.directories().admit(id).map(drop).is_ok();
-    let destructive_allowed = services.server.recovery().ensure_reset_allowed().is_ok()
-        && services.server.recovery().ensure_update_allowed().is_ok();
+    let update_allowed = services.server.recovery().ensure_update_allowed().is_ok();
     let fresh = if receipt_absent && admitted {
         let content =
             ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap();
@@ -1285,8 +1279,8 @@ async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, o
         body,
         json!({"error":"content operation was cancelled before publication"})
     );
-    assert_eq!(before_fence, (503, true, true, true));
-    assert!(receipt_absent && readable && admitted && destructive_allowed);
+    assert_eq!(before_fence, (503, true, true));
+    assert!(receipt_absent && readable && admitted && update_allowed);
     assert_eq!(restored, original);
     let fresh = fresh
         .expect("settled instance must admit a fresh installation")

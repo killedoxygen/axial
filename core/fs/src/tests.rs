@@ -4521,26 +4521,6 @@ fn directory_move_is_no_replace_and_collision_is_no_effect() {
     assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
 }
 
-#[test]
-fn root_clear_retains_the_lease_until_release() {
-    let temporary = crate::test_tempdir().expect("temporary root");
-    std::fs::write(temporary.path().join("owned.bin"), b"owned").expect("owned file");
-    let session = acquire_test_root(temporary.path());
-    let reset = match session.begin_reset() {
-        ResetStartOutcome::Ready(authority) => authority,
-        outcome => panic!("reset did not become ready: {outcome:?}"),
-    };
-    reset.try_clear_root(&[]).expect("root clear");
-    assert!(!temporary.path().join("owned.bin").exists());
-    assert!(temporary.path().join(ROOT_LEASE_NAME).is_file());
-    assert!(matches!(
-        RootSession::acquire(temporary.path()),
-        RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
-    ));
-    reset.release().expect("release reset authority");
-    drop(acquire_test_root(temporary.path()));
-}
-
 #[cfg(unix)]
 #[test]
 fn retained_root_lease_rejects_a_new_hardlink_before_identity_read() {
@@ -6504,62 +6484,6 @@ fn root_lease_rejects_links_and_non_files_without_mutating_them() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn root_clear_refuses_a_replaced_lease_binding_before_deleting_children() {
-    let temporary = crate::test_tempdir().expect("temporary root");
-    let owned = temporary.path().join("owned.bin");
-    let lease = temporary.path().join(ROOT_LEASE_NAME);
-    let displaced = temporary.path().join("displaced-lease");
-    std::fs::write(&owned, b"owned").expect("owned file");
-    let session = acquire_test_root(temporary.path());
-    let reset = match session.begin_reset() {
-        ResetStartOutcome::Ready(authority) => authority,
-        outcome => panic!("reset did not become ready: {outcome:?}"),
-    };
-    std::fs::rename(&lease, &displaced).expect("displace retained lease");
-    std::fs::write(&lease, b"replacement").expect("replacement lease");
-
-    reset
-        .try_clear_root(&[])
-        .expect_err("clear accepted a replaced lease binding");
-    assert!(owned.is_file(), "clear mutated children before lease proof");
-    std::fs::remove_file(&lease).expect("remove replacement lease");
-    std::fs::rename(&displaced, &lease).expect("restore retained lease");
-    reset
-        .try_clear_root(&[])
-        .expect("clear recovers after lease restoration");
-    assert!(!owned.exists());
-    reset.release().expect("release reset authority");
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_exclusive_lease_prevents_substitution_before_root_clear() {
-    let temporary = crate::test_tempdir().expect("temporary root");
-    let owned = temporary.path().join("owned.bin");
-    let lease = temporary.path().join(ROOT_LEASE_NAME);
-    let displaced = temporary.path().join("displaced-lease");
-    std::fs::write(&owned, b"owned").expect("owned file");
-    let session = acquire_test_root(temporary.path());
-
-    std::fs::rename(&lease, &displaced)
-        .expect_err("exclusive lease must prevent pre-clear displacement");
-    File::create(&lease).expect_err("exclusive lease must prevent pre-clear substitution");
-    assert!(
-        owned.is_file(),
-        "denied substitution must not mutate children"
-    );
-
-    let reset = match session.begin_reset() {
-        ResetStartOutcome::Ready(authority) => authority,
-        outcome => panic!("reset did not become ready: {outcome:?}"),
-    };
-    reset.try_clear_root(&[]).expect("ordinary root clear");
-    assert!(!owned.exists());
-    reset.release().expect("release reset authority");
-}
-
 #[test]
 fn directory_overlaps_compares_independent_roots_and_retained_children() {
     let temporary = crate::test_tempdir().expect("temporary parent");
@@ -7854,40 +7778,6 @@ fn file_revision_observation_holds_admission_until_joined() {
 }
 
 #[test]
-fn file_revision_observation_blocks_reset_until_joined() {
-    for external in [false, true] {
-        let (_temporary, session, root, root_path) = observation_fixture(external);
-        let name = LeafName::new("sample.bin").unwrap();
-        let expected = root
-            .open_file(&name)
-            .unwrap()
-            .revision()
-            .unwrap()
-            .observation();
-        let (ready, release, observing) = paused_file_observation(&root, &name, &expected);
-        let opened = ready.recv_timeout(std::time::Duration::from_secs(5));
-        let outcome = session.begin_reset();
-        let _ = release.try_send(());
-        let observed = observing.join();
-        let refusal = match outcome {
-            ResetStartOutcome::Refused(refusal) => refusal,
-            other => panic!("live observation did not retain reset: {other:?}"),
-        };
-        let kind = refusal.error().kind();
-        let session = refusal.cancel_reset();
-        drop(root);
-        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
-        opened.unwrap();
-        observed.unwrap().unwrap();
-        assert_eq!(kind, io::ErrorKind::WouldBlock);
-        assert_eq!(
-            std::fs::read(root_path.join("sample.bin")).unwrap(),
-            b"sample"
-        );
-    }
-}
-
-#[test]
 fn revision_reader_operation_blocks_revocation_until_finish() {
     let temporary = crate::test_tempdir().expect("temporary root");
     std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
@@ -7909,31 +7799,6 @@ fn revision_reader_operation_blocks_revocation_until_finish() {
     let file = reader.finish().expect("stable reader finish");
     drop((file, root));
     assert!(matches!(refusal.retry(), RootRevokeOutcome::Revoked));
-}
-
-#[test]
-fn revision_reader_operation_blocks_reset_until_cancel() {
-    let temporary = crate::test_tempdir().expect("temporary root");
-    std::fs::write(temporary.path().join("sample.bin"), b"abcdef").expect("sample file");
-    let session = acquire_test_root(temporary.path());
-    let root = session.root().expect("root capability");
-    let file = root
-        .open_file(&LeafName::new("sample.bin").expect("sample leaf"))
-        .expect("sample capability");
-    let revision = file.revision().expect("sample revision");
-    let reader = file
-        .into_revision_reader(revision, 6)
-        .expect("owned revision reader");
-
-    let refusal = match session.begin_reset() {
-        ResetStartOutcome::Refused(failure) => failure,
-        outcome => panic!("live reader operation did not block reset: {outcome:?}"),
-    };
-    assert_eq!(refusal.error().kind(), io::ErrorKind::WouldBlock);
-    let (file, revision) = reader.cancel();
-    let session = refusal.cancel_reset();
-    drop((file, revision, root));
-    assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
 }
 
 #[test]

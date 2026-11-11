@@ -1165,13 +1165,6 @@ impl ResetStartFailure {
             .expect("reset start refusal retains session")
             .begin_reset()
     }
-
-    #[cfg(test)]
-    pub(crate) fn cancel_reset(mut self) -> RootSession {
-        self.session
-            .take()
-            .expect("reset start refusal retains session")
-    }
 }
 
 impl_error_accessor!(ResetStartFailure);
@@ -1226,13 +1219,6 @@ pub struct RootResetAuthority {
 impl_redacted_debug!(RootResetAuthority);
 
 impl RootResetAuthority {
-    pub fn root_identity(&self) -> DirectoryIdentity {
-        self.session
-            .as_ref()
-            .expect("reset session is retained")
-            .root_identity
-    }
-
     pub(crate) fn try_clear_root(
         &self,
         preserved: &[(&OsStr, platform::Identity)],

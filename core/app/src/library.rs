@@ -1200,17 +1200,6 @@ impl LibraryLifecycle {
         .map_err(|_| LibraryError::DrainTimeout)
     }
 
-    /// A replayed reset fence blocks metadata/services but grants no deletion
-    /// authority. Native startup must obtain a fresh explicit confirmation.
-    pub fn interrupted_root_reset(&self) -> Result<bool, LibraryError> {
-        let session = lock(&self.inner.application.session);
-        session
-            .as_ref()
-            .ok_or(LibraryError::Closed)?
-            .interrupted_reset(&crate::profile::marker_name())
-            .map_err(LibraryError::Files)
-    }
-
     /// Transfer only after every application owner drains. Any failure leaves
     /// the exact session here so the caller can retain and retry preservation.
     pub fn take_reset_session(&self) -> Result<RootSession, LibraryError> {
@@ -1525,16 +1514,6 @@ mod tests {
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
     }
 
-    fn clear_application_root(owner: &LibraryLifecycle, root: &Path) {
-        std::fs::write(root.join("reset-anchor"), b"reset").unwrap();
-        let mut reset = axial_fs::PendingRootReset::new(
-            owner.take_reset_session().unwrap(),
-            axial_fs::LeafName::new("reset-anchor").unwrap(),
-            b"reset".to_vec(),
-        );
-        reset.try_clear().unwrap();
-    }
-
     fn open(path: &Path) -> LibraryLifecycle {
         match LibraryLifecycle::open(path) {
             LibraryOpenOutcome::Ready(owner) => owner,
@@ -1772,26 +1751,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_external_selection_reset_clears_only_the_application_root() {
-        let application = temporary();
-        let external = temporary();
-        save_existing(application.path(), external.path(), LibraryId::new());
-        std::fs::write(external.path().join("user-file.txt"), b"untouched").unwrap();
-        let owner = open(application.path());
-        let managed_id = owner.snapshot().current.unwrap().library_id;
-        owner.restore_startup_selection(managed_id).unwrap();
-        owner.close_admission();
-        clear_application_root(&owner, application.path());
-        assert!(!application.path().join("library.json").exists());
-        assert_eq!(
-            std::fs::read(external.path().join("user-file.txt")).unwrap(),
-            b"untouched"
-        );
-        let reopened = open(external.path());
-        revoke(&reopened);
-    }
-
-    #[test]
     fn switch_closes_admission_but_retains_old_pins() {
         let directory = temporary();
         let owner = open(directory.path());
@@ -1837,32 +1796,6 @@ mod tests {
         ));
         assert!(matches!(owner.admit(), Err(LibraryError::Closed)));
         revoke(&owner);
-    }
-
-    #[tokio::test]
-    async fn reset_waits_for_escaped_pin_and_keeps_root_untouched() {
-        let directory = temporary();
-        std::fs::write(directory.path().join("valuable.txt"), b"kept until reset").unwrap();
-        let owner = open(directory.path());
-        let escaped = owner.admit().unwrap();
-        owner.close_admission();
-        assert!(matches!(
-            owner.take_reset_session(),
-            Err(LibraryError::RetirementPending)
-        ));
-        assert!(matches!(
-            owner.wait_for_pins(Duration::from_millis(1)).await,
-            Err(LibraryError::DrainTimeout)
-        ));
-        assert_eq!(
-            std::fs::read(directory.path().join("valuable.txt")).unwrap(),
-            b"kept until reset"
-        );
-        escaped.revalidate().unwrap();
-        drop(escaped);
-        owner.wait_for_pins(Duration::from_secs(1)).await.unwrap();
-        clear_application_root(&owner, directory.path());
-        assert!(!directory.path().join("valuable.txt").exists());
     }
 
     #[test]

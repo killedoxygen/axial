@@ -1495,36 +1495,6 @@ fn prove_root_anchors(root: &RootGuard, anchors: &[(&OsStr, Identity)]) -> io::R
     Ok(())
 }
 
-pub(crate) fn lease_identity_witness(lease: &LeaseHandle) -> [u8; 32] {
-    identity_witness(lease.identity)
-}
-
-pub(crate) fn finish_root_reset(
-    root: &RootGuard,
-    lease: &LeaseHandle,
-    marker: (&OsStr, Identity),
-    intent: (&OsStr, Identity, &File),
-) -> io::Result<()> {
-    validate_root(root)?;
-    validate_lease(lease)?;
-    let anchors = [(lease.name.as_os_str(), lease.identity), marker];
-    match entry_observation(&root.handle, intent.0)? {
-        Some((EntryKind::File, identity)) if identity == intent.1 => {
-            prove_root_children_cleared(
-                root,
-                lease,
-                &[anchors[0], anchors[1], (intent.0, intent.1)],
-            )?;
-            sync_directory(&root.handle)?;
-            remove_tree_leaf(&root.handle, intent.0, EntryKind::File, intent.1)?;
-        }
-        None if retained_file_identity(intent.2)? == (intent.1, 0) => {}
-        _ => return Err(binding_changed("reset intent changed before completion")),
-    }
-    sync_directory(&root.handle)?;
-    prove_root_children_cleared(root, lease, &anchors)
-}
-
 pub(crate) fn directory_identity(handle: &DirectoryHandle) -> io::Result<Identity> {
     let stat = rfs::fstat(handle)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {

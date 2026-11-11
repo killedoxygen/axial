@@ -1,5 +1,5 @@
 //! The isolated replacement profile: path admission, its identity marker and
-//! the recovery obligations that refuse destructive reset or update.
+//! the recovery obligations that refuse an update.
 use crate::{
     content::install::ContentMutations,
     install::queue::InstallQueue,
@@ -8,10 +8,9 @@ use crate::{
     performance::PerformanceService,
     public::DEVELOPMENT_APPLICATION_ID,
     resources::ResourceService,
-    tasks::TaskOwner,
 };
 use axial_fs::{
-    Directory, FileCreateOutcome, FileCreateResolution, LeafName, Outcome, Resolution, RootSession,
+    Directory, FileCreateOutcome, FileCreateResolution, LeafName, Outcome, Resolution,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -45,7 +44,7 @@ pub fn marker_name() -> LeafName {
 }
 
 /// Refuses filesystem roots and any path inside an installed application's data.
-pub fn independent(root: &Path) -> bool {
+fn independent(root: &Path) -> bool {
     root.is_absolute()
         && root.parent().is_some()
         && !root.components().any(|part| {
@@ -56,18 +55,12 @@ pub fn independent(root: &Path) -> bool {
 }
 
 /// Read and validate the marker through the retained application root.
-pub fn marker(pin: &ApplicationRootPin) -> io::Result<Vec<u8>> {
+fn marker(pin: &ApplicationRootPin) -> io::Result<Vec<u8>> {
     pin.read_projection()?;
-    read_marker(&pin.directory()?)
-}
-
-/// Read and validate the marker of an already admitted root session.
-pub fn session_marker(session: &RootSession) -> io::Result<Vec<u8>> {
-    read_marker(&session.root()?)
-}
-
-fn read_marker(root: &Directory) -> io::Result<Vec<u8>> {
-    let bytes = root.open_file(&marker_name())?.read_bounded(MARKER_LIMIT)?;
+    let bytes = pin
+        .directory()?
+        .open_file(&marker_name())?
+        .read_bounded(MARKER_LIMIT)?;
     identity(&bytes)
         .map(|_| bytes)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "profile marker is invalid"))
@@ -196,12 +189,11 @@ fn publish_marker(root: &Directory, bytes: &[u8]) -> Result<(), &'static str> {
     }
 }
 
-/// Unsettled effects and recovery intents that a reset would discard or an
-/// update would strand. Each check reads its owner's current state.
+/// Unsettled effects and recovery intents that an update would strand. Each
+/// check reads its owner's current state.
 #[derive(Clone)]
 pub struct Recovery {
     pub library: LibraryLifecycle,
-    pub tasks: TaskOwner,
     pub instances: Arc<InstanceService>,
     pub installs: Arc<InstallQueue>,
     pub performance: PerformanceService,
@@ -215,28 +207,6 @@ impl Recovery {
         self.library.ensure_no_interrupted_launch().map_err(|_| {
             "A previous game process has not been proven settled. The local API remains available."
         })
-    }
-
-    pub fn ensure_reset_allowed(&self) -> Result<(), &'static str> {
-        self.ensure_no_interrupted_launch()?;
-        if self.instances.has_pending_intents() {
-            return Err("Reset is blocked while instance changes still require recovery.");
-        }
-        if self.tasks.status().is_idle() && self.content.has_unsettled_effects() {
-            return Err("Reset is blocked while content changes still require recovery.");
-        }
-        Ok(())
-    }
-
-    pub fn ensure_reset_settled(&self) -> Result<(), &'static str> {
-        self.ensure_reset_allowed()?;
-        if self.tasks.shutdown_receipt().is_none()
-            || self.content.has_unsettled_effects()
-            || self.installs.has_unsettled_effects()
-        {
-            return Err("Reset is blocked while file changes still require recovery.");
-        }
-        Ok(())
     }
 
     pub fn ensure_update_allowed(&self) -> Result<(), &'static str> {

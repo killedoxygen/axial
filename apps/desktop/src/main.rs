@@ -114,15 +114,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         native_content::NativeContentFiles::new(services.library.clone(), services.tasks.clone());
     let lifecycle = DesktopLifecycle::new(&services, presence, skin_files.clone());
     #[cfg(debug_assertions)]
-    let reset = match reset::NativeReset::new(services.library.clone(), services.tasks.clone()) {
-        Ok(reset) => reset,
-        Err(error) => {
-            services.telemetry.report_startup_failure();
-            lifecycle.shutdown_after_event_loop().await;
-            let message = startup::report(context, error.into()).await;
-            return Err(std::io::Error::other(message).into());
-        }
-    };
+    let reset = reset::NativeReset::new(services.library.clone());
     let transport = services.server.bootstrap();
     if let Err(error) = bootstrap::confine_content_policy(context.config_mut(), &transport.base_url)
     {
@@ -321,8 +313,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         services.telemetry.report_startup_failure();
     }
     lifecycle.shutdown_after_event_loop().await;
-    #[cfg(debug_assertions)]
-    reset.quiesce_after_exit().await;
     let observer = lock(&api_observer).take();
     if let Some(observer) = observer {
         let _ = observer.await;
@@ -331,20 +321,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         lifecycle.release_services_after_exit()
     })
     .await;
-    #[cfg(debug_assertions)]
-    let pending_reset = reset.take_after_exit();
     let restart_after_exit = lifecycle.restart_after_exit();
     // Managed native facades may outlive the event loop. Their shared service
     // references are now released; drop main's remaining owners before reset.
     drop(lifecycle);
     drop(services);
     #[cfg(debug_assertions)]
-    {
-        drop(reset);
-        if let Some(pending) = pending_reset {
-            startup::complete_reset(pending).await;
-            tauri::process::restart(&restart_environment);
-        }
+    if reset.clear_if_accepted().await {
+        tauri::process::restart(&restart_environment);
     }
     if exit_code != 0 {
         return Err(std::io::Error::other(

@@ -79,7 +79,7 @@ export function AdvancedSettingsSection(): JSX.Element {
     try {
       const { showConfirm } = await import('../../ui/Dialog');
       const confirmed = await showConfirm(
-        'Stop active work, delete this isolated Axial rewrite development profile and its managed library, then restart? The window will close while cleanup finishes. If cleanup is delayed, Axial will keep retrying before restarting. If the process stops before cleanup finishes, Axial will ask before continuing at the next startup. Other Axial profiles, external libraries and saved Microsoft system credentials are preserved.',
+        'Stop active work, delete this isolated development profile and its managed library, then restart? Other profiles, external libraries and saved Microsoft credentials are kept.',
         {
           destructive: true,
           confirmText: 'Reset',

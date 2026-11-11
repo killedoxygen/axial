@@ -4,51 +4,24 @@ use axial_api::StartupError;
 use axial_app::tasks::retry_until_settled;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tauri::{Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-
-#[derive(Default)]
-struct ResetDecision(AtomicU8);
-
-impl ResetDecision {
-    fn choose(&self, confirmed: bool) {
-        let _ = self.0.compare_exchange(
-            0,
-            if confirmed { 1 } else { 2 },
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    fn finish(&self) -> bool {
-        // An unexpected event-loop return closes the decision gate. A late
-        // callback cannot turn preservation into deletion afterward.
-        self.choose(false);
-        self.0.load(Ordering::Acquire) == 1
-    }
-}
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 struct Failure {
     message: String,
     error: Mutex<Option<StartupError>>,
-    #[cfg(debug_assertions)]
-    reset: Mutex<Option<crate::reset::PendingReset>>,
-    resetting: bool,
     safe_message: Mutex<Option<String>>,
     preserved: AtomicBool,
     attempts: AtomicU64,
 }
 
 impl Failure {
-    fn new(message: String, error: Option<StartupError>, resetting: bool) -> Self {
+    fn new(message: String, error: StartupError) -> Self {
         Self {
             message,
-            error: Mutex::new(error),
-            #[cfg(debug_assertions)]
-            reset: Mutex::new(None),
-            resetting,
+            error: Mutex::new(Some(error)),
             safe_message: Mutex::new(None),
             preserved: AtomicBool::new(false),
             attempts: AtomicU64::new(0),
@@ -59,35 +32,10 @@ impl Failure {
 pub async fn report(context: tauri::Context<tauri::Wry>, error: StartupError) -> String {
     let message = error.to_string();
     tracing::error!(error = %message, "Desktop startup failed; preserving application ownership");
-    report_failure(context, Arc::new(Failure::new(message, Some(error), false))).await
-}
-
-/// Reuse the retained retry owner after the old desktop/services have dropped.
-/// Tao permits only one event loop per process: post-exit reset stays headless,
-/// retains exact authority and logs retries until restart is safe.
-#[cfg(debug_assertions)]
-pub async fn complete_reset(pending: crate::reset::PendingReset) {
-    let failure = Failure {
-        reset: Mutex::new(Some(pending)),
-        ..Failure::new(
-            "Reset is incomplete because launcher-owned data could not be deleted. Axial will retry.".into(),
-            None,
-            true,
-        )
-    };
-    preserve(Arc::new(failure)).await;
+    report_failure(context, Arc::new(Failure::new(message, error))).await
 }
 
 async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failure>) -> String {
-    #[cfg(debug_assertions)]
-    let reset_decision = crate::lock(&failure.error)
-        .as_ref()
-        .is_some_and(StartupError::interrupted_reset)
-        .then(|| Arc::new(ResetDecision::default()));
-    #[cfg(not(debug_assertions))]
-    let reset_decision: Option<Arc<ResetDecision>> = None;
-    let setup_decision = reset_decision.clone();
-    let (callback_finished, callback_completion) = tokio::sync::oneshot::channel();
     let page_failure = failure.clone();
     let window_failure = failure.clone();
     let setup_failure = failure.clone();
@@ -108,24 +56,6 @@ async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failur
             }
         })
         .setup(move |app| {
-            if let Some(decision) = setup_decision {
-                // This is the process's first and only native event loop. No
-                // webview/storage owner is created in the interrupted profile.
-                let handle = app.handle().clone();
-                app.dialog().message("The previous development-profile reset was interrupted. The reset has not continued. Reset profile deletes the current launcher-owned files, including files added since the interruption. Preserve files closes Axial without continuing the reset.")
-                    .title("Development profile reset interrupted")
-                    .kind(MessageDialogKind::Warning)
-                    .buttons(MessageDialogButtons::OkCancelCustom("Reset profile".into(), "Preserve files".into()))
-                    .show(move |confirmed| {
-                        decision.choose(confirmed);
-                        handle.exit(1);
-                        drop(handle);
-                        // The post-loop reset waits until this callback has
-                        // released its last explicitly retained AppHandle.
-                        let _ = callback_finished.send(());
-                    });
-                return Ok(());
-            }
             // This window has no native capability or domain connection.
             let window = WebviewWindowBuilder::new(app, "startup-error", WebviewUrl::CustomProtocol(
                 tauri::Url::parse("axial-startup://localhost/").expect("fixed startup URL"),
@@ -164,30 +94,6 @@ async fn report_failure(context: tauri::Context<tauri::Wry>, failure: Arc<Failur
             return preserve(failure).await;
         }
     };
-    if let Some(decision) = reset_decision {
-        #[cfg(debug_assertions)]
-        let restart_environment = app.env();
-        app.run_return(|_, _| {});
-        #[cfg(target_os = "macos")]
-        drop(termination);
-        let confirmed = decision.finish();
-        #[cfg(debug_assertions)]
-        if confirmed && callback_completion.await.is_ok() {
-            let error = crate::lock(&failure.error).take();
-            let retained = Failure::new(
-                "Reset is incomplete. Axial will retain the profile and retry.".into(),
-                error,
-                true,
-            );
-            preserve(Arc::new(retained)).await;
-            tauri::process::restart(&restart_environment);
-        }
-        #[cfg(not(debug_assertions))]
-        let _ = (confirmed, callback_completion);
-        // Cancel, window close, UI failure and unexpected loop return preserve
-        // ownership. None can fall through to normal application startup.
-        return preserve(failure).await;
-    }
     let worker_failure = failure.clone();
     let worker = tokio::spawn(async move { preserve(worker_failure).await });
     let exit_failure = failure.clone();
@@ -245,11 +151,7 @@ async fn preserve(failure: Arc<Failure>) -> String {
     })
     .await;
     failure.preserved.store(true, Ordering::Release);
-    if failure.resetting {
-        tracing::info!("Development profile reset completed; restart is permitted");
-    } else {
-        tracing::error!(error = %message, "Startup failed; application files have been preserved");
-    }
+    tracing::error!(error = %message, "Startup failed; application files have been preserved");
     message
 }
 
@@ -293,32 +195,6 @@ fn escape_html(text: &str) -> String {
 }
 
 fn try_preserve(failure: &Failure) -> Option<String> {
-    #[cfg(debug_assertions)]
-    if failure.resetting {
-        let mut reset = crate::lock(&failure.reset);
-        if reset.is_none() {
-            let mut error = crate::lock(&failure.error);
-            if let Some(pending) = error.as_mut() {
-                match pending.take_interrupted_reset_session() {
-                    Ok(session) => {
-                        *reset = Some(crate::reset::PendingReset::from_confirmed_startup(session));
-                        error.take();
-                    }
-                    Err(_) => return None,
-                }
-            }
-        }
-        if let Some(pending) = reset.as_mut() {
-            if pending.try_clear().is_err() {
-                return None;
-            }
-            reset.take();
-            let message = "Development profile reset completed.".to_string();
-            *crate::lock(&failure.safe_message) = Some(message.clone());
-            return Some(message);
-        }
-        return crate::lock(&failure.safe_message).clone();
-    }
     let mut error = crate::lock(&failure.error);
     let Some(pending) = error.take() else {
         return crate::lock(&failure.safe_message).clone();
@@ -339,26 +215,11 @@ fn try_preserve(failure: &Failure) -> Option<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn interrupted_reset_requires_fresh_choice_and_late_callbacks_cannot_authorize_it() {
-        let unexpected = ResetDecision::default();
-        assert!(!unexpected.finish());
-        unexpected.choose(true);
-        assert!(!unexpected.finish());
-        let cancel = ResetDecision::default();
-        cancel.choose(false);
-        assert!(!cancel.finish());
-        let accepted = ResetDecision::default();
-        accepted.choose(true);
-        assert!(accepted.finish());
-    }
-
     #[tokio::test]
     async fn simple_startup_failure_is_not_exitable_until_preservation_is_explicit() {
         let failure = Arc::new(Failure::new(
             "Existing <files> remain & protected.".into(),
-            Some(StartupError::from("Safe startup failure.")),
-            false,
+            StartupError::from("Safe startup failure."),
         ));
         assert!(!failure.preserved.load(Ordering::Acquire));
         let blocked = failure_page(&failure);

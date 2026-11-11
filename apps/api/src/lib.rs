@@ -9,8 +9,6 @@ mod library_tests;
 #[cfg(all(test, unix))]
 mod offline_journey_tests;
 mod open_folder;
-#[cfg(test)]
-mod reset_tests;
 pub mod routes;
 pub mod transport;
 
@@ -85,7 +83,6 @@ pub struct StartupError {
     message: String,
     root: Option<LibraryOpenOutcome>,
     runtime: Option<ManagedRuntimeCache>,
-    interrupted_reset: bool,
 }
 
 impl StartupError {
@@ -94,29 +91,7 @@ impl StartupError {
             message,
             root: Some(LibraryOpenOutcome::Ready(library)),
             runtime: None,
-            interrupted_reset: false,
         }
-    }
-
-    pub fn interrupted_reset(&self) -> bool {
-        self.interrupted_reset
-    }
-
-    /// Only a fresh native confirmation may consume this retained root.
-    pub fn take_interrupted_reset_session(&mut self) -> Result<axial_fs::RootSession, String> {
-        if !self.interrupted_reset {
-            return Err("This startup failure does not authorize a reset.".into());
-        }
-        let Some(LibraryOpenOutcome::Ready(library)) = self.root.as_ref() else {
-            return Err("The interrupted profile is not available for reset.".into());
-        };
-        library.close_admission();
-        let session = library.take_reset_session().map_err(|_| {
-            "The profile is still in use. Its files have been preserved.".to_owned()
-        })?;
-        self.root.take();
-        self.interrupted_reset = false;
-        Ok(session)
     }
 
     pub fn try_preserve(mut self) -> Result<String, Self> {
@@ -160,7 +135,6 @@ impl From<String> for StartupError {
             message,
             root: None,
             runtime: None,
-            interrupted_reset: false,
         }
     }
 }
@@ -244,11 +218,10 @@ impl ServerHandle {
         self.shutdown_settled.load(Ordering::Acquire)
     }
 
-    /// The recovery obligations that refuse destructive reset or update.
+    /// The recovery obligations that refuse an update.
     pub fn recovery(&self) -> Recovery {
         Recovery {
             library: self.library.clone(),
-            tasks: self.tasks.clone(),
             instances: self.instances.clone(),
             installs: self.installs.clone(),
             performance: self.performance.clone(),
@@ -619,27 +592,11 @@ async fn start_profile_inner(
                     message: "Replacement profile admission is unresolved. Startup is blocked while its filesystem obligations remain owned.".into(),
                     root: Some(LibraryOpenOutcome::Unresolved(obligation)),
                     runtime: None,
-                    interrupted_reset: false,
                 });
             }
         };
         if let Err(message) = profile.bind(&library) {
             return Err(StartupError::with_library(message.into(), library));
-        }
-        match library.interrupted_root_reset() {
-            Ok(false) => {}
-            Ok(true) => {
-                let mut failure = StartupError::with_library(
-                    "A previous reset was interrupted. The profile is preserved until you confirm a new reset.".into(),
-                    library,
-                );
-                failure.interrupted_reset = true;
-                return Err(failure);
-            }
-            Err(_) => return Err(StartupError::with_library(
-                "The profile reset record could not be verified. Existing files have been preserved.".into(),
-                library,
-            )),
         }
         let retained_library = library.clone();
         (|| {
@@ -884,7 +841,6 @@ async fn start_profile_inner(
                 message,
                 root: Some(LibraryOpenOutcome::Ready(retained_library)),
                 runtime: retained_runtime,
-                interrupted_reset: false,
             })
         })
         .await
