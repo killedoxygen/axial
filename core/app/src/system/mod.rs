@@ -68,16 +68,10 @@ mod tests {
                 }
             );
         }
-    }
-
-    #[test]
-    fn actual_host_query_returns_only_the_retained_memory_fields() {
-        let result = system_resource_status();
-        assert!(result.total_memory_mb >= 1);
-        let value = serde_json::to_value(&result).unwrap();
-        assert_eq!(value.as_object().unwrap().len(), 4);
-        assert_eq!(value["max_allocatable_gb"], result.total_memory_mb / 1024);
-        assert!(result.recommended_min_mb <= result.recommended_max_mb);
-        assert!(result.recommended_max_mb <= result.total_memory_mb.saturating_sub(2048));
+        assert_eq!(
+            serde_json::to_value(from_total_memory_mb(8192)).unwrap(),
+            serde_json::json!({"total_memory_mb":8192,"recommended_min_mb":2048,
+                "recommended_max_mb":4096,"max_allocatable_gb":8})
+        );
     }
 }

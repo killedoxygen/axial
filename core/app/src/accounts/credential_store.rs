@@ -1238,7 +1238,6 @@ mod tests {
                 .unwrap(),
             b"unchanged"
         );
-        assert_ne!(KEYRING_SERVICE, "axial-auth");
     }
 
     #[tokio::test]

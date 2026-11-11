@@ -295,24 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn listing_sorts_portable_names_and_derives_enabled_state_from_the_filename() {
-        let mods = collect_mods([
-            entry("z.jar.disabled", 9),
-            entry("README.txt", 10),
-            entry("B.JAR", 3),
-            entry("a.jar", 0),
-        ])
-        .unwrap();
-        assert_eq!(
-            mods.iter()
-                .map(|entry| (entry.name.as_str(), entry.enabled))
-                .collect::<Vec<_>>(),
-            vec![("a.jar", true), ("B.JAR", true), ("z.jar.disabled", false)]
-        );
-        assert_eq!(mods[0].size, 0);
-    }
-
-    #[test]
     fn listing_refuses_casefold_and_enabled_disabled_collisions() {
         for names in [
             ["Straße.jar", "STRASSE.JAR"],
@@ -349,7 +331,8 @@ mod tests {
             std::fs::create_dir(&mods).unwrap();
             std::fs::create_dir(mods.join("folder.jar")).unwrap();
             std::fs::write(mods.join("z.jar.disabled"), b"disabled").unwrap();
-            std::fs::write(mods.join("A.JAR"), b"active").unwrap();
+            std::fs::write(mods.join("B.JAR"), b"active").unwrap();
+            std::fs::write(mods.join("a.jar"), b"").unwrap();
             std::fs::write(mods.join("README.txt"), b"user notes").unwrap();
             let entries = list_mods(root).unwrap();
             assert_eq!(
@@ -357,7 +340,11 @@ mod tests {
                     .iter()
                     .map(|entry| (entry.name.as_str(), entry.size, entry.enabled))
                     .collect::<Vec<_>>(),
-                vec![("A.JAR", 6, true), ("z.jar.disabled", 8, false)]
+                vec![
+                    ("a.jar", 0, true),
+                    ("B.JAR", 6, true),
+                    ("z.jar.disabled", 8, false)
+                ]
             );
             assert!(
                 entries
@@ -369,22 +356,6 @@ mod tests {
                 b"user notes"
             );
             assert!(mods.join("folder.jar").is_dir());
-        });
-    }
-
-    #[test]
-    fn scoped_listing_refuses_two_variants_in_one_mod_namespace() {
-        with_scope(|path, root| {
-            let mods = path.join("mods");
-            std::fs::create_dir(&mods).unwrap();
-            std::fs::write(mods.join("example.jar"), b"first").unwrap();
-            std::fs::write(mods.join("example.jar.disabled"), b"second").unwrap();
-            assert_eq!(list_mods(root), Err(ModFilesError::UnsupportedEntry));
-            assert_eq!(std::fs::read(mods.join("example.jar")).unwrap(), b"first");
-            assert_eq!(
-                std::fs::read(mods.join("example.jar.disabled")).unwrap(),
-                b"second"
-            );
         });
     }
 

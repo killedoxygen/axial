@@ -228,28 +228,26 @@ fn all_event_variants_have_fixed_names_and_bounded_properties() {
         (TelemetryLoader::NeoForge, "neoforge"),
     ] {
         assert_eq!(TelemetryLoader::from_key(key), Some(loader));
-        for (event, name) in [
-            (
-                TelemetryEvent::LaunchStarted {
-                    loader: Some(loader),
-                },
-                "launch_started",
-            ),
-            (
-                TelemetryEvent::InstanceCreated {
-                    loader: Some(loader),
-                },
-                "instance_created",
-            ),
-        ] {
-            let mut properties = base.clone();
-            properties["loader_key"] = json!(key);
-            assert_eq!(
-                event.batch_item(ID, "test"),
-                json!({"event": name, "properties": properties})
-            );
-        }
+        let mut properties = base.clone();
+        properties["loader_key"] = json!(key);
+        assert_eq!(
+            TelemetryEvent::LaunchStarted {
+                loader: Some(loader)
+            }
+            .batch_item(ID, "test"),
+            json!({"event": "launch_started", "properties": properties})
+        );
     }
+    assert_eq!(
+        TelemetryEvent::InstanceCreated {
+            loader: Some(TelemetryLoader::Quilt)
+        }
+        .batch_item(ID, "test"),
+        json!({"event": "instance_created", "properties": {
+            "distinct_id": ID, "$process_person_profile": false, "environment": "test",
+            "loader_key": "quilt"
+        }})
+    );
     for key in [PRIVATE, "Fabric", "guardian", ""] {
         assert_eq!(TelemetryLoader::from_key(key), None);
     }

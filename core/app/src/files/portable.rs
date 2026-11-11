@@ -256,13 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn admits_leading_spaces_unicode_and_non_reserved_internal_names() {
-        for value in [" leading.jar", "caf\u{e9}.jar", ".axial-user-file"] {
-            assert!(PortableFileName::new(value).is_ok(), "rejected {value:?}");
-        }
-    }
-
-    #[test]
     fn rejects_forbidden_characters_trailing_aliases_and_devices() {
         for value in [
             "",
@@ -304,7 +297,15 @@ mod tests {
                 "accepted {value:?}"
             );
         }
-        for value in ["com10.jar", "lpt10.jar", "clock", "computer.jar"] {
+        for value in [
+            "com10.jar",
+            "lpt10.jar",
+            "clock",
+            "computer.jar",
+            " leading.jar",
+            "caf\u{e9}.jar",
+            ".axial-user-file",
+        ] {
             assert!(PortableFileName::new(value).is_ok(), "rejected {value:?}");
         }
     }
