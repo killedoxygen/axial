@@ -2,10 +2,10 @@
 use crate::download::DownloadError;
 use crate::download::library_source::RetainedLibraryComponentSource;
 use crate::download::{
-    ASSET_OBJECT_BASE_URL, AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources,
-    ExpectedIntegrity, LibraryArtifactPlan, ManagedInstallActivationContractId,
-    ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
-    SelectedDownloadArtifactKind, library_artifact_plans_for, parse_asset_index,
+    AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources, ExpectedIntegrity,
+    LibraryArtifactPlan, ManagedInstallActivationContractId, ReconstructedVanillaAuthority,
+    ReconstructedVanillaAuthorityParts, SelectedDownloadArtifactKind, library_artifact_plans_for,
+    parse_asset_index,
 };
 use crate::known_good_libraries::{SealedExactLibraryDeclarations, SealedLibraryKind};
 use crate::launch::{Library, VersionJson, effective_java_version_for};
@@ -28,7 +28,6 @@ use crate::runtime::{
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -228,131 +227,20 @@ pub fn known_good_link_target_matches(entry: &KnownGoodEntry, observed: &Path) -
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodInventory {
     entries: Vec<KnownGoodEntry>,
-    standalone_leaf_repair_sources: BTreeMap<usize, KnownGoodStandaloneLeafRepairSourceContract>,
-}
-
-impl fmt::Debug for KnownGoodInventory {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("KnownGoodInventory")
-            .field("entries", &self.entries)
-            .field(
-                "standalone_leaf_repair_source_count",
-                &self.standalone_leaf_repair_sources.len(),
-            )
-            .finish()
-    }
-}
-
-impl PartialEq for KnownGoodInventory {
-    fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
-            && self.standalone_leaf_repair_sources == other.standalone_leaf_repair_sources
-    }
-}
-
-impl Eq for KnownGoodInventory {}
-
-#[derive(Clone, Eq, PartialEq)]
-struct KnownGoodStandaloneLeafRepairSourceContract {
-    root: KnownGoodRoot,
-    path: KnownGoodRelativePath,
-    kind: KnownGoodArtifactKind,
-    digest: Sha1Digest,
-    size: u64,
-    provider_url: String,
-}
-
-pub struct KnownGoodStandaloneLeafRepairSource<'a> {
-    inventory_ordinal: usize,
-    contract: &'a KnownGoodStandaloneLeafRepairSourceContract,
-}
-
-impl KnownGoodStandaloneLeafRepairSource<'_> {
-    pub fn inventory_ordinal(&self) -> usize {
-        self.inventory_ordinal
-    }
-
-    pub fn root(&self) -> &KnownGoodRoot {
-        &self.contract.root
-    }
-
-    pub fn path(&self) -> &KnownGoodRelativePath {
-        &self.contract.path
-    }
-
-    pub fn kind(&self) -> KnownGoodArtifactKind {
-        self.contract.kind
-    }
-
-    pub fn sha1(&self) -> &Sha1Digest {
-        &self.contract.digest
-    }
-
-    pub fn size(&self) -> u64 {
-        self.contract.size
-    }
-
-    pub fn provider_url(&self) -> &str {
-        &self.contract.provider_url
-    }
 }
 
 impl KnownGoodInventory {
     fn loader_derivation_copy(&self) -> Self {
         Self {
             entries: self.entries.clone(),
-            standalone_leaf_repair_sources: self.standalone_leaf_repair_sources.clone(),
         }
     }
 
     pub fn entries(&self) -> &[KnownGoodEntry] {
         &self.entries
-    }
-
-    pub fn bind_standalone_leaf_repair_source(
-        &self,
-        inventory_ordinal: usize,
-    ) -> Result<KnownGoodStandaloneLeafRepairSource<'_>, KnownGoodRepairSourceError> {
-        let entry = self
-            .entries
-            .get(inventory_ordinal)
-            .ok_or(KnownGoodRepairSourceError::UnknownInventoryOrdinal)?;
-        let contract = self
-            .standalone_leaf_repair_sources
-            .get(&inventory_ordinal)
-            .ok_or(KnownGoodRepairSourceError::UnsupportedInventoryEntry)?;
-        if !contract.matches(entry) {
-            return Err(KnownGoodRepairSourceError::ContractMismatch);
-        }
-        Ok(KnownGoodStandaloneLeafRepairSource {
-            inventory_ordinal,
-            contract,
-        })
-    }
-
-    fn inherited_repair_provider_for_entry<'a>(
-        &'a self,
-        entry: &KnownGoodEntry,
-        effective_provider_url: Option<&str>,
-    ) -> Result<Option<&'a str>, KnownGoodInventoryError> {
-        let Some(effective_provider_url) = effective_provider_url else {
-            return Ok(None);
-        };
-        let inventory_ordinal = self
-            .entries
-            .iter()
-            .position(|candidate| candidate == entry)
-            .ok_or(KnownGoodInventoryError::InvalidRepairSource)?;
-        let Some(contract) = self.standalone_leaf_repair_sources.get(&inventory_ordinal) else {
-            return Ok(None);
-        };
-        if !contract.matches(entry) || contract.provider_url != effective_provider_url {
-            return Err(KnownGoodInventoryError::ConflictingRepairSource);
-        }
-        Ok(Some(&contract.provider_url))
     }
 
     pub fn launch_tier0_projection(
@@ -606,27 +494,6 @@ impl KnownGoodInventory {
             })?;
         }
         Ok(builder.finish())
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn with_test_standalone_leaf_repair_source(
-        mut self,
-        inventory_ordinal: usize,
-        provider_url: &str,
-    ) -> Result<Self, KnownGoodInventoryError> {
-        let entry = self
-            .entries
-            .get(inventory_ordinal)
-            .ok_or(KnownGoodInventoryError::InvalidRepairSource)?;
-        let contract = KnownGoodStandaloneLeafRepairSourceContract::new(entry, provider_url)?;
-        if self
-            .standalone_leaf_repair_sources
-            .insert(inventory_ordinal, contract)
-            .is_some()
-        {
-            return Err(KnownGoodInventoryError::ConflictingRepairSource);
-        }
-        Ok(self)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1359,26 +1226,19 @@ impl AuthenticatedKnownGoodReceipt {
             return Err(KnownGoodInventoryError::VersionIdentityMismatch);
         }
         let mut builder = InventoryBuilder::default();
-        for (ordinal, entry) in self.inventory.entries.iter().enumerate() {
-            builder.insert_preserving_standalone_leaf_repair_source(
-                &self.inventory,
-                ordinal,
-                entry.clone(),
-            )?;
+        for entry in &self.inventory.entries {
+            builder.insert(entry.clone())?;
         }
         for requirement in requirements.entries() {
-            builder.insert_with_standalone_leaf_repair_source(
-                KnownGoodEntry {
-                    root: KnownGoodRoot::Libraries,
-                    path: KnownGoodRelativePath::new(requirement.path())?,
-                    kind: KnownGoodArtifactKind::Library,
-                    integrity: KnownGoodIntegrity::Sha1 {
-                        digest: Sha1Digest::from_metadata(requirement.sha1())?,
-                        size: requirement.size(),
-                    },
+            builder.insert(KnownGoodEntry {
+                root: KnownGoodRoot::Libraries,
+                path: KnownGoodRelativePath::new(requirement.path())?,
+                kind: KnownGoodArtifactKind::Library,
+                integrity: KnownGoodIntegrity::Sha1 {
+                    digest: Sha1Digest::from_metadata(requirement.sha1())?,
+                    size: requirement.size(),
                 },
-                Some(requirement.provider_url()),
-            )?;
+            })?;
         }
         self.inventory = Arc::new(builder.finish());
         Ok(())
@@ -1433,20 +1293,6 @@ fn hash_inventory_activation_contract(
                 digest.write(target.as_str().as_bytes());
             }
         }
-    }
-
-    digest.write(b"inventory.standalone_leaf_repair_sources.v1");
-    digest.write_u64(inventory.standalone_leaf_repair_sources.len() as u64);
-    for (ordinal, contract) in &inventory.standalone_leaf_repair_sources {
-        digest.write(b"inventory.standalone_leaf_repair_source.v1");
-        digest.write_u64(*ordinal as u64);
-        digest.write(contract.root.stable_id().as_bytes());
-        digest.write(contract.root.scope_id().as_bytes());
-        digest.write(contract.path.as_str().as_bytes());
-        digest.write(contract.kind.stable_id().as_bytes());
-        digest.write(contract.digest.as_str().as_bytes());
-        digest.write_u64(contract.size);
-        digest.write(contract.provider_url.as_bytes());
     }
 }
 
@@ -1816,7 +1662,7 @@ fn derive_installer_receipt(
         } else {
             KnownGoodArtifactKind::Library
         };
-        let (integrity, provider_url) = if let Some((sealed_kind, sha1, size, provider_url)) =
+        let integrity = if let Some((sealed_kind, sha1, size)) =
             library_declarations.get(&plan.relative_path)
         {
             if sealed_kind
@@ -1834,34 +1680,24 @@ fn derive_installer_receipt(
                 return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
             }
             used_declarations.insert(plan.relative_path.clone());
-            (
-                KnownGoodIntegrity::Sha1 {
-                    digest: sha1_array_digest(&sha1),
-                    size,
-                },
-                provider_url,
-            )
+            KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&sha1),
+                size,
+            }
         } else if allows_base {
-            let entry = matching_base_library_entry(&base, &plan, &path, kind)
-                .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
-            (
-                entry.integrity().clone(),
-                base.inventory
-                    .inherited_repair_provider_for_entry(entry, plan.source_url.as_deref())
-                    .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?,
-            )
+            matching_base_library_entry(&base, &plan, &path, kind)
+                .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?
+                .integrity()
+                .clone()
         } else {
             return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
         };
-        builder.insert_with_standalone_leaf_repair_source(
-            KnownGoodEntry {
-                root: KnownGoodRoot::Libraries,
-                path,
-                kind,
-                integrity,
-            },
-            provider_url,
-        )?;
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path,
+            kind,
+            integrity,
+        })?;
     }
     if used_declarations.len() != library_declarations.len() {
         return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
@@ -2117,49 +1953,39 @@ fn derive_profile_receipt(
         } else {
             KnownGoodArtifactKind::Library
         };
-        let (integrity, provider_url) =
-            if let Some((sealed_kind, sealed_sha1, sealed_size, provider_url)) =
-                library_declarations.get(&plan.relative_path)
-            {
-                let expected_kind = if plan.is_native {
-                    SealedLibraryKind::Native
-                } else {
-                    SealedLibraryKind::Library
-                };
-                if sealed_kind != expected_kind
-                    || plan.expected.size != Some(sealed_size)
-                    || plan.expected.sha1.as_deref().is_none_or(|sha1| {
-                        !Sha1Digest::from_metadata(sha1)
-                            .is_ok_and(|digest| digest == sha1_array_digest(&sealed_sha1))
-                    })
-                {
-                    return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-                }
-                used_proofs.insert(plan.relative_path.clone());
-                (
-                    KnownGoodIntegrity::Sha1 {
-                        digest: sha1_array_digest(&sealed_sha1),
-                        size: sealed_size,
-                    },
-                    provider_url,
-                )
+        let integrity = if let Some((sealed_kind, sealed_sha1, sealed_size)) =
+            library_declarations.get(&plan.relative_path)
+        {
+            let expected_kind = if plan.is_native {
+                SealedLibraryKind::Native
             } else {
-                let entry = matching_base_library_entry(base, &plan, &path, kind)?;
-                (
-                    entry.integrity().clone(),
-                    base.inventory
-                        .inherited_repair_provider_for_entry(entry, plan.source_url.as_deref())?,
-                )
+                SealedLibraryKind::Library
             };
-        builder.insert_with_standalone_leaf_repair_source(
-            KnownGoodEntry {
-                root: KnownGoodRoot::Libraries,
-                path,
-                kind,
-                integrity,
-            },
-            provider_url,
-        )?;
+            if sealed_kind != expected_kind
+                || plan.expected.size != Some(sealed_size)
+                || plan.expected.sha1.as_deref().is_none_or(|sha1| {
+                    !Sha1Digest::from_metadata(sha1)
+                        .is_ok_and(|digest| digest == sha1_array_digest(&sealed_sha1))
+                })
+            {
+                return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+            }
+            used_proofs.insert(plan.relative_path.clone());
+            KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&sealed_sha1),
+                size: sealed_size,
+            }
+        } else {
+            matching_base_library_entry(base, &plan, &path, kind)?
+                .integrity()
+                .clone()
+        };
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path,
+            kind,
+            integrity,
+        })?;
     }
     if used_proofs.len() != library_declarations.len() {
         return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
@@ -2249,18 +2075,7 @@ impl KnownGoodLoaderBaseDerivation {
         if authenticated.inventory.entries.len() > MAX_KNOWN_GOOD_ENTRIES {
             return Err(KnownGoodInventoryError::InputTooLarge);
         }
-        for (ordinal, entry) in authenticated.inventory.entries.iter().enumerate() {
-            let repair_provider_url = authenticated
-                .inventory
-                .standalone_leaf_repair_sources
-                .get(&ordinal)
-                .map(|contract| {
-                    if !contract.matches(entry) {
-                        return Err(KnownGoodInventoryError::InvalidRepairSource);
-                    }
-                    Ok(contract.provider_url.clone())
-                })
-                .transpose()?;
+        for entry in &authenticated.inventory.entries {
             contract_bytes = contract_bytes
                 .saturating_add(entry.root.stable_id().len())
                 .saturating_add(entry.root.scope_id().len())
@@ -2270,8 +2085,7 @@ impl KnownGoodLoaderBaseDerivation {
                     | KnownGoodIntegrity::ExactBytes { digest, .. } => digest.as_str().len() + 8,
                     KnownGoodIntegrity::Directory => 1,
                     KnownGoodIntegrity::LinkTarget(target) => target.as_str().len(),
-                })
-                .saturating_add(repair_provider_url.as_deref().map_or(0, str::len));
+                });
             if contract_bytes > MAX_LOADER_BASE_DERIVATION_BYTES {
                 return Err(KnownGoodInventoryError::InputTooLarge);
             }
@@ -2890,17 +2704,8 @@ pub enum KnownGoodInventoryError {
     ProfileLibraryProofMismatch,
     InstallerLibraryProofMismatch,
     ConflictingEntry,
-    InvalidRepairSource,
-    ConflictingRepairSource,
     ConflictingRuntimePath,
     TooManyEntries,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KnownGoodRepairSourceError {
-    UnknownInventoryOrdinal,
-    UnsupportedInventoryEntry,
-    ContractMismatch,
 }
 
 struct VersionSourceObservation<'a> {
@@ -3019,7 +2824,7 @@ fn add_sealed_libraries(
         return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
     }
     for plan in plans {
-        let (kind, observed_sha1, size, provider_url) = authority
+        let (kind, observed_sha1, size) = authority
             .get(&plan.relative_path)
             .ok_or(KnownGoodInventoryError::VanillaLibraryProofMismatch)?;
         let expected_kind = if plan.is_native {
@@ -3036,22 +2841,19 @@ fn add_sealed_libraries(
         {
             return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
         }
-        builder.insert_with_standalone_leaf_repair_source(
-            KnownGoodEntry {
-                root: KnownGoodRoot::Libraries,
-                path: KnownGoodRelativePath::new(plan.relative_path.as_str())?,
-                kind: if plan.is_native {
-                    KnownGoodArtifactKind::NativeLibrary
-                } else {
-                    KnownGoodArtifactKind::Library
-                },
-                integrity: KnownGoodIntegrity::Sha1 {
-                    digest: sha1_array_digest(&observed_sha1),
-                    size,
-                },
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path: KnownGoodRelativePath::new(plan.relative_path.as_str())?,
+            kind: if plan.is_native {
+                KnownGoodArtifactKind::NativeLibrary
+            } else {
+                KnownGoodArtifactKind::Library
             },
-            provider_url,
-        )?;
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&observed_sha1),
+                size,
+            },
+        })?;
     }
     Ok(())
 }
@@ -3088,9 +2890,7 @@ fn add_exact_inherited_libraries(
         {
             return Err(KnownGoodInventoryError::VanillaLibraryProofMismatch);
         }
-        let provider_url =
-            base.inherited_repair_provider_for_entry(entry, plan.source_url.as_deref())?;
-        builder.insert_with_standalone_leaf_repair_source(entry.clone(), provider_url)?;
+        builder.insert(entry.clone())?;
     }
     Ok(())
 }
@@ -3099,17 +2899,13 @@ fn add_inherited_assets_and_runtime(
     builder: &mut InventoryBuilder,
     base: &KnownGoodInventory,
 ) -> Result<(), KnownGoodInventoryError> {
-    for (inventory_ordinal, entry) in base.entries.iter().enumerate().filter(|(_, entry)| {
+    for entry in base.entries.iter().filter(|entry| {
         matches!(
             entry.root(),
             KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
         )
     }) {
-        builder.insert_preserving_standalone_leaf_repair_source(
-            base,
-            inventory_ordinal,
-            entry.clone(),
-        )?;
+        builder.insert(entry.clone())?;
     }
     Ok(())
 }
@@ -3175,15 +2971,12 @@ fn add_asset_index(
     let index_id = KnownGoodId::new(&asset_index.id)?;
     let expected = ExpectedIntegrity::from_mojang(asset_index.size, &asset_index.sha1);
     validate_bytes(bytes, &expected).map_err(|_| KnownGoodInventoryError::AssetIndexIntegrity)?;
-    builder.insert_with_standalone_leaf_repair_source(
-        KnownGoodEntry {
-            root: KnownGoodRoot::Assets,
-            path: KnownGoodRelativePath::new(&format!("indexes/{}.json", index_id.as_str()))?,
-            kind: KnownGoodArtifactKind::AssetIndex,
-            integrity: expected_integrity_with_observed_size(&expected, bytes.len() as u64)?,
-        },
-        Some(&asset_index.url),
-    )?;
+    builder.insert(KnownGoodEntry {
+        root: KnownGoodRoot::Assets,
+        path: KnownGoodRelativePath::new(&format!("indexes/{}.json", index_id.as_str()))?,
+        kind: KnownGoodArtifactKind::AssetIndex,
+        integrity: expected_integrity_with_observed_size(&expected, bytes.len() as u64)?,
+    })?;
 
     let index = parse_asset_index(bytes).map_err(|_| KnownGoodInventoryError::AssetIndexParse)?;
     for object in index.objects.values() {
@@ -3191,16 +2984,12 @@ fn add_asset_index(
             .map_err(|_| KnownGoodInventoryError::InvalidAssetObject)?;
         let size =
             u64::try_from(object.size).map_err(|_| KnownGoodInventoryError::InvalidAssetObject)?;
-        let provider_url = asset_object_provider_url(&digest);
-        builder.insert_with_standalone_leaf_repair_source(
-            KnownGoodEntry {
-                root: KnownGoodRoot::Assets,
-                path: KnownGoodRelativePath::new(&asset_object_path(&digest))?,
-                kind: KnownGoodArtifactKind::AssetObject,
-                integrity: KnownGoodIntegrity::Sha1 { digest, size },
-            },
-            Some(&provider_url),
-        )?;
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Assets,
+            path: KnownGoodRelativePath::new(&asset_object_path(&digest))?,
+            kind: KnownGoodArtifactKind::AssetObject,
+            integrity: KnownGoodIntegrity::Sha1 { digest, size },
+        })?;
     }
     Ok(())
 }
@@ -3464,160 +3253,39 @@ fn windows_prefixed(value: &str) -> bool {
 
 #[derive(Default)]
 struct InventoryBuilder {
-    entries: BTreeMap<(String, String, String), PendingInventoryEntry>,
-}
-
-struct PendingInventoryEntry {
-    entry: KnownGoodEntry,
-    standalone_leaf_repair_source: Option<KnownGoodStandaloneLeafRepairSourceContract>,
+    entries: BTreeMap<(String, String, String), KnownGoodEntry>,
 }
 
 impl InventoryBuilder {
     fn insert(&mut self, entry: KnownGoodEntry) -> Result<(), KnownGoodInventoryError> {
-        self.insert_with_standalone_leaf_repair_source(entry, None)
-    }
-
-    fn insert_with_standalone_leaf_repair_source(
-        &mut self,
-        entry: KnownGoodEntry,
-        provider_url: Option<&str>,
-    ) -> Result<(), KnownGoodInventoryError> {
         let key = (
             entry.root.stable_id().to_string(),
             entry.root.scope_id().to_string(),
             entry.path.as_str().to_string(),
         );
-        let repair_source = provider_url
-            .map(|provider_url| {
-                KnownGoodStandaloneLeafRepairSourceContract::new(&entry, provider_url)
-            })
-            .transpose()?;
-        if let Some(existing) = self.entries.get_mut(&key) {
-            if existing.entry != entry {
-                return Err(KnownGoodInventoryError::ConflictingEntry);
-            }
-            match (&existing.standalone_leaf_repair_source, repair_source) {
-                (Some(existing), Some(candidate)) if existing != &candidate => {
-                    return Err(KnownGoodInventoryError::ConflictingRepairSource);
-                }
-                (None, Some(candidate)) => {
-                    existing.standalone_leaf_repair_source = Some(candidate);
-                }
-                _ => {}
-            }
-            return Ok(());
+        if let Some(existing) = self.entries.get(&key) {
+            return if *existing == entry {
+                Ok(())
+            } else {
+                Err(KnownGoodInventoryError::ConflictingEntry)
+            };
         }
         if self.entries.len() >= MAX_KNOWN_GOOD_ENTRIES {
             return Err(KnownGoodInventoryError::TooManyEntries);
         }
-        self.entries.insert(
-            key,
-            PendingInventoryEntry {
-                entry,
-                standalone_leaf_repair_source: repair_source,
-            },
-        );
+        self.entries.insert(key, entry);
         Ok(())
     }
 
-    fn insert_preserving_standalone_leaf_repair_source(
-        &mut self,
-        source_inventory: &KnownGoodInventory,
-        source_inventory_ordinal: usize,
-        entry: KnownGoodEntry,
-    ) -> Result<(), KnownGoodInventoryError> {
-        let provider_url = match source_inventory
-            .standalone_leaf_repair_sources
-            .get(&source_inventory_ordinal)
-        {
-            Some(contract) if contract.matches(&entry) => Some(contract.provider_url.as_str()),
-            Some(_) => return Err(KnownGoodInventoryError::InvalidRepairSource),
-            None => None,
-        };
-        self.insert_with_standalone_leaf_repair_source(entry, provider_url)
-    }
-
     fn finish(self) -> KnownGoodInventory {
-        let mut entries = Vec::with_capacity(self.entries.len());
-        let mut standalone_leaf_repair_sources = BTreeMap::new();
-        for (inventory_ordinal, pending) in self.entries.into_values().enumerate() {
-            entries.push(pending.entry);
-            if let Some(source) = pending.standalone_leaf_repair_source {
-                standalone_leaf_repair_sources.insert(inventory_ordinal, source);
-            }
-        }
         KnownGoodInventory {
-            entries,
-            standalone_leaf_repair_sources,
+            entries: self.entries.into_values().collect(),
         }
     }
-}
-
-impl KnownGoodStandaloneLeafRepairSourceContract {
-    fn new(entry: &KnownGoodEntry, provider_url: &str) -> Result<Self, KnownGoodInventoryError> {
-        let KnownGoodIntegrity::Sha1 { digest, size } = entry.integrity() else {
-            return Err(KnownGoodInventoryError::InvalidRepairSource);
-        };
-        let supported = match (entry.root(), entry.kind()) {
-            (
-                KnownGoodRoot::Libraries,
-                KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary,
-            ) => *size > 0 && repair_provider_url_is_supported(provider_url),
-            (KnownGoodRoot::Assets, KnownGoodArtifactKind::AssetIndex) => {
-                *size > 0
-                    && asset_index_path_is_canonical(entry.path())
-                    && repair_provider_url_is_supported(provider_url)
-            }
-            (KnownGoodRoot::Assets, KnownGoodArtifactKind::AssetObject) => {
-                entry.path().as_str() == asset_object_path(digest)
-                    && provider_url == asset_object_provider_url(digest)
-            }
-            _ => false,
-        };
-        if !supported {
-            return Err(KnownGoodInventoryError::InvalidRepairSource);
-        }
-        Ok(Self {
-            root: entry.root().clone(),
-            path: entry.path().clone(),
-            kind: entry.kind(),
-            digest: digest.clone(),
-            size: *size,
-            provider_url: provider_url.to_string(),
-        })
-    }
-
-    fn matches(&self, entry: &KnownGoodEntry) -> bool {
-        Self::new(entry, &self.provider_url).is_ok_and(|candidate| candidate.eq(self))
-    }
-}
-
-fn asset_index_path_is_canonical(path: &KnownGoodRelativePath) -> bool {
-    path.as_str()
-        .strip_prefix("indexes/")
-        .and_then(|path| path.strip_suffix(".json"))
-        .is_some_and(|id| KnownGoodId::new(id).is_ok())
 }
 
 fn asset_object_path(digest: &Sha1Digest) -> String {
     format!("objects/{}/{}", &digest.as_str()[..2], digest.as_str())
-}
-
-fn asset_object_provider_url(digest: &Sha1Digest) -> String {
-    format!(
-        "{ASSET_OBJECT_BASE_URL}/{}/{}",
-        &digest.as_str()[..2],
-        digest.as_str()
-    )
-}
-
-fn repair_provider_url_is_supported(provider_url: &str) -> bool {
-    reqwest::Url::parse(provider_url).is_ok_and(|url| {
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-    })
 }
 
 #[cfg(test)]
@@ -3685,10 +3353,7 @@ mod tests {
         };
         receipt.inventory = Arc::new(copy_inventory(
             &receipt.inventory,
-            Some((
-                retained_entry.clone(),
-                Some("https://example.invalid/retained.jar"),
-            )),
+            Some(retained_entry.clone()),
         ));
         let original_inventory = Arc::clone(&receipt.inventory);
         let original_version = receipt.effective_version.clone();
@@ -3703,33 +3368,18 @@ mod tests {
         for entry in &original_inventory.entries {
             assert!(receipt.inventory.entries.contains(entry));
         }
-        let ordinal = receipt
-            .inventory
-            .entries
-            .iter()
-            .position(|entry| entry == &retained_entry)
-            .unwrap();
-        assert_eq!(
-            receipt.inventory.standalone_leaf_repair_sources[&ordinal].provider_url,
-            "https://example.invalid/retained.jar"
-        );
         let enhanced_contract = receipt.activation_contract_id().unwrap();
         receipt.require_game_libraries(&requirements).unwrap();
         assert_eq!(receipt.activation_contract_id().unwrap(), enhanced_contract);
         for requirement in requirements.entries() {
-            let (ordinal, entry) = receipt
+            let entry = receipt
                 .inventory
                 .entries
                 .iter()
-                .enumerate()
-                .find(|(_, entry)| entry.path.as_str() == requirement.path())
+                .find(|entry| entry.path.as_str() == requirement.path())
                 .unwrap();
             assert_eq!(entry.root, KnownGoodRoot::Libraries);
             assert_eq!(entry.kind, KnownGoodArtifactKind::Library);
-            assert_eq!(
-                receipt.inventory.standalone_leaf_repair_sources[&ordinal].provider_url,
-                requirement.provider_url()
-            );
         }
         let mut other = activation_contract_fixture("unrelated-version");
         let original = Arc::clone(&other.inventory);
@@ -3742,28 +3392,19 @@ mod tests {
 
     fn copy_inventory(
         source: &KnownGoodInventory,
-        extra: Option<(KnownGoodEntry, Option<&str>)>,
+        extra: Option<KnownGoodEntry>,
     ) -> KnownGoodInventory {
         let mut builder = InventoryBuilder::default();
-        for (ordinal, entry) in source.entries.iter().cloned().enumerate() {
-            let provider = source
-                .standalone_leaf_repair_sources
-                .get(&ordinal)
-                .map(|contract| contract.provider_url.as_str());
+        for entry in source.entries.iter().cloned().chain(extra) {
             builder
-                .insert_with_standalone_leaf_repair_source(entry, provider)
+                .insert(entry)
                 .expect("copy authenticated inventory entry");
-        }
-        if let Some((extra, provider)) = extra {
-            builder
-                .insert_with_standalone_leaf_repair_source(extra, provider)
-                .expect("insert additional authenticated inventory entry");
         }
         builder.finish()
     }
 
     #[test]
-    fn activation_contract_rejects_inventory_and_repair_source_drift() {
+    fn activation_contract_rejects_inventory_drift() {
         let library_entry = |digest: &str| KnownGoodEntry {
             root: KnownGoodRoot::Libraries,
             path: KnownGoodRelativePath::new("org/example/contract/1/contract-1.jar")
@@ -3777,18 +3418,12 @@ mod tests {
         let mut baseline = activation_contract_fixture("activation-inventory-drift");
         baseline.inventory = Arc::new(copy_inventory(
             &baseline.inventory,
-            Some((
-                library_entry("1111111111111111111111111111111111111111"),
-                None,
-            )),
+            Some(library_entry("1111111111111111111111111111111111111111")),
         ));
         let mut library_drift = activation_contract_fixture("activation-inventory-drift");
         library_drift.inventory = Arc::new(copy_inventory(
             &library_drift.inventory,
-            Some((
-                library_entry("2222222222222222222222222222222222222222"),
-                None,
-            )),
+            Some(library_entry("2222222222222222222222222222222222222222")),
         ));
         let baseline_bundle = baseline
             .inventory
@@ -3816,35 +3451,6 @@ mod tests {
             library_drift
                 .activation_contract_id()
                 .expect("library-drift contract")
-        );
-
-        let mut first_provider = activation_contract_fixture("activation-provider-drift");
-        first_provider.inventory = Arc::new(copy_inventory(
-            &first_provider.inventory,
-            Some((
-                library_entry("3333333333333333333333333333333333333333"),
-                Some("https://example.invalid/library-a"),
-            )),
-        ));
-        let mut second_provider = activation_contract_fixture("activation-provider-drift");
-        second_provider.inventory = Arc::new(copy_inventory(
-            &second_provider.inventory,
-            Some((
-                library_entry("3333333333333333333333333333333333333333"),
-                Some("https://example.invalid/library-b"),
-            )),
-        ));
-        assert_eq!(
-            first_provider.inventory.entries,
-            second_provider.inventory.entries
-        );
-        assert_ne!(
-            first_provider
-                .activation_contract_id()
-                .expect("first provider contract"),
-            second_provider
-                .activation_contract_id()
-                .expect("second provider contract")
         );
     }
 
@@ -4350,30 +3956,7 @@ mod tests {
             &exact_bytes_integrity(&version_bytes),
         );
         assert!(has_kind(&inventory, KnownGoodArtifactKind::AssetIndex));
-        let inherited_asset_index_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.kind() == KnownGoodArtifactKind::AssetIndex)
-            .expect("inherited asset index ordinal");
-        assert_eq!(
-            inventory
-                .bind_standalone_leaf_repair_source(inherited_asset_index_ordinal)
-                .expect("inherited asset index source")
-                .provider_url(),
-            fixture.version.asset_index.url
-        );
-        let inherited_asset_object_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.kind() == KnownGoodArtifactKind::AssetObject)
-            .expect("inherited asset object ordinal");
-        assert_eq!(
-            inventory
-                .bind_standalone_leaf_repair_source(inherited_asset_object_ordinal)
-                .expect("inherited asset object source")
-                .provider_url(),
-            format!("{ASSET_OBJECT_BASE_URL}/aa/{SHA_A}")
-        );
+        assert!(has_kind(&inventory, KnownGoodArtifactKind::AssetObject));
         assert!(has_kind(
             &inventory,
             KnownGoodArtifactKind::RuntimeExecutable
@@ -4788,7 +4371,6 @@ mod tests {
                     KnownGoodArtifactKind::RuntimeExecutable,
                 ),
             ],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
 
         assert_eq!(
@@ -4831,7 +4413,6 @@ mod tests {
         };
         let inventory = KnownGoodInventory {
             entries: (0..=MAX_LAUNCH_TIER0_ENTRIES).map(|_| entry()).collect(),
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
         assert_eq!(
             inventory
@@ -4932,7 +4513,6 @@ mod tests {
                     29,
                 ),
             ],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
 
         let projection = inventory
@@ -5026,12 +4606,9 @@ mod tests {
         })
         .collect();
 
-        let projection = KnownGoodInventory {
-            entries,
-            standalone_leaf_repair_sources: BTreeMap::new(),
-        }
-        .launch_tier1_projection()
-        .expect("excluded kinds cannot invalidate projection");
+        let projection = KnownGoodInventory { entries }
+            .launch_tier1_projection()
+            .expect("excluded kinds cannot invalidate projection");
         assert_eq!(projection.into_entries().len(), 0);
     }
 
@@ -5049,7 +4626,6 @@ mod tests {
             .collect::<Vec<_>>();
         let exact = KnownGoodInventory {
             entries: entries.clone(),
-            standalone_leaf_repair_sources: BTreeMap::new(),
         }
         .launch_tier1_projection()
         .expect("exact entry bound");
@@ -5063,12 +4639,9 @@ mod tests {
             0,
         ));
         assert_eq!(
-            KnownGoodInventory {
-                entries: oversized,
-                standalone_leaf_repair_sources: BTreeMap::new(),
-            }
-            .launch_tier1_projection()
-            .expect_err("entry bound must be closed"),
+            KnownGoodInventory { entries: oversized }
+                .launch_tier1_projection()
+                .expect_err("entry bound must be closed"),
             LaunchTier1ProjectionError::TooManyEntries {
                 selected_entry_count: MAX_LAUNCH_TIER1_ENTRIES + 1,
             }
@@ -5097,12 +4670,9 @@ mod tests {
             .collect();
 
         assert_eq!(
-            KnownGoodInventory {
-                entries,
-                standalone_leaf_repair_sources: BTreeMap::new(),
-            }
-            .launch_tier1_projection()
-            .expect_err("large matching projection must refuse before admission"),
+            KnownGoodInventory { entries }
+                .launch_tier1_projection()
+                .expect_err("large matching projection must refuse before admission"),
             LaunchTier1ProjectionError::TooManyEntries {
                 selected_entry_count,
             }
@@ -5132,7 +4702,6 @@ mod tests {
                         integrity,
                     ),
                 ],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             };
             assert_eq!(
                 inventory
@@ -5155,7 +4724,6 @@ mod tests {
                 KnownGoodArtifactKind::ClientJar,
                 MAX_LAUNCH_TIER1_ARTIFACT_BYTES,
             )],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         }
         .launch_tier1_projection()
         .expect("exact artifact byte bound");
@@ -5175,7 +4743,6 @@ mod tests {
                 KnownGoodArtifactKind::ClientJar,
                 oversized,
             )],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         }
         .launch_tier1_projection()
         .expect_err("artifact byte bound must be closed");
@@ -5206,7 +4773,6 @@ mod tests {
         };
         let exact = KnownGoodInventory {
             entries: entries(4),
-            standalone_leaf_repair_sources: BTreeMap::new(),
         }
         .launch_tier1_projection()
         .expect("exact aggregate byte bound");
@@ -5226,7 +4792,6 @@ mod tests {
         assert_eq!(
             KnownGoodInventory {
                 entries: entries(5),
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .launch_tier1_projection()
             .expect_err("aggregate byte bound must be closed"),
@@ -5326,7 +4891,6 @@ mod tests {
                     6,
                 ),
             ],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
 
         let version = inventory
@@ -5406,7 +4970,6 @@ mod tests {
             assert_eq!(
                 KnownGoodInventory {
                     entries: vec![tier_one_sha1_entry(root, "private/entry", kind, 1)],
-                    standalone_leaf_repair_sources: BTreeMap::new(),
                 }
                 .managed_component_projection(component)
                 .expect_err("cross-root selected entry must be refused"),
@@ -5445,7 +5008,6 @@ mod tests {
             assert_eq!(
                 KnownGoodInventory {
                     entries: vec![tier_one_entry(root, "entry", kind, integrity)],
-                    standalone_leaf_repair_sources: BTreeMap::new(),
                 }
                 .managed_component_projection(component)
                 .expect_err("non-file component entry must be refused"),
@@ -5468,7 +5030,6 @@ mod tests {
         assert_eq!(
             KnownGoodInventory {
                 entries: vec![entry.clone(), entry],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
             .expect_err("duplicate path must be refused"),
@@ -5495,7 +5056,6 @@ mod tests {
                         1,
                     ),
                 ],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
             .expect_err("file ancestor must be refused"),
@@ -5518,7 +5078,6 @@ mod tests {
         assert_eq!(
             KnownGoodInventory {
                 entries: vec![bounded; MAX_TIER2_ENTRIES + 1],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
             .expect_err("entry bound must be refused"),
@@ -5536,7 +5095,6 @@ mod tests {
                     KnownGoodArtifactKind::AssetObject,
                     oversized,
                 )],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .managed_component_projection(ManagedKnownGoodComponent::Assets)
             .expect_err("artifact byte bound must be refused"),
@@ -5562,7 +5120,6 @@ mod tests {
         assert_eq!(
             KnownGoodInventory {
                 entries: entries.clone(),
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
             .expect("exact aggregate bound")
@@ -5577,12 +5134,9 @@ mod tests {
             1,
         ));
         assert_eq!(
-            KnownGoodInventory {
-                entries: above,
-                standalone_leaf_repair_sources: BTreeMap::new(),
-            }
-            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
-            .expect_err("aggregate byte bound must be refused"),
+            KnownGoodInventory { entries: above }
+                .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+                .expect_err("aggregate byte bound must be refused"),
             ManagedComponentProjectionError::AggregateByteLimitExceeded {
                 selected_entry_count: entry_count + 1,
                 expected_byte_count: MAX_TIER2_AGGREGATE_BYTES + 1,
@@ -5692,7 +5246,6 @@ mod tests {
                     link("bin/java-link", "java"),
                 ),
             ],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
 
         let projection = inventory.tier2_projection().expect("tier two projection");
@@ -5744,7 +5297,6 @@ mod tests {
         ] {
             let inventory = KnownGoodInventory {
                 entries: vec![tier_one_sha1_entry(root, "private/entry", kind, 1)],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             };
             let error = inventory
                 .tier2_projection()
@@ -5817,7 +5369,6 @@ mod tests {
         ] {
             let inventory = KnownGoodInventory {
                 entries: vec![tier_one_entry(root, "entry", kind, integrity)],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             };
             assert_eq!(
                 inventory
@@ -5842,7 +5393,6 @@ mod tests {
         let entries = vec![entry; MAX_TIER2_ENTRIES];
         let exact = KnownGoodInventory {
             entries: entries.clone(),
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
         let projection = exact.tier2_projection().expect("exact entry bound");
         assert_eq!(projection.entry_count(), MAX_TIER2_ENTRIES);
@@ -5860,12 +5410,9 @@ mod tests {
             0,
         ));
         assert_eq!(
-            KnownGoodInventory {
-                entries: oversized,
-                standalone_leaf_repair_sources: BTreeMap::new(),
-            }
-            .tier2_projection()
-            .expect_err("entry bound must be closed"),
+            KnownGoodInventory { entries: oversized }
+                .tier2_projection()
+                .expect_err("entry bound must be closed"),
             Tier2ProjectionError::TooManyEntries {
                 entry_count: MAX_TIER2_ENTRIES + 1,
             }
@@ -5881,7 +5428,6 @@ mod tests {
                 KnownGoodArtifactKind::AssetObject,
                 MAX_TIER2_ARTIFACT_BYTES,
             )],
-            standalone_leaf_repair_sources: BTreeMap::new(),
         };
         assert_eq!(
             exact_file
@@ -5899,7 +5445,6 @@ mod tests {
                     KnownGoodArtifactKind::AssetObject,
                     oversized,
                 )],
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .tier2_projection()
             .expect_err("file byte bound must be closed"),
@@ -5925,7 +5470,6 @@ mod tests {
         assert_eq!(
             KnownGoodInventory {
                 entries: entries.clone(),
-                standalone_leaf_repair_sources: BTreeMap::new(),
             }
             .tier2_projection()
             .expect("exact aggregate bound")
@@ -5940,12 +5484,9 @@ mod tests {
             1,
         ));
         assert_eq!(
-            KnownGoodInventory {
-                entries: above,
-                standalone_leaf_repair_sources: BTreeMap::new(),
-            }
-            .tier2_projection()
-            .expect_err("aggregate byte bound must be closed"),
+            KnownGoodInventory { entries: above }
+                .tier2_projection()
+                .expect_err("aggregate byte bound must be closed"),
             Tier2ProjectionError::AggregateByteLimitExceeded {
                 entry_count: entry_count + 1,
                 expected_byte_count: MAX_TIER2_AGGREGATE_BYTES + 1,
@@ -6007,137 +5548,7 @@ mod tests {
     }
 
     #[test]
-    fn vanilla_inventory_binds_exact_standalone_library_and_asset_sources() {
-        let inventory = fixture(false).derive().expect("vanilla inventory");
-        let library_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.path().as_str() == "com/mojang/strict/1.0/strict-1.0.jar")
-            .expect("library ordinal");
-        let library = inventory
-            .bind_standalone_leaf_repair_source(library_ordinal)
-            .expect("standalone library source");
-        assert_eq!(library.inventory_ordinal(), library_ordinal);
-        assert_eq!(library.root(), &KnownGoodRoot::Libraries);
-        assert_eq!(library.kind(), KnownGoodArtifactKind::Library);
-        assert_eq!(
-            library.path().as_str(),
-            "com/mojang/strict/1.0/strict-1.0.jar"
-        );
-        assert_eq!(library.sha1().as_str(), SHA_A);
-        assert_eq!(library.size(), 10);
-        assert_eq!(library.provider_url(), "https://example.invalid/library");
-
-        let asset_index_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.kind() == KnownGoodArtifactKind::AssetIndex)
-            .expect("asset index ordinal");
-        let asset_index = inventory
-            .bind_standalone_leaf_repair_source(asset_index_ordinal)
-            .expect("standalone asset index source");
-        assert_eq!(asset_index.root(), &KnownGoodRoot::Assets);
-        assert_eq!(asset_index.kind(), KnownGoodArtifactKind::AssetIndex);
-        assert_eq!(asset_index.path().as_str(), "indexes/fixture-assets.json");
-        assert_eq!(asset_index.provider_url(), "https://example.invalid/assets");
-
-        let asset_object_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.kind() == KnownGoodArtifactKind::AssetObject)
-            .expect("asset object ordinal");
-        let asset_object = inventory
-            .bind_standalone_leaf_repair_source(asset_object_ordinal)
-            .expect("standalone asset object source");
-        assert_eq!(asset_object.root(), &KnownGoodRoot::Assets);
-        assert_eq!(asset_object.kind(), KnownGoodArtifactKind::AssetObject);
-        assert_eq!(asset_object.sha1().as_str(), SHA_A);
-        assert_eq!(asset_object.size(), 5);
-        assert_eq!(
-            asset_object.provider_url(),
-            format!("{ASSET_OBJECT_BASE_URL}/aa/{SHA_A}")
-        );
-
-        for (inventory_ordinal, entry) in inventory.entries().iter().enumerate() {
-            if matches!(
-                entry.kind(),
-                KnownGoodArtifactKind::ClientJar
-                    | KnownGoodArtifactKind::VersionMetadata
-                    | KnownGoodArtifactKind::LogConfig
-                    | KnownGoodArtifactKind::RuntimeManifestProof
-                    | KnownGoodArtifactKind::RuntimeReadyMarker
-                    | KnownGoodArtifactKind::RuntimeFile
-                    | KnownGoodArtifactKind::RuntimeExecutable
-                    | KnownGoodArtifactKind::RuntimeDirectory
-                    | KnownGoodArtifactKind::RuntimeLink
-            ) {
-                assert!(matches!(
-                    inventory.bind_standalone_leaf_repair_source(inventory_ordinal),
-                    Err(KnownGoodRepairSourceError::UnsupportedInventoryEntry)
-                ));
-            }
-        }
-        assert!(matches!(
-            inventory.bind_standalone_leaf_repair_source(inventory.entries().len()),
-            Err(KnownGoodRepairSourceError::UnknownInventoryOrdinal)
-        ));
-    }
-
-    #[test]
-    fn profile_receipt_preserves_authenticated_leaf_sources() {
-        let (base, record, declarations, resolved, version_bytes) = profile_receipt_fixture();
-        let inventory = KnownGoodInstallReceipt::from_verified_profile_source(
-            &base,
-            &record,
-            resolved,
-            &version_bytes,
-            declarations,
-        )
-        .expect("profile receipt")
-        .seal_after_version_bundle_commit()
-        .into_activation_source()
-        .into_parts()
-        .1;
-        let profile_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.path().as_str() == "example/profile/1/profile-1.jar")
-            .expect("profile library ordinal");
-        let profile = inventory
-            .bind_standalone_leaf_repair_source(profile_ordinal)
-            .expect("profile library source");
-        assert_eq!(profile.kind(), KnownGoodArtifactKind::Library);
-        assert_eq!(profile.provider_url(), "https://example.invalid/library");
-        for kind in [
-            KnownGoodArtifactKind::AssetIndex,
-            KnownGoodArtifactKind::AssetObject,
-        ] {
-            let inventory_ordinal = inventory
-                .entries()
-                .iter()
-                .position(|entry| entry.kind() == kind)
-                .expect("inherited asset ordinal");
-            assert_eq!(
-                inventory
-                    .bind_standalone_leaf_repair_source(inventory_ordinal)
-                    .expect("inherited asset source")
-                    .kind(),
-                kind
-            );
-        }
-        let client_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.kind() == KnownGoodArtifactKind::ClientJar)
-            .expect("profile client ordinal");
-        assert!(matches!(
-            inventory.bind_standalone_leaf_repair_source(client_ordinal),
-            Err(KnownGoodRepairSourceError::UnsupportedInventoryEntry)
-        ));
-    }
-
-    #[test]
-    fn zero_byte_asset_object_retains_its_canonical_hash_source() {
+    fn zero_byte_asset_object_keeps_its_content_address() {
         let mut fixture = fixture(false);
         let empty_digest = sha1_digest(&[]);
         fixture.replace_asset_index(
@@ -6150,25 +5561,20 @@ mod tests {
         );
 
         let inventory = fixture.derive().expect("zero-byte asset inventory");
-        let inventory_ordinal = inventory
-            .entries()
-            .iter()
-            .position(|entry| entry.kind() == KnownGoodArtifactKind::AssetObject)
-            .expect("zero-byte object ordinal");
-        let source = inventory
-            .bind_standalone_leaf_repair_source(inventory_ordinal)
-            .expect("zero-byte object source");
-        assert_eq!(source.size(), 0);
-        assert_eq!(source.sha1(), &empty_digest);
-        assert_eq!(source.path().as_str(), asset_object_path(&empty_digest));
-        assert_eq!(
-            source.provider_url(),
-            asset_object_provider_url(&empty_digest)
+        assert_entry(
+            &inventory,
+            &KnownGoodRoot::Assets,
+            &asset_object_path(&empty_digest),
+            KnownGoodArtifactKind::AssetObject,
+            &KnownGoodIntegrity::Sha1 {
+                digest: empty_digest.clone(),
+                size: 0,
+            },
         );
     }
 
     #[test]
-    fn invalid_asset_object_hash_fails_before_source_authority_exists() {
+    fn invalid_asset_object_hash_fails_closed() {
         let mut fixture = fixture(false);
         fixture.replace_asset_index(
             br#"{"objects":{"invalid":{"hash":"not-a-sha1","size":0}}}"#.to_vec(),
@@ -6179,196 +5585,6 @@ mod tests {
             fixture.derive(),
             Err(KnownGoodInventoryError::InvalidAssetObject)
         );
-    }
-
-    #[test]
-    fn inherited_library_plan_url_cannot_mint_repair_authority() {
-        let library = checksum_library(
-            "com.mojang:inherited:1",
-            "com/mojang/inherited/1/inherited-1.jar",
-            SHA_A,
-            10,
-        );
-        let mut base = InventoryBuilder::default();
-        base.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Libraries,
-            path: KnownGoodRelativePath::new("com/mojang/inherited/1/inherited-1.jar")
-                .expect("library path"),
-            kind: KnownGoodArtifactKind::Library,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
-                size: 10,
-            },
-        })
-        .expect("base library");
-        let base = base.finish();
-        let mut inherited = InventoryBuilder::default();
-        add_exact_inherited_libraries(
-            &mut inherited,
-            &[library],
-            &crate::rules::default_environment(),
-            &base,
-        )
-        .expect("inherited library");
-        let inherited = inherited.finish();
-        assert!(matches!(
-            inherited.bind_standalone_leaf_repair_source(0),
-            Err(KnownGoodRepairSourceError::UnsupportedInventoryEntry)
-        ));
-    }
-
-    #[test]
-    fn plain_asset_entries_cannot_mint_repair_authority() {
-        let digest = Sha1Digest::from_metadata(SHA_A).expect("asset digest");
-        let mut source_free_asset = InventoryBuilder::default();
-        source_free_asset
-            .insert(KnownGoodEntry {
-                root: KnownGoodRoot::Assets,
-                path: KnownGoodRelativePath::new(&asset_object_path(&digest))
-                    .expect("asset object path"),
-                kind: KnownGoodArtifactKind::AssetObject,
-                integrity: KnownGoodIntegrity::Sha1 { digest, size: 0 },
-            })
-            .expect("source-free asset");
-        assert!(matches!(
-            source_free_asset
-                .finish()
-                .bind_standalone_leaf_repair_source(0),
-            Err(KnownGoodRepairSourceError::UnsupportedInventoryEntry)
-        ));
-    }
-
-    #[test]
-    fn repair_source_contracts_fail_closed_on_invalid_conflicting_and_mismatched_facts() {
-        let entry = || KnownGoodEntry {
-            root: KnownGoodRoot::Libraries,
-            path: KnownGoodRelativePath::new("example/library.jar").expect("library path"),
-            kind: KnownGoodArtifactKind::Library,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
-                size: 10,
-            },
-        };
-        let mut builder = InventoryBuilder::default();
-        builder
-            .insert_with_standalone_leaf_repair_source(
-                entry(),
-                Some("https://example.invalid/library.jar"),
-            )
-            .expect("first source");
-        assert_eq!(
-            builder.insert_with_standalone_leaf_repair_source(
-                entry(),
-                Some("https://mirror.invalid/library.jar"),
-            ),
-            Err(KnownGoodInventoryError::ConflictingRepairSource)
-        );
-
-        let mut inventory = builder.finish();
-        inventory
-            .standalone_leaf_repair_sources
-            .get_mut(&0)
-            .expect("source contract")
-            .digest = Sha1Digest::from_metadata(SHA_B).expect("mismatched digest");
-        assert!(matches!(
-            inventory.bind_standalone_leaf_repair_source(0),
-            Err(KnownGoodRepairSourceError::ContractMismatch)
-        ));
-
-        let mut invalid = InventoryBuilder::default();
-        assert_eq!(
-            invalid.insert_with_standalone_leaf_repair_source(
-                entry(),
-                Some("file:///tmp/library.jar"),
-            ),
-            Err(KnownGoodInventoryError::InvalidRepairSource)
-        );
-        let mut client = entry();
-        client.root = KnownGoodRoot::Versions;
-        client.kind = KnownGoodArtifactKind::ClientJar;
-        assert_eq!(
-            invalid.insert_with_standalone_leaf_repair_source(
-                client,
-                Some("https://example.invalid/client.jar"),
-            ),
-            Err(KnownGoodInventoryError::InvalidRepairSource)
-        );
-
-        let asset_object = |path: &str, digest: &str| KnownGoodEntry {
-            root: KnownGoodRoot::Assets,
-            path: KnownGoodRelativePath::new(path).expect("asset object path"),
-            kind: KnownGoodArtifactKind::AssetObject,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: Sha1Digest::from_metadata(digest).expect("asset object digest"),
-                size: 0,
-            },
-        };
-        assert_eq!(
-            invalid.insert_with_standalone_leaf_repair_source(
-                asset_object(&format!("objects/aa/{SHA_A}"), SHA_A),
-                Some("https://mirror.invalid/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            ),
-            Err(KnownGoodInventoryError::InvalidRepairSource)
-        );
-        assert_eq!(
-            invalid.insert_with_standalone_leaf_repair_source(
-                asset_object(&format!("objects/bb/{SHA_B}"), SHA_A),
-                Some(&format!("{ASSET_OBJECT_BASE_URL}/aa/{SHA_A}")),
-            ),
-            Err(KnownGoodInventoryError::InvalidRepairSource)
-        );
-        let asset_index = KnownGoodEntry {
-            root: KnownGoodRoot::Assets,
-            path: KnownGoodRelativePath::new("indexes/invalid/nested.json")
-                .expect("safe but noncanonical index path"),
-            kind: KnownGoodArtifactKind::AssetIndex,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: Sha1Digest::from_metadata(SHA_A).expect("asset index digest"),
-                size: 1,
-            },
-        };
-        assert_eq!(
-            invalid.insert_with_standalone_leaf_repair_source(
-                asset_index,
-                Some("https://example.invalid/index.json"),
-            ),
-            Err(KnownGoodInventoryError::InvalidRepairSource)
-        );
-        let canonical_asset_index = KnownGoodEntry {
-            root: KnownGoodRoot::Assets,
-            path: KnownGoodRelativePath::new("indexes/canonical.json")
-                .expect("canonical index path"),
-            kind: KnownGoodArtifactKind::AssetIndex,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: Sha1Digest::from_metadata(SHA_A).expect("asset index digest"),
-                size: 1,
-            },
-        };
-        assert_eq!(
-            invalid.insert_with_standalone_leaf_repair_source(
-                canonical_asset_index,
-                Some("file:///tmp/index.json"),
-            ),
-            Err(KnownGoodInventoryError::InvalidRepairSource)
-        );
-
-        let mut asset_contract = InventoryBuilder::default();
-        asset_contract
-            .insert_with_standalone_leaf_repair_source(
-                asset_object(&format!("objects/aa/{SHA_A}"), SHA_A),
-                Some(&format!("{ASSET_OBJECT_BASE_URL}/aa/{SHA_A}")),
-            )
-            .expect("canonical asset source");
-        let mut asset_contract = asset_contract.finish();
-        asset_contract
-            .standalone_leaf_repair_sources
-            .get_mut(&0)
-            .expect("asset source contract")
-            .provider_url = format!("{ASSET_OBJECT_BASE_URL}/bb/{SHA_B}");
-        assert!(matches!(
-            asset_contract.bind_standalone_leaf_repair_source(0),
-            Err(KnownGoodRepairSourceError::ContractMismatch)
-        ));
     }
 
     #[test]

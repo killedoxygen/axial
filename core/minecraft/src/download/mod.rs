@@ -16,7 +16,6 @@ mod transfer;
 mod transient_transfer;
 
 pub(crate) use crate::asset_index::parse_asset_index;
-pub(crate) use assets::ASSET_OBJECT_BASE_URL;
 pub use assets::materialize_virtual_assets;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,

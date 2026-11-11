@@ -30,7 +30,6 @@ struct SealedExactLibraryDeclaration {
     kind: SealedLibraryKind,
     sha1: [u8; 20],
     size: u64,
-    provider_url: Option<String>,
 }
 
 pub(crate) struct SealedExactLibraryDeclarations {
@@ -319,7 +318,7 @@ pub(crate) fn bind_installer_library_declarations(
                 let sha1 = Sha1::digest(artifact.bytes()).into();
                 let size = artifact.bytes().len() as u64;
                 validate_plan_contract(&plan, sha1, size)?;
-                insert_exact_declaration(&mut entries, &plan, sha1, size, false)?;
+                insert_exact_declaration(&mut entries, &plan, sha1, size)?;
                 InstallerLibraryProducer::Embedded
             }
             (None, None) => {
@@ -329,7 +328,7 @@ pub(crate) fn bind_installer_library_declarations(
                 match (plan.expected.sha1.as_deref(), plan.expected.size) {
                     (Some(sha1), Some(size)) if size > 0 => {
                         let sha1 = decode_sha1(sha1)?;
-                        insert_exact_declaration(&mut entries, &plan, sha1, size, true)?;
+                        insert_exact_declaration(&mut entries, &plan, sha1, size)?;
                         InstallerLibraryProducer::ExactNetwork
                     }
                     _ => InstallerLibraryProducer::FreshNetwork,
@@ -358,7 +357,6 @@ fn insert_exact_declaration(
     plan: &LibraryArtifactPlan,
     sha1: [u8; 20],
     size: u64,
-    independently_downloadable: bool,
 ) -> Result<(), SealedLibraryDeclarationError> {
     if size == 0
         || entries
@@ -369,9 +367,6 @@ fn insert_exact_declaration(
                     kind: kind_for_plan(plan),
                     sha1,
                     size,
-                    provider_url: independently_downloadable
-                        .then(|| plan.source_url.clone())
-                        .flatten(),
                 },
             )
             .is_some()
@@ -554,7 +549,6 @@ impl PendingInstallerNetworkDeclarations {
                     &selected.plan,
                     source.observed_sha1(),
                     source.observed_size(),
-                    true,
                 )?;
             }
             network_sources.push(source);
@@ -628,7 +622,7 @@ impl PendingInstallerReconstructionDeclarations {
                 return Err(SealedLibraryDeclarationError::ContractDrift);
             }
             validate_plan_contract(&selected.plan, proof.sha1, proof.size)?;
-            insert_exact_declaration(&mut entries, &selected.plan, proof.sha1, proof.size, true)?;
+            insert_exact_declaration(&mut entries, &selected.plan, proof.sha1, proof.size)?;
         }
         if !streamed.is_empty() {
             return Err(SealedLibraryDeclarationError::ExtraDeclaration);
@@ -670,7 +664,7 @@ impl PendingInstallerReconstructionTerminalDeclarations {
                 .size
                 .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
             validate_plan_contract(&selected.plan, *sha1, size)?;
-            insert_exact_declaration(&mut entries, &selected.plan, *sha1, size, false)?;
+            insert_exact_declaration(&mut entries, &selected.plan, *sha1, size)?;
         }
         if entries.len() != self.selected.len() {
             return Err(SealedLibraryDeclarationError::MissingDeclaration);
@@ -705,7 +699,7 @@ impl PendingInstallerReconstructionTerminalDeclarations {
                 return Err(SealedLibraryDeclarationError::ContractDrift);
             }
             validate_plan_contract(&selected.plan, sha1, size)?;
-            insert_exact_declaration(&mut entries, &selected.plan, sha1, size, false)?;
+            insert_exact_declaration(&mut entries, &selected.plan, sha1, size)?;
         }
         if !outputs.is_empty() {
             return Err(SealedLibraryDeclarationError::ExtraDeclaration);
@@ -819,7 +813,7 @@ impl PendingInstallerTerminalDeclarations {
                 return Err(SealedLibraryDeclarationError::ContractDrift);
             }
             validate_plan_contract(&selected.plan, sha1, size)?;
-            insert_exact_declaration(&mut entries, &selected.plan, sha1, size, false)?;
+            insert_exact_declaration(&mut entries, &selected.plan, sha1, size)?;
             sources.push(
                 RetainedLibraryComponentSource::from_authenticated_local_bytes(
                     path.clone(),
@@ -933,15 +927,10 @@ impl SealedExactLibraryDeclarations {
     pub(crate) fn get(
         &self,
         path: &PortableRelativePath,
-    ) -> Option<(SealedLibraryKind, [u8; 20], u64, Option<&str>)> {
-        self.entries.get(path).map(|entry| {
-            (
-                entry.kind,
-                entry.sha1,
-                entry.size,
-                entry.provider_url.as_deref(),
-            )
-        })
+    ) -> Option<(SealedLibraryKind, [u8; 20], u64)> {
+        self.entries
+            .get(path)
+            .map(|entry| (entry.kind, entry.sha1, entry.size))
     }
 
     pub(crate) fn matches_version(&self, version: &VersionJson, environment: &Environment) -> bool {
@@ -1196,7 +1185,6 @@ pub(crate) fn seal_profile_exact_library_declarations(
             kind: SealedLibraryKind::Library,
             sha1,
             size,
-            provider_url: plan.source_url.clone(),
         })?;
     }
 
@@ -1372,7 +1360,6 @@ fn merge_selected_library_declarations(
                     kind: proof.kind,
                     sha1: proof.sha1,
                     size: proof.size,
-                    provider_url: Some(proof.provider_url),
                 }
             }
             (None, None) => return Err(SealedLibraryDeclarationError::MissingDeclaration),
@@ -1421,7 +1408,6 @@ fn seal_exact_plan_subset(
                 kind: kind_for_plan(&plan),
                 sha1,
                 size,
-                provider_url: plan.source_url.clone(),
             })?;
         }
         if selected.insert(plan.relative_path.clone(), plan).is_some() {
@@ -1664,7 +1650,6 @@ mod tests {
             },
             sha1: [1; 20],
             size: 7,
-            provider_url: None,
         }
     }
 
@@ -2477,16 +2462,9 @@ mod tests {
         assert_eq!(sealed.len(), 4);
         let exact_path = PortableRelativePath::new(exact_path).expect("exact path");
         let fresh_path = PortableRelativePath::new(fresh_path).expect("fresh path");
-        assert_eq!(
-            sealed.get(&exact_path).and_then(|entry| entry.3),
-            Some("https://example.invalid/library.jar")
-        );
-        assert_eq!(
-            sealed.get(&fresh_path).and_then(|entry| entry.3),
-            Some("https://example.invalid/library.jar")
-        );
-        assert_eq!(sealed.get(&embedded_path).and_then(|entry| entry.3), None);
-        assert_eq!(sealed.get(&terminal_path).and_then(|entry| entry.3), None);
+        for path in [&exact_path, &fresh_path, &embedded_path, &terminal_path] {
+            assert!(sealed.get(path).is_some(), "missing sealed {path:?}");
+        }
         assert_eq!(sources.len(), 4);
         assert_eq!(
             sources
@@ -2555,7 +2533,7 @@ mod tests {
         assert_eq!(sealed.len(), 3);
         assert_eq!(
             sealed.get(&terminal_path),
-            Some((SealedLibraryKind::Library, terminal_sha1, 9, None))
+            Some((SealedLibraryKind::Library, terminal_sha1, 9))
         );
     }
 
@@ -2934,7 +2912,7 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(
             sealed.get(&path),
-            Some((SealedLibraryKind::Library, sha1, bytes.len() as u64, None,))
+            Some((SealedLibraryKind::Library, sha1, bytes.len() as u64))
         );
     }
 
@@ -3035,7 +3013,7 @@ mod tests {
             assert_eq!(source.observed_size(), size);
             assert_eq!(
                 sealed.get(source.relative_path()),
-                Some((SealedLibraryKind::Library, sha1, size, None))
+                Some((SealedLibraryKind::Library, sha1, size))
             );
         }
     }

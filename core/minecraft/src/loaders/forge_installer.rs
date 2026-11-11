@@ -4384,7 +4384,7 @@ mod tests {
                     )
                     .expect("terminal path"),
                 )
-                .map(|(_, _, size, _)| size),
+                .map(|(_, _, size)| size),
             Some(9)
         );
     }
