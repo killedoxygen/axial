@@ -270,8 +270,49 @@ enum Source {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(into = "EncodedReceipt", try_from = "EncodedReceipt")]
 struct Receipt {
+    schema: u32,
+    operation_id: String,
+    instance_id: InstanceId,
+    instance_revision: u64,
+    directory_receipt: String,
+    before_manifest: Option<Vec<u8>>,
+    before_observed_manifest: Vec<u8>,
+    after_manifest: Vec<u8>,
+    changes: Vec<Change>,
+    native_settled: bool,
+    ready_checkpoint: Option<String>,
+    kind: Kind,
+}
+
+#[derive(Clone, Debug)]
+enum Kind {
+    Content {
+        /// Untracked files whose exact bytes became managed without a payload write.
+        adopted: Vec<String>,
+        /// Untracked files the person chose to replace; their bytes are change preconditions.
+        displaced: Vec<String>,
+    },
+    Pack(CanonicalId),
+    LocalMod(LocalModIntent),
+    /// Adds untracked mod files without changing managed provenance.
+    Import,
+}
+
+impl Kind {
+    fn adopted(&self) -> &[String] {
+        match self {
+            Self::Content { adopted, .. } => adopted,
+            _ => &[],
+        }
+    }
+}
+
+/// The durable receipt encoding. Ready checkpoints bind these exact bytes.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EncodedReceipt {
     schema: u32,
     operation_id: String,
     instance_id: InstanceId,
@@ -288,15 +329,78 @@ struct Receipt {
     local_mod: Option<LocalModIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ready_checkpoint: Option<String>,
-    /// Untracked files whose exact bytes became managed without a payload write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     adopted: Vec<String>,
-    /// Untracked files the person chose to replace; their bytes are change preconditions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     displaced: Vec<String>,
-    /// Adds untracked mod files without changing managed provenance.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     import: bool,
+}
+
+impl From<Receipt> for EncodedReceipt {
+    fn from(receipt: Receipt) -> Self {
+        let (mut pack, mut local_mod, mut adopted, mut displaced, mut import) =
+            (None, None, Vec::new(), Vec::new(), false);
+        match receipt.kind {
+            Kind::Content {
+                adopted: content_adopted,
+                displaced: content_displaced,
+            } => (adopted, displaced) = (content_adopted, content_displaced),
+            Kind::Pack(id) => pack = Some(id),
+            Kind::LocalMod(intent) => local_mod = Some(intent),
+            Kind::Import => import = true,
+        }
+        Self {
+            schema: receipt.schema,
+            operation_id: receipt.operation_id,
+            instance_id: receipt.instance_id,
+            instance_revision: receipt.instance_revision,
+            directory_receipt: receipt.directory_receipt,
+            before_manifest: receipt.before_manifest,
+            before_observed_manifest: receipt.before_observed_manifest,
+            after_manifest: receipt.after_manifest,
+            changes: receipt.changes,
+            native_settled: receipt.native_settled,
+            pack,
+            local_mod,
+            ready_checkpoint: receipt.ready_checkpoint,
+            adopted,
+            displaced,
+            import,
+        }
+    }
+}
+
+impl TryFrom<EncodedReceipt> for Receipt {
+    type Error = &'static str;
+
+    fn try_from(encoded: EncodedReceipt) -> Result<Self, Self::Error> {
+        let untracked = !encoded.adopted.is_empty() || !encoded.displaced.is_empty();
+        let kind = match (encoded.pack, encoded.local_mod, encoded.import) {
+            (None, None, false) => Kind::Content {
+                adopted: encoded.adopted,
+                displaced: encoded.displaced,
+            },
+            (Some(pack), None, false) if !untracked => Kind::Pack(pack),
+            (None, Some(intent), false) if !untracked => Kind::LocalMod(intent),
+            (None, None, true) if !untracked => Kind::Import,
+            _ => return Err("content receipt kind is ambiguous"),
+        };
+        Ok(Self {
+            schema: encoded.schema,
+            operation_id: encoded.operation_id,
+            instance_id: encoded.instance_id,
+            instance_revision: encoded.instance_revision,
+            directory_receipt: encoded.directory_receipt,
+            before_manifest: encoded.before_manifest,
+            before_observed_manifest: encoded.before_observed_manifest,
+            after_manifest: encoded.after_manifest,
+            changes: encoded.changes,
+            native_settled: encoded.native_settled,
+            ready_checkpoint: encoded.ready_checkpoint,
+            kind,
+        })
+    }
 }
 
 /// Screens downloaded mod jars against the instance's loader and the mods that
@@ -787,12 +891,8 @@ impl ContentMutations {
             after_manifest: after.encode_managed()?,
             changes,
             native_settled: false,
-            pack: Some(canonical_id),
-            local_mod: None,
             ready_checkpoint: None,
-            adopted: Vec::new(),
-            displaced: Vec::new(),
-            import: false,
+            kind: Kind::Pack(canonical_id),
         };
         validate_receipt(&receipt)?;
         if cancel.is_cancelled() {
@@ -1356,12 +1456,8 @@ impl ContentMutations {
             before_observed_manifest: before.encode_managed()?,
             changes,
             native_settled: false,
-            pack: None,
-            local_mod: Some(intent),
             ready_checkpoint: None,
-            adopted: Vec::new(),
-            displaced: Vec::new(),
-            import: false,
+            kind: Kind::LocalMod(intent),
         };
         validate_receipt(&receipt)?;
         Ok(Some(receipt))
@@ -1459,12 +1555,8 @@ impl ContentMutations {
             before_observed_manifest: encoded,
             changes,
             native_settled: false,
-            pack: None,
-            local_mod: None,
             ready_checkpoint: None,
-            adopted: Vec::new(),
-            displaced: Vec::new(),
-            import: true,
+            kind: Kind::Import,
         };
         validate_receipt(&receipt)?;
         Ok((receipt, payloads))
@@ -1568,12 +1660,8 @@ impl ContentMutations {
             after_manifest: after.encode_managed()?,
             changes,
             native_settled: false,
-            pack: None,
-            local_mod: None,
             ready_checkpoint: None,
-            adopted,
-            displaced,
-            import: false,
+            kind: Kind::Content { adopted, displaced },
         };
         Ok(receipt)
     }
@@ -2264,7 +2352,7 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
     if receipt.schema != 1
         || uuid::Uuid::parse_str(&receipt.operation_id).is_err()
         || receipt.changes.len()
-            > if receipt.pack.is_some() {
+            > if matches!(receipt.kind, Kind::Pack(_)) {
                 20_000 + 8192
             } else {
                 8192
@@ -2272,52 +2360,62 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), MutationError> {
     {
         return Err(MutationError::Changed);
     }
-    let untracked = !receipt.adopted.is_empty() || !receipt.displaced.is_empty();
-    if untracked && (receipt.pack.is_some() || receipt.local_mod.is_some()) {
-        return Err(MutationError::Changed);
-    }
-    let mut recorded = ContentManifest::decode_managed(receipt.before_manifest.as_deref())?;
+    let recorded = ContentManifest::decode_managed(receipt.before_manifest.as_deref())?;
     let before = ContentManifest::decode_managed(Some(&receipt.before_observed_manifest))?;
-    if let Some(intent) = &receipt.local_mod {
-        if receipt.import {
-            return Err(MutationError::Changed);
+    match &receipt.kind {
+        Kind::LocalMod(intent) => validate_local_mod_receipt(receipt, intent, &recorded, &before),
+        Kind::Import => validate_import_receipt(receipt, &recorded, &before),
+        Kind::Pack(pack) => {
+            let after = managed_after(receipt, recorded, &before)?;
+            validate_pack_receipt(receipt, pack, &before, &after)
         }
-        return validate_local_mod_receipt(receipt, intent, &recorded, &before);
+        Kind::Content { adopted, displaced } => {
+            let after = managed_after(receipt, recorded, &before)?;
+            validate_content_receipt(receipt, adopted, displaced, &before, &after)
+        }
     }
-    if receipt.import {
-        return validate_import_receipt(receipt, &recorded, &before);
-    }
-    // Observation may correct only enabled/disabled spelling. It cannot invent
-    // provenance or change a provider identity, digest, dependency, or filename.
+}
+
+/// Observation may correct only enabled/disabled spelling. It cannot invent
+/// provenance or change a provider identity, digest, dependency, or filename.
+fn managed_after(
+    receipt: &Receipt,
+    mut recorded: ContentManifest,
+    before: &ContentManifest,
+) -> Result<ContentManifest, MutationError> {
     for entry in before.entries() {
         recorded.try_set_enabled(entry.canonical_id(), entry.enabled())?;
     }
-    if recorded != before {
+    if &recorded != before {
         return Err(MutationError::Changed);
     }
-    let after = ContentManifest::decode_managed(Some(&receipt.after_manifest))?;
-    if let Some(pack) = &receipt.pack {
-        return validate_pack_receipt(receipt, pack, &before, &after);
-    }
-    let before = manifest_paths(&before)?;
-    let after = manifest_paths(&after)?;
-    let adopted = receipt.adopted.iter().collect::<HashSet<_>>();
-    let displaced = receipt.displaced.iter().collect::<HashSet<_>>();
-    if adopted.len() != receipt.adopted.len()
-        || displaced.len() != receipt.displaced.len()
-        || receipt
-            .adopted
-            .iter()
-            .chain(&receipt.displaced)
-            .any(|path| {
-                before.contains_key(path)
-                    || !direct_managed_path(path)
-                    || adopted.contains(path) && displaced.contains(path)
-            })
-        || receipt.adopted.iter().any(|path| {
+    Ok(ContentManifest::decode_managed(Some(
+        &receipt.after_manifest,
+    ))?)
+}
+
+fn validate_content_receipt(
+    receipt: &Receipt,
+    adopted_paths: &[String],
+    displaced_paths: &[String],
+    before: &ContentManifest,
+    after: &ContentManifest,
+) -> Result<(), MutationError> {
+    let before = manifest_paths(before)?;
+    let after = manifest_paths(after)?;
+    let adopted = adopted_paths.iter().collect::<HashSet<_>>();
+    let displaced = displaced_paths.iter().collect::<HashSet<_>>();
+    if adopted.len() != adopted_paths.len()
+        || displaced.len() != displaced_paths.len()
+        || adopted_paths.iter().chain(displaced_paths).any(|path| {
+            before.contains_key(path)
+                || !direct_managed_path(path)
+                || adopted.contains(path) && displaced.contains(path)
+        })
+        || adopted_paths.iter().any(|path| {
             !after.contains_key(path) || receipt.changes.iter().any(|change| &change.path == path)
         })
-        || receipt.displaced.iter().any(|path| {
+        || displaced_paths.iter().any(|path| {
             !receipt
                 .changes
                 .iter()
@@ -2392,8 +2490,7 @@ fn validate_import_receipt(
     before: &ContentManifest,
 ) -> Result<(), MutationError> {
     let after = ContentManifest::decode_managed(Some(&receipt.after_manifest))?;
-    if receipt.pack.is_some()
-        || recorded != before
+    if recorded != before
         || &after != before
         || receipt
             .before_manifest
@@ -2447,8 +2544,7 @@ fn validate_local_mod_receipt(
     recorded: &ContentManifest,
     before: &ContentManifest,
 ) -> Result<(), MutationError> {
-    if receipt.pack.is_some()
-        || recorded != before
+    if recorded != before
         || receipt.before_manifest.as_deref() != Some(receipt.after_manifest.as_slice())
         || receipt.changes.len() != 1 + usize::from(intent.destination.is_some())
     {
@@ -2692,7 +2788,7 @@ fn preflight(game: &ScopedDirectory, receipt: &Receipt, resume: bool) -> Result<
         if current != change.before && (!resume || current != change.after) {
             return Err(MutationError::Conflict);
         }
-        if receipt.pack.is_some() && !direct_managed_path(&change.path) {
+        if matches!(receipt.kind, Kind::Pack(_)) && !direct_managed_path(&change.path) {
             continue;
         }
         let alternate = change
@@ -2713,14 +2809,15 @@ fn preflight(game: &ScopedDirectory, receipt: &Receipt, resume: bool) -> Result<
 }
 
 fn adopted_proofs(receipt: &Receipt) -> Result<Vec<(String, Proof)>, MutationError> {
-    if receipt.adopted.is_empty() {
+    if receipt.kind.adopted().is_empty() {
         return Ok(Vec::new());
     }
     let after = manifest_paths(&ContentManifest::decode_managed(Some(
         &receipt.after_manifest,
     ))?)?;
     receipt
-        .adopted
+        .kind
+        .adopted()
         .iter()
         .map(|path| {
             Ok((
@@ -2740,7 +2837,7 @@ fn direct_managed_path(path: &str) -> bool {
 fn removed_absence_preconditions(receipt: &Receipt) -> Result<Vec<String>, MutationError> {
     let before = ContentManifest::decode_managed(Some(&receipt.before_observed_manifest))?;
     let after = ContentManifest::decode_managed(Some(&receipt.after_manifest))?;
-    if let Some(pack) = &receipt.pack {
+    if let Kind::Pack(pack) = &receipt.kind {
         return Ok(pack_stale_paths(&before, &after, pack)?
             .into_keys()
             .filter(|path| !receipt.changes.iter().any(|change| &change.path == path))
@@ -2771,7 +2868,7 @@ struct ContentAuthority {
 
 /// Packs and imports may publish into a content folder that does not exist yet.
 fn creates_parents(receipt: &Receipt) -> bool {
-    receipt.pack.is_some() || receipt.import
+    matches!(receipt.kind, Kind::Pack(_) | Kind::Import)
 }
 
 fn transaction_root(
@@ -3488,12 +3585,8 @@ pub(crate) mod tests {
             after_manifest: after.encode_managed().unwrap(),
             changes,
             native_settled: false,
-            pack: Some(pack.canonical_id.clone()),
-            local_mod: None,
             ready_checkpoint: None,
-            adopted: Vec::new(),
-            displaced: Vec::new(),
-            import: false,
+            kind: Kind::Pack(pack.canonical_id.clone()),
         };
         validate_receipt(&receipt).unwrap();
         receipt
@@ -3528,6 +3621,7 @@ pub(crate) mod tests {
             tasks.clone(),
             Arc::new(ContentService::new(client.clone()).unwrap()),
             crate::performance::public_transfer_resolver(),
+            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
         ContentMutations::new(directories, client, tasks).with_performance(performance)
@@ -3588,6 +3682,7 @@ pub(crate) mod tests {
             tasks.clone(),
             Arc::new(ContentService::new(client.clone()).unwrap()),
             crate::performance::public_transfer_resolver(),
+            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
         let owner = ContentMutations::new(directories, client, tasks).with_performance(performance);
@@ -3630,12 +3725,11 @@ pub(crate) mod tests {
             before_observed_manifest: before.encode_managed().unwrap(),
             after_manifest: after.encode_managed().unwrap(),
             native_settled: false,
-            pack: None,
-            local_mod: None,
             ready_checkpoint: None,
-            adopted: Vec::new(),
-            displaced: Vec::new(),
-            import: false,
+            kind: Kind::Content {
+                adopted: Vec::new(),
+                displaced: Vec::new(),
+            },
             changes: vec![Change {
                 path,
                 before: before
@@ -3795,6 +3889,58 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn receipt_kinds_keep_their_durable_encoding() {
+        let pack = CanonicalId::for_project(ProviderId::Modrinth, "pack");
+        for (kind, expected) in [
+            (
+                Kind::Content {
+                    adopted: vec!["mods/adopted.jar".into()],
+                    displaced: vec!["mods/displaced.jar".into()],
+                },
+                serde_json::json!({
+                    "adopted": ["mods/adopted.jar"],
+                    "displaced": ["mods/displaced.jar"],
+                }),
+            ),
+            (
+                Kind::Pack(pack.clone()),
+                serde_json::json!({ "pack": serde_json::to_value(&pack).unwrap() }),
+            ),
+            (
+                Kind::LocalMod(LocalModIntent {
+                    source: "mods/local.jar".into(),
+                    destination: None,
+                }),
+                serde_json::json!({
+                    "local_mod": { "source": "mods/local.jar", "destination": null },
+                }),
+            ),
+            (Kind::Import, serde_json::json!({ "import": true })),
+        ] {
+            let receipt = Receipt {
+                schema: 1,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                instance_id: InstanceId::new(),
+                instance_revision: 1,
+                directory_receipt: "receipt".into(),
+                before_manifest: None,
+                before_observed_manifest: Vec::new(),
+                after_manifest: Vec::new(),
+                changes: Vec::new(),
+                native_settled: false,
+                ready_checkpoint: None,
+                kind,
+            };
+            let encoded = serde_json::to_value(&receipt).unwrap();
+            for key in ["pack", "local_mod", "adopted", "displaced", "import"] {
+                assert_eq!(encoded.get(key), expected.get(key), "{key}");
+            }
+            let decoded: Receipt = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        }
+    }
+
     #[tokio::test]
     async fn local_mod_receipt_rejects_unrelated_or_managed_mutation_authority() {
         let (_root, owner, id) = fixture().await;
@@ -3807,16 +3953,15 @@ pub(crate) mod tests {
             "download",
             "extra",
             "manifest",
-            "pack",
             "digest",
         ] {
             let mut record = original.clone();
+            let Kind::LocalMod(intent) = &mut record.kind else {
+                panic!("local mod receipt");
+            };
             match tamper {
-                "source" => record.local_mod.as_mut().unwrap().source = "mods/unrelated.jar".into(),
-                "destination" => {
-                    record.local_mod.as_mut().unwrap().destination =
-                        Some("mods/unrelated.jar".into())
-                }
+                "source" => intent.source = "mods/unrelated.jar".into(),
+                "destination" => intent.destination = Some("mods/unrelated.jar".into()),
                 "managed" => {
                     let managed = Proof::bytes(b"managed");
                     record.changes[1].before = Some(managed.clone());
@@ -3829,9 +3974,6 @@ pub(crate) mod tests {
                 "download" => record.changes[0].source = Some(Source::PackOverride),
                 "extra" => record.changes.push(record.changes[1].clone()),
                 "manifest" => record.after_manifest.push(b' '),
-                "pack" => {
-                    record.pack = Some(CanonicalId::for_project(ProviderId::Modrinth, "pack"))
-                }
                 "digest" => record.changes[1].before.as_mut().unwrap().sha512 = "invalid".into(),
                 _ => unreachable!(),
             }
@@ -3839,6 +3981,10 @@ pub(crate) mod tests {
         }
         let encoded = serde_json::to_string(&original).unwrap();
         validate_receipt(&serde_json::from_str(&encoded).unwrap()).unwrap();
+        let mut forged = serde_json::to_value(&original).unwrap();
+        forged["pack"] =
+            serde_json::to_value(CanonicalId::for_project(ProviderId::Modrinth, "pack")).unwrap();
+        assert!(serde_json::from_value::<Receipt>(forged).is_err());
     }
 
     #[tokio::test]
@@ -4761,10 +4907,15 @@ pub(crate) mod tests {
         let instance = owner.directories.admit(&id).unwrap();
         let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
         assert!(receipt.changes.is_empty());
-        assert_eq!(receipt.adopted, vec!["resourcepacks/known.zip".to_string()]);
+        assert_eq!(
+            receipt.kind.adopted(),
+            ["resourcepacks/known.zip".to_string()]
+        );
         validate_receipt(&receipt).unwrap();
         let mut forged = receipt.clone();
-        forged.adopted.push("resourcepacks/other.zip".into());
+        if let Kind::Content { adopted, .. } = &mut forged.kind {
+            adopted.push("resourcepacks/other.zip".into());
+        }
         assert!(matches!(
             validate_receipt(&forged),
             Err(MutationError::Changed)
@@ -4826,14 +4977,16 @@ pub(crate) mod tests {
         let receipt = owner
             .prepare_install(&instance, &plan, false, &["resourcepacks/known.zip".into()])
             .unwrap();
-        assert_eq!(
-            receipt.displaced,
-            vec!["resourcepacks/known.zip".to_string()]
-        );
+        assert!(matches!(
+            &receipt.kind,
+            Kind::Content { displaced, .. } if displaced == &["resourcepacks/known.zip".to_string()]
+        ));
         assert_eq!(receipt.changes[0].before, Some(Proof::bytes(b"mine!")));
         validate_receipt(&receipt).unwrap();
         let mut forged = receipt.clone();
-        forged.displaced.clear();
+        if let Kind::Content { displaced, .. } = &mut forged.kind {
+            displaced.clear();
+        }
         assert!(matches!(
             validate_receipt(&forged),
             Err(MutationError::Changed)
@@ -4877,8 +5030,8 @@ pub(crate) mod tests {
         let instance = owner.directories.admit(&id).unwrap();
         let receipt = owner.prepare_install(&instance, &plan, false, &[]).unwrap();
         assert_eq!(
-            receipt.adopted,
-            vec!["resourcepacks/known.zip.disabled".to_string()]
+            receipt.kind.adopted(),
+            ["resourcepacks/known.zip.disabled".to_string()]
         );
         owner.persist_receipt(&receipt).unwrap();
         owner
