@@ -1,5 +1,6 @@
 mod assets;
 pub mod coordinator;
+pub mod crash;
 pub(crate) mod jvm;
 mod libraries;
 pub mod logs;

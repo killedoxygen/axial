@@ -213,7 +213,7 @@ pub fn boot_marker_detected(text: &str) -> bool {
             && (text.contains("textures/atlas/") || text.contains("-atlas")))
 }
 
-use super::reports::{
+use super::crash::{
     CrashArtifactKind, CrashEvidence, CrashNativeFrameKind, is_out_of_memory_failure_line,
 };
 
@@ -669,7 +669,7 @@ mod tests {
             SessionExitReason::StartupStalled
         );
     }
-    use super::super::reports::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
+    use super::super::crash::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
 
     const RANKED_FAILURES: [FailureClass; 17] = [
         FailureClass::StartupStalled,
