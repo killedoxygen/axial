@@ -742,8 +742,8 @@ mod tests {
     }
 
     #[test]
-    fn named_deleted_scratch_explicit_discard_settles() {
-        for seal in [false, true] {
+    fn named_deleted_scratch_discard_or_drop_settles() {
+        for (seal, explicit) in [(false, false), (false, true), (true, false), (true, true)] {
             let (temp, session, root) = fixture();
             let mut stage = stage(&root, "artifact.bin");
             stage.write_all(b"owned").unwrap();
@@ -751,35 +751,16 @@ mod tests {
             let outcome = if seal {
                 let stage = stage.seal().unwrap();
                 std::fs::remove_file(&scratch).unwrap();
-                stage.discard()
+                explicit.then(|| stage.discard())
             } else {
                 std::fs::remove_file(&scratch).unwrap();
-                stage.discard()
+                explicit.then(|| stage.discard())
             };
-            let TransientDiscardOutcome::Pending(obligation) = outcome else {
-                panic!("missing scratch must retain native cleanup until reconciled")
-            };
-            cancel(obligation.reconcile());
-            assert!(!scratch.exists());
-            assert!(!temp.path().join("artifact.bin").exists());
-            finish(session, root);
-        }
-    }
-
-    #[test]
-    fn named_deleted_scratch_drop_drains() {
-        for seal in [false, true] {
-            let (temp, session, root) = fixture();
-            let mut stage = stage(&root, "artifact.bin");
-            stage.write_all(b"owned").unwrap();
-            let scratch = scratch(temp.path(), &stage);
-            if seal {
-                let stage = stage.seal().unwrap();
-                std::fs::remove_file(&scratch).unwrap();
-                drop(stage);
-            } else {
-                std::fs::remove_file(&scratch).unwrap();
-                drop(stage);
+            if let Some(outcome) = outcome {
+                let TransientDiscardOutcome::Pending(obligation) = outcome else {
+                    panic!("missing scratch must retain native cleanup until reconciled")
+                };
+                cancel(obligation.reconcile());
             }
             finish(session, root);
             assert!(!scratch.exists());

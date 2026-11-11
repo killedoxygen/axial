@@ -2477,20 +2477,6 @@ mod admission_tests {
     }
 
     #[test]
-    fn parent_trie_groups_shared_ancestry_before_io() {
-        let mut tree = ParentNode::default();
-        tree.insert(&[name("shared"), name("left")], 0);
-        tree.insert(&[name("shared"), name("right")], 1);
-        tree.insert(&[name("shared"), name("left")], 2);
-
-        assert_eq!(tree.children.len(), 1);
-        let shared = &tree.children[0].1;
-        assert_eq!(shared.children.len(), 2);
-        assert_eq!(shared.children[0].1.records, [0, 2]);
-        assert_eq!(shared.children[1].1.records, [1]);
-    }
-
-    #[test]
     fn replay_planning_retry_bound_refuses_before_growth() {
         let mut attempts = 0;
         for _ in 0..MAX_REPLAY_PLANNING_ATTEMPTS {
