@@ -213,7 +213,7 @@ struct State {
 struct Entry {
     request: InstallQueueRequest,
     item: InstallQueueInstallItemViewModel,
-    status: InstallStatusResponse,
+    status: Status,
     pin: Option<GenerationPin>,
     started_at: Option<u64>,
     cancel: CancellationToken,
@@ -225,10 +225,231 @@ struct Entry {
     setup: Option<SetupWork>,
 }
 
+impl Entry {
+    fn view(&self, id: &str) -> InstallStatusResponse {
+        self.status.view(id, &self.request)
+    }
+}
+
+/// One install's queue state. Display text is derived only by [`Status::view`].
+#[derive(Clone)]
+struct Status {
+    revision: u64,
+    operation_id: OperationId,
+    phase: Phase,
+    /// Latest event per download phase.
+    progress: Vec<DownloadProgress>,
+}
+
+#[derive(Clone, Debug)]
+enum Phase {
+    Queued(Waiting),
+    Starting,
+    Running(DownloadProgress),
+    SettlementRequired,
+    Finished {
+        outcome: InstallOutcome,
+        error: Option<InstallError>,
+        detail: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Waiting {
+    Accepted,
+    Restarted,
+    Slot,
+}
+
+impl Waiting {
+    const ALL: [Self; 3] = [Self::Accepted, Self::Restarted, Self::Slot];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "Queued for installation",
+            Self::Restarted => "Queued after restart",
+            Self::Slot => "Waiting for an install slot",
+        }
+    }
+}
+
+impl Phase {
+    fn is_finished(&self) -> bool {
+        matches!(self, Self::Finished { .. })
+    }
+
+    fn is_settlement(&self) -> bool {
+        matches!(self, Self::SettlementRequired)
+    }
+
+    /// The durable `install_queue.phase` column.
+    fn column(&self) -> &'static str {
+        match self {
+            Self::Queued(_) => "queued",
+            Self::Starting | Self::Running(_) => "running",
+            Self::SettlementRequired => "settlement_required",
+            Self::Finished { .. } => "terminal",
+        }
+    }
+
+    fn view(&self) -> InstallProgressViewModel {
+        let plain = |phase_id: &str, label: &str| InstallProgressViewModel {
+            phase_id: phase_id.into(),
+            label: label.into(),
+            progress_pct: 0,
+            terminal: false,
+            failed: false,
+            active_step: None,
+        };
+        match self {
+            Self::Queued(waiting) => plain("queued", waiting.label()),
+            Self::Starting => plain("starting", "Preparing install"),
+            Self::SettlementRequired => {
+                plain("settlement_required", "Installation requires settlement")
+            }
+            Self::Running(event) => {
+                let label = match event.phase.as_str() {
+                    "version_json" => "Preparing Minecraft",
+                    "client" => "Downloading Minecraft",
+                    "libraries" => "Downloading libraries",
+                    "assets" => "Downloading assets",
+                    "runtime" | "java" => "Preparing Java",
+                    "processors" => "Preparing loader",
+                    "content_planning" => "Planning content changes",
+                    "content_download" => "Downloading content",
+                    "content_commit" => "Applying content changes",
+                    _ => "Installing game files",
+                };
+                let percent = if event.total > 0 {
+                    ((i64::from(event.current.max(0)) * 100) / i64::from(event.total)).clamp(0, 99)
+                        as u8
+                } else {
+                    0
+                };
+                InstallProgressViewModel {
+                    progress_pct: percent,
+                    active_step: Some(InstallProgressStepViewModel {
+                        phase_id: event.phase.clone(),
+                        label: label.into(),
+                        progress_pct: percent,
+                        current: event.current,
+                        total: event.total,
+                    }),
+                    ..plain(&event.phase, label)
+                }
+            }
+            Self::Finished { outcome, .. } => {
+                let (phase_id, label) = match outcome {
+                    InstallOutcome::Succeeded => ("done", "Installation complete"),
+                    InstallOutcome::Failed => ("error", "Installation failed"),
+                    InstallOutcome::Cancelled => ("cancelled", "Installation cancelled"),
+                    InstallOutcome::Removed => ("removed", "Removed from queue"),
+                };
+                InstallProgressViewModel {
+                    progress_pct: if *outcome == InstallOutcome::Succeeded {
+                        100
+                    } else {
+                        0
+                    },
+                    terminal: true,
+                    failed: *outcome == InstallOutcome::Failed,
+                    ..plain(phase_id, label)
+                }
+            }
+        }
+    }
+}
+
+impl Status {
+    fn queued(operation_id: OperationId) -> Self {
+        Self {
+            revision: 1,
+            operation_id,
+            phase: Phase::Queued(Waiting::Accepted),
+            progress: Vec::new(),
+        }
+    }
+
+    /// Decode a non-terminal row. Unfinished work restores as settlement.
+    fn restore(encoded: &str, column: &str) -> Result<Self, InstallError> {
+        let view: InstallStatusResponse =
+            serde_json::from_str(encoded).map_err(|_| InstallError::Storage)?;
+        let phase = if column == "queued" {
+            let waiting = Waiting::ALL
+                .into_iter()
+                .find(|waiting| waiting.label() == view.view_model.label)
+                .ok_or(InstallError::Storage)?;
+            Phase::Queued(waiting)
+        } else {
+            Phase::SettlementRequired
+        };
+        Ok(Self {
+            revision: view.revision,
+            operation_id: view.operation_id,
+            phase,
+            progress: view.progress,
+        })
+    }
+
+    fn bump(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    fn finish(
+        &mut self,
+        outcome: InstallOutcome,
+        error: Option<InstallError>,
+        detail: Option<String>,
+    ) {
+        self.bump();
+        self.phase = Phase::Finished {
+            outcome,
+            error,
+            detail,
+        };
+    }
+
+    fn view(&self, id: &str, request: &InstallQueueRequest) -> InstallStatusResponse {
+        let allowed_actions = match self.phase {
+            Phase::Queued(_) => vec![InstallActionViewModel::enabled(
+                "remove_from_queue",
+                "Remove from queue",
+            )],
+            Phase::Starting if !matches!(request, InstallQueueRequest::Content { .. }) => {
+                vec![InstallActionViewModel::enabled("cancel", "Cancel install")]
+            }
+            _ => Vec::new(),
+        };
+        let (outcome, failure_view_model) = match &self.phase {
+            Phase::Finished {
+                outcome,
+                error,
+                detail,
+            } => (
+                Some(*outcome),
+                error.map(|error| failure_view(error, detail.clone())),
+            ),
+            _ => (None, None),
+        };
+        InstallStatusResponse {
+            revision: self.revision,
+            queue_id: id.into(),
+            outcome,
+            allowed_actions,
+            install_id: id.into(),
+            operation_id: self.operation_id.clone(),
+            done: self.phase.is_finished(),
+            progress: self.progress.clone(),
+            view_model: self.phase.view(),
+            failure_view_model,
+            failure_point: None,
+        }
+    }
+}
+
 fn retained_retry_eligible(entry: &Entry) -> bool {
     !matches!(entry.request, InstallQueueRequest::Content { .. })
-        && !entry.status.done
-        && entry.status.view_model.phase_id == "settlement_required"
+        && entry.status.phase.is_settlement()
         && entry.pin.is_some()
         && entry.recovery_lease.is_some()
         && !entry.recovery_running
@@ -264,8 +485,7 @@ impl InstallQueue {
             let request: InstallQueueRequest =
                 serde_json::from_str(&request).map_err(|_| InstallError::Storage)?;
             let item = serde_json::from_str(&item).map_err(|_| InstallError::Storage)?;
-            let mut status: InstallStatusResponse =
-                serde_json::from_str(&status).map_err(|_| InstallError::Storage)?;
+            let status = Status::restore(&status, &phase)?;
             let pin = library
                 .admit()
                 .ok()
@@ -274,10 +494,6 @@ impl InstallQueue {
                 state.queued.push_back(id.clone());
                 None
             } else {
-                status.view_model = settlement_progress();
-                status.done = false;
-                status.outcome = None;
-                status.allowed_actions.clear();
                 state.active = Some(id.clone());
                 let lease = exclusions
                     .try_acquire(
@@ -514,7 +730,7 @@ impl InstallQueue {
         state
             .entries
             .iter()
-            .filter(|(id, entry)| !entry.status.done && !state.queued.contains(id))
+            .filter(|(id, entry)| !entry.status.phase.is_finished() && !state.queued.contains(id))
             .count()
     }
     pub(crate) fn invalidate_registry(&self) {
@@ -539,7 +755,7 @@ impl InstallQueue {
             .expect("install queue lock")
             .entries
             .get(id)
-            .map(|entry| entry.status.clone())
+            .map(|entry| entry.view(id))
         {
             return Ok(status);
         }
@@ -715,7 +931,7 @@ impl InstallQueue {
                     state.entries.get(*id).is_some_and(|entry| {
                         entry.request == request
                             && !matches!(request, InstallQueueRequest::Content { .. })
-                            && entry.status.view_model.phase_id == "settlement_required"
+                            && entry.status.phase.is_settlement()
                     })
                 })
                 .cloned()
@@ -781,7 +997,7 @@ impl InstallQueue {
             .entries
             .values()
             .any(|entry| {
-                !entry.status.done
+                !entry.status.phase.is_finished()
                     && entry
                         .setup
                         .as_ref()
@@ -815,7 +1031,7 @@ impl InstallQueue {
             .expect("install queue lock")
             .entries
             .values()
-            .filter(|entry| !entry.status.done)
+            .filter(|entry| !entry.status.phase.is_finished())
             .filter_map(|entry| entry.setup.as_ref())
             .find(|work| &work.instance().record().instance.id == id)
             .cloned();
@@ -876,7 +1092,7 @@ impl InstallQueue {
             let existing_content = state
                 .entries
                 .values()
-                .any(|entry| !entry.status.done && entry.request == request);
+                .any(|entry| !entry.status.phase.is_finished() && entry.request == request);
             let result = if front {
                 self.admit_locked(&mut state, request, item, pin.clone(), Some(work), true)
                     .and_then(|id| {
@@ -910,7 +1126,7 @@ impl InstallQueue {
                     state
                         .entries
                         .get(&id)
-                        .map(|entry| start_response(&entry.status)),
+                        .map(|entry| start_response(&entry.view(&id))),
                 )
             })
         };
@@ -971,7 +1187,7 @@ impl InstallQueue {
                 state
                     .entries
                     .get(&id)
-                    .map(|entry| start_response(&entry.status)),
+                    .map(|entry| start_response(&entry.view(&id))),
             )
         })
     }
@@ -1012,7 +1228,7 @@ impl InstallQueue {
         if let Some(existing_id) = state
             .entries
             .iter()
-            .find(|(_, entry)| !entry.status.done && entry.request == request)
+            .find(|(_, entry)| !entry.status.phase.is_finished() && entry.request == request)
             .map(|(id, _)| id.clone())
         {
             let existing = state.entries.get(&existing_id).expect("existing install");
@@ -1044,29 +1260,11 @@ impl InstallQueue {
         if state.queued.len() + usize::from(state.active.is_some()) >= 128 {
             return Err(InstallError::AtCapacity);
         }
-        let status = InstallStatusResponse {
-            revision: 1,
-            queue_id: id.clone(),
-            outcome: None,
-            allowed_actions: vec![InstallActionViewModel::enabled(
-                "remove_from_queue",
-                "Remove from queue",
-            )],
-            install_id: id.clone(),
-            operation_id,
-            done: false,
-            progress: Vec::new(),
-            view_model: InstallProgressViewModel {
-                phase_id: "queued".into(),
-                label: "Queued for installation".into(),
-                ..InstallProgressViewModel::starting()
-            },
-            failure_view_model: None,
-            failure_point: None,
-        };
+        let status = Status::queued(operation_id);
         let request_json = serde_json::to_string(&request).map_err(|_| InstallError::Storage)?;
         let item_json = serde_json::to_string(&item).map_err(|_| InstallError::Storage)?;
-        let status_json = serde_json::to_string(&status).map_err(|_| InstallError::Storage)?;
+        let status_json = serde_json::to_string(&status.view(&id, &request))
+            .map_err(|_| InstallError::Storage)?;
         self.inner.storage.transaction(|db| {
             let accepted_at = if front {
                 db.query_row("SELECT COALESCE(MIN(accepted_at)-1,?1) FROM install_queue WHERE phase='queued'", [now_ms() as i64], |row| row.get::<_, i64>(0))?
@@ -1167,8 +1365,8 @@ impl InstallQueue {
             .ok_or(InstallError::NotFound)?;
         let entry = state.entries.get_mut(id).ok_or(InstallError::NotFound)?;
         let mut status = entry.status.clone();
-        finish_status(&mut status, InstallOutcome::Removed, None, None);
-        persist_status(&self.inner.storage, &status, "terminal")?;
+        status.finish(InstallOutcome::Removed, None, None);
+        persist_status(&self.inner.storage, id, &entry.request, &status)?;
         entry.status = status;
         entry.pin = None;
         entry.setup = None;
@@ -1184,12 +1382,12 @@ impl InstallQueue {
         let state = self.inner.state.lock().expect("install queue lock");
         let entry = state.entries.get(id).ok_or(InstallError::NotFound)?;
         if matches!(entry.request, InstallQueueRequest::Content { .. })
-            || entry.status.view_model.phase_id != "starting"
+            || !matches!(entry.status.phase, Phase::Starting)
         {
             return Err(InstallError::Busy);
         }
         entry.cancel.cancel();
-        Ok(entry.status.clone())
+        Ok(entry.view(id))
     }
 
     /// Resume retained native proofs or reconstruct their exact activation
@@ -1271,10 +1469,13 @@ impl InstallQueue {
                 .entries
                 .get_mut(expected_id)
                 .ok_or(InstallError::NotFound)?;
-            if entry.status.done || entry.status.view_model.phase_id == "queued" {
+            if matches!(
+                entry.status.phase,
+                Phase::Finished { .. } | Phase::Queued(_)
+            ) {
                 return Ok(());
             }
-            if !active || entry.status.view_model.phase_id != "settlement_required" {
+            if !active || !entry.status.phase.is_settlement() {
                 return Err(InstallError::Busy);
             }
             if entry.recovery_running {
@@ -1427,13 +1628,11 @@ impl InstallQueue {
         let mut setup_changed = false;
         if let Some(entry) = state.entries.get_mut(id) {
             entry.recovery_running = false;
-            if !settled && !entry.status.done {
-                setup_changed = entry.setup.is_some()
-                    && entry.status.view_model.phase_id != "settlement_required";
-                entry.status.view_model = settlement_progress();
-                entry.status.allowed_actions.clear();
-                entry.status.revision = entry.status.revision.saturating_add(1);
-                let _ = persist_status(&self.inner.storage, &entry.status, "settlement_required");
+            if !settled && !entry.status.phase.is_finished() {
+                setup_changed = entry.setup.is_some() && !entry.status.phase.is_settlement();
+                entry.status.phase = Phase::SettlementRequired;
+                entry.status.bump();
+                let _ = persist_status(&self.inner.storage, id, &entry.request, &entry.status);
             }
         }
         if setup_changed || settled {
@@ -1450,13 +1649,8 @@ impl InstallQueue {
         let mut state = self.inner.state.lock().expect("install queue lock");
         let entry = state.entries.get_mut(id).ok_or(InstallError::NotFound)?;
         let mut status = entry.status.clone();
-        status.view_model.phase_id = "queued".into();
-        status.view_model.label = "Queued after restart".into();
-        status.allowed_actions = vec![InstallActionViewModel::enabled(
-            "remove_from_queue",
-            "Remove from queue",
-        )];
-        persist_status(&self.inner.storage, &status, "queued")?;
+        status.phase = Phase::Queued(Waiting::Restarted);
+        persist_status(&self.inner.storage, id, &entry.request, &status)?;
         entry.status = status;
         entry.recovery_lease = None;
         entry.retained = None;
@@ -2092,14 +2286,9 @@ impl InstallQueue {
         let request = entry.request.clone();
         let cancel = entry.cancel.clone();
         let setup = entry.setup.clone();
-        entry.status.view_model = InstallProgressViewModel::starting();
-        entry.status.allowed_actions = if matches!(request, InstallQueueRequest::Content { .. }) {
-            Vec::new()
-        } else {
-            vec![InstallActionViewModel::enabled("cancel", "Cancel install")]
-        };
+        entry.status.phase = Phase::Starting;
         entry.started_at = Some(now_ms());
-        if persist_status(&self.inner.storage, &entry.status, "running").is_err() {
+        if persist_status(&self.inner.storage, &id, &request, &entry.status).is_err() {
             return;
         }
         state.active = Some(id.clone());
@@ -2127,20 +2316,14 @@ impl InstallQueue {
         if result.is_err() {
             let entry = state.entries.get_mut(&id).expect("install exists");
             let mut waiting = entry.status.clone();
-            waiting.view_model.phase_id = "queued".into();
-            waiting.view_model.label = "Waiting for an install slot".into();
-            waiting.allowed_actions = vec![InstallActionViewModel::enabled(
-                "remove_from_queue",
-                "Remove from queue",
-            )];
-            if persist_status(&self.inner.storage, &waiting, "queued").is_ok() {
+            waiting.phase = Phase::Queued(Waiting::Slot);
+            if persist_status(&self.inner.storage, &id, &entry.request, &waiting).is_ok() {
                 entry.status = waiting;
                 entry.started_at = None;
                 state.active = None;
                 state.queued.push_front(id);
             } else {
-                entry.status.view_model = settlement_progress();
-                entry.status.allowed_actions.clear();
+                entry.status.phase = Phase::SettlementRequired;
                 entry.recovery_lease = Some(rejected_retention.1);
                 entry.retained = Some(
                     if matches!(entry.request, InstallQueueRequest::Content { .. }) {
@@ -2589,11 +2772,10 @@ impl InstallQueue {
             if entry.recovery_running {
                 return Err(InstallError::Busy);
             }
-            let setup_changed =
-                entry.setup.is_some() && entry.status.view_model.phase_id == "settlement_required";
+            let setup_changed = entry.setup.is_some() && entry.status.phase.is_settlement();
             entry.recovery_running = true;
-            entry.status.view_model = InstallProgressViewModel::starting();
-            entry.status.revision = entry.status.revision.saturating_add(1);
+            entry.status.phase = Phase::Starting;
+            entry.status.bump();
             if setup_changed {
                 state.registry_revision = state.registry_revision.saturating_add(1);
             }
@@ -2874,11 +3056,13 @@ impl InstallQueue {
         let Some(entry) = state.entries.get_mut(id) else {
             return;
         };
-        if entry.status.done || entry.status.view_model.phase_id == "settlement_required" {
+        if matches!(
+            entry.status.phase,
+            Phase::Finished { .. } | Phase::SettlementRequired
+        ) {
             return;
         }
-        entry.status.allowed_actions.clear();
-        entry.status.view_model = progress_view(&event);
+        entry.status.phase = Phase::Running(event.clone());
         if let Some(previous) = entry
             .status
             .progress
@@ -2889,7 +3073,7 @@ impl InstallQueue {
         } else if entry.status.progress.len() < 32 {
             entry.status.progress.push(event);
         }
-        entry.status.revision = entry.status.revision.saturating_add(1);
+        entry.status.bump();
         publish(&self.inner, &mut state);
     }
 
@@ -2908,13 +3092,13 @@ impl InstallQueue {
         let Some(entry) = state.entries.get_mut(id) else {
             return false;
         };
-        if entry.status.done {
+        if entry.status.phase.is_finished() {
             return true;
         }
         let mut status = entry.status.clone();
-        finish_status(&mut status, outcome, error, detail);
-        if persist_status(&self.inner.storage, &status, "terminal").is_err() {
-            entry.status.view_model = settlement_progress();
+        status.finish(outcome, error, detail.clone());
+        if persist_status(&self.inner.storage, id, &entry.request, &status).is_err() {
+            entry.status.phase = Phase::SettlementRequired;
             publish(&self.inner, &mut state);
             return false;
         }
@@ -2924,20 +3108,17 @@ impl InstallQueue {
         entry.retained = None;
         entry.setup = None;
         let item = entry.item.clone();
-        let failure =
-            entry
-                .status
-                .failure_view_model
-                .clone()
-                .map(|failure| InstallQueueFailureViewModel {
-                    failed_at_ms: now_ms(),
-                    queue_id: id.into(),
-                    install_id: id.into(),
-                    operation_id: entry.status.operation_id.clone(),
-                    label: item_label(&item),
-                    install_item: item.clone(),
-                    failure_view_model: failure,
-                });
+        let failure = error
+            .map(|error| failure_view(error, detail))
+            .map(|failure| InstallQueueFailureViewModel {
+                failed_at_ms: now_ms(),
+                queue_id: id.into(),
+                install_id: id.into(),
+                operation_id: entry.status.operation_id.clone(),
+                label: item_label(&item),
+                install_item: item.clone(),
+                failure_view_model: failure,
+            });
         // A terminal result for an item supersedes its earlier failure.
         state
             .failures
@@ -2996,13 +3177,11 @@ impl InstallQueue {
         let mut state = self.inner.state.lock().expect("install queue lock");
         let mut setup_changed = false;
         if let Some(entry) = state.entries.get_mut(id) {
-            setup_changed =
-                entry.setup.is_some() && entry.status.view_model.phase_id != "settlement_required";
-            entry.status.view_model = settlement_progress();
-            entry.status.allowed_actions.clear();
-            entry.status.revision = entry.status.revision.saturating_add(1);
+            setup_changed = entry.setup.is_some() && !entry.status.phase.is_settlement();
+            entry.status.phase = Phase::SettlementRequired;
+            entry.status.bump();
             entry.retained = Some(retained);
-            let _ = persist_status(&self.inner.storage, &entry.status, "settlement_required");
+            let _ = persist_status(&self.inner.storage, id, &entry.request, &entry.status);
         }
         if setup_changed {
             state.registry_revision = state.registry_revision.saturating_add(1);
@@ -3019,9 +3198,7 @@ fn preserved_content_instance(state: &State) -> Result<Option<InstanceId>, Insta
         .entries
         .get(active)
         .ok_or(InstallError::SettlementRequired)?;
-    if entry.status.done
-        || entry.status.outcome.is_some()
-        || entry.status.view_model.phase_id != "settlement_required"
+    if !entry.status.phase.is_settlement()
         || !matches!(entry.retained, None | Some(RetainedInstall::Content(None)))
         || state.entries.iter().any(|(id, entry)| {
             entry.recovery_running
@@ -3426,16 +3603,21 @@ fn now_ms() -> u64 {
 }
 fn persist_status(
     storage: &MetadataStore,
-    status: &InstallStatusResponse,
-    phase: &str,
+    id: &str,
+    request: &InstallQueueRequest,
+    status: &Status,
 ) -> Result<(), InstallError> {
-    let encoded = serde_json::to_string(status).map_err(|_| InstallError::Storage)?;
+    let encoded =
+        serde_json::to_string(&status.view(id, request)).map_err(|_| InstallError::Storage)?;
     storage.transaction(|db| {
-        db.execute(
+        let changed = db.execute(
             "UPDATE install_queue SET status_json=?1, phase=?2 WHERE id=?3",
-            params![encoded, phase, status.install_id],
+            params![encoded, status.phase.column(), id],
         )?;
-        Ok::<_, InstallError>(())
+        if changed != 1 {
+            return Err(InstallError::Storage);
+        }
+        Ok(())
     })
 }
 fn start_response(status: &InstallStatusResponse) -> InstallStartResponse {
@@ -3443,49 +3625,6 @@ fn start_response(status: &InstallStatusResponse) -> InstallStartResponse {
         install_id: status.install_id.clone(),
         operation_id: status.operation_id.clone(),
         view_model: status.view_model.clone(),
-    }
-}
-fn progress_view(event: &DownloadProgress) -> InstallProgressViewModel {
-    let label = match event.phase.as_str() {
-        "version_json" => "Preparing Minecraft",
-        "client" => "Downloading Minecraft",
-        "libraries" => "Downloading libraries",
-        "assets" => "Downloading assets",
-        "runtime" | "java" => "Preparing Java",
-        "processors" => "Preparing loader",
-        "content_planning" => "Planning content changes",
-        "content_download" => "Downloading content",
-        "content_commit" => "Applying content changes",
-        _ => "Installing game files",
-    };
-    let percent = if event.total > 0 {
-        ((i64::from(event.current.max(0)) * 100) / i64::from(event.total)).clamp(0, 99) as u8
-    } else {
-        0
-    };
-    InstallProgressViewModel {
-        phase_id: event.phase.clone(),
-        label: label.into(),
-        progress_pct: percent,
-        terminal: false,
-        failed: false,
-        active_step: Some(InstallProgressStepViewModel {
-            phase_id: event.phase.clone(),
-            label: label.into(),
-            progress_pct: percent,
-            current: event.current,
-            total: event.total,
-        }),
-    }
-}
-fn settlement_progress() -> InstallProgressViewModel {
-    InstallProgressViewModel {
-        phase_id: "settlement_required".into(),
-        label: "Installation requires settlement".into(),
-        progress_pct: 0,
-        terminal: false,
-        failed: false,
-        active_step: None,
     }
 }
 /// Classify by the content owner's refusal so local failures never claim the
@@ -3532,55 +3671,26 @@ fn content_failure(error: &MutationError) -> InstallError {
     }
 }
 
-fn finish_status(
-    status: &mut InstallStatusResponse,
-    outcome: InstallOutcome,
-    error: Option<InstallError>,
-    detail: Option<String>,
-) {
-    status.done = true;
-    status.outcome = Some(outcome);
-    status.allowed_actions.clear();
-    status.revision = status.revision.saturating_add(1);
-    let (phase, label) = match outcome {
-        InstallOutcome::Succeeded => ("done", "Installation complete"),
-        InstallOutcome::Failed => ("error", "Installation failed"),
-        InstallOutcome::Cancelled => ("cancelled", "Installation cancelled"),
-        InstallOutcome::Removed => ("removed", "Removed from queue"),
-    };
-    status.view_model = InstallProgressViewModel {
-        phase_id: phase.into(),
-        label: label.into(),
-        progress_pct: if outcome == InstallOutcome::Succeeded {
-            100
-        } else {
-            0
-        },
-        terminal: true,
-        failed: outcome == InstallOutcome::Failed,
-        active_step: None,
-    };
-    if let Some(error) = error {
-        status.failure_view_model = Some(InstallFailureViewModel {
-            state_id: "failed".into(),
-            title: "Installation failed".into(),
-            tone: "danger".into(),
-            summary: error.to_string(),
-            detail,
-            details: Vec::new(),
-            retry_action: match error {
-                // Repeating the same request cannot succeed until the instance changes.
-                InstallError::ContentRequired | InstallError::ContentIncompatible => {
-                    InstallActionViewModel {
-                        enabled: false,
-                        disabled_reason: Some("Change the instance's content first.".into()),
-                        ..InstallActionViewModel::enabled("retry", "Retry")
-                    }
+fn failure_view(error: InstallError, detail: Option<String>) -> InstallFailureViewModel {
+    InstallFailureViewModel {
+        state_id: "failed".into(),
+        title: "Installation failed".into(),
+        tone: "danger".into(),
+        summary: error.to_string(),
+        detail,
+        details: Vec::new(),
+        retry_action: match error {
+            // Repeating the same request cannot succeed until the instance changes.
+            InstallError::ContentRequired | InstallError::ContentIncompatible => {
+                InstallActionViewModel {
+                    enabled: false,
+                    disabled_reason: Some("Change the instance's content first.".into()),
+                    ..InstallActionViewModel::enabled("retry", "Retry")
                 }
-                _ => InstallActionViewModel::enabled("retry", "Retry"),
-            },
-            dismiss_action: InstallActionViewModel::enabled("dismiss", "Dismiss"),
-        });
+            }
+            _ => InstallActionViewModel::enabled("retry", "Retry"),
+        },
+        dismiss_action: InstallActionViewModel::enabled("dismiss", "Dismiss"),
     }
 }
 fn publish(inner: &Inner, state: &mut State) {
@@ -3597,23 +3707,22 @@ fn project_with_started(
 }
 fn project(state: &State) -> InstallQueueStateResponse {
     let active = state.active.as_ref().and_then(|id| {
-        state
-            .entries
-            .get(id)
-            .map(|entry| InstallQueueActiveViewModel {
-                queue_id: id.clone(),
-                install_id: Some(id.clone()),
-                operation_id: Some(entry.status.operation_id.clone()),
-                install_started_at_ms: entry.started_at,
-                kind: kind(&entry.request).into(),
-                title: item_label(&entry.item),
-                label: item_label(&entry.item),
-                summary: entry.status.view_model.label.clone(),
-                install_item: entry.item.clone(),
-                progress: entry.status.view_model.clone(),
-                retry_action: (!state.closed && retained_retry_eligible(entry))
-                    .then(|| InstallActionViewModel::enabled("retry", "Retry settlement")),
-            })
+        let entry = state.entries.get(id)?;
+        let progress = entry.status.phase.view();
+        Some(InstallQueueActiveViewModel {
+            queue_id: id.clone(),
+            install_id: Some(id.clone()),
+            operation_id: Some(entry.status.operation_id.clone()),
+            install_started_at_ms: entry.started_at,
+            kind: kind(&entry.request).into(),
+            title: item_label(&entry.item),
+            label: item_label(&entry.item),
+            summary: progress.label.clone(),
+            install_item: entry.item.clone(),
+            progress,
+            retry_action: (!state.closed && retained_retry_eligible(entry))
+                .then(|| InstallActionViewModel::enabled("retry", "Retry settlement")),
+        })
     });
     let total = state.queued.len();
     let items = state
@@ -3761,27 +3870,8 @@ pub(crate) mod tests {
         ] {
             assert_eq!(content_failure(&error), expected, "{error:?}");
         }
-        let mut status = InstallStatusResponse {
-            revision: 1,
-            queue_id: "queue".into(),
-            outcome: None,
-            allowed_actions: Vec::new(),
-            install_id: "queue".into(),
-            operation_id: OperationId::new(),
-            done: false,
-            progress: Vec::new(),
-            view_model: settlement_progress(),
-            failure_view_model: None,
-            failure_point: None,
-        };
         let detail = "Sodium Extra needs Fabric Loader 0.20.1 or newer. This instance has 0.19.3.";
-        finish_status(
-            &mut status,
-            InstallOutcome::Failed,
-            Some(InstallError::ContentIncompatible),
-            Some(detail.into()),
-        );
-        let failure = status.failure_view_model.unwrap();
+        let failure = failure_view(InstallError::ContentIncompatible, Some(detail.into()));
         assert_eq!(failure.detail.as_deref(), Some(detail));
         assert!(!failure.retry_action.enabled);
         assert!(!failure.summary.contains("connection"));
@@ -4675,7 +4765,7 @@ pub(crate) mod tests {
         assert_eq!(queue.active_count(), 0);
 
         for id in &ids[2..] {
-            persist_status(&storage, &queue.status(id).unwrap(), "running").unwrap();
+            mark_running(&storage, id);
         }
         let runtime = queue.inner.runtime.clone();
         queue.close_admission();
@@ -5033,7 +5123,7 @@ pub(crate) mod tests {
                     false,
                 )
                 .unwrap();
-            persist_status(&queue.inner.storage, &state.entries[&id].status, "running").unwrap();
+            mark_running(&queue.inner.storage, &id);
             id
         };
         queue.close_admission();
@@ -5302,11 +5392,10 @@ pub(crate) mod tests {
         assert_eq!(state.queued.pop_front().as_deref(), Some(id.as_str()));
         state.active = Some(id.clone());
         let entry = state.entries.get_mut(&id).unwrap();
-        entry.status.view_model = settlement_progress();
-        entry.status.allowed_actions.clear();
+        entry.status.phase = Phase::SettlementRequired;
         entry.retained = Some(RetainedInstall::Retry);
         entry.recovery_lease = Some(lease);
-        persist_status(&queue.inner.storage, &entry.status, "settlement_required").unwrap();
+        persist_status(&queue.inner.storage, &id, &entry.request, &entry.status).unwrap();
         publish(&queue.inner, &mut state);
         id
     }
@@ -6074,9 +6163,7 @@ pub(crate) mod tests {
             let retained = {
                 let state = restarted.inner.state.lock().unwrap();
                 let entry = &state.entries[&id];
-                !entry.status.done
-                    && entry.status.outcome.is_none()
-                    && entry.status.view_model.phase_id == "settlement_required"
+                entry.status.phase.is_settlement()
                     && entry.pin.is_some()
                     && entry.recovery_lease.is_some()
                     && matches!(entry.retained, Some(RetainedInstall::Retry))
@@ -7556,6 +7643,34 @@ pub(crate) mod tests {
             .expect("512 observed assets below 128 descriptor limit");
         receipt.revalidate().unwrap();
     }
+    fn mark_running(storage: &MetadataStore, id: &str) {
+        storage
+            .transaction(|db| {
+                db.execute("UPDATE install_queue SET phase='running' WHERE id=?1", [id])?;
+                Ok::<_, InstallError>(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn restored_rows_keep_their_waiting_reason_or_require_settlement() {
+        let request = InstallQueueRequest::Vanilla {
+            version_id: "1.21.4".into(),
+        };
+        for waiting in Waiting::ALL {
+            let status = Status {
+                phase: Phase::Queued(waiting),
+                ..Status::queued(OperationId::new())
+            };
+            let encoded = serde_json::to_string(&status.view("id", &request)).unwrap();
+            let queued = Status::restore(&encoded, "queued").unwrap();
+            assert_eq!(queued.view("id", &request), status.view("id", &request));
+            let running = Status::restore(&encoded, "running").unwrap();
+            assert_eq!(
+                running.view("id", &request).view_model.phase_id,
+                "settlement_required"
+            );
+        }
+    }
     #[test]
     fn terminal_status_is_separate_from_leaf_publication_progress() {
         for (phase, label, current, total, percent) in [
@@ -7574,7 +7689,7 @@ pub(crate) mod tests {
                 bytes_total: None,
             };
             assert_eq!(
-                serde_json::to_value(progress_view(&event)).unwrap(),
+                serde_json::to_value(Phase::Running(event).view()).unwrap(),
                 serde_json::json!({
                     "phase_id": phase, "label": label, "progress_pct": percent,
                     "terminal": false, "failed": false,
@@ -7585,7 +7700,6 @@ pub(crate) mod tests {
                 })
             );
         }
-        assert!(!settlement_progress().terminal);
     }
     #[test]
     fn activation_projection_never_confers_filesystem_authority() {

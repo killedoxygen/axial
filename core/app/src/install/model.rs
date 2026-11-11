@@ -30,19 +30,6 @@ pub struct InstallProgressViewModel {
     pub active_step: Option<InstallProgressStepViewModel>,
 }
 
-impl InstallProgressViewModel {
-    pub fn starting() -> Self {
-        Self {
-            phase_id: "starting".to_string(),
-            label: "Preparing install".to_string(),
-            progress_pct: 0,
-            terminal: false,
-            failed: false,
-            active_step: None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallStatusResponse {
     pub revision: u64,
