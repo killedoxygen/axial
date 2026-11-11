@@ -699,9 +699,9 @@ function parsePnpmLock(source, repositoryRoot) {
   } catch (error) {
     fail(`could not load frontend yaml parser: ${error.message}`);
   }
-  if (yamlVersion !== "2.9.0")
+  if (yamlVersion !== "2.9.1")
     fail(
-      `frontend yaml parser is ${JSON.stringify(yamlVersion)}; expected "2.9.0"`,
+      `frontend yaml parser is ${JSON.stringify(yamlVersion)}; expected "2.9.1"`,
     );
   const document = yaml.parseDocument(source, {
     maxAliasCount: 0,

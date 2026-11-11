@@ -25,10 +25,8 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 url.workspace = true
 dirs.workspace = true
-thiserror.workspace = true
 include_dir = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
-hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 
 [build-dependencies]
