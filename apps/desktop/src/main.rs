@@ -50,9 +50,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     tauri::async_runtime::set(tokio::runtime::Handle::current());
     let mut context = app_context();
-    if context.config().identifier != bootstrap::APPLICATION_ID {
+    if context.config().identifier != axial_app::public::APPLICATION_ID {
         return Err(std::io::Error::other(
-            "The desktop rewrite must use its independent application identity.",
+            "The desktop app must use its configured application identity.",
         )
         .into());
     }

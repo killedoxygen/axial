@@ -1,4 +1,4 @@
-//! Composition for the isolated replacement application and its local HTTP API.
+//! Composition for the application and its local HTTP API.
 
 #[cfg(test)]
 mod fixture;
@@ -36,7 +36,7 @@ use axial_app::{
     network::{ClientConfig, ProviderClient},
     performance::{PerformanceService, benchmarks::BenchmarkService, rules::RulesSettings},
     profile::{Profile, Recovery},
-    public::DEVELOPMENT_APPLICATION_ID,
+    public::APPLICATION_ID,
     resources::{ResourceService, folders::FolderService},
     runtime::discovery::RuntimeDiscovery,
     settings::SettingsStore,
@@ -401,17 +401,17 @@ pub async fn start_browser(extra_origin: Option<&str>) -> Result<DesktopServices
 }
 
 fn configured_profile() -> Result<PathBuf, String> {
-    Ok(match std::env::var_os("AXIAL_REWRITE_PROFILE") {
+    Ok(match std::env::var_os("AXIAL_PROFILE") {
         Some(path) => PathBuf::from(path),
         None => dirs::data_local_dir()
             .ok_or("The application data directory is unavailable.")?
-            .join(DEVELOPMENT_APPLICATION_ID),
+            .join(APPLICATION_ID),
     })
 }
 
 fn configured_telemetry() -> Option<CollectorConfig> {
-    let key = std::env::var("AXIAL_REWRITE_TELEMETRY_API_KEY").ok()?;
-    let environment = std::env::var("AXIAL_REWRITE_TELEMETRY_ENVIRONMENT")
+    let key = std::env::var("AXIAL_TELEMETRY_API_KEY").ok()?;
+    let environment = std::env::var("AXIAL_TELEMETRY_ENVIRONMENT")
         .ok()
         .and_then(|label| TelemetryEnvironment::from_label(&label))
         .unwrap_or(if cfg!(debug_assertions) {
@@ -419,7 +419,7 @@ fn configured_telemetry() -> Option<CollectorConfig> {
         } else {
             TelemetryEnvironment::Production
         });
-    match std::env::var("AXIAL_REWRITE_TELEMETRY_HOST") {
+    match std::env::var("AXIAL_TELEMETRY_HOST") {
         Ok(host) => CollectorConfig::new(&key, &host, environment).ok(),
         Err(std::env::VarError::NotPresent) => CollectorConfig::posthog(&key, environment).ok(),
         Err(std::env::VarError::NotUnicode(_)) => None,
@@ -552,7 +552,7 @@ fn report_unresolved_profile_admission(error: &axial_fs::RootSessionError) {
         phase,
         io_error_kind = ?cause.map(io::Error::kind),
         native_code = ?cause.and_then(io::Error::raw_os_error),
-        "Replacement profile admission remains unresolved"
+        "Profile admission remains unresolved"
     );
 }
 
@@ -582,14 +582,14 @@ async fn start_profile_inner(
     let telemetry_for_init = telemetry.clone();
     let (profile, library, metadata, settings, accounts, consent, identity, inspector_override) = tokio::task::spawn_blocking(move || {
         let profile = Profile::admit(&profile_root)?;
-        let library_id = LibraryId::parse(&profile.id().to_string()).map_err(|_| "The replacement profile identity is invalid.")?;
+        let library_id = LibraryId::parse(&profile.id().to_string()).map_err(|_| "The profile identity is invalid.")?;
         let library = match LibraryLifecycle::open_with_id(profile.root(), library_id) {
             LibraryOpenOutcome::Ready(library) => library,
-            LibraryOpenOutcome::NoEffect(_) => return Err("The replacement profile is already open or unavailable. Existing files have been preserved.".into()),
+            LibraryOpenOutcome::NoEffect(_) => return Err("The profile is already open or unavailable. Existing files have been preserved.".into()),
             LibraryOpenOutcome::Unresolved(obligation) => {
                 report_unresolved_profile_admission(obligation.error());
                 return Err(StartupError {
-                    message: "Replacement profile admission is unresolved. Startup is blocked while its filesystem obligations remain owned.".into(),
+                    message: "Profile admission is unresolved. Startup is blocked while its filesystem obligations remain owned.".into(),
                     root: Some(LibraryOpenOutcome::Unresolved(obligation)),
                     runtime: None,
                 });
@@ -603,9 +603,9 @@ async fn start_profile_inner(
         library.restore_startup_selection(library_id)
             .map_err(|error| error.to_string())?;
         let metadata = Arc::new(MetadataStore::open(profile.root().join("metadata.sqlite"))
-            .map_err(|_| "Could not open replacement metadata. Existing data has been preserved.".to_string())?);
+            .map_err(|_| "Could not open profile metadata. Existing data has been preserved.".to_string())?);
         metadata.migrate(axial_app::storage::SCHEMA)
-            .map_err(|_| "Could not migrate replacement metadata. Existing data has been preserved.".to_string())?;
+            .map_err(|_| "Could not migrate profile metadata. Existing data has been preserved.".to_string())?;
         let settings = Arc::new(SettingsStore::new_with_telemetry_identity(metadata.clone(), telemetry_for_init.export_configured())
             .map_err(|error| error.to_string())?);
         let accounts = Arc::new(AccountDirectory::new(metadata.clone()).map_err(|error| error.to_string())?);
@@ -615,7 +615,7 @@ async fn start_profile_inner(
             .any(|flag| flag.key == axial_app::settings::STATE_INSPECTOR_FLAG && flag.enabled != flag.default_enabled);
         Ok::<_, String>((profile, library, metadata, settings, accounts, consent, identity, inspector_override))
         })().map_err(|message| StartupError::with_library(message, retained_library))
-    }).await.map_err(|_| "Replacement profile initialization was interrupted.".to_string())??;
+    }).await.map_err(|_| "Profile initialization was interrupted.".to_string())??;
     // Recovery can commit real feature outcomes. It must observe the persisted
     // consent and identity loaded above, never the default startup state.
     telemetry

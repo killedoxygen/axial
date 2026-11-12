@@ -66,7 +66,7 @@ test("packaging refuses foreign hosts and mismatched binaries before creating ou
   const foreign = native === "linux-amd64" ? "windows-amd64" : "linux-amd64";
   const output = path.join(root, "candidate");
   const binary = path.join(root, "synthetic-header");
-  const source = { schema: "axial.rewrite.source.v1", app_id: "com.mateoltd.axial.rewrite", tag: "v9.8.7", source_sha: "a".repeat(40) };
+  const source = { schema: "axial.source.v1", app_id: "com.killedoxygen.axial", tag: "v9.8.7", source_sha: "a".repeat(40) };
   await assert.rejects(packageArtifacts({ platform: foreign, source, binary, bundleRoot: root, output }), { message: "packaging_requires_matching_native_host" });
   await assert.rejects(access(output), { code: "ENOENT" });
   if (native) {
@@ -87,7 +87,7 @@ test("packaging never merges a retry into an existing candidate directory", asyn
   const binary = path.join(root, "synthetic-header");
   await writeFile(binary, header(platform));
   await assert.rejects(packageArtifacts({ platform, binary, bundleRoot: root, output,
-    source: { schema: "axial.rewrite.source.v1", app_id: "com.mateoltd.axial.rewrite", tag: "v9.8.7", source_sha: "a".repeat(40) },
+    source: { schema: "axial.source.v1", app_id: "com.killedoxygen.axial", tag: "v9.8.7", source_sha: "a".repeat(40) },
   }), { code: "EEXIST" });
   assert.equal(await readFile(marker, "utf8"), "previous candidate must remain unchanged");
 });

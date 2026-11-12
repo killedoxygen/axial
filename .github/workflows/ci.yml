@@ -1,15 +1,15 @@
-name: Rewrite verification
+name: Verification
 
 on:
   pull_request:
   push:
-    branches: [main, feat/clean-rewrite]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: rewrite-verification-${{ github.ref }}
+  group: verification-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

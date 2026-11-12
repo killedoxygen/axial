@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       run_id:
-        description: Run ID of the "Rewrite candidate artifacts" build for that tag
+        description: Run ID of the "Candidate artifacts" build for that tag
         required: true
         type: string
 
@@ -39,11 +39,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run_id }}
         run: |
-          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/downloads" -p 'rewrite-assets-*'
-          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/downloads/rewrite-source" -n rewrite-source
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/downloads" -p 'candidate-assets-*'
+          gh run download "$RUN_ID" -R "$GITHUB_REPOSITORY" -D "$RUNNER_TEMP/downloads/candidate-source" -n candidate-source
           mkdir "$RUNNER_TEMP/assets"
           for platform in linux-amd64 windows-amd64 macos-amd64 macos-arm64; do
-            mv "$RUNNER_TEMP/downloads/rewrite-assets-$platform" "$RUNNER_TEMP/assets/$platform"
+            mv "$RUNNER_TEMP/downloads/candidate-assets-$platform" "$RUNNER_TEMP/assets/$platform"
           done
       - name: Verify signatures and stage the release
         env:
@@ -53,8 +53,8 @@ jobs:
           printf '[Resolve]\nDNS=1.1.1.1 8.8.8.8\nDomains=~.\n' | sudo tee /etc/systemd/resolved.conf.d/public-dns.conf > /dev/null
           sudo systemctl restart systemd-resolved
           sudo apt-get update > /dev/null && sudo apt-get install -y minisign > /dev/null
-          node -e 'const s=require(process.argv[1]); if (s.tag !== process.env.CANDIDATE_TAG || s.source_sha !== process.argv[2]) process.exit(1)' "$RUNNER_TEMP/downloads/rewrite-source/source.json" "$(git rev-parse HEAD)"
-          node scripts/release/publish.mjs --source "$RUNNER_TEMP/downloads/rewrite-source/source.json" --assets "$RUNNER_TEMP/assets" --public-key apps/desktop/updater.pub --changelog CHANGELOG.md --guide apps/desktop/platform/install-guide.html --output "$RUNNER_TEMP/publish"
+          node -e 'const s=require(process.argv[1]); if (s.tag !== process.env.CANDIDATE_TAG || s.source_sha !== process.argv[2]) process.exit(1)' "$RUNNER_TEMP/downloads/candidate-source/source.json" "$(git rev-parse HEAD)"
+          node scripts/release/publish.mjs --source "$RUNNER_TEMP/downloads/candidate-source/source.json" --assets "$RUNNER_TEMP/assets" --public-key apps/desktop/updater.pub --changelog CHANGELOG.md --guide apps/desktop/platform/install-guide.html --output "$RUNNER_TEMP/publish"
       - name: Create the pre-release
         env:
           GH_TOKEN: ${{ github.token }}

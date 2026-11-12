@@ -193,7 +193,7 @@ mod tests {
     async fn retained_login_future_owns_auth_until_it_returns_but_idle_facade_does_not() {
         let directory =
             tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let services = axial_api::start_in_profile(directory.path().join("rewrite"), None)
+        let services = axial_api::start_in_profile(directory.path().join("profile"), None)
             .await
             .unwrap();
         let native = NativeSignIn::new(

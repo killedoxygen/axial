@@ -1,4 +1,4 @@
-//! The isolated replacement profile: path admission, its identity marker and
+//! The application profile: path admission, its identity marker and
 //! the recovery obligations that refuse an update.
 use crate::{
     content::install::ContentMutations,
@@ -6,7 +6,7 @@ use crate::{
     instances::create::InstanceService,
     library::{ApplicationRootPin, LibraryLifecycle},
     performance::PerformanceService,
-    public::DEVELOPMENT_APPLICATION_ID,
+    public::APPLICATION_ID,
     resources::ResourceService,
 };
 use axial_fs::{
@@ -21,10 +21,10 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const MARKER: &str = ".axial-rewrite-profile";
+pub const MARKER: &str = ".axial-profile";
 const MARKER_LIMIT: u64 = 4096;
-const INVALID: &str = "Use an absolute, isolated replacement profile directory.";
-const UNKNOWN: &str = "The selected directory is not an admitted replacement profile. Existing files have been preserved.";
+const INVALID: &str = "Use an absolute profile directory.";
+const UNKNOWN: &str = "The selected directory is not an Axial profile. Existing files have been preserved.";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -35,23 +35,12 @@ struct Identity {
 
 fn identity(marker: &[u8]) -> Option<Uuid> {
     let identity: Identity = serde_json::from_slice(marker).ok()?;
-    (identity.application_id == DEVELOPMENT_APPLICATION_ID && !identity.profile_id.is_nil())
+    (identity.application_id == APPLICATION_ID && !identity.profile_id.is_nil())
         .then_some(identity.profile_id)
 }
 
 pub fn marker_name() -> LeafName {
     LeafName::new(MARKER).expect("fixed profile marker")
-}
-
-/// Refuses filesystem roots and any path inside an installed application's data.
-fn independent(root: &Path) -> bool {
-    root.is_absolute()
-        && root.parent().is_some()
-        && !root.components().any(|part| {
-            matches!(part, Component::ParentDir | Component::CurDir)
-                || matches!(part, Component::Normal(name)
-                    if name == "dev.mateoltd.axial" || name == "com.mateoltd.axial")
-        })
 }
 
 /// Read and validate the marker through the retained application root.
@@ -85,8 +74,7 @@ impl Profile {
         {
             return Err(INVALID);
         }
-        // Resolve the existing ancestor before creating anything. An alias into
-        // an installed profile must be refused just like its direct spelling.
+        // Resolve the existing ancestor before creating anything.
         let mut ancestor = requested;
         let mut missing = Vec::new();
         while !ancestor.try_exists().map_err(|_| UNKNOWN)? {
@@ -95,7 +83,7 @@ impl Profile {
         }
         let mut root = fs::canonicalize(ancestor).map_err(|_| UNKNOWN)?;
         root.extend(missing.iter().rev());
-        if !independent(&root) || std::env::home_dir().is_some_and(|home| root == home) {
+        if root.parent().is_none() || std::env::home_dir().is_some_and(|home| root == home) {
             return Err(INVALID);
         }
         let marker = if missing.is_empty() {
@@ -129,7 +117,7 @@ impl Profile {
             None => {
                 pin.read_projection().map_err(|_| UNKNOWN)?;
                 let identity = Identity {
-                    application_id: DEVELOPMENT_APPLICATION_ID.into(),
+                    application_id: APPLICATION_ID.into(),
                     profile_id: self.id,
                 };
                 let bytes = serde_json::to_vec(&identity).map_err(|_| UNKNOWN)?;
@@ -271,9 +259,6 @@ mod tests {
         assert!(Profile::admit(&unknown).is_err());
         assert_eq!(fs::read_dir(&unknown).unwrap().count(), 1);
         assert!(Profile::admit(Path::new("relative-profile")).is_err());
-        let installed = temporary.path().join("dev.mateoltd.axial").join("rewrite");
-        assert!(Profile::admit(&installed).is_err());
-        assert!(!temporary.path().join("dev.mateoltd.axial").exists());
     }
 
     #[test]
@@ -287,7 +272,7 @@ mod tests {
         drop(library);
         let admitted = Profile::admit(&root).unwrap();
         let replaced = format!(
-            "{{\"application_id\":\"{DEVELOPMENT_APPLICATION_ID}\",\"profile_id\":\"{}\"}}",
+            "{{\"application_id\":\"{APPLICATION_ID}\",\"profile_id\":\"{}\"}}",
             Uuid::new_v4()
         );
         fs::write(root.join(MARKER), replaced).unwrap();

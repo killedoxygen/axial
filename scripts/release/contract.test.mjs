@@ -10,7 +10,7 @@ import { changelogRelease, verifyArtifacts, verifySource, verifyUpdaterSignature
 import { payloads, releaseIdentity } from "./matrix.mjs";
 
 const exec = promisify(execFile);
-const APP_ID = "com.mateoltd.axial.rewrite";
+const APP_ID = "com.killedoxygen.axial";
 const VERSION = "9.8.7-rc.1";
 const TAG = `v${VERSION}`;
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
@@ -63,17 +63,17 @@ const ARTIFACTS = {
 
 async function artifactFixture(t, platform = "linux-amd64") {
   const root = await temporary(t);
-  const source = { schema: "axial.rewrite.source.v1", app_id: APP_ID, tag: TAG, version: VERSION, source_sha: "a".repeat(40) };
+  const source = { schema: "axial.source.v1", app_id: APP_ID, tag: TAG, version: VERSION, source_sha: "a".repeat(40) };
   const files = [];
   for (const [suffix, role] of ARTIFACTS[platform]) {
-    const name = `axial-rewrite-${platform}-${VERSION}${suffix}`;
+    const name = `axial-${platform}-${VERSION}${suffix}`;
     const bytes = `Synthetic ${role} bytes; not an installable artifact.\n`;
     const hash = sha256(bytes);
     await put(root, name, bytes);
     await put(root, `${name}.sha256`, `${hash}  ${name}\n`);
     files.push({ name, role, bytes: Buffer.byteLength(bytes), sha256: hash });
   }
-  const manifest = { schema: "axial.rewrite.artifacts.v1", app_id: APP_ID, platform,
+  const manifest = { schema: "axial.artifacts.v1", app_id: APP_ID, platform,
     tag: TAG, source_sha: source.source_sha, files, authenticity: "not-verified", native_acceptance: "not-run" };
   await put(root, "artifacts.json", manifest);
   return { root, source, platform, manifest };
@@ -85,7 +85,7 @@ test("release identities and the four artifact layouts stay explicit", () => {
     assert.throws(() => releaseIdentity(invalid), { message: "invalid_release_tag" });
   }
   for (const [platform, expected] of Object.entries(ARTIFACTS)) {
-    assert.deepEqual(payloads(platform, TAG), expected.map(([suffix, role]) => ({ name: `axial-rewrite-${platform}-${VERSION}${suffix}`, role })));
+    assert.deepEqual(payloads(platform, TAG), expected.map(([suffix, role]) => ({ name: `axial-${platform}-${VERSION}${suffix}`, role })));
   }
   assert.throws(() => payloads("linux-arm64", TAG), { message: "unsupported_artifact_platform" });
 });
@@ -106,8 +106,7 @@ test("source verification rejects mismatched metadata and dirty or retagged sour
     ["missing workspace member", "incomplete_workspace", async (f) => { f.metadata.workspace_members.pop(); }],
     ["wrong workspace root", "metadata_workspace_mismatch", async (f) => { f.metadata.workspace_root = path.join(f.root, "core"); }],
     ["noninherited package version", "package_version_not_inherited", async (f) => { await writeFile(f.metadata.packages[0].manifest_path, `[package]\nname="fixture"\nversion="${VERSION}"\n`); }],
-    ["legacy manifest", "manifest_outside_rewrite", async (f) => { f.metadata.packages[0].manifest_path = await put(f.root, "legacy/fixture/Cargo.toml", "[package]\nversion.workspace = true\n"); }],
-    ["wrong app identity", "application_identity_mismatch", async (f) => { await put(f.root, "apps/desktop/tauri.conf.json", { identifier: "com.mateoltd.axial", version: VERSION }); }],
+    ["wrong app identity", "application_identity_mismatch", async (f) => { await put(f.root, "apps/desktop/tauri.conf.json", { identifier: "com.example.other", version: VERSION }); }],
     ["wrong frontend version", "frontend_version_mismatch", async (f) => { await put(f.root, "frontend/package.json", { version: "0.0.1" }); }],
     ["untracked changes", "source_tree_not_clean", async (f) => { await put(f.root, "untracked.txt", "uncommitted fixture\n"); }],
     ["incorrect source commit", "source_head_mismatch", async (f) => { f.sourceSha = "f".repeat(40); }],

@@ -682,7 +682,7 @@ mod tests {
 
     async fn fixture() -> (tempfile::TempDir, DesktopLifecycle, std::net::SocketAddr) {
         let directory = tempfile::tempdir().unwrap();
-        let services = axial_api::start_in_profile(directory.path().join("rewrite"), None)
+        let services = axial_api::start_in_profile(directory.path().join("profile"), None)
             .await
             .unwrap();
         let url = tauri::Url::parse(&services.server.bootstrap().base_url).unwrap();
@@ -1094,7 +1094,7 @@ mod tests {
 
         let temporary =
             tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let root = temporary.path().join("rewrite");
+        let root = temporary.path().join("profile");
         std::fs::create_dir(&root).unwrap();
         let mut output = tempfile::tempfile().unwrap();
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())

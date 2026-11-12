@@ -255,7 +255,7 @@ pub struct ConsentChange<'a> {
 
 impl ConsentChange<'_> {
     /// Call only after the settings commit succeeds, before releasing this guard.
-    /// The identity belongs to the replacement profile; this never creates one.
+    /// The identity belongs to the profile; this never creates one.
     pub fn publish(&self, enabled: bool, identity: Option<&str>) {
         self.telemetry.publish_consent(enabled, identity);
     }

@@ -1,8 +1,6 @@
 use axial_api::transport::ApiTransportBootstrap;
 use tauri::{State, Url, WebviewWindow};
 
-pub const APPLICATION_ID: &str = "com.mateoltd.axial.rewrite";
-
 pub fn confine_content_policy(
     config: &mut tauri::Config,
     base_url: &str,

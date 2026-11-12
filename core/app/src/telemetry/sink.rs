@@ -57,8 +57,7 @@ pub struct CollectorConfig {
 pub struct CollectorConfigurationError;
 
 impl CollectorConfig {
-    /// Explicit construction avoids inheriting the installed application's
-    /// telemetry configuration or enabling exports during an isolated rewrite.
+    /// Exports are enabled only by explicit construction.
     pub fn new(
         key: &str,
         host: &str,

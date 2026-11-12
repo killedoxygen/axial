@@ -113,7 +113,7 @@ pub struct MetadataStore {
     limits: StorageLimits,
 }
 
-const APPLICATION_ID: i64 = 0x4158_4952; // AXIR, distinct replacement profile.
+const APPLICATION_ID: i64 = 0x4158_4952; // AXIR.
 const MIGRATION_TABLE: &str = "CREATE TABLE IF NOT EXISTS _axial_schema_migrations (
     id TEXT PRIMARY KEY NOT NULL CHECK(length(id) BETWEEN 1 AND 128),
     sql TEXT NOT NULL CHECK(length(sql) BETWEEN 1 AND 1048576)

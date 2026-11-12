@@ -24,8 +24,8 @@ pub struct CommandSummary {
     pub summary: &'static str,
 }
 
-/// Separate identity prevents development builds from admitting the legacy profile.
-pub const DEVELOPMENT_APPLICATION_ID: &str = "com.mateoltd.axial.rewrite";
+/// Names the default profile directory and binds each profile marker to this application.
+pub const APPLICATION_ID: &str = "com.killedoxygen.axial";
 
 /// Stable public correlation identity. It does not grant operation authority.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, TS)]

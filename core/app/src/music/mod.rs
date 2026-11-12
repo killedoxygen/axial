@@ -138,7 +138,7 @@ impl MusicService {
         task.join().await.map_err(|_| MusicError::Unavailable)?
     }
 
-    /// The legacy query defaults to the first track and clamps large indices.
+    /// An absent index selects the first track and clamps large indices.
     /// Dropping an HTTP waiter leaves the shared, owned operation running.
     pub async fn track(&self, index: Option<usize>) -> Result<MusicTrackBytes, MusicError> {
         let index = index.unwrap_or(0).min(MUSIC_FILES.len() - 1);

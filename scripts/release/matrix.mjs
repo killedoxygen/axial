@@ -1,4 +1,4 @@
-export const APPLICATION_ID = "com.mateoltd.axial.rewrite";
+export const APPLICATION_ID = "com.killedoxygen.axial";
 
 export const PLATFORMS = Object.freeze({
   "linux-amd64": { os: "linux", arch: "x64", target: "x86_64-unknown-linux-gnu", updater: "linux-x86_64", bundles: "appimage" },
@@ -24,7 +24,7 @@ export function platformInfo(platform) {
 export function payloads(platform, tag) {
   platformInfo(platform);
   const { version } = releaseIdentity(tag);
-  const prefix = `axial-rewrite-${platform}-${version}`;
+  const prefix = `axial-${platform}-${version}`;
   if (platform.startsWith("linux")) return [
     { name: prefix, role: "portable" },
     { name: `${prefix}.tar.gz`, role: "portable-archive" },

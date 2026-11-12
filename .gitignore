@@ -32,5 +32,5 @@ debug-builds
 apps/desktop/gen/schemas/
 
 
-# Replacement verification output
-.rewrite-logs/
+# Run logs and local evidence
+.run-logs/

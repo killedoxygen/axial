@@ -2,11 +2,11 @@
 
 Read and follow [docs/CONVENTIONS.md](docs/CONVENTIONS.md) before making changes.
 
-Active rewrite development is on `main`. Preserve existing commit history; the earlier rewrite branch is a recovery checkpoint, not the working branch. Full non-Guardian parity remains the completion condition.
+Development is on `main`. Preserve existing commit history.
 
 This pre-release is intentionally breaking: do not support predecessor-profile import or old application schema upgrades. Remove compatibility-only code and tests. Retain recovery for operations performed by the new application, current-app persistence/reopen, and supported Minecraft/loader versions.
 
-Agent-created or agent-downloaded artifacts used only for this rewrite's isolated testing are disposable and may be cleaned without asking again. Verify exact targets, preserve unrelated data, and retain needed recovery and acceptance evidence. Snapshot diagnostic state and release locks before assertions; retain unsettled owners before fallible reporting so failures preserve evidence and ownership.
+Agent-created or agent-downloaded artifacts used only for isolated testing are disposable and may be cleaned without asking again. Verify exact targets, preserve unrelated data, and retain needed recovery and acceptance evidence. Snapshot diagnostic state and release locks before assertions; retain unsettled owners before fallible reporting so failures preserve evidence and ownership.
 
 Keep only actively needed test processes running. For local shared verification, use `CARGO_BUILD_JOBS=1` and `RUST_TEST_THREADS=2`; serialize heavyweight commands. After each check, stop games and quit test apps through their owners, join/reap processes and verify exit. Invoke the application's Quit/Close control; external window destruction is interruption, not graceful-close evidence. After native Quit/Close, verify through the original process handle or inventory; app-bound accessibility reads can relaunch outside the explicit test profile. Retain on-disk evidence and unresolved recovery ownership; relaunch for later manual checks instead of leaving idle games running.
 

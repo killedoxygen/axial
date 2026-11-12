@@ -12,7 +12,7 @@ import { NATIVE_CASES } from "./matrix.mjs";
 import { payloads } from "../../scripts/release/matrix.mjs";
 
 const exec = promisify(execFile);
-const APP_ID = "com.mateoltd.axial.rewrite";
+const APP_ID = "com.killedoxygen.axial";
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
 async function temporary(t) {
@@ -37,7 +37,7 @@ async function receiptFixture(t) {
   ] };
   // A structurally complete fixture tests validation only. It stays in the OS
   // temporary directory and is never accepted as actual release evidence.
-  const receipt = { schema: "axial.rewrite.native.v1", app_id: APP_ID, platform: manifest.platform,
+  const receipt = { schema: "axial.native.v1", app_id: APP_ID, platform: manifest.platform,
     source_sha: manifest.source_sha, tag: manifest.tag,
     host: { os: "linux", arch: "x64", os_release: "synthetic host", webview_version: "synthetic webview" },
     environment: "clean-machine", installation: "installed-package",
@@ -133,7 +133,7 @@ test("all four intact unsigned candidates remain unready without installed evide
   const assets = path.join(root, "assets");
   const evidence = path.join(root, "evidence");
   await mkdir(evidence);
-  const source = { schema: "axial.rewrite.source.v1", app_id: APP_ID, tag: "v9.8.7", version: "9.8.7", source_sha: "a".repeat(40) };
+  const source = { schema: "axial.source.v1", app_id: APP_ID, tag: "v9.8.7", version: "9.8.7", source_sha: "a".repeat(40) };
   for (const platform of ["linux-amd64", "windows-amd64", "macos-amd64", "macos-arm64"]) {
     const directory = path.join(assets, platform);
     await mkdir(directory, { recursive: true });
@@ -145,7 +145,7 @@ test("all four intact unsigned candidates remain unready without installed evide
       await writeFile(path.join(directory, `${item.name}.sha256`), `${hash}  ${item.name}\n`);
       files.push({ ...item, sha256: hash, bytes: Buffer.byteLength(bytes) });
     }
-    await writeJson(path.join(directory, "artifacts.json"), { schema: "axial.rewrite.artifacts.v1", app_id: APP_ID,
+    await writeJson(path.join(directory, "artifacts.json"), { schema: "axial.artifacts.v1", app_id: APP_ID,
       platform, source_sha: source.source_sha, tag: source.tag, files });
   }
   const readiness = await releaseReadiness({ source, assets, evidence });

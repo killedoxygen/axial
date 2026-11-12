@@ -48,7 +48,7 @@ async function oneFile(directory, extension) {
 
 export async function packageArtifacts({ platform, source, binary, bundleRoot, output }) {
   check(hostPlatform() === platform, "packaging_requires_matching_native_host");
-  check(source.schema === "axial.rewrite.source.v1" && source.app_id === APPLICATION_ID, "invalid_source_receipt");
+  check(source.schema === "axial.source.v1" && source.app_id === APPLICATION_ID, "invalid_source_receipt");
   check(await executableArchitecture(binary) === platform, "binary_architecture_mismatch");
   const artifacts = payloads(platform, source.tag);
   output = path.resolve(output);
@@ -118,7 +118,7 @@ export async function packageArtifacts({ platform, source, binary, bundleRoot, o
       await writeFile(`${file}.sha256`, `${sha256}  ${item.name}\n`, { flag: "wx" });
       files.push({ ...item, bytes: info.size, sha256 });
     }
-    const manifest = { schema: "axial.rewrite.artifacts.v1", app_id: APPLICATION_ID, platform,
+    const manifest = { schema: "axial.artifacts.v1", app_id: APPLICATION_ID, platform,
       tag: source.tag, source_sha: source.source_sha, files,
       authenticity: "not-verified", native_acceptance: "not-run" };
     await writeJson(path.join(output, "artifacts.json"), manifest);

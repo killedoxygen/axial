@@ -1,4 +1,4 @@
-// Retained Minecraft texture semantics from the predecessor skin/image leaf.
+// Minecraft skin texture semantics.
 use super::{MediaError, SkinVariant};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;

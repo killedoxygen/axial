@@ -12,7 +12,7 @@ const NOTICE = `**New to Axial?** Go to **${SITE}**. It picks the right download
 
 Axial isn't signed with a paid certificate, so macOS and Windows warn once. The guide walks you through it in about a minute; after that Axial updates itself.
 
-This is a pre-release. Start with a fresh profile; earlier Axial profiles aren't imported.`;
+This is a pre-release.`;
 // The file each platform's download button offers.
 const DOWNLOAD_ROLE = { linux: "updater", win32: "updater", darwin: "installer" };
 const RELEASE_SLOT = '<script id="release" type="application/json">null</script>';
@@ -36,7 +36,7 @@ export async function stagePublication({ source, assets, publicKey, changelog, g
     const offered = manifest.files.find((item) => item.role === DOWNLOAD_ROLE[info.os]);
     downloads[platform] = { name: offered.name, bytes: offered.bytes, url: `${REPOSITORY}/releases/download/${source.tag}/${offered.name}` };
     const updater = manifest.files.find((item) => item.role === "updater");
-    platforms[`axial-rewrite-${info.updater}`] = {
+    platforms[`axial-${info.updater}`] = {
       signature: (await readFile(path.join(directory, `${updater.name}.sig`), "utf8")).trim(),
       url: `${REPOSITORY}/releases/download/${source.tag}/${updater.name}`,
     };

@@ -8,4 +8,4 @@
 - File effects go through `core/fs` capabilities. Never weaken path admission or recovery to make a test pass.
 - Tests exercise real behaviour: recovery, filesystem safety, serialized responses, user-visible results. Do not test source text, documentation or test tooling.
 - Run shared Cargo commands through `node scripts/cargo-target.mjs run -- cargo ...` so concurrent builds do not collide.
-- Commits follow Conventional Commits. Keep run logs and local evidence in the ignored `.rewrite-logs/`, not in Git.
+- Commits follow Conventional Commits. Keep run logs and local evidence in the ignored `.run-logs/`, not in Git.

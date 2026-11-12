@@ -15,8 +15,7 @@ use crate::tasks::TaskOwner;
 
 use super::credentials::{Credentials, MAX_CREDENTIAL_BYTES};
 
-/// Never use the legacy `axial-auth` service, including in development.
-pub const KEYRING_SERVICE: &str = "com.mateoltd.axial.rewrite.credentials";
+pub const KEYRING_SERVICE: &str = "com.killedoxygen.axial.credentials";
 const CHUNK_BYTES: usize = 900;
 const MAX_HEAD_BYTES: usize = 900;
 
@@ -1200,7 +1199,7 @@ mod tests {
             .values
             .lock()
             .unwrap()
-            .insert("legacy-axial-auth-canary".into(), b"unchanged".to_vec());
+            .insert("unrelated-entry".into(), b"unchanged".to_vec());
         let refresh = store.begin_change(ACCOUNT, 1).await.unwrap();
         assert_eq!(
             other_profile
@@ -1234,7 +1233,7 @@ mod tests {
                 .values
                 .lock()
                 .unwrap()
-                .get("legacy-axial-auth-canary")
+                .get("unrelated-entry")
                 .unwrap(),
             b"unchanged"
         );

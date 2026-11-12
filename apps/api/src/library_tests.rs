@@ -1556,7 +1556,7 @@ async fn unknown_launch_binding_blocks_before_runtime_recovery_and_can_be_preser
 
     for malformed in [false, true] {
         let temporary = temporary();
-        let root = temporary.path().join("rewrite");
+        let root = temporary.path().join("profile");
         admit_profile(&root).unwrap();
         let marker = fs::read(root.join(PROFILE_MARKER)).unwrap();
         fs::write(root.join("keep.txt"), b"profile user data").unwrap();

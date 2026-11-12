@@ -161,7 +161,7 @@ pub struct InstanceRecord {
 pub struct InstancePatch {
     pub expected_revision: Option<u64>,
     pub name: Option<String>,
-    /// Legacy edit clients send the expected existing version, never a retarget.
+    /// The expected existing version, never a retarget.
     pub version_id: Option<String>,
     pub art_seed: Option<u32>,
     pub max_memory_mb: Option<i32>,

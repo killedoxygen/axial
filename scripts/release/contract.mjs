@@ -71,7 +71,7 @@ export async function verifySource({ root = process.cwd(), tag, sourceSha, metad
   check(new Set(members.map((pkg) => pkg.id)).size === members.length, "duplicate_workspace_member");
   for (const pkg of members) {
     const relative = path.relative(root, await realpath(pkg.manifest_path));
-    check(relative && !relative.startsWith("..") && !path.isAbsolute(relative) && !relative.startsWith(`legacy${path.sep}`), "manifest_outside_rewrite");
+    check(relative && !relative.startsWith("..") && !path.isAbsolute(relative), "manifest_outside_workspace");
     const manifest = await readFile(pkg.manifest_path, "utf8");
     const section = /^\[package\]\s*\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(manifest)?.[1];
     check(section && /^version\.workspace\s*=\s*true\s*$/m.test(section), "package_version_not_inherited");
@@ -87,16 +87,16 @@ export async function verifySource({ root = process.cwd(), tag, sourceSha, metad
   check(await git("status", "--porcelain", "--untracked-files=normal") === "", "source_tree_not_clean");
   const changelog = path.join(root, "CHANGELOG.md");
   await regularFile(changelog, 4 * 1024 ** 2);
-  return { schema: "axial.rewrite.source.v1", app_id: APPLICATION_ID, ...identity, source_sha: sourceSha,
+  return { schema: "axial.source.v1", app_id: APPLICATION_ID, ...identity, source_sha: sourceSha,
     ...changelogRelease(await readFile(changelog, "utf8"), identity.version), changelog_sha256: await digest(changelog) };
 }
 
 export async function verifyArtifacts(directory, source, platform) {
-  check(source.schema === "axial.rewrite.source.v1" && source.app_id === APPLICATION_ID && COMMIT.test(source.source_sha), "invalid_source_receipt");
+  check(source.schema === "axial.source.v1" && source.app_id === APPLICATION_ID && COMMIT.test(source.source_sha), "invalid_source_receipt");
   check(releaseIdentity(source.tag).version === source.version, "source_version_mismatch");
   const expected = payloads(platform, source.tag);
   const manifest = await jsonFile(path.join(directory, "artifacts.json"));
-  check(manifest.schema === "axial.rewrite.artifacts.v1" && manifest.app_id === APPLICATION_ID, "invalid_artifact_receipt");
+  check(manifest.schema === "axial.artifacts.v1" && manifest.app_id === APPLICATION_ID, "invalid_artifact_receipt");
   check(manifest.platform === platform && manifest.source_sha === source.source_sha && manifest.tag === source.tag, "artifact_source_mismatch");
   check(Array.isArray(manifest.files), "invalid_artifact_files");
   const updater = expected.find((entry) => entry.role === "updater");
@@ -140,7 +140,7 @@ export async function verifyUpdaterSignature(directory, manifest, publicKeyFile)
   const updater = manifest.files.find((item) => item.role === "updater");
   const signature = manifest.files.find((item) => item.role === "updater-signature");
   check(updater && signature, "updater_signature_unavailable");
-  const work = await mkdtemp(path.join(tmpdir(), "axial-rewrite-signature-"));
+  const work = await mkdtemp(path.join(tmpdir(), "axial-signature-"));
   try {
     const key = minisignText(await readFile(publicKeyFile, "utf8"), "key");
     await regularFile(path.join(directory, signature.name), 8192);

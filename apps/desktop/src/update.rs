@@ -50,7 +50,7 @@ pub fn configure(
         validate_config(&config)?;
         app.plugin(tauri_plugin_updater::Builder::new().build())
             .map_err(|_| CONFIG_REQUIRED)?;
-        let target = rewrite_target().ok_or(CONFIG_REQUIRED)?;
+        let target = updater_target().ok_or(CONFIG_REQUIRED)?;
         let updater = build_updater(app, &target).map_err(|_| CONFIG_REQUIRED)?;
         let adapter = NativeUpdates {
             updater: Arc::new(updater),
@@ -94,8 +94,8 @@ fn supported_package() -> bool {
     )
 }
 
-fn rewrite_target() -> Option<String> {
-    tauri_plugin_updater::target().map(|target| format!("axial-rewrite-{target}"))
+fn updater_target() -> Option<String> {
+    tauri_plugin_updater::target().map(|target| format!("axial-{target}"))
 }
 
 fn build_updater<R: Runtime>(
@@ -345,7 +345,7 @@ impl Drop for InstallationSettlement {
 }
 
 fn validate_release(update: &Update, target: &str) -> Result<(), UpdateError> {
-    // Dynamic responses cannot establish the artifact's rewrite/platform slot.
+    // Dynamic responses cannot establish the artifact's platform slot.
     let selected = update
         .raw_json
         .get("platforms")
@@ -469,7 +469,7 @@ mod tests {
     const PAYLOAD: &[u8] = b"Axial updater fixture only; not an installable package.\n";
     const KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IFJGQyA4MDMyIHRlc3Qga2V5LCBuZXZlciBhIHJlbGVhc2Uga2V5ClJXUUJBZ01FQlFZSENOZGFtQUdDc1FxMzFVdiswOGxrQnpvTzRYTHoycVlqSmE4Q0dtajNCMUVhCg==";
     const SIGNATURE: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IHRlc3QgZml4dHVyZSBvbmx5ClJXUUJBZ01FQlFZSENFemNDaVFkeUFsc0FYMTBlOXVRR2lON3MyR3RIeE1KUkwxMnNTMlVHWHB0Vmlmb3BFL29TMUs4SUJBbS8vdzNseTBmQnNTZUVxVzEyQTBkMTlqY1ZBVT0KdHJ1c3RlZCBjb21tZW50OiB0aW1lc3RhbXA6MTcwMDAwMDAwMAlmaWxlOmZpeHR1cmUJdmVyc2lvbjo5LjkuOQovakppZ3RuT3NBT1pYQzBJeGtTN1hhSjBZOHpmd0wxRkI0ZStOOEJTdjQySHNJMHdlQzl6cmQrRUxNZnRMWHdoNHVLUFdyeGZOUjdxeDltR0pTcU1CZz09Cg==";
-    const TARGET: &str = "axial-rewrite-fixture-platform";
+    const TARGET: &str = "axial-fixture-platform";
 
     struct Fixture {
         _app: tauri::App<tauri::test::MockRuntime>,
@@ -585,7 +585,7 @@ mod tests {
 
     async fn lifecycle_fixture() -> (tempfile::TempDir, DesktopLifecycle, TaskOwner) {
         let directory = tempfile::tempdir().unwrap();
-        let services = axial_api::start_in_profile(directory.path().join("rewrite"), None)
+        let services = axial_api::start_in_profile(directory.path().join("profile"), None)
             .await
             .unwrap();
         let lifecycle =
@@ -651,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn a_release_for_another_platform_is_not_an_available_update() {
         let fixture = fixture(
-            "axial-rewrite-other-platform",
+            "axial-other-platform",
             "9.9.9",
             PAYLOAD,
             SIGNATURE,
@@ -673,7 +673,7 @@ mod tests {
         )
         .await;
         let mut update = fixture.updater.check().await.unwrap().unwrap();
-        update.download_url = "https://example.invalid/rewrite/package".parse().unwrap();
+        update.download_url = "https://example.invalid/release/package".parse().unwrap();
         assert!(validate_release(&update, TARGET).is_ok());
         assert_eq!(notes_url(&update), "");
         for value in [
@@ -684,9 +684,9 @@ mod tests {
             update.raw_json["notes_url"] = value;
             assert!(validate_release(&update, TARGET).is_err());
         }
-        update.raw_json["notes_url"] = json!("https://example.invalid/rewrite/notes");
+        update.raw_json["notes_url"] = json!("https://example.invalid/release/notes");
         assert!(validate_release(&update, TARGET).is_ok());
-        assert_eq!(notes_url(&update), "https://example.invalid/rewrite/notes");
+        assert_eq!(notes_url(&update), "https://example.invalid/release/notes");
     }
 
     #[tokio::test]
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn release_configuration_never_relaxes_transport_or_version_trust() {
-        let trusted = json!({ "pubkey": KEY, "endpoints": ["https://example.invalid/rewrite/latest.json"], "requireSignedVersion": true });
+        let trusted = json!({ "pubkey": KEY, "endpoints": ["https://example.invalid/release/latest.json"], "requireSignedVersion": true });
         let config = serde_json::from_value(trusted.clone()).unwrap();
         assert!(validate_config(&config).is_ok());
         for (field, value) in [

@@ -16,7 +16,7 @@ async function evidenceFile(directory, relative, sha256) {
 
 export async function verifyNativeReceipt(file, manifest) {
   const receipt = await jsonFile(file);
-  check(receipt.schema === "axial.rewrite.native.v1" && receipt.app_id === APPLICATION_ID, "invalid_native_receipt");
+  check(receipt.schema === "axial.native.v1" && receipt.app_id === APPLICATION_ID, "invalid_native_receipt");
   check(receipt.platform === manifest.platform && receipt.source_sha === manifest.source_sha && receipt.tag === manifest.tag, "native_source_mismatch");
   const host = PLATFORMS[manifest.platform];
   check(receipt.host?.os === host.os && receipt.host?.arch === host.arch, "native_host_mismatch");
@@ -44,7 +44,7 @@ export async function verifyNativeReceipt(file, manifest) {
 }
 
 export async function releaseReadiness({ source, assets, evidence, publicKey }) {
-  const result = { schema: "axial.rewrite.readiness.v1", source_sha: source.source_sha, tag: source.tag, release_ready: false, platforms: [] };
+  const result = { schema: "axial.readiness.v1", source_sha: source.source_sha, tag: source.tag, release_ready: false, platforms: [] };
   for (const platform of Object.keys(PLATFORMS)) {
     const row = { platform, integrity: "not-verified", authenticity: "not-verified", installed: "not-verified", gaps: [] };
     let manifest;

@@ -416,7 +416,7 @@ mod tests {
 
     fn available(service: &UpdateService) {
         let check = service.begin_check().unwrap();
-        service.checked(check, Some(("1.1.0", "https://example.com/rewrite/1.1.0")));
+        service.checked(check, Some(("1.1.0", "https://example.com/release/1.1.0")));
     }
 
     #[test]
