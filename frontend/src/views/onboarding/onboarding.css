@@ -7,6 +7,8 @@
   grid-template-columns: minmax(340px, 39%) minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
+  /* The step's column and headline grow with the window so they hold their own beside the stage. */
+  --ob-col: min(clamp(440px, 32vw, 520px), 100%);
   color: var(--text);
   background: var(--bg);
   animation: cp-ob-enter 320ms var(--ease-out) both;
@@ -41,9 +43,11 @@
 
 /* macOS: the panel is cut away around the traffic lights, which sit in the notch on the window's own colour. */
 html[data-desktop-chrome='mac-overlay'] .cp-ob-stage::before {
-  --w: 60px;
+  /* Clears the lights by the same 16px on the right as above and below them. */
+  --w: 72px;
   --h: calc(var(--chrome-h) - 12px);
-  --r: 16px;
+  --r: 14px;
+  --in: 20px;
   --cut: linear-gradient(var(--bg), var(--bg));
   --corner: radial-gradient(circle at 100% 100%, transparent var(--r), var(--bg) calc(var(--r) + 0.5px));
   content: '';
@@ -57,10 +61,10 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage::before {
   background:
     var(--corner) var(--w) 0 / var(--r) var(--r),
     var(--corner) 0 var(--h) / var(--r) var(--r),
-    radial-gradient(circle at 0 0, var(--bg) var(--r), transparent calc(var(--r) + 0.5px)) calc(var(--w) - var(--r))
-      calc(var(--h) - var(--r)) / var(--r) var(--r),
-    var(--cut) 0 0 / var(--w) calc(var(--h) - var(--r)),
-    var(--cut) 0 0 / calc(var(--w) - var(--r)) var(--h);
+    radial-gradient(circle at 0 0, var(--bg) var(--in), transparent calc(var(--in) + 0.5px)) calc(var(--w) - var(--in))
+      calc(var(--h) - var(--in)) / var(--in) var(--in),
+    var(--cut) 0 0 / var(--w) calc(var(--h) - var(--in)),
+    var(--cut) 0 0 / calc(var(--w) - var(--in)) var(--h);
   background-repeat: no-repeat;
 }
 
@@ -126,9 +130,9 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage::before {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  width: min(440px, 100%);
+  width: var(--ob-col);
   min-height: 0;
-  padding-top: clamp(24px, 20vh, 180px);
+  padding-top: clamp(24px, calc(40vh - 170px), 420px);
   overflow-y: auto;
   animation: cp-ob-rise 360ms var(--ease-out) both;
 }
@@ -152,7 +156,7 @@ html[data-desktop-chrome='custom-frameless'] .cp-ob-pane > .cp-mark {
 
 .cp-ob-heading h1 {
   margin: 0;
-  font-size: 40px;
+  font-size: clamp(40px, calc(2.2vw + 8px), 56px);
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.1;
@@ -165,7 +169,7 @@ html[data-desktop-chrome='custom-frameless'] .cp-ob-pane > .cp-mark {
 
 .cp-ob-lead {
   margin: 12px 0 28px;
-  font-size: 15px;
+  font-size: clamp(15px, calc(0.5vw + 8px), 18px);
   line-height: 1.55;
   color: var(--text-dim);
 }
@@ -340,7 +344,7 @@ html[data-desktop-chrome='custom-frameless'] .cp-ob-pane > .cp-mark {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  width: min(440px, 100%);
+  width: var(--ob-col);
   min-height: 44px;
   margin: 16px 0 28px;
 }
