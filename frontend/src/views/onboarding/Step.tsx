@@ -1,6 +1,7 @@
 import type { ComponentChildren, JSX } from 'preact';
 import { Button } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
+import { Logo } from '../../ui/Logo';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
 import type { Player } from './use-identity';
 
@@ -39,6 +40,7 @@ export function Step({
         ))}
       </div>
       <div class="cp-ob-body" key={view}>
+        <Logo size={28} />
         <header class="cp-ob-heading">
           {/* Stands in for the stage when the window is too small to show it. */}
           {player && <PlayerHeadPreview class="cp-ob-head" textureSrc={player.src} size={56} radius={12} />}

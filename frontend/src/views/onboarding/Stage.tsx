@@ -1,7 +1,6 @@
 import type { JSX } from 'preact';
 import { useRef } from 'preact/hooks';
 import { DEFAULT_SKINS } from '../../default-skins';
-import { Logo } from '../../ui/Logo';
 import { LazySkinThreePreview } from '../accounts/LazySkinThreePreview';
 import type { Player } from './use-identity';
 
@@ -17,7 +16,6 @@ export function Stage({ player }: { player: Player | null }): JSX.Element {
 
   return (
     <aside class="cp-ob-stage">
-      <Logo size={28} />
       <LazySkinThreePreview
         src={shown.src}
         capeSrc={shown.capeSrc}
