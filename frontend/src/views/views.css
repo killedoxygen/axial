@@ -9,25 +9,26 @@
   padding: 22px 28px 28px;
 }
 
+/* A page's parts rise in one after another, overlapping, so the page arrives as one movement. */
 .cp-view-page > * {
-  animation: cp-float-up var(--t-move) var(--ease-out) both;
+  --enter-y: 10px;
+  animation: cp-enter var(--t-move) var(--ease-out) both;
 }
 .cp-view-page > *:nth-child(2) {
-  animation-delay: 35ms;
+  animation-delay: 40ms;
 }
 .cp-view-page > *:nth-child(3) {
-  animation-delay: 70ms;
+  animation-delay: 80ms;
 }
-.cp-view-page > *:nth-child(4) {
-  animation-delay: 105ms;
+.cp-view-page > *:nth-child(n + 4) {
+  animation-delay: 120ms;
 }
-.cp-view-page > *:nth-child(n + 5) {
-  animation-delay: 140ms;
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-view-page > * {
-    animation: none;
-  }
+
+/* What a tab shows swaps in with a short rise of its own, with no wait. */
+.cp-view-page > .cp-pane,
+.cp-settings-page > * {
+  --enter-y: 6px;
+  animation: cp-enter var(--t-pop) var(--ease-out) both;
 }
 
 /* A list row's first cell: the item's art, which its selection mark replaces on hover, on focus and once chosen. */

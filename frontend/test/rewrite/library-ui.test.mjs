@@ -263,6 +263,7 @@ function libraryHarness(initialInstances = []) {
     '../../ui/InstanceFacts': facts,
     '../../ui/InstanceVisual': { ...parts, guardedInstanceHue: () => 40, artSeedFor: () => 0 },
     '../../ui/Segmented': parts,
+    '../../ui/motion': { settleChildren() {} },
     '../../ui/SelectionActionTray': parts,
     '../../ui/ContextMenu': {
       /** @param {TestEvent} e @param {MenuItem[]} menu */

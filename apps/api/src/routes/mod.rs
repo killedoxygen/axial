@@ -86,9 +86,7 @@ async fn status(
         .map_err(|_| unavailable())?
         .map_err(|_| unavailable())?;
     let snapshot = library.snapshot();
-    let mut warnings = vec![
-        "This isolated rewrite is under development. Some retained features are still being integrated.",
-    ];
+    let mut warnings = Vec::new();
     if snapshot.admission == AdmissionState::Unavailable {
         warnings.push("The selected external library is unavailable. Its files have been preserved; restore its location and restart the launcher.");
     }

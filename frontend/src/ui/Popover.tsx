@@ -2,6 +2,7 @@ import type { ComponentChildren, JSX, RefObject } from 'preact';
 import { createContext } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef } from 'preact/hooks';
+import { leaveBehind } from './motion';
 
 const MARGIN = 10;
 
@@ -106,6 +107,9 @@ export function Popover({
     return passive ? undefined : registerInParent?.(element);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // It leaves the way it came, after it is gone.
+  useLayoutEffect(() => () => leaveBehind(ref.current), []);
 
   useEffect(() => {
     const onDismiss = (): void => dismiss.current();

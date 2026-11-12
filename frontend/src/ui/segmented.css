@@ -8,17 +8,9 @@
   border-radius: var(--rad-ctl);
   background: var(--fill);
 }
-.cp-seg-thumb {
-  position: absolute;
-  top: var(--seg-pad);
-  bottom: var(--seg-pad);
-  left: 0;
+.cp-seg > .cp-thumb {
   z-index: 0;
-  border-radius: var(--rad-ctl);
   background: var(--fill-3);
-  transition:
-    translate var(--t-pop) var(--ease-out),
-    width var(--t-pop) var(--ease-out);
 }
 .cp-seg > button {
   position: relative;
@@ -38,7 +30,7 @@
   cursor: pointer;
   transition:
     color var(--t-quick) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-seg > button > svg {
   flex: none;
@@ -79,9 +71,4 @@
 .cp-seg--full > button {
   flex: 1 1 0;
   min-width: 0;
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-seg-thumb {
-    transition: none;
-  }
 }

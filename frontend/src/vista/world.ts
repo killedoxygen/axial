@@ -569,7 +569,7 @@ const DARK_HOURS: Hour[] = [
   // Dusk: the sun just gone ahead, the moon rising behind.
   { time: 0.546, bearing: 3.0 },
   // Night, the moon low ahead.
-  { time: 0.6, bearing: -0.3 },
+  { time: 0.566, bearing: -0.3 },
 ];
 
 const LIGHT_HOURS: Hour[] = [
@@ -774,14 +774,14 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
   let gladeZ = -99;
   if (has(LAVA) && (dark || next() < biome.lava)) {
     // The nearest shore-side land to either side of the view's middle.
-    const wanted = 10 + next() * 5;
+    const wanted = 14 + next() * 4;
     let best = Infinity;
     for (let z = cameraZ; z < cameraZ + 110; z++) {
       for (let x = 8; x < n - 8; x++) {
         const ahead = aheadOf(x, z);
         const aside = asideOf(x, z);
         const wide = Math.abs(aside);
-        if (ahead < 9 || wide < ahead * 0.15 || wide > ahead * 0.92 || ground[z * n + x]! <= sea) continue;
+        if (ahead < 12 || wide < ahead * 0.15 || wide > ahead * 0.92 || ground[z * n + x]! <= sea) continue;
         // Right of centre for choice; left of it sooner than far away.
         const score =
           Math.abs(ahead - wanted) +

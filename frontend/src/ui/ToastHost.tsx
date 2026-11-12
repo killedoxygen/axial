@@ -4,7 +4,9 @@ import { Face, type Eyes, type FaceTone } from './Face';
 import { toasts } from '../store';
 import { showOnboardingOverlay } from '../ui-state';
 import { dismissToast } from '../toast';
-import type { ToastKind } from '../types-ui';
+import { useLeave } from '../hooks/use-leave';
+import type { ToastItem, ToastKind } from '../types-ui';
+import { settleChildren } from './motion';
 
 const FACE_FOR: Record<ToastKind, { eyes: Eyes; tone?: FaceTone }> = {
   success: { eyes: 'happy' },
@@ -17,16 +19,30 @@ export function ToastHost(): JSX.Element | null {
   if (showOnboardingOverlay.value) return null;
   const list = toasts.value;
   return (
-    <div class="cp-toasts" role="region" aria-live="polite" aria-label="Notifications">
+    <div
+      class="cp-toasts"
+      role="region"
+      data-settles
+      ref={(list) => settleChildren(list)}
+      aria-live="polite"
+      aria-label="Notifications"
+    >
       {list.map((t) => (
-        <div key={t.id} class="cp-toast cp-pop" role="status">
-          <Face {...FACE_FOR[t.type]} />
-          <span class="cp-toast-msg" title={t.message}>
-            {t.message}
-          </span>
-          <IconButton icon="x" size={28} tooltip="Dismiss" onClick={() => dismissToast(t.id)} />
-        </div>
+        <Toast key={t.id} toast={t} />
       ))}
+    </div>
+  );
+}
+
+function Toast({ toast }: { toast: ToastItem }): JSX.Element {
+  const leaving = useLeave<HTMLDivElement>();
+  return (
+    <div ref={leaving} class="cp-toast cp-pop" role="status">
+      <Face {...FACE_FOR[toast.type]} />
+      <span class="cp-toast-msg" title={toast.message}>
+        {toast.message}
+      </span>
+      <IconButton icon="x" size={28} tooltip="Dismiss" onClick={() => dismissToast(toast.id)} />
     </div>
   );
 }

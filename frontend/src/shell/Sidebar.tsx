@@ -20,6 +20,7 @@ import { openInstanceContextMenu } from '../views/instance/instance-menu';
 import type { Instance } from '../types-instance';
 import { shortcutHint } from '../shortcuts';
 import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
+import { settleChildren } from '../ui/motion';
 
 function isRouteActive(target: Route, current: Route): boolean {
   if (target.name !== current.name) return false;
@@ -109,7 +110,7 @@ function RailTray(): JSX.Element {
   return (
     <div class="cp-rail-tray">
       {list.length > 0 && (
-        <div class="cp-rail-instances">
+        <div class="cp-rail-instances" data-settles ref={(list) => settleChildren(list)}>
           {list.map((inst) => {
             const active = current.name === 'instance' && current.id === inst.id;
             const session = launchSessions.value[inst.id];

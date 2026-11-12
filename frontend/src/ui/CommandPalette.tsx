@@ -1,5 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useLeave } from '../hooks/use-leave';
 import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
 import { Music } from '../music';
 import { reloadApplication } from '../preferences/persistence';
@@ -253,6 +254,7 @@ export function CommandPalette(): JSX.Element | null {
   const [more, setMore] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const leaving = useLeave<HTMLDivElement>();
   const drag = useDraggableOverlay<HTMLDivElement>({ id: 'command-center', enabled: open });
 
   const commands = open ? buildCommands() : [];
@@ -310,6 +312,7 @@ export function CommandPalette(): JSX.Element | null {
 
   return (
     <div
+      ref={leaving}
       class="cp-cmd-overlay"
       data-window-drag-strip
       onClick={(event) => {

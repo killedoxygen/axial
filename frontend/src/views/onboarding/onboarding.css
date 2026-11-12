@@ -363,11 +363,3 @@ html[data-desktop-chrome='mac-overlay'] .cp-ob-stage .cp-mark {
     margin-bottom: 20px;
   }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .cp-ob,
-  .cp-ob * {
-    animation-duration: 1ms !important;
-    transition-duration: 1ms !important;
-  }
-}

@@ -5,10 +5,31 @@
   box-shadow: var(--shadow-pop);
   color: var(--text);
 }
+/* Every popover arrives the same way: out of the edge it hangs from. */
 .cp-popover {
+  --enter-scale: 0.95;
   position: fixed;
   z-index: 1300;
   box-sizing: border-box;
+  animation: cp-enter var(--t-pop) var(--ease-spring) both;
+}
+.cp-popover[data-side='below'] {
+  --enter-y: -6px;
+  transform-origin: top;
+}
+.cp-popover[data-side='above'] {
+  --enter-y: 6px;
+  transform-origin: bottom;
+}
+.cp-popover[data-side='right'] {
+  --enter-x: -6px;
+  --enter-y: 0;
+  transform-origin: left;
+}
+.cp-popover[data-side='left'] {
+  --enter-x: 6px;
+  --enter-y: 0;
+  transform-origin: right;
 }
 .cp-menu {
   display: flex;
@@ -60,7 +81,4 @@
 .cp-menu-gap {
   flex: none;
   height: 6px;
-}
-.cp-ctx-host {
-  animation: cp-float-up var(--t-quick) var(--ease-out);
 }

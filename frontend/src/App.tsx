@@ -20,7 +20,9 @@ import {
   showOnboardingOverlay,
 } from './ui-state';
 import { devMode } from './store';
+import { useLeave } from './hooks/use-leave';
 import { useShortcuts } from './hooks/use-shortcuts';
+import { leaveView } from './ui/motion';
 import { reportRenderError } from './error-reporting';
 import { reloadApplication } from './preferences/persistence';
 
@@ -177,6 +179,16 @@ function CurrentView(): JSX.Element {
   }
 }
 
+/** One place's page. Going to another place, it leaves over the view while the next arrives. */
+function RoutePage(): JSX.Element {
+  const leaving = useLeave<HTMLDivElement>(leaveView);
+  return (
+    <div class="cp-route" ref={leaving}>
+      <CurrentView />
+    </div>
+  );
+}
+
 function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.Element {
   const [reloadFailed, setReloadFailed] = useState(false);
   const [error] = useErrorBoundary((caughtError) => {
@@ -186,8 +198,11 @@ function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.El
   if (error) {
     const reload = (): void => {
       void (async () => {
-        try { setReloadFailed(!(await reloadApplication())); }
-        catch { setReloadFailed(true); }
+        try {
+          setReloadFailed(!(await reloadApplication()));
+        } catch {
+          setReloadFailed(true);
+        }
       })();
     };
     return (
@@ -195,7 +210,11 @@ function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.El
         <Empty
           eyes="x"
           title="Axial hit a render error"
-          actions={<Button variant="secondary" icon="refresh" onClick={reload}>Reload</Button>}
+          actions={
+            <Button variant="secondary" icon="refresh" onClick={reload}>
+              Reload
+            </Button>
+          }
         >
           {reloadFailed
             ? 'Interface preferences could not be confirmed. Keep this window open and retry Reload.'
@@ -213,7 +232,7 @@ function AppContent(): JSX.Element {
   return (
     <>
       <AppFrame>
-        <CurrentView />
+        <RoutePage key={route.value.name} />
       </AppFrame>
       {createOpen.value && <CreateOverlay />}
       {accountSwitcherOpen.value && <AccountSwitcherOverlay />}

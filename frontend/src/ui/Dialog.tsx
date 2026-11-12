@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { computed, signal } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { useLeave } from '../hooks/use-leave';
 import { Button, Input } from './Atoms';
 import { Face } from './Face';
 
@@ -159,6 +160,7 @@ export function DialogHost(): JSX.Element | null {
   const [draft, setDraft] = useState('');
   const [touched, setTouched] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const leaving = useLeave<HTMLDivElement>();
   const inputRef = useRef<HTMLInputElement>(null);
   const primaryRef = useRef<HTMLButtonElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -245,6 +247,7 @@ export function DialogHost(): JSX.Element | null {
 
   return (
     <div
+      ref={leaving}
       class="cp-dialog-overlay"
       data-window-drag-strip
       onClick={(e) => {

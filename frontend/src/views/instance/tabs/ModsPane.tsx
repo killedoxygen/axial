@@ -34,6 +34,7 @@ import {
   setModsEnabled,
   type ModProvenance,
 } from '../mod-actions';
+import { settleChildren } from '../../../ui/motion';
 
 type ModFilter = 'all' | 'enabled' | 'disabled';
 
@@ -232,7 +233,7 @@ export function ModsPane({
       ) : resources.status === 'ready' && filteredRows.length === 0 ? (
         <Empty title="No mods match this filter">Try a different filter.</Empty>
       ) : (
-        <div class="cp-entries">
+        <div class="cp-entries" data-settles ref={(list) => settleChildren(list)}>
           {filteredRows.map(({ mod, view }) => (
             <ContentRow
               key={mod.name}

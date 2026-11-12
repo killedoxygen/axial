@@ -18,7 +18,9 @@ export function Art({ url, icon, size }: { url?: string; icon: IconName; size?: 
           decoding="async"
           draggable={false}
           onLoad={(event) => {
-            if (event.currentTarget.naturalWidth <= 64) event.currentTarget.dataset.pixel = 'true';
+            const image = event.currentTarget;
+            if (image.naturalWidth <= 64) image.dataset.pixel = 'true';
+            image.dataset.loaded = 'true';
           }}
           onError={() => setFailed(url)}
         />

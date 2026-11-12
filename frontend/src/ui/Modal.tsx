@@ -2,6 +2,7 @@ import type { ComponentChildren, JSX } from 'preact';
 import { createContext } from 'preact';
 import { createPortal } from 'preact/compat';
 import { useContext, useEffect, useRef } from 'preact/hooks';
+import { leaveBehind } from './motion';
 import { Icon } from './Icons';
 import { cn } from '../utils';
 import { dialogOpen } from './Dialog';
@@ -39,6 +40,7 @@ function ModalContent({
 }): JSX.Element {
   const { close } = useContext(ModalContext);
   const panelRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const suspended = dialogOpen.value;
 
   useEffect(() => {
@@ -75,6 +77,9 @@ function ModalContent({
     return () => {
       document.removeEventListener('keydown', onKeyDown);
       if (!dialogOpen.value) previouslyFocused?.focus?.();
+      // Both leave after they are gone.
+      leaveBehind(overlayRef.current);
+      leaveBehind(panelRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -83,6 +88,7 @@ function ModalContent({
     <>
       <div
         data-slot="modal-overlay"
+        ref={overlayRef}
         class="cp-modal-overlay"
         data-window-drag-strip
         onClick={suspended ? undefined : close}

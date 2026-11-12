@@ -17,6 +17,7 @@ import { deleteInstancesFlow } from '../instance/instance-actions';
 import { fmtRelative } from '../../format';
 import type { EnrichedInstance } from '../../types-instance';
 import { PendingRemovalsNotice } from './PendingRemovalsNotice';
+import { settleChildren } from '../../ui/motion';
 
 function ListRow({
   inst,
@@ -65,9 +66,7 @@ function ListRow({
           />
         </span>
         <strong>{inst.name}</strong>
-        {session && (
-          <SessionChip session={session} />
-        )}
+        {session && <SessionChip session={session} />}
       </span>
       <span class="cp-library-cell">
         {inst.version_display.loader_label}
@@ -160,7 +159,7 @@ export function InstancesView(): JSX.Element {
           {q ? 'Try a different search term.' : 'Create your first Minecraft instance to get started.'}
         </Empty>
       ) : view === 'grid' ? (
-        <div class="cp-covers">
+        <div class="cp-covers" data-settles ref={(list) => settleChildren(list)}>
           {filtered.map((i) => (
             <InstanceCard
               key={i.id}

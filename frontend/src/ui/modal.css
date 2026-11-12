@@ -4,6 +4,7 @@
   z-index: 900;
   background: color-mix(in oklab, var(--bg-deep) 62%, transparent);
   animation: cp-fade-in var(--t-move) var(--ease-out) both;
+  --enter-y: 0;
 }
 .cp-modal-panel {
   position: fixed;
@@ -16,17 +17,9 @@
   margin: auto;
   outline: none;
   transform-origin: center;
-  animation: cp-modal-in 340ms var(--ease-out) both;
-}
-@keyframes cp-modal-in {
-  from {
-    opacity: 0;
-    transform: translateY(14px) scale(0.975);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+  --enter-y: 16px;
+  --enter-scale: 0.96;
+  animation: cp-enter var(--t-move) var(--ease-spring) both;
 }
 .cp-modal-x {
   position: absolute;
@@ -45,10 +38,4 @@
   font-size: 15px;
   font-weight: 650;
   letter-spacing: -0.005em;
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-modal-overlay,
-  .cp-modal-panel {
-    animation: none;
-  }
 }

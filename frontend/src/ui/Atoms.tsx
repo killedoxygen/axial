@@ -1,6 +1,7 @@
 import type { JSX, ComponentChildren } from 'preact';
 import type { SoundKind } from '../sound';
 import { Face, type Eyes, type FaceTone } from './Face';
+import { glideThumb, settleWidth } from './motion';
 import { Icon, type IconName } from './Icons';
 
 /** `ok` and `info` arrive from wire view models; both read as the accent. */
@@ -36,7 +37,7 @@ export function Button({
   disabled?: boolean;
   full?: boolean;
   title?: string;
-  buttonRef?: { current: HTMLButtonElement | null };
+  buttonRef?: { current: HTMLButtonElement | null } | ((button: HTMLButtonElement | null) => void);
   sound?: SoundKind | false;
   pressed?: boolean;
   /** Still working: the ring stands in for the icon, and with `progress` (0 to 100) shows how far. */
@@ -88,7 +89,7 @@ export function SplitButton({
 >): JSX.Element {
   return (
     <div class={`cp-split cp-split--${size}`} role="group" aria-label={label} data-busy={busy || undefined}>
-      <Button size={size} busy={busy} {...button}>
+      <Button size={size} busy={busy} buttonRef={(main) => settleWidth(main)} {...button}>
         {children}
       </Button>
       <button
@@ -398,6 +399,7 @@ export function Tabs<T extends string>({
 }): JSX.Element {
   return (
     <div class={lead ? 'cp-tabs cp-tabs--lead' : 'cp-tabs'} role="tablist" aria-label={label}>
+      <span class="cp-thumb" aria-hidden="true" ref={(thumb) => glideThumb(thumb)} />
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -446,7 +448,7 @@ export function Meter({
       aria-valuemax={100}
       aria-valuenow={Math.round(boundedValue)}
     >
-      <span style={{ width: `${boundedValue}%` }} />
+      <span style={{ '--done': boundedValue / 100 }} />
     </div>
   );
 }

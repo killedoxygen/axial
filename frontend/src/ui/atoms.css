@@ -27,7 +27,7 @@
   transition:
     background var(--t-quick) var(--ease-out),
     color var(--t-quick) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-btn:hover:not([disabled]) {
   background: var(--chip-bg-hover, var(--fill-2));
@@ -179,7 +179,10 @@
 .cp-split--lg {
   --cap: 34px;
 }
+/* Its words change with what it is doing; it grows to them (`settleWidth`), clipping while it does. */
 .cp-split > .cp-btn {
+  justify-content: flex-start;
+  overflow: hidden;
   padding-right: 12px;
   border-radius: var(--rad-ctl) 0 0 var(--rad-ctl);
   font-weight: 650;
@@ -227,7 +230,7 @@
   transition:
     background var(--t-quick) var(--ease-out),
     color var(--t-quick) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-ibtn:hover:not([disabled]) {
   background: var(--fill);
@@ -357,10 +360,16 @@
 .cp-art:has(img) {
   background: none;
 }
+/* Art fades in once it has loaded, over its holder, so a list filling with art never flickers. */
 .cp-art img {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  opacity: 0;
+  transition: opacity var(--t-pop) var(--ease-out);
+}
+.cp-art img[data-loaded] {
+  opacity: 1;
 }
 .cp-art img[data-pixel] {
   image-rendering: pixelated;
@@ -492,11 +501,6 @@
     stroke-dashoffset: -100;
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .cp-ring[data-busy='true'] .cp-ring-run {
-    animation-duration: 2400ms;
-  }
-}
 .cp-status {
   display: inline-flex;
   align-items: center;
@@ -544,7 +548,7 @@
   cursor: pointer;
   transition:
     background var(--t-pop) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-toggle::after {
   content: '';
@@ -556,7 +560,7 @@
   border-radius: 3.75px;
   background: var(--text-mute);
   transition:
-    translate var(--t-pop) var(--ease-out),
+    translate var(--t-pop) var(--ease-spring),
     background var(--t-pop) var(--ease-out);
 }
 .cp-toggle[data-on='true'] {
@@ -634,12 +638,14 @@
   background: var(--fill-2);
   overflow: hidden;
 }
+/* The fill is the whole bar, scaled: progress never lays anything out. */
 .cp-meter > span {
   display: block;
   height: 100%;
-  border-radius: 2px;
   background: var(--accent);
-  transition: width var(--t-move) var(--ease-out);
+  transform: scaleX(var(--done, 0));
+  transform-origin: left;
+  transition: transform var(--t-move) var(--ease-out);
 }
 .cp-meter--warn > span {
   background: var(--warn);
@@ -650,10 +656,28 @@
 
 /* ── Tabs: pills in a row. The current one takes the rail's selection, a neutral fill and an accent icon. ── */
 .cp-tabs {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 2px;
+}
+/* The thumb: the fill under whichever item of a track is chosen. `glideThumb` keeps it there, so a choice
+   glides from one item to the next. Shared by tabs and the segmented control. */
+.cp-thumb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  border-radius: var(--rad-ctl);
+  background: var(--fill-2);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    translate var(--t-pop) var(--ease-spring),
+    width var(--t-pop) var(--ease-spring),
+    height var(--t-pop) var(--ease-out);
 }
 .cp-tabs button {
   display: inline-flex;
@@ -674,7 +698,7 @@
   transition:
     background var(--t-quick) var(--ease-out),
     color var(--t-quick) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-tabs button:has(.cp-tab-count) {
   padding-right: 8px;
@@ -722,7 +746,6 @@
   height: 16px;
 }
 .cp-tabs button[data-active='true'] {
-  background: var(--fill-2);
   color: var(--text);
 }
 .cp-tabs button[data-active='true'] .cp-tab-icon {
@@ -760,6 +783,7 @@
   grid-template-columns: 28px minmax(0, 1fr);
   align-items: start;
   gap: 10px;
+  animation: cp-enter var(--t-pop) var(--ease-out) both;
 }
 .cp-notice:has(> .cp-ibtn) {
   grid-template-columns: 28px minmax(0, 1fr) 28px;
@@ -960,23 +984,9 @@
   overflow: hidden;
   pointer-events: none;
 }
-.cp-tip--float[data-side='right'] {
-  animation: cp-tip-from-left var(--t-quick) var(--ease-out) both;
-}
-@keyframes cp-tip-from-left {
-  from {
-    opacity: 0;
-    transform: translateX(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-tip--float {
-    animation: none;
-  }
+.cp-popover.cp-tip--float {
+  --enter-scale: 0.96;
+  animation-duration: var(--t-quick);
 }
 .cp-tip .cp-kbd {
   margin-right: -4px;
@@ -987,4 +997,13 @@
   margin-right: -4px;
   background: color-mix(in oklab, var(--text) 10%, transparent);
   color: var(--text);
+}
+
+/* ── Press: whatever can be pressed gives a little under the hand, tiles by their holder ── */
+:is(.cp-account, .cp-option, .cp-swatch, .cp-topbar-search):active:not(:disabled),
+.cp-wear:active:not(:disabled) .cp-wear-holder,
+.cp-theme:active:not(:disabled) .cp-theme-art,
+.cp-cover:active .cp-cover-art,
+.cp-home-item:active .cp-home-cover {
+  scale: 0.97;
 }

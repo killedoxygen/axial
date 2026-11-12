@@ -104,6 +104,20 @@ input::placeholder {
 }
 
 :root {
+  /* Motion: fluid, never abrupt and never slow. Things start at once, travel far enough to be seen, and land
+     with a little spring.
+     Curves: --ease-out for colour and anything answering the pointer; --ease-in for what leaves; --ease-spring for what lands (it passes
+     its rest by a hair and settles); --ease-glide for what travels or changes size.
+     Times: a press, a hover or colour, something popping in, a surface moving, a size changing. */
+  --ease-out: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-spring: cubic-bezier(0.3, 1.28, 0.5, 1);
+  --ease-glide: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --t-press: 130ms;
+  --t-quick: 170ms;
+  --t-pop: 240ms;
+  --t-move: 340ms;
+  --t-size: 420ms;
   color-scheme: dark;
   /* Neutrals, darkest first: the frame, the panel, a quiet holder, the three control fills, an overlay. */
   --bg-deep: oklch(0.155 0.012 140);
@@ -212,22 +226,32 @@ textarea:focus-visible {
     transform: rotate(360deg);
   }
 }
-@keyframes cp-float-up {
+/* The one entrance: from a small offset (and scale) to rest. What enters says where from. */
+@keyframes cp-enter {
   from {
-    transform: translateY(4px);
     opacity: 0;
+    transform: translate(var(--enter-x, 0), var(--enter-y, 4px)) scale(var(--enter-scale, 1));
   }
+}
+/* The one exit: back the way it came, quicker than it arrived. `leaveBehind` stands a copy of an unmounted
+   surface in its place, and the copy leaves by this rule; nothing inside the copy moves on its own. */
+@keyframes cp-leave {
   to {
-    transform: translateY(0);
-    opacity: 1;
+    opacity: 0;
+    transform: translate(var(--enter-x, 0), var(--enter-y, 4px)) scale(var(--enter-scale, 1));
   }
+}
+[data-leaving] {
+  animation: cp-leave var(--t-quick) var(--ease-in) both !important;
+  pointer-events: none;
+}
+[data-leaving] * {
+  animation: none !important;
+  transition: none !important;
 }
 @keyframes cp-fade-in {
   from {
     opacity: 0;
-  }
-  to {
-    opacity: 1;
   }
 }
 @keyframes cp-eq {
@@ -237,5 +261,28 @@ textarea:focus-visible {
   }
   50% {
     transform: scaleY(1);
+  }
+}
+
+/* Reduced motion: nothing travels, scales or loops; colour and opacity still ease, so the interface stays soft.
+   The ring keeps turning, slowly, because it is the only sign of work. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    --enter-x: 0 !important;
+    --enter-y: 0 !important;
+    --enter-scale: 1 !important;
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    scale: none !important;
+  }
+  .cp-ring[data-busy='true'] .cp-ring-run,
+  .cp-ob-spinner {
+    animation-duration: 2400ms !important;
+    animation-iteration-count: infinite !important;
   }
 }

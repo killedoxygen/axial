@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
-import { useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useRef } from 'preact/hooks';
 import { Icon, type IconName } from './Icons';
+import { glideThumb } from './motion';
 
 export type SegmentedOption<T extends string> = {
   value: T;
@@ -32,31 +33,7 @@ export function Segmented<T extends string>({
   class?: string;
 }): JSX.Element {
   const trackRef = useRef<HTMLDivElement>(null);
-  const [thumb, setThumb] = useState<{ left: number; width: number } | null>(null);
-
   const activeIndex = options.findIndex((opt) => opt.value === value);
-  const optionsKey = options.map((opt) => `${opt.value}:${opt.label}:${opt.disabled ? 1 : 0}`).join('|');
-
-  useLayoutEffect(() => {
-    const track = trackRef.current;
-    if (!track) return;
-    const measure = (): void => {
-      const active = track.querySelector<HTMLButtonElement>('button[data-active="true"]');
-      if (!active) {
-        setThumb(null);
-        return;
-      }
-      setThumb((prev) => {
-        const next = { left: active.offsetLeft, width: active.offsetWidth };
-        return prev && prev.left === next.left && prev.width === next.width ? prev : next;
-      });
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(track);
-    return () => observer.disconnect();
-  }, [value, optionsKey, size, full]);
-
   const focusAndSelect = (index: number): void => {
     const option = options[index];
     if (!option || option.disabled) return;
@@ -92,9 +69,7 @@ export function Segmented<T extends string>({
 
   return (
     <div ref={trackRef} class={rootCls} role={role} aria-label={ariaLabel}>
-      {thumb && (
-        <span class="cp-seg-thumb" aria-hidden="true" style={{ translate: `${thumb.left}px 0`, width: thumb.width }} />
-      )}
+      <span class="cp-thumb" aria-hidden="true" ref={(thumb) => glideThumb(thumb)} />
       {options.map((opt, index) => {
         const active = opt.value === value;
         return (

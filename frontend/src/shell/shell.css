@@ -20,6 +20,8 @@
   align-items: center;
   gap: 6px;
   padding: 10px 0 12px;
+  /* Depth by tone, like the solid button's socket: a lit top edge over a darker foot. Nothing casts. */
+  --rail-depth: inset 0 1px 0 oklch(1 0 0 / 0.05), inset 0 -1px 0 oklch(0 0 0 / 0.16);
 }
 .cp-rail-brand {
   width: 44px;
@@ -69,7 +71,8 @@
   transition:
     background var(--t-quick) var(--ease-out),
     color var(--t-quick) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    box-shadow var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-rail-btn:hover,
 .cp-rail-user:is(:hover, [data-open='true']) {
@@ -84,6 +87,7 @@
 .cp-rail-btn[data-active='true'] {
   background: var(--fill-2);
   color: var(--accent);
+  box-shadow: var(--rail-depth);
 }
 .cp-rail-btn[data-accent='true'] {
   color: var(--accent);
@@ -105,6 +109,7 @@
   padding: 5px 0;
   border-radius: var(--hold-lg);
   background: var(--tile);
+  box-shadow: var(--rail-depth);
 }
 .cp-rail-tray .cp-rail-btn {
   width: 40px;
@@ -135,7 +140,7 @@
   border-radius: var(--hold);
   background: transparent;
   cursor: pointer;
-  transition: scale var(--t-press) var(--ease-out);
+  transition: scale var(--t-press) var(--ease-spring);
 }
 .cp-rail-tile:active {
   scale: 0.92;
@@ -157,6 +162,7 @@
 }
 .cp-rail-tile[data-active='true'] {
   background: var(--fill-3);
+  box-shadow: var(--rail-depth);
 }
 /* Installing: the cover dims and the ring runs along the tile's own edge, where the current one has its fill. */
 .cp-rail-tile[data-installing='true'] .cp-rail-tile-art {
@@ -189,8 +195,6 @@
 
 .cp-userm {
   width: 240px;
-  transform-origin: left bottom;
-  animation: cp-userm-in var(--t-pop) var(--ease-out) both;
 }
 .cp-userm .cp-menu-item {
   padding: 0 8px 0 11px;
@@ -294,7 +298,8 @@
   cursor: pointer;
   transition:
     background var(--t-quick) var(--ease-out),
-    color var(--t-quick) var(--ease-out);
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-topbar-search:hover {
   background: var(--fill);
@@ -346,7 +351,7 @@
   transition:
     background 320ms ease,
     color 320ms ease,
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-status-pill[data-tone='accent'] {
   background: var(--accent-soft);
@@ -375,7 +380,7 @@
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  transition: width 380ms var(--ease-glide);
+  transition: width var(--t-size) var(--ease-glide);
 }
 .cp-status-pill-swap {
   display: inline-flex;
@@ -478,14 +483,14 @@
   display: grid;
   grid-template-columns: 1fr;
   min-width: 0;
-  transition: grid-template-columns 420ms var(--ease-glide);
+  transition: grid-template-columns var(--t-size) var(--ease-glide);
 }
 .cp-update-collapse .cp-update-dock-wrap {
   min-width: 0;
   transform-origin: left center;
   transition:
     opacity var(--t-move) var(--ease-out) 60ms,
-    scale 380ms var(--ease-glide);
+    scale var(--t-size) var(--ease-glide);
 }
 .cp-update-collapse[data-collapsed='true'] {
   grid-template-columns: 0fr;
@@ -522,7 +527,7 @@
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
-  transition: scale var(--t-press) var(--ease-out);
+  transition: scale var(--t-press) var(--ease-spring);
 }
 .cp-update-dock:is(:hover, [data-open='true']) {
   background-color: color-mix(in oklab, var(--accent) 10%, transparent);
@@ -531,32 +536,9 @@
   scale: 0.96;
 }
 
-@keyframes cp-userm-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px) scale(0.97);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
 /* An unfocused window stops its ambient motion. */
 .cp-topbar[data-calm='true'] :is(.cp-ring-run, .cp-music-eq > span, .cp-boot-bar-fill) {
   animation-play-state: paused;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .cp-userm,
-  .cp-status-pill,
-  .cp-status-pill-swap,
-  .cp-status-pill-body,
-  .cp-music-eq > span,
-  .cp-update-collapse,
-  .cp-update-collapse .cp-update-dock-wrap {
-    animation: none !important;
-    transition: none !important;
-  }
 }
 
 .cp-main {
@@ -576,6 +558,18 @@
   width: 100%;
   background-color: var(--bg);
   border-top-left-radius: 20px;
+}
+/* A place's page sits straight in the view. When it is left, its copy lies over the view and fades. */
+.cp-route {
+  display: contents;
+}
+.cp-view-ghost {
+  --enter-y: 0;
+  position: absolute;
+  z-index: 1;
+  overflow: hidden;
+  border-top-left-radius: 20px;
+  background: var(--bg);
 }
 
 .cp-boot {
@@ -634,9 +628,10 @@
 }
 .cp-boot-bar-fill {
   height: 100%;
-  border-radius: inherit;
   background: var(--accent);
-  transition: width var(--t-move) var(--ease-out);
+  transform: scaleX(var(--done, 0));
+  transform-origin: left;
+  transition: transform var(--t-move) var(--ease-out);
 }
 .cp-boot-label {
   font-size: 13px;
@@ -664,14 +659,6 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .cp-boot,
-  .cp-boot-stack,
-  .cp-boot-bar-fill,
-  .cp-mark,
-  .cp-mark * {
-    animation: none;
-    transition: none;
-  }
   .cp-boot-logo.cp-mark--assembly .cp-mark-face,
   .cp-boot-logo.cp-mark--assembly .cp-mark-left,
   .cp-boot-logo.cp-mark--assembly .cp-mark-right {

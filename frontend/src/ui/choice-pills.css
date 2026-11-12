@@ -18,7 +18,7 @@
   transition:
     background var(--t-quick) var(--ease-out),
     color var(--t-quick) var(--ease-out),
-    scale var(--t-press) var(--ease-out);
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-pills > button:hover:not(:disabled):not([data-active='true']) {
   background: var(--fill-2);

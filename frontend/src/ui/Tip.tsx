@@ -7,7 +7,15 @@ const tip = signal<{ id: number; content: ComponentChildren; target: HTMLElement
   null,
 );
 
+/** A tooltip waits for the pointer to rest; once one has shown, the next ones answer at once. */
+const REST_MS = 280;
+const WARM_MS = 400;
+let waiting: number | undefined;
+let hiddenAt = -Infinity;
+
 export function hideTip(): void {
+  window.clearTimeout(waiting);
+  if (tip.value) hiddenAt = performance.now();
   tip.value = null;
 }
 
@@ -21,11 +29,25 @@ export function tipProps(
   onFocus: (event: JSX.TargetedEvent<HTMLElement>) => void;
   onBlur: () => void;
 } {
-  const show = (event: JSX.TargetedEvent<HTMLElement>): void => {
+  const show = (target: HTMLElement): void => {
+    if (!target.isConnected) return;
     shown += 1;
-    tip.value = { id: shown, content, target: event.currentTarget, side };
+    tip.value = { id: shown, content, target, side };
   };
-  return { onMouseEnter: show, onMouseLeave: hideTip, onFocus: show, onBlur: hideTip };
+  return {
+    onMouseEnter: (event) => {
+      const target = event.currentTarget;
+      window.clearTimeout(waiting);
+      if (tip.value || performance.now() - hiddenAt < WARM_MS) show(target);
+      else waiting = window.setTimeout(() => show(target), REST_MS);
+    },
+    onMouseLeave: hideTip,
+    onFocus: (event) => {
+      window.clearTimeout(waiting);
+      show(event.currentTarget);
+    },
+    onBlur: hideTip,
+  };
 }
 
 /** The one tooltip, centred on its target's side. */

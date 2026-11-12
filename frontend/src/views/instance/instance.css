@@ -1,5 +1,5 @@
 /* An instance reads from the top-left like Home: its name as display type, its facts, Launch; behind them stands
-   its world, shallower than Home's and gone before the tabs. Then the tabs and the pane, flat on the panel. */
+   its world, as wide as Home's and shallower, running out behind the tabs. Then the tabs and the pane, flat on the panel. */
 .cp-view-page.cp-instance {
   position: relative;
   gap: 0;
@@ -9,9 +9,9 @@
   position: relative;
 }
 .cp-instance > .cp-vista {
-  --vista-foot: linear-gradient(to bottom, #000 52%, oklch(0 0 0 / 0.55) 74%, oklch(0 0 0 / 0.15) 90%, transparent);
-  width: 76%;
-  height: 288px;
+  --vista-foot-from: 56%;
+  width: 88%;
+  height: 272px;
   aspect-ratio: auto;
 }
 

@@ -13,6 +13,7 @@ import { ResourceMutationStatus, ResourceStatus } from '../components/resource-b
 import { Entry } from '../components/content-row';
 import { deleteWorlds, worldMenuItems } from '../world-actions';
 import { resourceMutationState } from '../bulk-actions';
+import { settleChildren } from '../../../ui/motion';
 
 export function WorldsPane({
   inst,
@@ -74,7 +75,7 @@ export function WorldsPane({
           Create a new world, import an existing save, or launch Minecraft and create one there.
         </Empty>
       ) : (
-        <div class="cp-entries">
+        <div class="cp-entries" data-settles ref={(list) => settleChildren(list)}>
           {worlds.map((world) => (
             <Entry
               key={world.name}

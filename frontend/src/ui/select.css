@@ -94,17 +94,6 @@
   flex-direction: column;
   overflow: hidden;
   outline: none;
-  animation: cp-select-in var(--t-quick) var(--ease-out) both;
-}
-@keyframes cp-select-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
 }
 .cp-select-viewport {
   min-height: 0;
@@ -131,9 +120,4 @@
   height: 6px;
   border-radius: 1.9px;
   background: var(--accent);
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-select-content {
-    animation: none;
-  }
 }

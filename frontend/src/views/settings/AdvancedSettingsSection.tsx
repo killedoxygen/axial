@@ -134,7 +134,7 @@ export function AdvancedSettingsSection(): JSX.Element {
       {isDev && hasNativeDesktopRuntime() && (
         <SettingRow
           title="Reset launcher"
-          description="Stops active work and deletes this isolated rewrite development profile and its managed library. Other profiles, external libraries and saved Microsoft system credentials are preserved."
+          description="Stops active work and deletes this development profile and its managed library. Other profiles, external libraries and saved Microsoft system credentials are preserved."
           control={
             <Button variant="danger" busy={resetting} disabled={resetting} onClick={() => void resetLauncher()}>
               {resetting ? 'Resetting…' : 'Reset'}

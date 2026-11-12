@@ -124,7 +124,9 @@
   line-height: 17px;
   text-align: left;
   cursor: pointer;
-  transition: background var(--t-quick) var(--ease-out);
+  transition:
+    background var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-spring);
 }
 .cp-option > span {
   font-weight: 450;
@@ -180,6 +182,7 @@
   overflow: hidden;
   border-radius: var(--hold-lg);
   background: var(--art-deep);
+  transition: scale var(--t-press) var(--ease-spring);
 }
 /* The outline lies over the preview, so nothing in it covers the line. */
 .cp-theme-art::after {

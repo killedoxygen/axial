@@ -24,6 +24,7 @@ import { packMembership } from '../components/pack-origin';
 import { resourceMutationState } from '../bulk-actions';
 import { applyModUpdates, cachedModProvenance, fetchModProvenance, type ModProvenance } from '../mod-actions';
 import { PACK_NOUN, packMenuItems, removePacks, type PackRow } from '../pack-actions';
+import { settleChildren } from '../../../ui/motion';
 
 const KIND = { resourcepacks: 'resource_pack', shaderpacks: 'shader_pack' } as const;
 
@@ -176,7 +177,7 @@ export function PacksPane({ inst, folder }: { inst: EnrichedInstance; folder: Pa
       ) : shown.length === 0 ? (
         <Empty title={`No ${noun}s match this filter`}>Try a different filter.</Empty>
       ) : (
-        <div class="cp-entries">
+        <div class="cp-entries" data-settles ref={(list) => settleChildren(list)}>
           {shown.map(({ row, view }) => (
             <ContentRow
               key={view.key}

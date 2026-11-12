@@ -62,7 +62,8 @@ export function createRenderer(world: World, width: number, height: number, hori
   const glow = world.atlas.glow;
   const W = width;
   const H = height;
-  const focal = W / 2 / Math.tan(FOV / 2);
+  // A very shallow picture takes a wider view instead of a closer one, so what stands by the camera still fits.
+  const focal = Math.min(W / 2 / Math.tan(FOV / 2), H * 1.4);
   const hz = H * horizon;
   const cx = camera.x;
   const cy = camera.y;

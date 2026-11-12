@@ -105,7 +105,7 @@ function harness() {
   });
   const atoms = source<typeof import('../../src/ui/Atoms')>('ui/Atoms.tsx', {
     'preact/jsx-runtime': jsx, './Icons': { Icon: 'Icon' },
-    './Face': { Face: 'Face' },
+    './Face': { Face: 'Face' }, './motion': { glideThumb() {}, settleWidth() {} },
   });
   const view = source<typeof import('../../src/views/downloads/DownloadsView')>('views/downloads/DownloadsView.tsx', {
     'preact/jsx-runtime': jsx, '../../ui/Atoms': atoms, '../../ui/Icons': { Icon: 'Icon' },

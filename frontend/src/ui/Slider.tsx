@@ -30,7 +30,7 @@ interface Thumb {
 /**
  * The track every slider is: one thumb or several. A thumb follows the pointer exactly while it is dragged and
  * settles on the nearest step when let go; the value it reports is always a step. Each thumb's place is published
- * as `--t0`, `--t1`… for whatever the track draws. Keys go to a hidden native range input per thumb.
+ * as a ratio, `--r0`, `--r1`…, for whatever the track draws. Keys go to a hidden native range input per thumb.
  */
 function Track({
   min,
@@ -89,7 +89,7 @@ function Track({
     <div
       class={className ? `cp-slider ${className}` : 'cp-slider'}
       data-dragging={drag ? 'true' : undefined}
-      style={Object.fromEntries(thumbs.map((thumb, index) => [`--t${index}`, `${place(thumb, index) * 100}%`]))}
+      style={Object.fromEntries(thumbs.map((thumb, index) => [`--r${index}`, place(thumb, index)]))}
       onPointerDown={(event) => {
         if (event.button !== 0) return;
         event.preventDefault();
@@ -128,7 +128,7 @@ function Track({
         />
       ))}
       {thumbs.map((_, index) => (
-        <div key={index} class="cp-slider-thumb" data-thumb={index} style={{ left: `var(--t${index})` }} />
+        <div key={index} class="cp-slider-thumb" data-thumb={index} style={{ '--at': `var(--r${index})` }} />
       ))}
     </div>
   );

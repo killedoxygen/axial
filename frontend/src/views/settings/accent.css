@@ -20,6 +20,7 @@
   border-radius: var(--rad-chip);
   background: var(--swatch);
   cursor: pointer;
+  transition: scale var(--t-press) var(--ease-spring);
 }
 /* A ring of its own colour, drawn as a shadow: every engine rounds a shadow, not every one rounds an outline. */
 .cp-swatch[data-active='true'] {

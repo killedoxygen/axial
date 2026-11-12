@@ -52,8 +52,8 @@ pub fn build_main_window(
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
         // Centred on the rail (72 wide) and on the top bar (46 tall), as `frontend/src/shell/chrome.css` lays out.
-        // The lights are centred in a title bar as tall as a light (16) plus `y`, so their centre is (16 + y) / 2.
-        .traffic_light_position(tauri::LogicalPosition::new(7.0, 30.0));
+        // `y` moves the lights point for point; measured in the running app, 24.5 puts their centre on the bar's.
+        .traffic_light_position(tauri::LogicalPosition::new(7.0, 24.5));
     builder.build()
 }
 

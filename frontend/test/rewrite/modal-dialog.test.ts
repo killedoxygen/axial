@@ -247,6 +247,7 @@ function harness(
     'ui/Dialog.tsx',
     {
       'preact/hooks': dialogHooks,
+      '../hooks/use-leave': { useLeave: () => () => {} },
       './Atoms': { Button: 'Button', Input: 'Input' },
       './Face': { Face: 'Face' },
     },
@@ -268,6 +269,7 @@ function harness(
         }),
       },
       './Icons': { Icon: 'Icon' },
+      './motion': { leaveBehind() {} },
       '../utils': { cn: (...names: string[]) => names.filter(Boolean).join(' ') },
       './Dialog': dialogs,
     },
@@ -312,7 +314,7 @@ function harness(
   );
   const atoms = source<typeof import('../../src/ui/Atoms')>(
     'ui/Atoms.tsx',
-    { './Icons': { Icon: 'Icon' }, './Face': { Face: 'Face' } },
+    { './Icons': { Icon: 'Icon' }, './Face': { Face: 'Face' }, './motion': { glideThumb() {}, settleWidth() {} } },
     globals,
   );
   const lightboxHooks = hooks();

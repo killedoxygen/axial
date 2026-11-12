@@ -1,14 +1,16 @@
-/* One track for every slider. A thumb's place is --t0 (and --t1 for a range), which the fill and band follow.
-   While dragged a thumb follows the pointer; let go, it glides to the step it settled on. */
+/* One track for every slider. A thumb's place is the ratio --r0 (and --r1 for a range), which the fill and band
+   follow. Everything that moves is a transform, so dragging never lays anything out. While dragged a thumb
+   follows the pointer; let go, it glides to the step it settled on. */
 .cp-slider {
-  --t0: 0%;
-  --t1: 100%;
-  --settle: var(--t-pop) var(--ease-out);
+  --r0: 0;
+  --r1: 1;
+  --settle: var(--t-pop) var(--ease-spring);
   position: relative;
   display: flex;
   align-items: center;
   width: 100%;
   height: 28px;
+  container-type: inline-size;
   cursor: pointer;
   touch-action: none;
 }
@@ -23,23 +25,17 @@
 .cp-slider-fill,
 .cp-slider-band {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
+  inset: 0;
   z-index: 2;
-  border-radius: 999px;
   background: var(--accent);
+  transform-origin: left;
+  transition: transform var(--settle);
 }
 .cp-slider-fill {
-  width: var(--t0);
-  transition: width var(--settle);
+  transform: scaleX(var(--r0));
 }
 .cp-slider-band {
-  left: var(--t0);
-  right: calc(100% - var(--t1));
-  transition:
-    left var(--settle),
-    right var(--settle);
+  transform: translateX(calc(var(--r0) * 100%)) scaleX(calc(var(--r1) - var(--r0)));
 }
 .cp-slider-zone {
   position: absolute;
@@ -63,19 +59,20 @@
 .cp-slider-thumb {
   position: absolute;
   top: 50%;
+  left: 0;
   z-index: 3;
   width: 14px;
   height: 14px;
   border-radius: 4.4px;
   background: var(--text);
-  translate: -50% -50%;
+  translate: calc(var(--at) * 100cqw - 50%) -50%;
   transition:
-    left var(--settle),
-    scale var(--t-quick) var(--ease-out);
+    translate var(--settle),
+    scale var(--t-press) var(--ease-spring);
   pointer-events: none;
 }
 .cp-slider[data-dragging] :is(.cp-slider-thumb, .cp-slider-fill, .cp-slider-band) {
-  transition: scale var(--t-quick) var(--ease-out);
+  transition: scale var(--t-press) var(--ease-spring);
 }
 .cp-slider:hover .cp-slider-thumb {
   scale: 1.14;
@@ -98,9 +95,4 @@
   appearance: none;
   opacity: 0;
   pointer-events: none;
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-slider {
-    --settle: 0ms;
-  }
 }

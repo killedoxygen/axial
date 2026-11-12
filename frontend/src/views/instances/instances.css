@@ -77,6 +77,7 @@
   margin-bottom: 10px;
   border-radius: var(--hold-xl);
   overflow: hidden;
+  transition: scale var(--t-press) var(--ease-spring);
 }
 .cp-cover-art > .cp-tile {
   position: absolute;

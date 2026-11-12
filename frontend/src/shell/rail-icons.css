@@ -65,13 +65,3 @@
     transform: rotate(360deg);
   }
 }
-
-@media (prefers-reduced-motion: reduce) {
-  .cp-rail-icon > svg,
-  .cp-rail-stack-layer {
-    animation: none !important;
-    animation-duration: 0s !important;
-    animation-iteration-count: 1 !important;
-    transition: none !important;
-  }
-}

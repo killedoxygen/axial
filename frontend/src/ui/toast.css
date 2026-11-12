@@ -5,23 +5,28 @@
   z-index: 1250;
   display: flex;
   flex-direction: column-reverse;
+  /* A definite width: sized to its content, the stack grew as wide as the longest unwrapped message and left its toasts adrift from the corner. */
+  align-items: flex-end;
   gap: 8px;
-  max-width: calc(100vw - 40px);
+  width: min(420px, 100vw - 40px);
   pointer-events: none;
 }
 .cp-toast {
   display: flex;
   align-items: center;
   gap: 9px;
-  min-width: 280px;
-  max-width: min(420px, 100%);
+  box-sizing: border-box;
+  min-width: min(280px, 100%);
+  max-width: 100%;
   min-height: 36px;
   padding: 4px 4px 4px 10px;
   font-size: 13px;
   line-height: 1.35;
   pointer-events: auto;
   transform-origin: right center;
-  animation: cp-toast-in var(--t-move) var(--ease-out) both;
+  --enter-y: 12px;
+  --enter-scale: 0.96;
+  animation: cp-enter var(--t-move) var(--ease-spring) both;
 }
 .cp-toast-msg {
   flex: 1;
@@ -32,19 +37,4 @@
   overflow: hidden;
   font-weight: 500;
   overflow-wrap: break-word;
-}
-@keyframes cp-toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px) scale(0.96);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .cp-toast {
-    animation: none;
-  }
 }

@@ -9,18 +9,11 @@ import type { TexturePack } from './textures';
 const engine = (): Promise<[typeof import('./world'), typeof import('./render')]> =>
   Promise.all([import('./world'), import('./render')]);
 
-/**
- * Every picture is drawn once, at one size: as wide as the screen could ever show it and never more than this
- * many pixels. The page then scales and crops that one picture, so resizing the window draws nothing again.
- */
+/** The most pixels a picture may have; below it, a picture has exactly the pixels of the screen it fills. */
 const PIXELS = 2_400_000;
+/** The shape of the whole picture. A shallower space shows less sky, down to this little of its height. */
 const ASPECT = 2.3;
-
-function size(): [width: number, height: number] {
-  const wanted = window.screen.width * (window.devicePixelRatio || 1) * 0.88;
-  const width = Math.max(320, Math.round(Math.min(wanted, Math.sqrt(PIXELS * ASPECT)) / 16) * 16);
-  return [width, Math.round(width / ASPECT)];
-}
+const LEAST_SKY = 0.2;
 
 const SLICE_MS = 7;
 const KEEP = 4;
@@ -59,22 +52,30 @@ function textures(version: string): Promise<TexturePack | null> {
 }
 
 /** Draws in slices, giving the thread back between them. Resolves null once `request` is cancelled or there is nothing to draw with. */
-async function draw(request: Request, seed: number, version: string, dark: boolean): Promise<ImageData | null> {
-  const key = `${seed}:${version}:${dark}`;
+async function draw(
+  request: Request,
+  seed: number,
+  version: string,
+  dark: boolean,
+  width: number,
+  height: number,
+): Promise<ImageData | null> {
+  const key = `${seed}:${version}:${dark}:${width}x${height}`;
   const kept = pictures.get(key);
   if (kept) {
     pictures.delete(key);
     pictures.set(key, kept);
     return kept;
   }
-  const [width, height] = size();
+  // The shallower the space, the higher the horizon: what stands on the ground by the camera is what must show.
+  const horizon = Math.min(0.5, Math.max(LEAST_SKY, 0.5 - (width / ASPECT / height - 1) * 0.45));
   const [pack, [{ buildWorld }, { createRenderer }]] = await Promise.all([textures(version), engine()]);
   await pause();
   if (request.cancelled || !pack) return null;
   const world = buildWorld(seed, dark, pack);
   await pause();
   if (request.cancelled || !world) return null;
-  const renderer = createRenderer(world, width, height);
+  const renderer = createRenderer(world, width, height, horizon);
   for (let x = 0; x < width;) {
     await pause();
     if (request.cancelled) return null;
@@ -101,8 +102,8 @@ async function draw(request: Request, seed: number, version: string, dark: boole
 /**
  * An instance's world, drawn from its art seed with its own version's block textures: sunset to night in dark mode,
  * daylight in light. Until the version's files are there, nothing is shown; `installing` turning false asks again.
- * The picture has no frame; its stylesheet anchors it to the panel's corner, crops it to the space it has and lets
- * its lower edge run out into the page.
+ * The picture is drawn for exactly the pixels it fills, since scaling a picture of blocks grains it. When the
+ * space changes size the picture it has is stretched to fit until one drawn for the new size quietly replaces it.
  */
 export function Vista({
   seed,
@@ -119,18 +120,40 @@ export function Vista({
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || installing) return undefined;
-    const request: Request = { cancelled: false };
-    const drawn = queue.then(() => (request.cancelled ? null : draw(request, seed, version, dark)));
-    queue = drawn.catch(() => null);
-    void drawn.then((picture) => {
-      if (request.cancelled || !picture) return;
-      canvas.width = picture.width;
-      canvas.height = picture.height;
-      canvas.getContext('2d')?.putImageData(picture, 0, 0);
-      canvas.dataset.ready = 'true';
+    // The newest request owns the canvas; an older one is cancelled and may not paint.
+    let current: Request | null = null;
+    let settle = 0;
+    const paint = (): void => {
+      const box = canvas.getBoundingClientRect();
+      if (box.width < 16 || box.height < 16) return;
+      const scale = Math.min(window.devicePixelRatio || 1, Math.sqrt(PIXELS / (box.width * box.height)));
+      const width = Math.round(box.width * scale);
+      const height = Math.round(box.height * scale);
+      if (canvas.width === width && canvas.height === height && canvas.dataset.ready) return;
+      if (current) current.cancelled = true;
+      const request: Request = { cancelled: false };
+      current = request;
+      const drawn = queue.then(() => (request.cancelled ? null : draw(request, seed, version, dark, width, height)));
+      queue = drawn.catch(() => null);
+      void drawn.then((picture) => {
+        if (request.cancelled || !picture) return;
+        canvas.width = picture.width;
+        canvas.height = picture.height;
+        canvas.getContext('2d')?.putImageData(picture, 0, 0);
+        canvas.dataset.ready = 'true';
+      });
+    };
+    delete canvas.dataset.ready;
+    paint();
+    const observer = new ResizeObserver(() => {
+      window.clearTimeout(settle);
+      settle = window.setTimeout(paint, 250);
     });
+    observer.observe(canvas);
     return () => {
-      request.cancelled = true;
+      if (current) current.cancelled = true;
+      window.clearTimeout(settle);
+      observer.disconnect();
     };
   }, [seed, version, installing, dark]);
 
