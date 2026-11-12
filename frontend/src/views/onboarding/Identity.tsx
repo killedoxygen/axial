@@ -1,8 +1,10 @@
 import type { JSX } from 'preact';
+import { useEffect, useRef } from 'preact/hooks';
 import { Button, Input, Chip } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
 import { MicrosoftMark } from '../../ui/MicrosoftMark';
 import { PlayerHeadPreview } from '../../ui/PlayerHeadPreview';
+import { hideTip, showTip } from '../../ui/Tip';
 import type { Identity as IdentityState, IdentityView } from './use-identity';
 import { Step } from './Step';
 
@@ -74,7 +76,36 @@ function SignedIn({ identity }: { identity: IdentityState }): JSX.Element {
   );
 }
 
+let introduced = false;
+
+/** Points out the typed name's own skin the first time one is found: its tile rings and a tooltip names it. */
+function useOwnLookIntro(found: boolean): { current: HTMLLabelElement | null } {
+  const ref = useRef<HTMLLabelElement>(null);
+
+  useEffect(() => {
+    const tile = ref.current;
+    if (!found || introduced || !tile) return undefined;
+    tile.dataset.fresh = '';
+    showTip("You can wear this name's Minecraft skin", tile);
+    const done = (): void => {
+      delete tile.dataset.fresh;
+      hideTip();
+    };
+    const timer = window.setTimeout(() => {
+      introduced = true;
+      done();
+    }, 4200);
+    return () => {
+      window.clearTimeout(timer);
+      done();
+    };
+  }, [found]);
+
+  return ref;
+}
+
 function Offline({ identity }: { identity: IdentityState }): JSX.Element {
+  const own = useOwnLookIntro(identity.looks[0].lookup !== undefined);
   return (
     <>
       <label class="cp-ob-field">
@@ -87,7 +118,7 @@ function Offline({ identity }: { identity: IdentityState }): JSX.Element {
       <fieldset class="cp-ob-looks">
         <legend class="cp-ob-label">Your look</legend>
         {identity.looks.map((look) => (
-          <label key={look.id} class="cp-ob-look" title={look.name}>
+          <label key={look.id} ref={look.lookup ? own : undefined} class="cp-ob-look" title={look.name}>
             <input
               type="radio"
               name="look"

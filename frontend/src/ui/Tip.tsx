@@ -19,6 +19,13 @@ export function hideTip(): void {
   tip.value = null;
 }
 
+/** Shows a tooltip on an element, also unprompted; `hideTip` takes it down. */
+export function showTip(content: ComponentChildren, target: HTMLElement, side: 'below' | 'right' = 'below'): void {
+  if (!target.isConnected) return;
+  shown += 1;
+  tip.value = { id: shown, content, target, side };
+}
+
 /** Handlers that name an element in a tooltip while it is pointed at or focused. */
 export function tipProps(
   content: ComponentChildren,
@@ -29,11 +36,7 @@ export function tipProps(
   onFocus: (event: JSX.TargetedEvent<HTMLElement>) => void;
   onBlur: () => void;
 } {
-  const show = (target: HTMLElement): void => {
-    if (!target.isConnected) return;
-    shown += 1;
-    tip.value = { id: shown, content, target, side };
-  };
+  const show = (target: HTMLElement): void => showTip(content, target, side);
   return {
     onMouseEnter: (event) => {
       const target = event.currentTarget;

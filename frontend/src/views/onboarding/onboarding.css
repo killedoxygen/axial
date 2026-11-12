@@ -319,6 +319,28 @@ html[data-desktop-chrome='custom-frameless'] .cp-ob-pane > .cp-mark {
   box-shadow: inset 0 0 0 2px var(--accent);
 }
 
+/* A newly found skin rings twice so it is noticed arriving. */
+.cp-ob-look[data-fresh]::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow: 0 0 0 2px var(--accent);
+  animation: cp-ob-ring 1400ms var(--ease-out) 2 both;
+}
+
+@keyframes cp-ob-ring {
+  from {
+    opacity: 0.9;
+  }
+  to {
+    opacity: 0;
+    inset: -6px;
+    border-radius: 16px;
+  }
+}
+
 .cp-ob-look:has(:focus-visible) {
   outline: 1.5px solid var(--accent);
   outline-offset: 2px;
