@@ -102,9 +102,11 @@ export function AccountRow(): JSX.Element {
             >
               <AccountHead account={account} />
               <strong>{name}</strong>
-              <span class="cp-account-kind">
-                <AccountKindMark account={account} />
-              </span>
+              {account.kind === 'microsoft' && (
+                <span class="cp-account-kind">
+                  <AccountKindMark account={account} />
+                </span>
+              )}
               {account.active && <Icon name="check" size={13} stroke={2.6} />}
             </button>
           );
