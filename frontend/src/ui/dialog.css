@@ -22,7 +22,7 @@
   border-radius: var(--rad-dialog);
   --enter-y: 10px;
   --enter-scale: 0.96;
-  animation: cp-enter var(--t-pop) var(--ease-spring) both;
+  animation: cp-enter var(--t-pop) var(--ease-spring) backwards;
 }
 .cp-dialog--choice {
   width: min(520px, 100%);

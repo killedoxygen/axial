@@ -783,7 +783,7 @@
   grid-template-columns: 28px minmax(0, 1fr);
   align-items: start;
   gap: 10px;
-  animation: cp-enter var(--t-pop) var(--ease-out) both;
+  animation: cp-enter var(--t-pop) var(--ease-out) backwards;
 }
 .cp-notice:has(> .cp-ibtn) {
   grid-template-columns: 28px minmax(0, 1fr) 28px;

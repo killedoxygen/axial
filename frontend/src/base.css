@@ -226,7 +226,9 @@ textarea:focus-visible {
     transform: rotate(360deg);
   }
 }
-/* The one entrance: from a small offset (and scale) to rest. What enters says where from. */
+/* The one entrance: from a small offset (and scale) to rest. What enters says where from.
+   It fills backwards only: once arrived, nothing of the animation stays on the element, so a surface is never
+   left as the containing block of the popovers that open inside it. */
 @keyframes cp-enter {
   from {
     opacity: 0;

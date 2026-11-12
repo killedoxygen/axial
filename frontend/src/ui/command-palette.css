@@ -23,7 +23,7 @@
   padding: 6px;
   --enter-y: 10px;
   --enter-scale: 0.96;
-  animation: cp-enter var(--t-pop) var(--ease-spring) both;
+  animation: cp-enter var(--t-pop) var(--ease-spring) backwards;
 }
 .cp-cmd[data-positioned='true'] {
   animation: none;

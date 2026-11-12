@@ -26,7 +26,7 @@
   transform-origin: right center;
   --enter-y: 12px;
   --enter-scale: 0.96;
-  animation: cp-enter var(--t-move) var(--ease-spring) both;
+  animation: cp-enter var(--t-move) var(--ease-spring) backwards;
 }
 .cp-toast-msg {
   flex: 1;

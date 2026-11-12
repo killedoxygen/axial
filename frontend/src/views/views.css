@@ -12,7 +12,7 @@
 /* A page's parts rise in one after another, overlapping, so the page arrives as one movement. */
 .cp-view-page > * {
   --enter-y: 10px;
-  animation: cp-enter var(--t-move) var(--ease-out) both;
+  animation: cp-enter var(--t-move) var(--ease-out) backwards;
 }
 .cp-view-page > *:nth-child(2) {
   animation-delay: 40ms;
@@ -28,7 +28,7 @@
 .cp-view-page > .cp-pane,
 .cp-settings-page > * {
   --enter-y: 6px;
-  animation: cp-enter var(--t-pop) var(--ease-out) both;
+  animation: cp-enter var(--t-pop) var(--ease-out) backwards;
 }
 
 /* A list row's first cell: the item's art, which its selection mark replaces on hover, on focus and once chosen. */

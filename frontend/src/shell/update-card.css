@@ -13,7 +13,7 @@
   transform-origin: top right;
   --enter-y: -6px;
   --enter-scale: 0.95;
-  animation: cp-enter var(--t-pop) var(--ease-spring) both;
+  animation: cp-enter var(--t-pop) var(--ease-spring) backwards;
 }
 .cp-update-card-head {
   display: flex;
