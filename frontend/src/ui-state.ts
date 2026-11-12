@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import type { ContentKind } from './types-content';
+import type { ContentKind, ContentSelection } from './types-content';
 import { ROUTE_PREFERENCES_KEY, parseRoutePreference } from './preferences/local';
 import { hasNativeDesktopRuntime } from './native';
 import { canEditPreferences, saveNativeRoute } from './preferences/persistence';
@@ -268,6 +268,8 @@ export interface CreateModpackDraft {
   loader_label: string;
   selection_id: string;
   icon_url?: string;
+  /** The pick it was opened from, which leaves the picks once its instance is made. */
+  pick?: ContentSelection;
 }
 
 export const createModpack = signal<CreateModpackDraft | null>(null);
@@ -292,9 +294,10 @@ export function openCreateDraft(draft: CreateDraftItem[]): void {
   createOpen.value = true;
 }
 
-export function openCreateModpack(pack: CreateModpackDraft): void {
+/** `extras` install into the pack's instance once the pack has. */
+export function openCreateModpack(pack: CreateModpackDraft, extras: CreateDraftItem[] = []): void {
   createIntent = Symbol();
-  createDraft.value = null;
+  createDraft.value = extras.length > 0 ? extras : null;
   createModpack.value = pack;
   createOpen.value = true;
 }

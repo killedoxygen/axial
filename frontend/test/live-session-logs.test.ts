@@ -4,14 +4,14 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as logContract from '../../src/dto-launch';
-import type { EnrichedInstance } from '../../src/types-instance';
-import type { LaunchSession } from '../../src/types-launch';
+import * as logContract from '../src/dto-launch';
+import type { EnrichedInstance } from '../src/types-instance';
+import type { LaunchSession } from '../src/types-launch';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
 const ts: typeof import('typescript') = requireDependency('typescript');
-type PaneProps = Parameters<typeof import('../../src/views/instance/tabs/LogsPane').LogsPane>[0];
+type PaneProps = Parameters<typeof import('../src/views/instance/tabs/LogsPane').LogsPane>[0];
 type Node = { type: unknown; props: Record<string, unknown> & { children?: unknown } };
 
 function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
@@ -187,7 +187,7 @@ function harness() {
   let refreshes = 0;
   let read: (path: string) => Promise<unknown> = async () => history('Game started');
   const store = { launchSessions: { value: { 'instance-1': session() } as Record<string, LaunchSession> } };
-  const logs = source<typeof import('../../src/views/instance/logs')>('views/instance/logs.ts', {
+  const logs = source<typeof import('../src/views/instance/logs')>('views/instance/logs.ts', {
     '../../api': {
       api: async (method: string, path: string) => {
         assert.equal(method, 'GET');
@@ -197,7 +197,7 @@ function harness() {
     },
     '../../dto-launch': logContract,
   });
-  const pane = source<typeof import('../../src/views/instance/tabs/LogsPane')>(
+  const pane = source<typeof import('../src/views/instance/tabs/LogsPane')>(
     'views/instance/tabs/LogsPane.tsx',
     {
       'preact/hooks': hooks,

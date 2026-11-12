@@ -15,6 +15,8 @@ export interface CanonicalContent {
   author: string;
   summary: string;
   icon_url?: string;
+  /** The screenshot its author chose to represent it. */
+  cover_url?: string;
   downloads: number;
   follows: number;
   categories: string[];

@@ -1,4 +1,10 @@
-import { activeDownload, downloadFailures, downloadQueue, type DownloadFailure } from './machines/downloads';
+import {
+  activeDownload,
+  downloadFailures,
+  downloadQueue,
+  installedStateSettling,
+  type DownloadFailure,
+} from './machines/downloads';
 import { installItemFromQueueInstallItem, installItemFromQueuedViewModel, isSameInstallItem } from './install-item';
 import { minecraftVersionLabel } from './version-display';
 import type { Version } from './types-version';
@@ -19,6 +25,8 @@ export type InstanceInstallStatus = {
   target: string;
   state: 'idle' | 'active' | 'queued' | 'failed';
   installing: boolean;
+  /** Nothing is installing any more, but the instance has not been re-read since: its readiness is from before. */
+  settling: boolean;
   label: string;
   progress: InstanceInstallProgress | null;
   queuedItem?: InstallQueuedItemViewModel;
@@ -82,7 +90,7 @@ export function instanceInstallStatus(
     failure?.item ??
     expectedItem;
   const progress = activeInstall
-    ? { pct: activeInstall.pct, label: activeInstall.label, displayName: activeInstall.displayName }
+    ? { pct: activeInstall.ringPct, label: activeInstall.label, displayName: activeInstall.displayName }
     : null;
   const state = progress ? 'active' : queuedItem ? 'queued' : failure ? 'failed' : 'idle';
   const label =
@@ -93,6 +101,7 @@ export function instanceInstallStatus(
     target: item?.versionId ?? '',
     state,
     installing: state === 'active' || state === 'queued',
+    settling: state === 'idle' && installedStateSettling.value,
     label,
     progress,
     queuedItem,

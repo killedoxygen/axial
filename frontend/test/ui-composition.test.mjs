@@ -8,27 +8,27 @@ import test from 'node:test';
 
 /**
  * @typedef {{
- *   'src/preferences/local.ts': typeof import('../../src/preferences/local'),
- *   'src/dto-contract.ts': typeof import('../../src/dto-contract'),
- *   'src/native.ts': typeof import('../../src/native'),
- *   'src/launch-notice-tracker.ts': typeof import('../../src/launch-notice-tracker'),
- *   'src/launch-response-adapters.ts': typeof import('../../src/launch-response-adapters'),
- *   'src/dto-install.ts': typeof import('../../src/dto-install'),
- *   'src/dto-core.ts': typeof import('../../src/dto-core'),
- *   'src/actions.ts': typeof import('../../src/actions'),
- *   'src/hooks/use-autosave.ts': typeof import('../../src/hooks/use-autosave'),
- *   'src/views/accounts/api.ts': typeof import('../../src/views/accounts/api'),
- *   'src/machines/accounts.ts': typeof import('../../src/machines/accounts'),
- *   'src/machines/accounts-state.ts': typeof import('../../src/machines/accounts-state'),
- *   'src/machines/downloads.ts': typeof import('../../src/machines/downloads'),
- *   'src/machines/download-view-models.ts': typeof import('../../src/machines/download-view-models'),
- *   'src/install-item.ts': typeof import('../../src/install-item'),
- *   'src/instance-readiness.ts': typeof import('../../src/instance-readiness'),
- *   'src/state.ts': typeof import('../../src/state'),
- *   'src/ui-state.ts': typeof import('../../src/ui-state'),
- *   'src/bootstrap.ts': typeof import('../../src/bootstrap'),
+ *   'src/preferences/local.ts': typeof import('../src/preferences/local'),
+ *   'src/dto-contract.ts': typeof import('../src/dto-contract'),
+ *   'src/native.ts': typeof import('../src/native'),
+ *   'src/launch-notice-tracker.ts': typeof import('../src/launch-notice-tracker'),
+ *   'src/launch-response-adapters.ts': typeof import('../src/launch-response-adapters'),
+ *   'src/dto-install.ts': typeof import('../src/dto-install'),
+ *   'src/dto-core.ts': typeof import('../src/dto-core'),
+ *   'src/actions.ts': typeof import('../src/actions'),
+ *   'src/hooks/use-autosave.ts': typeof import('../src/hooks/use-autosave'),
+ *   'src/views/accounts/api.ts': typeof import('../src/views/accounts/api'),
+ *   'src/machines/accounts.ts': typeof import('../src/machines/accounts'),
+ *   'src/machines/accounts-state.ts': typeof import('../src/machines/accounts-state'),
+ *   'src/machines/downloads.ts': typeof import('../src/machines/downloads'),
+ *   'src/machines/download-view-models.ts': typeof import('../src/machines/download-view-models'),
+ *   'src/install-item.ts': typeof import('../src/install-item'),
+ *   'src/instance-readiness.ts': typeof import('../src/instance-readiness'),
+ *   'src/state.ts': typeof import('../src/state'),
+ *   'src/ui-state.ts': typeof import('../src/ui-state'),
+ *   'src/bootstrap.ts': typeof import('../src/bootstrap'),
  * }} SourceModules
- * @typedef {import('../../src/types-settings').Config} Config
+ * @typedef {import('../src/types-settings').Config} Config
  * @typedef {Partial<Config> & { expected_revision: number, expected_account_selection_revision?: number }} ConfigPatch
  * @typedef {(method: string, path: string, patch?: ConfigPatch) => Promise<unknown>} ConfigApi
  * @typedef {[string, string, number | undefined]} RevisionCall
@@ -322,7 +322,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
   let selectionRevision = 4;
   /** @type {Array<[string, string, unknown]>} */
   const calls = [];
-  /** @type {Array<Parameters<typeof import('../../src/toast').toast>>} */
+  /** @type {Array<Parameters<typeof import('../src/toast').toast>>} */
   const toasts = [];
   /** @type {string[]} */
   const errors = [];
@@ -331,7 +331,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       errors.push(message);
     },
   };
-  /** @param {string} id @param {boolean} launchable @returns {import('../../src/types-instance').EnrichedInstance} */
+  /** @param {string} id @param {boolean} launchable @returns {import('../src/types-instance').EnrichedInstance} */
   function instance(id, launchable) {
     return {
       id,
@@ -437,7 +437,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       '../player-name': { promptPlayerName: async () => 'Renamed' },
       '../player-skin': { refreshAccountSkin() {}, moveAccountSkin() {}, forgetAccountSkin() {} },
       '../toast': {
-        toast: /** @param {Parameters<typeof import('../../src/toast').toast>} args */ (...args) => toasts.push(args),
+        toast: /** @param {Parameters<typeof import('../src/toast').toast>} args */ (...args) => toasts.push(args),
       },
       '../ui/Dialog': {},
       '../views/accounts/api': accountsApi,
@@ -829,7 +829,7 @@ test('browser preferences persist edits and return independent preference maps',
 });
 
 test('stored browser preferences validate values and recover with fresh defaults', () => {
-  const localStorage = storage([['axial_rewrite_ui', JSON.stringify({ theme: 'end', sounds: false })]]);
+  const localStorage = storage([['axial_ui', JSON.stringify({ theme: 'end', sounds: false })]]);
   const state = loadSource('src/state.ts', browserPreferenceImports, { localStorage });
   assert.equal(state.local.theme, 'end');
   assert.equal(state.local.sounds, false);

@@ -5,16 +5,16 @@ import { basename, dirname, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 
-/** @typedef {Parameters<typeof import('../../src/api').api>} ApiCall */
+/** @typedef {Parameters<typeof import('../src/api').api>} ApiCall */
 /** @typedef {{ type: unknown, props: Record<string, unknown> }} ViewNode */
 /** @typedef {{ Button: { onClick: () => void, disabled?: boolean }, OptionTiles: { options: { value: string }[], onChange: (value: string) => void, value: string, disabled?: boolean } }} Controls */
 /**
  * @typedef {{
- *   'views/settings/PerformanceSection': typeof import('../../src/views/settings/PerformanceSection'),
- *   'views/instance/performance-mode': typeof import('../../src/views/instance/performance-mode'),
- *   'views/settings/PerformanceLabProofHistory': typeof import('../../src/views/settings/PerformanceLabProofHistory'),
- *   'views/settings/PerformanceLabSuiteDrivers': typeof import('../../src/views/settings/PerformanceLabSuiteDrivers'),
- *   'dto-performance': typeof import('../../src/dto-performance'),
+ *   'views/settings/PerformanceSection': typeof import('../src/views/settings/PerformanceSection'),
+ *   'views/instance/performance-mode': typeof import('../src/views/instance/performance-mode'),
+ *   'views/settings/PerformanceLabProofHistory': typeof import('../src/views/settings/PerformanceLabProofHistory'),
+ *   'views/settings/PerformanceLabSuiteDrivers': typeof import('../src/views/settings/PerformanceLabSuiteDrivers'),
+ *   'dto-performance': typeof import('../src/dto-performance'),
  * }} ViewModules
  */
 
@@ -24,7 +24,7 @@ const { transformSync } = /** @type {typeof import('esbuild')} */ (dependencies(
 
 // Execute the real view functions and DTO decoders without a DOM or shared build
 // output. Hooks and primitive boundaries are modeled; this is not visual QA.
-/** @param {{ config?: { performance_mode: import('../../src/types-performance').PerformanceMode }, api?: (...args: ApiCall) => Promise<unknown> }} [options] */
+/** @param {{ config?: { performance_mode: import('../src/types-performance').PerformanceMode }, api?: (...args: ApiCall) => Promise<unknown> }} [options] */
 function viewHarness({ config = { performance_mode: 'managed' }, api = async () => ({}) } = {}) {
   /** @type {unknown[]} */
   const cells = [];
@@ -34,7 +34,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
   const cleanups = [];
   /** @type {ApiCall[]} */
   const calls = [];
-  /** @type {Parameters<typeof import('../../src/toast').toast>[]} */
+  /** @type {Parameters<typeof import('../src/toast').toast>[]} */
   const notices = [];
   /** @type {string[]} */
   const clipboard = [];
@@ -46,9 +46,9 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
   const store = {
     config: { value: config },
     devMode: { value: false },
-    instances: { value: /** @type {import('../../src/types-instance').EnrichedInstance[]} */ ([]) },
-    launchSessions: { value: /** @type {Record<string, import('../../src/types-launch').LaunchSession>} */ ({}) },
-    launchState: { value: /** @type {import('../../src/store').LaunchState} */ ({ status: 'idle' }) },
+    instances: { value: /** @type {import('../src/types-instance').EnrichedInstance[]} */ ([]) },
+    launchSessions: { value: /** @type {Record<string, import('../src/types-launch').LaunchSession>} */ ({}) },
+    launchState: { value: /** @type {import('../src/store').LaunchState} */ ({ status: 'idle' }) },
     logLines: { value: 0 },
     collapsedLogSeverity: { value: null },
     selectedInstanceId: { value: null },
@@ -120,7 +120,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
     music: { Music: { suppress() {}, unsuppress() {} } },
     sound: { Sound: { init() {} } },
     toast: {
-      /** @param {Parameters<typeof import('../../src/toast').toast>} args */
+      /** @param {Parameters<typeof import('../src/toast').toast>} args */
       toast: (...args) => notices.push(args),
     },
     'ui/Atoms': primitives(['Button', 'Pill', 'Toggle']),
@@ -284,7 +284,7 @@ test('instance modes preserve inheritance and health passes backend copy through
   assert.equal(h.calls[0][1], '/performance/health?instance_id=instance+%2F%3F');
 });
 
-/** @returns {import('../../src/types-launch').LaunchProofRecord} */
+/** @returns {import('../src/types-launch').LaunchProofRecord} */
 function proofRecord() {
   return {
     schema: 'launch-proof',
@@ -379,7 +379,7 @@ function driverResponse({ id = 'driver', state = 'stopped', pending = null, canR
   };
 }
 
-/** @type {Parameters<typeof import('../../src/views/settings/PerformanceLabSuiteDrivers').BenchmarkSuiteDriversBlock>[0]} */
+/** @type {Parameters<typeof import('../src/views/settings/PerformanceLabSuiteDrivers').BenchmarkSuiteDriversBlock>[0]} */
 const driverProps = {
   matrixState: {
     status: 'ready',
@@ -395,7 +395,7 @@ const driverProps = {
   },
 };
 
-/** @param {string} id @returns {import('../../src/types-instance').EnrichedInstance} */
+/** @param {string} id @returns {import('../src/types-instance').EnrichedInstance} */
 function driverInstance(id) {
   return {
     id,

@@ -13,13 +13,15 @@ import { navigate } from '../../ui-state';
 import { errMessage } from '../../utils';
 import { actionVerb } from './ContentAction';
 import { gameVersionOptions, KIND_CATEGORIES, LOADER_OPTIONS, SORT_OPTIONS } from './filters';
+import { staging } from './fit';
 import { InstallConflictSheet, useInstallFlow } from './install-flow';
 import { InstallTarget } from './InstallTarget';
 import { ResultGhost, ResultRow } from './ResultRow';
-import { KIND_TABS, tagLabel, usesLoaderFilter } from './shared';
+import { FitFacts, KIND_TABS, tagLabel, usesLoaderFilter } from './shared';
 import {
   category,
   clearFilters,
+  fitOnly,
   gameVersion,
   kind,
   loader,
@@ -34,6 +36,7 @@ import {
   sort,
   targetInstance,
   total,
+  tray,
 } from './state';
 import { Tray } from './Tray';
 import { inHandResult, useResultKeys } from './use-result-keys';
@@ -41,6 +44,8 @@ import { inHandResult, useResultKeys } from './use-result-keys';
 const PAGE_SIZE = 40;
 const SEARCH_DEBOUNCE_MS = 220;
 const QUICK_CATEGORIES = 5;
+/** Where looks are what is being chosen, a result shows its screenshot. */
+const COVER_KINDS: ReadonlySet<ContentKind> = new Set(['modpack', 'resource_pack', 'shader_pack']);
 
 /** The categories the results carry most, as one-click refinements. */
 function commonCategories(): string[] {
@@ -67,23 +72,36 @@ export function DiscoverView(): JSX.Element {
   const currentCategory = category.value;
   const trimmedQuery = query.value.trim();
   const modless = instance !== null && !instance.version_display.supports_mods;
+  // A pack brings its own loader and version, so the picks never narrow the packs themselves.
+  const staged = staging.value;
+  const fit = instance || currentKind === 'modpack' ? null : staged.fit;
+  const fitting = fit !== null && (fitOnly.value ?? staged.packs.length > 0);
   const activeLoader = !usesLoaderFilter(currentKind)
     ? ''
     : instance
       ? modless
         ? ''
         : instance.version_display.loader_key
-      : loader.value;
-  const activeVersion = instance ? instance.version_display.minecraft_label : gameVersion.value;
+      : fitting
+        ? fit.loader === 'vanilla'
+          ? ''
+          : fit.loader
+        : loader.value;
+  const activeVersion = instance
+    ? instance.version_display.minecraft_label
+    : fitting
+      ? fit.gameVersion
+      : gameVersion.value;
 
+  const picks = tray.value;
   const tabs = useMemo(
     () =>
-      modless
-        ? KIND_TABS.map((tab) =>
-            tab.id === 'mod' ? { ...tab, disabled: true, title: `${instance.name} has no mod loader` } : tab,
-          )
-        : KIND_TABS,
-    [instance, modless],
+      KIND_TABS.map((tab) => {
+        const picked = instance ? 0 : picks.filter((item) => item.kind === tab.id).length;
+        if (modless && tab.id === 'mod') return { ...tab, disabled: true, title: `${instance.name} has no mod loader` };
+        return picked > 0 ? { ...tab, count: picked, title: `${tab.label}: ${picked} picked` } : tab;
+      }),
+    [instance, modless, picks],
   );
   useEffect(() => {
     if (modless && kind.value === 'mod') kind.value = 'resource_pack';
@@ -144,7 +162,12 @@ export function DiscoverView(): JSX.Element {
   const error = searchError.value;
   const inHand = inHandResult();
   const kindLabel = KIND_TABS.find((tab) => tab.id === currentKind)!.label.toLowerCase();
-  const fitsLabel = instance ? ` for ${instance.version_display.summary_label}` : '';
+  const fitsLabel = instance
+    ? ` for ${instance.version_display.summary_label}`
+    : fitting
+      ? ` for ${fit.loaderLabel} ${fit.gameVersion}`
+      : '';
+  const covers = COVER_KINDS.has(currentKind);
 
   // The quick refinements stay put while one of them is narrowing the results they were drawn from.
   const quick = useRef<{ kind: ContentKind; slugs: string[] }>({ kind: currentKind, slugs: [] });
@@ -210,7 +233,26 @@ export function DiscoverView(): JSX.Element {
           <InstanceFacts inst={instance} />
         ) : (
           <>
-            {usesLoaderFilter(currentKind) && (
+            {fit && (
+              <button
+                type="button"
+                class="cp-discover-fit"
+                aria-pressed={fitting}
+                title={
+                  fitting
+                    ? 'Showing only what runs with your picks. Press to browse everything.'
+                    : `Show only what runs on ${fit.loaderLabel} ${fit.gameVersion}, like your picks`
+                }
+                onClick={() => {
+                  fitOnly.value = !fitting;
+                }}
+              >
+                <Icon name="check" size={12} stroke={2.6} />
+                Fits your picks
+                {fitting && <FitFacts fit={fit} />}
+              </button>
+            )}
+            {!fitting && usesLoaderFilter(currentKind) && (
               <SelectField
                 look="quiet"
                 value={loader.value}
@@ -221,15 +263,17 @@ export function DiscoverView(): JSX.Element {
                 ariaLabel="Loader"
               />
             )}
-            <SelectField
-              look="quiet"
-              value={gameVersion.value}
-              onChange={(value) => {
-                gameVersion.value = value;
-              }}
-              options={versionOptions}
-              ariaLabel="Minecraft version"
-            />
+            {!fitting && (
+              <SelectField
+                look="quiet"
+                value={gameVersion.value}
+                onChange={(value) => {
+                  gameVersion.value = value;
+                }}
+                options={versionOptions}
+                ariaLabel="Minecraft version"
+              />
+            )}
           </>
         )}
         <div class="cp-discover-cats" role="group" aria-label="Categories">
@@ -286,7 +330,7 @@ export function DiscoverView(): JSX.Element {
       {error ? (
         <Empty
           eyes="x"
-          title="Could not reach Modrinth"
+          title="Search did not load"
           actions={
             <Button variant="secondary" icon="refresh" onClick={() => setAttempt((value) => value + 1)}>
               Try again
@@ -296,9 +340,9 @@ export function DiscoverView(): JSX.Element {
           {error}
         </Empty>
       ) : isLoading && items.length === 0 ? (
-        <div class="cp-discover-list">
+        <div class="cp-discover-list" data-covers={covers}>
           {Array.from({ length: 6 }, (_, index) => (
-            <ResultGhost key={index} />
+            <ResultGhost key={index} covers={covers} />
           ))}
         </div>
       ) : items.length === 0 ? (
@@ -306,7 +350,13 @@ export function DiscoverView(): JSX.Element {
           title="Nothing matched"
           actions={
             (trimmedQuery || activeLoader || activeVersion || currentCategory) && (
-              <Button variant="secondary" onClick={clearFilters}>
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  clearFilters();
+                  fitOnly.value = false;
+                }}
+              >
                 Clear filters
               </Button>
             )
@@ -318,11 +368,13 @@ export function DiscoverView(): JSX.Element {
         </Empty>
       ) : (
         <>
-          <div class="cp-discover-list" role="list" ref={listRef} data-loading={isLoading}>
+          <div class="cp-discover-list" role="list" ref={listRef} data-loading={isLoading} data-covers={covers}>
             {items.map((item) => (
               <ResultRow
                 key={item.canonical_id}
                 item={item}
+                browsing={currentKind}
+                covers={covers}
                 instance={instance}
                 flow={flow}
                 inHand={item.canonical_id === inHand}

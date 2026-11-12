@@ -4,8 +4,8 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { DeletionSnapshot } from '../../src/generated/DeletionSnapshot';
-import type { EnrichedInstance } from '../../src/types-instance';
+import type { DeletionSnapshot } from '../src/generated/DeletionSnapshot';
+import type { EnrichedInstance } from '../src/types-instance';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
@@ -39,9 +39,9 @@ function source<T>(path: string, imports: Record<string, unknown>, globals: Reco
   return exports as T;
 }
 
-const contract = source<typeof import('../../src/dto-contract')>('dto-contract.ts', {});
-const installDto = source<typeof import('../../src/dto-install')>('dto-install.ts', { './dto-contract': contract });
-const coreDto = source<typeof import('../../src/dto-core')>('dto-core.ts', {
+const contract = source<typeof import('../src/dto-contract')>('dto-contract.ts', {});
+const installDto = source<typeof import('../src/dto-install')>('dto-install.ts', { './dto-contract': contract });
+const coreDto = source<typeof import('../src/dto-core')>('dto-core.ts', {
   './dto-contract': contract,
   './dto-install': installDto,
 });
@@ -175,7 +175,7 @@ function harness() {
     },
     './mod-provenance-cache': { clearModProvenance: (id: string) => cleared.push(id) },
   };
-  const helper = source<typeof import('../../src/views/instance/deletions')>(
+  const helper = source<typeof import('../src/views/instance/deletions')>(
     'views/instance/deletions.ts',
     shared,
     {
@@ -187,12 +187,12 @@ function harness() {
       },
     },
   );
-  const bulk = source<typeof import('../../src/views/instance/bulk-actions')>('views/instance/bulk-actions.ts', shared);
-  const actions = source<typeof import('../../src/views/instance/instance-actions')>(
+  const bulk = source<typeof import('../src/views/instance/bulk-actions')>('views/instance/bulk-actions.ts', shared);
+  const actions = source<typeof import('../src/views/instance/instance-actions')>(
     'views/instance/instance-actions.ts',
     { ...shared, './deletions': helper, './bulk-actions': bulk },
   );
-  const notice = source<typeof import('../../src/views/instances/PendingRemovalsNotice')>(
+  const notice = source<typeof import('../src/views/instances/PendingRemovalsNotice')>(
     'views/instances/PendingRemovalsNotice.tsx',
     {
       'preact/jsx-runtime': {

@@ -4,15 +4,15 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as contracts from '../../src/dto-contract';
-import * as core from '../../src/dto-core';
-import * as installs from '../../src/dto-install';
-import * as items from '../../src/install-item';
-import * as presenters from '../../src/create-presenters';
-import * as launchAdapters from '../../src/launch-response-adapters';
-import * as downloadViews from '../../src/machines/download-view-models';
-import type { InstallQueueStateResponse } from '../../src/types-install';
-import type { LaunchSession } from '../../src/types-launch';
+import * as contracts from '../src/dto-contract';
+import * as core from '../src/dto-core';
+import * as installs from '../src/dto-install';
+import * as items from '../src/install-item';
+import * as presenters from '../src/create-presenters';
+import * as launchAdapters from '../src/launch-response-adapters';
+import * as downloadViews from '../src/machines/download-view-models';
+import type { InstallQueueStateResponse } from '../src/types-install';
+import type { LaunchSession } from '../src/types-launch';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -113,13 +113,13 @@ function harness(create = false) {
   } };
   const utils = { errMessage: String, showError: (message: string) => errors.push(message) };
   const toast = { toast: (...args: unknown[]) => notices.push(args) };
-  const actions = source<typeof import('../../src/actions')>('actions.ts', {
+  const actions = source<typeof import('../src/actions')>('actions.ts', {
     './store': store, './launch-response-adapters': launchAdapters,
   });
-  const readiness = source<typeof import('../../src/instance-readiness')>('instance-readiness.ts', {
+  const readiness = source<typeof import('../src/instance-readiness')>('instance-readiness.ts', {
     './api': api, './dto-core': core, './store': store, './utils': utils,
   }, { window: { setTimeout: (callback: () => void) => queueMicrotask(callback) } });
-  const downloads = source<typeof import('../../src/machines/downloads')>('machines/downloads.ts', {
+  const downloads = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
     '../api': api, '../utils': utils, '../toast': toast, '../store': store,
     '../loaders/api': { connectInstallQueueSSE(next: typeof subscription) { subscription = next; return () => {}; } },
     '../content-activity': { markContentChanged() {} }, '../dto-install': installs, '../dto-core': core,
@@ -131,8 +131,8 @@ function harness(create = false) {
     './instance-readiness': readiness, './machines/downloads': downloads, './toast': toast, './utils': utils,
     './ui-state': { navigate: (target: unknown) => navigation.push(target) },
   };
-  const setup = source<typeof import('../../src/instance-setup')>('instance-setup.ts', dependencies);
-  const creation = source<typeof import('../../src/instance-create')>('instance-create.ts', dependencies);
+  const setup = source<typeof import('../src/instance-setup')>('instance-setup.ts', dependencies);
+  const creation = source<typeof import('../src/instance-create')>('instance-create.ts', dependencies);
   return {
     requests, errors, notices, navigation, reply, store, downloads, setup, creation,
     ready(): void { backend = [instance(true)]; },

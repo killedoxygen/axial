@@ -3,7 +3,7 @@
 use super::error::{ApiError, ApiResult, Extracted};
 use axial_app::{
     content::{
-        catalog::ContentService,
+        catalog::{ContentError, ContentService},
         compatibility,
         install::{ContentMutations, MutationError, MutationReceipt},
         model::*,
@@ -67,6 +67,17 @@ fn unavailable() -> ApiError {
         StatusCode::SERVICE_UNAVAILABLE,
         "Content provider is unavailable. Try again later.",
     )
+}
+/// Why a provider read failed, without its request or response detail.
+fn read_failure(error: ContentError) -> ApiError {
+    match error {
+        ContentError::Invalid(_) => invalid(INVALID_QUERY),
+        ContentError::Parse(_) | ContentError::ProviderMetadataInvalid(_) => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "Modrinth sent a response Axial could not read. Try again later.",
+        ),
+        ContentError::Provider(_) | ContentError::Unavailable => unavailable(),
+    }
 }
 fn id(value: &str) -> Result<InstanceId, ApiError> {
     value
@@ -143,7 +154,7 @@ async fn search(
     )
     .await
     .map(Json)
-    .map_err(|_| unavailable())
+    .map_err(read_failure)
 }
 
 #[derive(Deserialize)]
@@ -160,7 +171,7 @@ async fn detail(
         .detail(&CanonicalId(query.id))
         .await
         .map(Json)
-        .map_err(|_| unavailable())
+        .map_err(read_failure)
 }
 
 #[derive(Deserialize)]

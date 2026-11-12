@@ -15,6 +15,11 @@ export const loader = signal('');
 export const gameVersion = signal('');
 export const category = signal('');
 export const sort = signal<ContentSort>('relevance');
+/**
+ * Whether browsing is narrowed to what the picks run on. Unset, it follows them: a staged pack fixes its loader
+ * and version, so it narrows; picks alone can still land on several versions, so they do not.
+ */
+export const fitOnly = signal<boolean | null>(null);
 
 export const results = signal<SearchHit[]>([]);
 /** The result the pointer or the arrow keys last took; kept across a visit to its details. */
@@ -123,10 +128,18 @@ export function clearTray(): void {
   tray.value = [];
 }
 
-export function traySelections(): ContentSelection[] {
-  return tray.value.map((item) => ({
+/** Drop the picks an accepted install took. One staged or switched to another version since was not in it and stays. */
+export function unstageAll(taken: readonly ContentSelection[]): void {
+  const versions = new Map(taken.map((selection) => [selection.canonical_id, selection.version_id]));
+  tray.value = tray.value.filter(
+    (item) => !versions.has(item.canonical_id) || versions.get(item.canonical_id) !== item.version_id,
+  );
+}
+
+export function selectionOf(item: TrayItem): ContentSelection {
+  return {
     canonical_id: item.canonical_id,
     kind: item.kind,
     ...(item.version_id ? { version_id: item.version_id } : {}),
-  }));
+  };
 }

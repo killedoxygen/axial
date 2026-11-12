@@ -34,6 +34,8 @@ function Lead({ inst }: { inst: EnrichedInstance }): JSX.Element {
   const action = inst.launch_action;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
   const canPlay = action.launchable && !session && !install.installing;
+  // Just after an install the instance is still as it was before it; it stays busy until it is re-read.
+  const busy = install.installing || (install.settling && !action.launchable);
   const play = (): void => {
     selectInstance(inst.id);
     void launchGame();
@@ -75,12 +77,12 @@ function Lead({ inst }: { inst: EnrichedInstance }): JSX.Element {
           <Button
             size="lg"
             icon={
-              session || install.installing ? undefined : action.primary_action === 'install' ? 'download' : 'alert'
+              session || busy ? undefined : action.primary_action === 'install' ? 'download' : 'alert'
             }
             title={action.primary_action === 'blocked' ? action.disabled_reason : undefined}
             onClick={open}
           >
-            {session || install.installing ? 'Open' : action.label}
+            {session || busy ? 'Open' : action.label}
           </Button>
         )}
       </div>

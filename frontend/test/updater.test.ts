@@ -4,9 +4,9 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { UpdateFlowState, UpdateInfo } from '../../src/types-update';
-import type { UpdateFlow } from '../../src/generated/UpdateFlow';
-import type { UpdateSnapshot } from '../../src/generated/UpdateSnapshot';
+import type { UpdateFlowState, UpdateInfo } from '../src/types-update';
+import type { UpdateFlow } from '../src/generated/UpdateFlow';
+import type { UpdateSnapshot } from '../src/generated/UpdateSnapshot';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -45,8 +45,8 @@ function source<T>(path: string, imports: Record<string, unknown> = {}, globals:
   return exports as T;
 }
 
-const dto = source<typeof import('../../src/dto-contract')>('dto-contract.ts');
-const updateTypes = source<typeof import('../../src/types-update')>('types-update.ts');
+const dto = source<typeof import('../src/dto-contract')>('dto-contract.ts');
+const updateTypes = source<typeof import('../src/types-update')>('types-update.ts');
 
 function flow(phase: UpdateFlowState['phase'], message = '', terminal = false): UpdateFlow {
   return {
@@ -108,7 +108,7 @@ function harness() {
     activeDownload: signal<object | null>(null),
     downloadQueue: signal({ view_model: { queued_count: 0 } }),
   };
-  const updater = source<typeof import('../../src/updater')>(
+  const updater = source<typeof import('../src/updater')>(
     'updater.ts',
     {
       './state': {
@@ -413,8 +413,8 @@ function renderControls(h: ReturnType<typeof harness>, surface: 'widget' | 'abou
   };
   return nodes(
     surface === 'widget'
-      ? source<typeof import('../../src/shell/UpdateWidget')>('shell/UpdateWidget.tsx', imports).UpdateWidget()
-      : source<typeof import('../../src/views/settings/AboutSettingsSection')>(
+      ? source<typeof import('../src/shell/UpdateWidget')>('shell/UpdateWidget.tsx', imports).UpdateWidget()
+      : source<typeof import('../src/views/settings/AboutSettingsSection')>(
           'views/settings/AboutSettingsSection.tsx',
           imports,
         ).AboutSettingsSection(),

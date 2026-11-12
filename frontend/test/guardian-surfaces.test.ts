@@ -567,7 +567,7 @@ test('launch session convergence rejects stale, malformed, and replacement-sessi
 });
 
 // Transport failure/polling and operation-scoped failure dismissal are exercised
-// against the API owners in rewrite/session-download-recovery.test.ts.
+// against the API owners in session-download-recovery.test.ts.
 
 test('install failure adapters cover every backend state and action without reading raw fields', () => {
   const states = [

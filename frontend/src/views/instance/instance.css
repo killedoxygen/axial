@@ -11,8 +11,8 @@
 .cp-instance > .cp-vista {
   --vista-foot-from: 56%;
   width: 88%;
-  height: 272px;
-  aspect-ratio: auto;
+  min-height: 272px;
+  aspect-ratio: 4.2;
 }
 
 .cp-instance-head {

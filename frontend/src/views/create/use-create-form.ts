@@ -8,7 +8,9 @@ import { api } from '../../api';
 import { contentCompatibility, planInstanceSetup } from '../../content';
 import { toast } from '../../toast';
 import type { CompatCandidate, ContentSelection } from '../../types-content';
-import { clearTray } from '../discover/state';
+import { recheck, staging } from '../discover/fit';
+import { addPicksTo } from '../discover/make';
+import { selectionOf, unstageAll } from '../discover/state';
 import { errMessage, getMemoryRecommendation } from '../../utils';
 import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
@@ -77,6 +79,8 @@ function rowSearchText(row: VersionRowModel): string {
 export function useCreateForm() {
   const pack = createModpack.value;
   const draft = createDraft.value;
+  // Picks alone choose their loader and version; with a pack they follow the pack's.
+  const openDraft = pack ? null : draft;
   const theme = useTheme();
   const [sourceId, setSourceId] = useState<CreateSourceId>('vanilla');
   const [selectedSelectionId, setSelectedSelectionId] = useState<string | null>(null);
@@ -84,7 +88,7 @@ export function useCreateForm() {
   const [query, setQuery] = useState('');
   const [nameOverride, setNameOverride] = useState<string | null>(null);
   const [viewError, setViewError] = useState<string | null>(null);
-  const [viewLoading, setViewLoading] = useState(Boolean(draft));
+  const [viewLoading, setViewLoading] = useState(Boolean(openDraft));
   const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
@@ -117,7 +121,7 @@ export function useCreateForm() {
   );
 
   useEffect(() => {
-    if (!draft) return;
+    if (!openDraft) return;
     let cancelled = false;
     contentCompatibility(draftSelections)
       .then((response) => {
@@ -139,7 +143,7 @@ export function useCreateForm() {
     return () => {
       cancelled = true;
     };
-  }, [draft, draftSelections]);
+  }, [openDraft, draftSelections]);
 
   const draftCandidateFor = (loader: LoaderKey, mcVersion: string): CompatCandidate | null =>
     draftCandidates?.find(
@@ -147,9 +151,9 @@ export function useCreateForm() {
     ) ?? null;
 
   const draftLoaders = useMemo(() => {
-    if (!draft || !draftCandidates) return null;
+    if (!openDraft || !draftCandidates) return null;
     return new Set(draftCandidates.map((candidate) => loaderKeyFromWire(candidate.loader)));
-  }, [draft, draftCandidates]);
+  }, [openDraft, draftCandidates]);
 
   const [screenMax, setScreenMax] = useState<ScreenSize>(() => ({
     w: typeof window !== 'undefined' && window.screen ? window.screen.width : 1920,
@@ -257,9 +261,9 @@ export function useCreateForm() {
   };
 
   useEffect(() => {
-    if (draft && draftCandidates === null && !draftError) return;
-    if (draft && draftCandidates?.length === 0) return;
-    if (draft && loadedCreateViewSourceRef.current === sourceId) return;
+    if (openDraft && draftCandidates === null && !draftError) return;
+    if (openDraft && draftCandidates?.length === 0) return;
+    if (openDraft && loadedCreateViewSourceRef.current === sourceId) return;
     void loadCreateView(sourceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceId, draftCandidates, draftError]);
@@ -282,14 +286,14 @@ export function useCreateForm() {
   );
 
   const compatibleForSource = useMemo(() => {
-    if (!draft || !draftCandidates) return availableForSource;
+    if (!openDraft || !draftCandidates) return availableForSource;
     return availableForSource.filter((row) =>
       draftCandidates.some(
         (candidate) =>
           loaderKeyFromWire(candidate.loader) === sourceKey && candidate.game_version === row.minecraft_version_id,
       ),
     );
-  }, [availableForSource, draft, draftCandidates, sourceKey]);
+  }, [availableForSource, openDraft, draftCandidates, sourceKey]);
 
   const availableChannels = useMemo<Channel[]>(() => {
     const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
@@ -337,7 +341,7 @@ export function useCreateForm() {
   }, [channelOptions, availableChannels]);
 
   useEffect(() => {
-    if (!draft || !draftCandidates || draftAutoPicked) return;
+    if (!openDraft || !draftCandidates || draftAutoPicked) return;
     const best = draftCandidates[0];
     if (!best) return;
     const bestKey = loaderKeyFromWire(best.loader);
@@ -347,13 +351,22 @@ export function useCreateForm() {
       setSelectedSelectionId(row.selectionId);
       setDraftAutoPicked(true);
     }
-  }, [draft, draftCandidates, draftAutoPicked, sourceKey, versionRows]);
+  }, [openDraft, draftCandidates, draftAutoPicked, sourceKey, versionRows]);
 
-  const draftCandidate = draft && selectedVersionRow ? draftCandidateFor(sourceKey, selectedVersionRow.id) : null;
-  const draftDropped = useMemo(
-    () => new Set((draftCandidate?.drops ?? []).map((drop) => drop.canonical_id)),
-    [draftCandidate],
+  const draftCandidate = openDraft && selectedVersionRow ? draftCandidateFor(sourceKey, selectedVersionRow.id) : null;
+  // With a pack the picks were already checked against its loader and version, where they were staged.
+  const picked = pack && draft ? staging.value : null;
+  const packDrops = picked?.packs.find((entry) => entry.item.canonical_id === pack?.canonical_id)?.fit?.drops;
+  const draftDrops = useMemo(
+    () =>
+      pack
+        ? (draft ?? [])
+            .filter((item) => packDrops?.has(item.canonical_id))
+            .map((item) => ({ canonical_id: item.canonical_id, title: item.title }))
+        : (draftCandidate?.drops ?? []),
+    [pack, draft, packDrops, draftCandidate],
   );
+  const draftDropped = useMemo(() => new Set(draftDrops.map((drop) => drop.canonical_id)), [draftDrops]);
 
   const suggestedName = useMemo(() => {
     if (pack) return pack.name;
@@ -389,8 +402,8 @@ export function useCreateForm() {
     setSelectedSelectionId(null);
   }, [versionRows, selectedSelectionId]);
 
-  const draftReady = !draft || draftCandidates !== null;
-  const versionReady = pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled === true) && draftReady;
+  const draftReady = picked ? Boolean(packDrops) : !openDraft || draftCandidates !== null;
+  const versionReady = (pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled === true)) && draftReady;
   const currentLoaderBuilds =
     loaderBuilds?.source_id === sourceId && loaderBuilds.minecraft_version_id === mcVersionId ? loaderBuilds : null;
   const createSelectionId = pack
@@ -463,7 +476,7 @@ export function useCreateForm() {
         : [];
       let setupPlanId: string | undefined;
       let setupSelectionId: string | undefined;
-      if (draft && mcVersionId && keptSelections.length > 0) {
+      if (openDraft && mcVersionId && keptSelections.length > 0) {
         try {
           const setup = await planInstanceSetup(
             createSelectionId,
@@ -504,7 +517,13 @@ export function useCreateForm() {
         },
       });
       if (!result.ok) return;
-      if (draft && !pack && result.instance) clearTray();
+      if (result.instance) {
+        const held = pack && draft ? await addPicksTo(result.instance.id, draft, draftDropped) : [];
+        unstageAll([
+          ...(pack?.pick ? [pack.pick] : []),
+          ...(draft ?? []).filter((item) => !held.includes(item)).map(selectionOf),
+        ]);
+      }
       closeCreate();
     } finally {
       submittingRef.current = false;
@@ -542,7 +561,8 @@ export function useCreateForm() {
       loading: viewLoading,
       error: viewError,
       reload: () => void loadCreateView(),
-      compatibility: (row: VersionRowModel) => (draft && draftCandidates ? draftCandidateFor(sourceKey, row.id) : null),
+      compatibility: (row: VersionRowModel) =>
+        openDraft && draftCandidates ? draftCandidateFor(sourceKey, row.id) : null,
     },
     loaderBuild: {
       shown: !pack && sourceKey !== 'vanilla' && mcVersionId != null,
@@ -562,8 +582,10 @@ export function useCreateForm() {
     },
     staged: {
       dropped: draftDropped,
-      drops: draftCandidate?.drops ?? [],
-      error: draftError,
+      drops: draftDrops,
+      error: picked ? picked.error : draftError,
+      /** Ask again what the pack's instance takes, when that check failed. */
+      retry: picked ? recheck : undefined,
       candidates: draftCandidates,
     },
     options: {

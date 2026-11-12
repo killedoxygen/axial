@@ -136,7 +136,7 @@ export function ContentDetailView(): JSX.Element {
           ) : (
             detail.kind !== 'modpack' && (
               <InstanceTargetPicker
-                placeholder="Add to…"
+                placeholder="Add to an instance…"
                 onPick={(id) => navigate({ name: 'content', id: detail.canonical_id, target: id })}
               />
             )

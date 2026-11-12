@@ -3,24 +3,24 @@ import { createRequire } from 'node:module';
 import { basename, dirname, resolve } from 'node:path';
 import { before, test } from 'node:test';
 
-/** @typedef {typeof import('../../src/views/instance/resources') & typeof import('../../src/views/instance/bulk-actions') & typeof import('../../src/views/instance/world-actions') & typeof import('../../src/views/instance/screenshot-actions') & typeof import('../../src/views/instance/mod-actions') & typeof import('../../src/views/instance/mod-provenance-cache')} ResourceActions */
-/** @typedef {Parameters<typeof import('../../src/api').api>} ApiCall */
-/** @typedef {import('../../src/types-content').ContentSelection} ContentSelection */
-/** @typedef {import('../../src/views/instance/mod-provenance-cache').ModProvenance} ModProvenance */
+/** @typedef {typeof import('../src/views/instance/resources') & typeof import('../src/views/instance/bulk-actions') & typeof import('../src/views/instance/world-actions') & typeof import('../src/views/instance/screenshot-actions') & typeof import('../src/views/instance/mod-actions') & typeof import('../src/views/instance/mod-provenance-cache')} ResourceActions */
+/** @typedef {Parameters<typeof import('../src/api').api>} ApiCall */
+/** @typedef {import('../src/types-content').ContentSelection} ContentSelection */
+/** @typedef {import('../src/views/instance/mod-provenance-cache').ModProvenance} ModProvenance */
 /**
  * @typedef {object} ResourceIo
- * @property {Parameters<typeof import('../../src/toast').toast>[]} notices
+ * @property {Parameters<typeof import('../src/toast').toast>[]} notices
  * @property {ApiCall[]} calls
  * @property {unknown[][]} folders
  * @property {unknown[][]} navigation
  * @property {(...args: ApiCall) => Promise<unknown>} api
  * @property {() => Promise<string | null>} choice
  * @property {() => Promise<boolean>} confirm
- * @property {typeof import('../../src/ui/Dialog').prompt} prompt
+ * @property {typeof import('../src/ui/Dialog').prompt} prompt
  * @property {() => Promise<unknown>} list
  * @property {() => Promise<unknown>} updates
- * @property {(...args: Parameters<typeof import('../../src/content').installContent>) => Promise<unknown>} install
- * @property {(...args: Parameters<typeof import('../../src/content').uninstallContents>) => Promise<unknown>} uninstall
+ * @property {(...args: Parameters<typeof import('../src/content').installContent>) => Promise<unknown>} install
+ * @property {(...args: Parameters<typeof import('../src/content').uninstallContents>) => Promise<unknown>} uninstall
  * @property {() => Promise<void>} queue
  */
 
@@ -126,7 +126,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-/** @type {import('../../src/types-instance').EnrichedInstance} */
+/** @type {import('../src/types-instance').EnrichedInstance} */
 const instance = {
   id: 'instance A',
   name: 'Resource fixture',
@@ -152,7 +152,7 @@ const instance = {
 };
 const shot = { name: 'photo #1.png', size: 25, modified_at: '2026-09-08T12:00:00Z' };
 
-/** @param {string} name @param {boolean} [enabled] @returns {import('../../src/types-instance').InstanceMod} */
+/** @param {string} name @param {boolean} [enabled] @returns {import('../src/types-instance').InstanceMod} */
 function mod(name, enabled = true) {
   return { name, enabled, size: 25, modified_at: shot.modified_at };
 }

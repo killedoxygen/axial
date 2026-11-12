@@ -72,7 +72,8 @@ export function launchActionPresentation({
   const progress = preparing
     ? { pct: preparing.pct, label: preparing.label, determinate: preparing.determinate !== false }
     : installProgress
-      ? { ...installProgress, determinate: true }
+      ? // Until a first measured step there is no figure to show: the ring travels instead of sitting at 0.
+        { ...installProgress, determinate: installProgress.pct > 0 }
       : null;
   const usesInstallAction = launchAction.primary_action === 'install';
   const blocked = launchAction.primary_action === 'blocked';

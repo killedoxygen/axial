@@ -42,6 +42,8 @@ pub(super) mod dto {
         #[serde(default)]
         pub icon_url: Option<String>,
         #[serde(default)]
+        pub featured_gallery: Option<String>,
+        #[serde(default)]
         pub author: String,
         #[serde(default)]
         pub versions: Vec<String>,
@@ -49,6 +51,9 @@ pub(super) mod dto {
         pub date_modified: Option<String>,
         #[serde(default)]
         pub project_type: String,
+        /// Every type the project publishes; `project_type` is only its primary one.
+        #[serde(default)]
+        pub all_project_types: Vec<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -293,13 +298,18 @@ pub(super) fn map_search_page(
             "content search pagination does not match the request".to_string(),
         ));
     }
+    let queried = project_type_facet(query.kind);
     let mut seen = HashSet::with_capacity(response.hits.len());
     let items = response
         .hits
         .into_iter()
         .map(|hit| {
+            // A project of several types is listed under each of them and keeps
+            // its primary type, the one installs are admitted against.
+            let listed = hit.project_type == queried
+                || hit.all_project_types.iter().any(|kind| kind == queried);
             let item = map_search_hit(hit)?;
-            if item.kind != query.kind || !seen.insert(item.project_id.clone()) {
+            if !listed || !seen.insert(item.project_id.clone()) {
                 return Err(ContentError::ProviderMetadataInvalid(
                     "content search returned an unexpected or duplicate project".to_string(),
                 ));
@@ -461,6 +471,7 @@ pub(super) fn map_search_hit(hit: dto::SearchHit) -> ContentResult<CanonicalCont
         author: hit.author,
         summary: hit.description,
         icon_url: hit.icon_url.filter(|url| !url.is_empty()),
+        cover_url: hit.featured_gallery.filter(|url| !url.is_empty()),
         downloads: hit.downloads,
         follows: hit.follows,
         categories,
@@ -501,6 +512,7 @@ pub(super) fn map_project_detail(
         author: String::new(),
         summary: project.description,
         icon_url: project.icon_url.filter(|url| !url.is_empty()),
+        cover_url: None,
         downloads: project.downloads,
         follows: project.followers,
         categories,
@@ -836,10 +848,38 @@ mod tests {
         let mut malformed = payload.clone();
         malformed["hits"][0]["project_type"] = json!("plugin");
         assert!(map_search_page(&query, serde_json::from_value(malformed).unwrap()).is_err());
+        let mut malformed = payload.clone();
+        malformed["hits"][0]["project_type"] = json!("shader");
+        assert!(map_search_page(&query, serde_json::from_value(malformed).unwrap()).is_err());
         let mut malformed = payload;
         let duplicate = malformed["hits"][0].clone();
         malformed["hits"].as_array_mut().unwrap().push(duplicate);
         assert!(map_search_page(&query, serde_json::from_value(malformed).unwrap()).is_err());
+    }
+
+    #[test]
+    fn search_lists_a_multi_type_project_under_each_type_with_its_primary_kind() {
+        let payload = json!({"hits":[
+            {"project_id":"textures","title":"Textures","project_type":"resourcepack",
+                "featured_gallery":"https://cdn.modrinth.com/data/textures/cover.webp"},
+            {"project_id":"both","title":"Both","project_type":"mod",
+                "all_project_types":["datapack","mod","resourcepack"],"featured_gallery":""}],
+            "offset":0,"limit":40,"total_hits":2});
+        let query = ContentQuery::new(ContentKind::ResourcePack);
+        let page =
+            map_search_page(&query, serde_json::from_value(payload.clone()).unwrap()).unwrap();
+        assert_eq!(
+            page.items.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            [ContentKind::ResourcePack, ContentKind::Mod]
+        );
+        assert_eq!(
+            page.items[0].cover_url.as_deref(),
+            Some("https://cdn.modrinth.com/data/textures/cover.webp")
+        );
+        assert_eq!(page.items[1].cover_url, None);
+        // Listed under another type only, the same hit does not belong to this page.
+        let shaders = ContentQuery::new(ContentKind::ShaderPack);
+        assert!(map_search_page(&shaders, serde_json::from_value(payload).unwrap()).is_err());
     }
 
     #[test]

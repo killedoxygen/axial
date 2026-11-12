@@ -51,12 +51,8 @@ export interface NativeMicrosoftSignInResult {
   owns_minecraft_java?: boolean | null;
 }
 
-export function isTauriRuntime(): boolean {
-  return getTauriBinding() !== null;
-}
-
 export function hasNativeDesktopRuntime(): boolean {
-  return isTauriRuntime();
+  return getTauriBinding() !== null;
 }
 
 export type DesktopPlatform = 'browser' | 'linux' | 'macos' | 'unknown' | 'windows';
@@ -91,9 +87,9 @@ function desktopChromeFromPayload(payload: unknown): NativeDesktopChrome {
 }
 
 async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return browserDesktopChrome;
-  const payload = await tauri.core.invoke('desktop_chrome');
+  const core = nativeCommands();
+  if (!core) return browserDesktopChrome;
+  const payload = await core.invoke('desktop_chrome');
   return desktopChromeFromPayload(payload);
 }
 
@@ -136,16 +132,16 @@ export function nativePreferencesRequest(value: unknown): NativePreferencesReque
 }
 
 export async function pendingNativePreferences(): Promise<NativePreferencesRequest | null> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) throw new Error('Desktop preference coordination is unavailable.');
-  const value = await tauri.core.invoke('pending_interface_preferences');
+  const core = nativeCommands();
+  if (!core) throw new Error('Desktop preference coordination is unavailable.');
+  const value = await core.invoke('pending_interface_preferences');
   return value === null ? null : nativePreferencesRequest(value);
 }
 
 export async function completeNativePreferences(requestId: string, saved: boolean): Promise<void> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) throw new Error('Desktop preference coordination is unavailable.');
-  await tauri.core.invoke('complete_interface_preferences', { requestId, saved });
+  const core = nativeCommands();
+  if (!core) throw new Error('Desktop preference coordination is unavailable.');
+  await core.invoke('complete_interface_preferences', { requestId, saved });
 }
 
 export async function onNativeEvent(
@@ -186,28 +182,19 @@ function nativeDragDropPayload(payload: unknown): NativeDragDropPayload | null {
   };
 }
 
-export async function onNativeDragDrop(
+export function onNativeDragDrop(
   callback: (payload: NativeDragDropPayload) => void,
 ): Promise<{ close(): void } | null> {
-  const tauri = getTauriBinding();
-  if (!tauri?.event) return null;
-
-  const unsubscribe = await tauri.event.listen('axial:desktop:skin-drag', (event) => {
-    const payload = nativeDragDropPayload(event.payload);
+  return onNativeEvent('axial:desktop:skin-drag', (data) => {
+    const payload = nativeDragDropPayload(data);
     if (payload) callback(payload);
   });
-
-  return {
-    close(): void {
-      unsubscribe();
-    },
-  };
 }
 
 export async function getNativeAppVersion(): Promise<string | null> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return null;
-  const value = await tauri.core.invoke('app_version');
+  const core = nativeCommands();
+  if (!core) return null;
+  const value = await core.invoke('app_version');
   if (typeof value !== 'string' || !value.trim()) throw new Error('Native app version response was invalid.');
   return value;
 }
@@ -218,9 +205,9 @@ export interface NativeApiTransportBootstrap {
 }
 
 export async function getNativeApiTransportBootstrap(): Promise<NativeApiTransportBootstrap | null> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return null;
-  const value = await tauri.core.invoke('api_transport_bootstrap');
+  const core = nativeCommands();
+  if (!core) return null;
+  const value = await core.invoke('api_transport_bootstrap');
   const record = dtoRecord(value, 'Native API transport bootstrap');
   const baseUrl = dtoString(record.base_url, 'Native API transport base URL');
   const capability = dtoString(record.capability, 'Native API transport capability');
@@ -231,9 +218,9 @@ export async function getNativeApiTransportBootstrap(): Promise<NativeApiTranspo
 }
 
 export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return undefined;
-  const value = await tauri.core
+  const core = nativeCommands();
+  if (!core) return undefined;
+  const value = await core
     .invoke('microsoft_sign_in')
     .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Microsoft sign-in could not be completed.'));
   const record = dtoRecord(value, 'Native Microsoft sign-in');
@@ -275,16 +262,16 @@ export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult
 }
 
 export async function requestNativeAppRestart(): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('app_restart');
+  const core = nativeCommands();
+  if (!core) return false;
+  await core.invoke('app_restart');
   return true;
 }
 
 export async function requestNativeAppReset(): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('app_reset');
+  const core = nativeCommands();
+  if (!core) return false;
+  await core.invoke('app_reset');
   return true;
 }
 
@@ -312,19 +299,19 @@ function rethrowNativeCommandError(reason: unknown, fallback: string): never {
 }
 
 export async function pickNativeSkinFile(): Promise<File | null | undefined> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return undefined;
-  const payload = await tauri.core
+  const core = nativeCommands();
+  if (!core) return undefined;
+  const payload = await core
     .invoke('pick_skin_file')
     .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Could not read skin file.'));
   return payload === null ? null : nativeSkinFileFromPayload(payload);
 }
 
 export async function consumeNativeSkinDrop(token: string): Promise<File | undefined> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return undefined;
+  const core = nativeCommands();
+  if (!core) return undefined;
 
-  const payload = await tauri.core
+  const payload = await core
     .invoke('consume_skin_drop', { token })
     .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Could not read skin file.'));
   return nativeSkinFileFromPayload(payload);
@@ -352,8 +339,8 @@ export async function openExternalURL(url: string): Promise<void> {
 }
 
 export async function windowSetResizeBackground(dark: boolean): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('window_set_resize_background', { dark });
+  const core = nativeCommands();
+  if (!core) return false;
+  await core.invoke('window_set_resize_background', { dark });
   return true;
 }

@@ -145,7 +145,7 @@ function RailTray(): JSX.Element {
                 {...tipProps(label, 'right')}
               >
                 <InstanceTile inst={inst} className="cp-rail-tile-art" />
-                {installing && <Ring size={44} edge={12} progress={install.progress?.pct} />}
+                {installing && <Ring size={44} edge={12} progress={install.progress?.pct || null} />}
                 {session && !installing && <span class="cp-rail-tile-dot" aria-hidden="true" />}
               </button>
             );

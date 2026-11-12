@@ -79,6 +79,16 @@ export function tagLabel(value: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+/** A loader and Minecraft version, as the facts an instance shows. */
+export function FitFacts({ fit }: { fit: { loaderLabel: string; gameVersion: string } }): JSX.Element {
+  return (
+    <>
+      <Chip>{fit.loaderLabel}</Chip>
+      <Chip mono>{fit.gameVersion}</Chip>
+    </>
+  );
+}
+
 /** How used a project is. */
 export function ContentStats({ downloads, follows }: { downloads: number; follows: number }): JSX.Element {
   return (

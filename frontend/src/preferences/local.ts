@@ -1,8 +1,8 @@
 import type { LocalPrefs, OverlayPosition, ShortcutBinding } from '../types-ui';
 import type { Route } from '../ui-state';
 
-export const LOCAL_PREFERENCES_KEY = 'axial_rewrite_ui';
-export const ROUTE_PREFERENCES_KEY = 'axial-rewrite:route';
+export const LOCAL_PREFERENCES_KEY = 'axial_ui';
+export const ROUTE_PREFERENCES_KEY = 'axial:route';
 
 export function defaultLocalPreferences(): LocalPrefs {
   return {

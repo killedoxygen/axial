@@ -11,7 +11,7 @@ export interface InstallFlow {
   busy: boolean;
   plan: ResolutionPlan | null;
   installable: ContentSelection[];
-  staged: number;
+  staged: ContentSelection[];
   add: (selections: ContentSelection[], label: string) => Promise<AddOutcome>;
   confirm: () => Promise<AddOutcome>;
   installRest: () => Promise<AddOutcome>;
@@ -44,18 +44,20 @@ export function InstallConflictSheet({
   onQueued,
 }: {
   flow: InstallFlow;
-  onQueued?: () => void;
+  /** Called with the selections the decision settled, once the queue has taken them. */
+  onQueued?: (settled: ContentSelection[]) => void;
 }): JSX.Element | null {
   if (!flow.plan) return null;
+  const settled = flow.staged;
   const queued = (outcome: AddOutcome): void => {
-    if (outcome.status === 'queued') onQueued?.();
+    if (outcome.status === 'queued') onQueued?.(settled);
   };
   return (
     <ConflictSheet
       plan={flow.plan}
       busy={flow.busy}
-      skipped={flow.installable.length > 0 ? flow.staged - flow.installable.length : 0}
-      staged={flow.staged}
+      skipped={flow.installable.length > 0 ? flow.staged.length - flow.installable.length : 0}
+      staged={flow.staged.length}
       onCancel={flow.cancel}
       onConfirm={() => void flow.confirm().then(queued)}
       onInstallRest={() => void flow.installRest().then(queued)}

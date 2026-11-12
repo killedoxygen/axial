@@ -730,7 +730,7 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
         // Flat-topped steps with sheer sides.
         if (biome.mesa && height > sea + 5) height = sea + 5 + Math.floor((height - sea - 5) / 8) * 9;
         // The camera stands on a slight rise.
-        const knoll = sea + (flat ? 5.5 : 2);
+        const knoll = sea + (flat ? 3.5 : 2);
         if (stand < 9) height = knoll + (height - knoll) * smooth(stand / 9);
       }
       const h = Math.max(3, Math.min(200, Math.round(height)));

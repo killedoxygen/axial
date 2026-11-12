@@ -4,10 +4,10 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as contracts from '../../src/dto-contract';
-import * as core from '../../src/dto-core';
-import * as installs from '../../src/dto-install';
-import * as presenters from '../../src/create-presenters';
+import * as contracts from '../src/dto-contract';
+import * as core from '../src/dto-core';
+import * as installs from '../src/dto-install';
+import * as presenters from '../src/create-presenters';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
@@ -75,7 +75,7 @@ function harness(options: { response?: unknown; requestError?: Error; queueError
       throw new Error(`Unreviewed setup dependency: ${id}`);
     },
   }, { filename });
-  return { ...(exports as typeof import('../../src/instance-setup')), requests, notices, queues, reads, state, release };
+  return { ...(exports as typeof import('../src/instance-setup')), requests, notices, queues, reads, state, release };
 }
 
 test('resume uses the registered identity, shares repeated clicks and preserves backend availability', async () => {

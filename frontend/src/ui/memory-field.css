@@ -19,17 +19,41 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* The gauge is a range slider whose track is the blocks. The slider spans the boundaries between blocks, the two
+   outer edges included; a handle is a bar the width of a gap, so one gap stays free at each end for the handle
+   that stands there. */
 .cp-memfield-gauge {
-  position: relative;
   margin-top: 12px;
+  padding: 0 calc(var(--gap) / 2);
 }
+.cp-memfield-gauge .cp-slider-track {
+  inset: 0;
+  height: auto;
+  overflow: visible;
+  border-radius: 0;
+  background: none;
+}
+/* Three layers of the same blocks. Each is cut by the handles' places (--r0, --r1), so the lit span moves with
+   a handle on the same frame and settles with it. */
 .cp-memfield-blocks {
+  position: absolute;
+  inset: 0;
   display: grid;
   grid-template-columns: repeat(var(--blocks), minmax(0, 1fr));
   gap: var(--gap);
-  height: 28px;
+  padding: 0 calc(var(--gap) / 2);
+  transition: clip-path var(--settle);
 }
-/* Each block is two halves, since a handle can stop half way through a gigabyte. */
+.cp-slider[data-dragging] .cp-memfield-blocks {
+  transition: none;
+}
+.cp-memfield-blocks[data-layer='floor'] {
+  clip-path: inset(0 calc((1 - var(--r0)) * 100%) 0 0);
+}
+.cp-memfield-blocks[data-layer='lit'] {
+  clip-path: inset(0 calc((1 - var(--r1)) * 100%) 0 calc(var(--r0) * 100%));
+}
+/* Each block is two halves, since a zone can start half way through a gigabyte. */
 .cp-memfield-blocks > i {
   display: flex;
   overflow: hidden;
@@ -39,38 +63,23 @@
   flex: 1;
   background: var(--fill);
 }
-.cp-memfield-blocks b[data-cell='base'] {
-  background: var(--fill-3);
-}
-.cp-memfield-blocks b[data-cell='on'] {
-  background: var(--accent);
-}
-.cp-memfield-blocks b[data-cell='warn'] {
-  background: var(--warn);
-}
-.cp-memfield-blocks b[data-cell='err'] {
-  background: var(--err);
-}
-.cp-memfield-blocks b[data-cell='warn-off'] {
+.cp-memfield-blocks b[data-zone='warn'] {
   background: color-mix(in oklab, var(--warn) 15%, var(--fill));
 }
-.cp-memfield-blocks b[data-cell='err-off'] {
+.cp-memfield-blocks b[data-zone='err'] {
   background: color-mix(in oklab, var(--err) 17%, var(--fill));
 }
-
-/* The slider spans the boundaries between blocks, the two outer edges included; a handle is a bar the width of a
-   gap, so the gauge keeps one gap free at each end for the handle that stands there. */
-.cp-memfield-gauge {
-  padding: 0 var(--gap);
+.cp-memfield-blocks[data-layer='floor'] b {
+  background: var(--fill-3);
 }
-.cp-memfield-gauge > .cp-slider {
-  position: absolute;
-  inset: 0 calc(var(--gap) / 2);
-  width: auto;
-  height: auto;
+.cp-memfield-blocks[data-layer='lit'] b {
+  background: var(--accent);
 }
-.cp-memfield-gauge .cp-slider-track {
-  display: none;
+.cp-memfield-blocks[data-layer='lit'] b[data-zone='warn'] {
+  background: var(--warn);
+}
+.cp-memfield-blocks[data-layer='lit'] b[data-zone='err'] {
+  background: var(--err);
 }
 .cp-memfield-gauge .cp-slider-thumb {
   width: var(--gap);

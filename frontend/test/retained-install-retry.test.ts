@@ -4,11 +4,11 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as installContract from '../../src/dto-install';
-import * as coreContract from '../../src/dto-core';
-import * as installItems from '../../src/install-item';
-import * as downloadPresenters from '../../src/machines/download-view-models';
-import type { InstallQueueActiveViewModel, InstallQueueStateResponse } from '../../src/types-install';
+import * as installContract from '../src/dto-install';
+import * as coreContract from '../src/dto-core';
+import * as installItems from '../src/install-item';
+import * as downloadPresenters from '../src/machines/download-view-models';
+import type { InstallQueueActiveViewModel, InstallQueueStateResponse } from '../src/types-install';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -91,7 +91,7 @@ function harness() {
     return request(method, path);
   } };
   const utils = { errMessage: String, showError: (message: string) => errors.push(message) };
-  const machine = source<typeof import('../../src/machines/downloads')>('machines/downloads.ts', {
+  const machine = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
     '@preact/signals': signals,
     '../api': api,
     '../utils': utils,
@@ -103,11 +103,11 @@ function harness() {
     '../dto-install': installContract, '../dto-core': coreContract,
     '../install-item': installItems, './download-view-models': downloadPresenters,
   });
-  const atoms = source<typeof import('../../src/ui/Atoms')>('ui/Atoms.tsx', {
+  const atoms = source<typeof import('../src/ui/Atoms')>('ui/Atoms.tsx', {
     'preact/jsx-runtime': jsx, './Icons': { Icon: 'Icon' },
     './Face': { Face: 'Face' }, './motion': { glideThumb() {}, settleWidth() {} },
   });
-  const view = source<typeof import('../../src/views/downloads/DownloadsView')>('views/downloads/DownloadsView.tsx', {
+  const view = source<typeof import('../src/views/downloads/DownloadsView')>('views/downloads/DownloadsView.tsx', {
     'preact/jsx-runtime': jsx, '../../ui/Atoms': atoms, '../../ui/Icons': { Icon: 'Icon' },
     '../../ui/Face': { Face: 'Face' },
     '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile' },

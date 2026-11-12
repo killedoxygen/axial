@@ -43,7 +43,7 @@ function reporter(consent = true, send = async () => {}) {
     EvalError,
   });
   vm.runInContext(`${executable}\nglobalThis.reporter = { initErrorReporting, reportRenderError };`, context);
-  /** @type {typeof import('../../src/error-reporting')} */
+  /** @type {typeof import('../src/error-reporting')} */
   const exported = context.reporter;
   return { ...exported, calls, events, window, settings };
 }

@@ -272,6 +272,9 @@ pub struct CanonicalContent {
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
+    /// The screenshot its author chose to represent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
     #[serde(default)]
     pub downloads: u64,
     #[serde(default)]

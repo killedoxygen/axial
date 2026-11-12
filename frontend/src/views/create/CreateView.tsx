@@ -57,17 +57,22 @@ function LoaderBuild({ build }: { build: CreateForm['loaderBuild'] }): JSX.Eleme
 }
 
 function Notices({ form, packError }: { form: CreateForm; packError: string | null }): JSX.Element | null {
-  const { draft, staged, versions, notices } = form;
+  const { pack, draft, staged, versions, notices } = form;
   const shown = [
     packError && <Notice key="pack" tone="error" role="alert" title={packError} />,
     draft && staged.error && (
       <Notice key="draft" tone="error" role="alert" title="Could not check what your picks support">
         <p>{staged.error}</p>
+        {staged.retry && (
+          <Button variant="secondary" size="sm" onClick={staged.retry}>
+            Retry
+          </Button>
+        )}
       </Notice>
     ),
-    draft && staged.candidates?.length === 0 && (
+    !pack && draft && staged.candidates?.length === 0 && (
       <Notice key="common" tone="warned" role="alert" title="These picks share no common version">
-        <p>Unstage one of them and try again.</p>
+        <p>Remove one of them and try again.</p>
       </Notice>
     ),
     !versions.loading && versions.error && (

@@ -4,13 +4,13 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as contract from '../../src/dto-contract';
-import * as preferences from '../../src/preferences/local';
-import type { Config } from '../../src/types-settings';
-import type { InterfacePreferences } from '../../src/generated/InterfacePreferences';
-import type { InterfacePreferencesSnapshot } from '../../src/generated/InterfacePreferencesSnapshot';
-import type { InterfacePreferencesUpdate } from '../../src/generated/InterfacePreferencesUpdate';
-import type { NativePreferencesRequest } from '../../src/native';
+import * as contract from '../src/dto-contract';
+import * as preferences from '../src/preferences/local';
+import type { Config } from '../src/types-settings';
+import type { InterfacePreferences } from '../src/generated/InterfacePreferences';
+import type { InterfacePreferencesSnapshot } from '../src/generated/InterfacePreferencesSnapshot';
+import type { InterfacePreferencesUpdate } from '../src/generated/InterfacePreferencesUpdate';
+import type { NativePreferencesRequest } from '../src/native';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
@@ -119,8 +119,8 @@ function harness(
   const completions: Array<{ requestId: string; saved: boolean }> = [];
   const notices: string[] = [];
   const storage = new Map([
-    ['axial_rewrite_ui', JSON.stringify({ theme: 'nether', sounds: false })],
-    ['axial-rewrite:route', JSON.stringify({ name: 'accounts' })],
+    ['axial_ui', JSON.stringify({ theme: 'nether', sounds: false })],
+    ['axial:route', JSON.stringify({ name: 'accounts' })],
   ]);
   let storageReads = 0;
   let reloads = 0;
@@ -185,12 +185,12 @@ function harness(
       },
     },
   };
-  const native = source<typeof import('../../src/native')>(
+  const native = source<typeof import('../src/native')>(
     'native.ts',
     { './dto-contract': contract },
     { window: nativeEnabled ? nativeWindow : {} },
   );
-  const owner = source<typeof import('../../src/preferences/persistence')>(
+  const owner = source<typeof import('../src/preferences/persistence')>(
     'preferences/persistence.ts',
     {
       '../api': api,
@@ -220,7 +220,7 @@ function harness(
       storage.delete(key);
     },
   };
-  const state = source<typeof import('../../src/state')>(
+  const state = source<typeof import('../src/state')>(
     'state.ts',
     {
       './preferences/local': preferences,
@@ -229,7 +229,7 @@ function harness(
     },
     { localStorage },
   );
-  const ui = source<typeof import('../../src/ui-state')>(
+  const ui = source<typeof import('../src/ui-state')>(
     'ui-state.ts',
     {
       './preferences/local': preferences,
@@ -249,7 +249,7 @@ function harness(
   const configWrites: unknown[] = [];
   const configState = signal(config());
   const css = new Map<string, string>();
-  const theme = source<typeof import('../../src/theme')>(
+  const theme = source<typeof import('../src/theme')>(
     'theme.ts',
     {
       './state': state,
@@ -274,7 +274,7 @@ function harness(
       },
     },
   );
-  const shortcuts = source<typeof import('../../src/shortcuts')>('shortcuts.ts', {
+  const shortcuts = source<typeof import('../src/shortcuts')>('shortcuts.ts', {
     './ui-state': ui,
     './store': {},
     './actions': {},
@@ -283,7 +283,7 @@ function harness(
     './state': state,
     './native': { isMacPlatform: () => false, desktopPlatform: () => 'linux' },
   });
-  const skin = source<typeof import('../../src/player-skin')>('player-skin.ts', {
+  const skin = source<typeof import('../src/player-skin')>('player-skin.ts', {
     './api': api,
     './default-skins': {
       DEFAULT_SKINS: [
@@ -382,7 +382,7 @@ test('a missing native envelope uses config fallback without writing defaults, w
   browser.ui.restoreRoute();
   assert.equal(browser.ui.route.value.name, 'accounts');
   browser.shortcuts.setShortcutOverride('new-instance', { key: 'n', meta: true });
-  assert.equal(JSON.parse(browser.storage.get('axial_rewrite_ui')!).shortcuts['new-instance'].meta, true);
+  assert.equal(JSON.parse(browser.storage.get('axial_ui')!).shortcuts['new-instance'].meta, true);
   assert.equal(browser.writes.length, 0);
 });
 
@@ -549,7 +549,7 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
     '/instances': { instances: [], last_instance_id: null },
     '/launch/sessions': {},
   };
-  const bootstrap = source<typeof import('../../src/bootstrap')>(
+  const bootstrap = source<typeof import('../src/bootstrap')>(
     'bootstrap.ts',
     {
       './api': {
@@ -672,7 +672,7 @@ test('an already rendered audio control cannot mutate local sound or audio state
   await h.hydrate();
   type Node = { props: { children?: Node[]; title?: string; control?: { props: { onChange: () => void } } } };
   const jsx = (_type: unknown, props: Node['props']): Node => ({ props });
-  const audio = source<typeof import('../../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
+  const audio = source<typeof import('../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
     'preact/jsx-runtime': { jsx, jsxs: jsx },
     'preact/hooks': { useState: (value: unknown) => [value, () => {}], useEffect() {} },
     '../../ui/Atoms': { Toggle: 'Toggle' },

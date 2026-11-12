@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 import test from 'node:test';
 
-/** @typedef {import('../../src/types-instance').EnrichedInstance} LibraryInstance */
+/** @typedef {import('../src/types-instance').EnrichedInstance} LibraryInstance */
 /** @typedef {ReturnType<typeof event>} TestEvent */
 /** @template [P = Record<string, unknown>] @typedef {{ type: unknown, props: P }} ViewNode */
 /** @typedef {{ onClick: (event?: TestEvent) => void, children?: unknown, icon?: string, title?: string, disabled?: boolean, tooltip?: string }} ActionProps */
@@ -72,7 +72,7 @@ function loadSource(path, imports = {}) {
 const presenters = loadSource('src/launch-presenters.ts');
 const contracts = loadSource('src/dto-contract.ts');
 const installDtos = loadSource('src/dto-install.ts', { './dto-contract': contracts });
-const { enrichedInstanceResponse } = /** @type {typeof import('../../src/dto-core')} */ (
+const { enrichedInstanceResponse } = /** @type {typeof import('../src/dto-core')} */ (
   loadSource('src/dto-core.ts', { './dto-contract': contracts, './dto-install': installDtos })
 );
 const parts = /** @type {Parts} */ (
@@ -317,10 +317,10 @@ function libraryHarness(initialInstances = []) {
       fmtRelative: (iso) => iso ?? 'Never',
     },
   };
-  const { HomeView } = /** @type {typeof import('../../src/views/home/HomeView')} */ (
+  const { HomeView } = /** @type {typeof import('../src/views/home/HomeView')} */ (
     loadSource('src/views/home/HomeView.tsx', imports)
   );
-  const { InstancesView } = /** @type {typeof import('../../src/views/instances/InstancesView')} */ (
+  const { InstancesView } = /** @type {typeof import('../src/views/instances/InstancesView')} */ (
     loadSource('src/views/instances/InstancesView.tsx', imports)
   );
   return {

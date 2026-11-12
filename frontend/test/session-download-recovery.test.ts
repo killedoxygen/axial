@@ -4,11 +4,11 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { ApiEventOptions } from '../../src/backend/events';
-import type { InstallQueueStateResponse } from '../../src/types-install';
-import type { LaunchSession } from '../../src/types-launch';
-import type { EnrichedInstance } from '../../src/types-instance';
-import type { Config } from '../../src/types-settings';
+import type { ApiEventOptions } from '../src/backend/events';
+import type { InstallQueueStateResponse } from '../src/types-install';
+import type { LaunchSession } from '../src/types-launch';
+import type { EnrichedInstance } from '../src/types-instance';
+import type { Config } from '../src/types-settings';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -62,14 +62,14 @@ function deferred<T>() {
 }
 
 const flush = (): Promise<void> => new Promise((done) => setImmediate(done));
-const contract = source<typeof import('../../src/dto-contract')>('dto-contract.ts');
-const installContract = source<typeof import('../../src/dto-install')>('dto-install.ts', { './dto-contract': contract });
-const coreContract = source<typeof import('../../src/dto-core')>('dto-core.ts', {
+const contract = source<typeof import('../src/dto-contract')>('dto-contract.ts');
+const installContract = source<typeof import('../src/dto-install')>('dto-install.ts', { './dto-contract': contract });
+const coreContract = source<typeof import('../src/dto-core')>('dto-core.ts', {
   './dto-contract': contract, './dto-install': installContract,
 });
-const logContract = source<typeof import('../../src/dto-launch')>('dto-launch.ts', { './dto-contract': contract });
-const noticeContract = source<typeof import('../../src/launch-notice-tracker')>('launch-notice-tracker.ts');
-const statusContract = source<typeof import('../../src/launch-response-adapters')>('launch-response-adapters.ts', {
+const logContract = source<typeof import('../src/dto-launch')>('dto-launch.ts', { './dto-contract': contract });
+const noticeContract = source<typeof import('../src/launch-notice-tracker')>('launch-notice-tracker.ts');
+const statusContract = source<typeof import('../src/launch-response-adapters')>('launch-response-adapters.ts', {
   './dto-contract': contract, './launch-notice-tracker': noticeContract,
 });
 
@@ -78,7 +78,7 @@ function historicalStatusApi(
   payload: unknown = { error: 'The instance was not found.', code: 'instance_not_found' },
   path = '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status',
 ) {
-  return source<typeof import('../../src/api')>(
+  return source<typeof import('../src/api')>(
     'api.ts',
     {
       './native': { getNativeApiTransportBootstrap: async () => null },
@@ -155,7 +155,7 @@ function launchHarness(intentResult?: unknown, running = true) {
     launchSessions: signal<Record<string, LaunchSession>>(
       statusContract.launchSessionsResponse({ sessions: intentResult === undefined && running ? [currentStatus] : [] }),
     ),
-    launchState: signal<import('../../src/store').LaunchState>({ status: 'idle' }),
+    launchState: signal<import('../src/store').LaunchState>({ status: 'idle' }),
     config: signal<Config | null>(null),
     instances: signal([instance()]),
     selectedInstance: signal(instance(true)),
@@ -165,7 +165,7 @@ function launchHarness(intentResult?: unknown, running = true) {
     versions: signal<unknown[]>([]),
     lastInstanceId: signal<string | null>(null),
   };
-  const actions = source<typeof import('../../src/actions')>('actions.ts', {
+  const actions = source<typeof import('../src/actions')>('actions.ts', {
     './store': store,
     './launch-response-adapters': statusContract,
   });
@@ -192,7 +192,7 @@ function launchHarness(intentResult?: unknown, running = true) {
       throw new Error(`Unexpected launch read ${path}`);
     },
   };
-  const readiness = source<typeof import('../../src/instance-readiness')>(
+  const readiness = source<typeof import('../src/instance-readiness')>(
     'instance-readiness.ts',
     {
       './api': api,
@@ -202,7 +202,7 @@ function launchHarness(intentResult?: unknown, running = true) {
     },
     { window: clock },
   );
-  const launch = source<typeof import('../../src/launch')>(
+  const launch = source<typeof import('../src/launch')>(
     'launch.ts',
     {
       './api': api,
@@ -1020,7 +1020,7 @@ function downloadsHarness(sharedStore?: {
   lastInstanceId: { value: string | null };
   config: { value: Config | null };
   launchSessions: { value: Record<string, LaunchSession> };
-  launchState: { value: import('../../src/store').LaunchState };
+  launchState: { value: import('../src/store').LaunchState };
 }) {
   const clock = timers();
   const calls: string[] = [];
@@ -1029,18 +1029,18 @@ function downloadsHarness(sharedStore?: {
   const store = sharedStore ?? {
     versions: signal<unknown[]>([]), instances: signal<unknown[]>([]), lastInstanceId: signal<string | null>(null),
     config: signal<Config | null>(null), launchSessions: signal<Record<string, LaunchSession>>({}),
-    launchState: signal<import('../../src/store').LaunchState>({ status: 'idle' }),
+    launchState: signal<import('../src/store').LaunchState>({ status: 'idle' }),
   };
   let read: (path: string) => Promise<unknown> = async (path) => path === '/versions'
     ? { versions: ['installed'] } : { instances: ['ready'], last_instance_id: null };
-  const machine = source<typeof import('../../src/machines/downloads')>('machines/downloads.ts', {
+  const machine = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
     '../api': { api: async (method: string, path: string) => { assert.equal(method, 'GET'); calls.push(path); return read(path); } },
     '../utils': { errMessage: String, showError: (message: string) => errors.push(message) }, '../toast': { toast() {} },
     '../loaders/api': { connectInstallQueueSSE: (next: typeof subscription) => { subscription = next; return () => {}; } }, '../store': store,
     '../content-activity': { markContentChanged() {} }, '../dto-install': installContract,
     '../dto-core': sharedStore ? coreContract : { versionsResponse: (value: unknown) => value, instancesResponse: (value: unknown) => value },
-    '../install-item': source<typeof import('../../src/install-item')>('install-item.ts'),
-    './download-view-models': source<typeof import('../../src/machines/download-view-models')>('machines/download-view-models.ts'),
+    '../install-item': source<typeof import('../src/install-item')>('install-item.ts'),
+    './download-view-models': source<typeof import('../src/machines/download-view-models')>('machines/download-view-models.ts'),
   }, clock);
   return { machine, store, calls, errors, clock, read: (next: typeof read): void => { read = next; },
     emit(response: InstallQueueStateResponse): void { assert.ok(subscription); subscription(response); },
@@ -1550,7 +1550,7 @@ test('new event connections deliver their complete snapshot even when revisions 
     close(): void {}
     emit(revision: number): void { this.listeners.get('message')?.({ data: JSON.stringify({ revision, value: revision }) }); }
   }
-  const events = source<typeof import('../../src/backend/events')>('backend/events.ts', {
+  const events = source<typeof import('../src/backend/events')>('backend/events.ts', {
     '../api': { apiEventSourceUrl: async () => '/fresh-ticket' },
   }, { ...clock, EventSource: FakeEventSource });
   const close = events.subscribeApiEvents('/install/queue/events', {
@@ -1600,7 +1600,7 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
     '../discover/shared': { KIND_ICON: {} },
     '../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
     '../create/loader-logos': { LoaderLogo: 'LoaderLogo' },
-    '../../install-item': source<typeof import('../../src/install-item')>('install-item.ts'),
+    '../../install-item': source<typeof import('../src/install-item')>('install-item.ts'),
     '../../hooks/use-now': { useNowTicker: () => 0 },
     '../../machines/downloads': { ...h.machine, removeQueuedInstall: (id: string) => removed.push(id) },
     '../../api': { api: async () => assert.fail('rendering issues no requests') },
@@ -1619,7 +1619,7 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
     if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
     throw new Error(`Unreviewed downloads view dependency: ${id}`);
   } }, { filename });
-  const { DownloadsView } = exports as typeof import('../../src/views/downloads/DownloadsView');
+  const { DownloadsView } = exports as typeof import('../src/views/downloads/DownloadsView');
   type Node = { type: unknown; props: Record<string, unknown> };
   function nodes(value: unknown): Node[] {
     if (Array.isArray(value)) return value.flatMap(nodes);
@@ -1638,4 +1638,31 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
   assert.ok(remove);
   (remove.props.onClick as () => void)();
   assert.deepEqual(removed, ['next-queue']);
+});
+
+test('install ring estimates advance only on accepted snapshots and reset for each owner', async () => {
+  const h = downloadsHarness();
+  const snapshot = (epoch: string, revision: number, phase: string, pct: number, install = 'first') => ({
+    ...queue(epoch, revision, 0),
+    active: {
+      queue_id: 'same-queue', install_id: install, operation_id: install,
+      kind: 'vanilla' as const, title: 'Minecraft', label: 'Minecraft', summary: '',
+      install_item: { version_id: '1.21.4' },
+      progress: { phase_id: phase, label: phase, progress_pct: pct, terminal: false, failed: false },
+    },
+  });
+  await h.machine.applyInstallQueueResponse(snapshot('epoch-1', 1, 'assets', 50));
+  const first = h.machine.activeDownload.value!;
+  assert.equal(first.pct, 50);
+  assert.ok(first.ringPct > 35);
+  assert.equal(h.machine.activeDownload.value!.ringPct, first.ringPct);
+  await h.machine.applyInstallQueueResponse(snapshot('epoch-1', 2, 'client', 10));
+  assert.equal(h.machine.activeDownload.value!.ringPct, first.ringPct);
+  assert.equal(h.machine.activeDownload.value!.pct, 10);
+  await h.machine.applyInstallQueueResponse(snapshot('epoch-1', 1, 'processors', 100));
+  assert.equal(h.machine.activeDownload.value!.ringPct, first.ringPct);
+  await h.machine.applyInstallQueueResponse(snapshot('epoch-1', 3, 'client', 0, 'retry'));
+  assert.equal(h.machine.activeDownload.value!.ringPct, 3);
+  await h.machine.applyInstallQueueResponse(snapshot('epoch-2', 1, 'version_json', 0, 'retry'));
+  assert.equal(h.machine.activeDownload.value!.ringPct, 0);
 });

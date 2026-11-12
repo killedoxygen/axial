@@ -7,11 +7,7 @@ import { config, instances, lastInstanceId, launchSessions, launchState, version
 import { markContentChanged } from '../content-activity';
 import { installQueueStateResponse } from '../dto-install';
 import { instancesResponse, versionsResponse } from '../dto-core';
-import {
-  cloneInstallItem,
-  installItemFromQueueInstallItem,
-  installQueueRequestFromItem,
-} from '../install-item';
+import { cloneInstallItem, installItemFromQueueInstallItem, installQueueRequestFromItem } from '../install-item';
 import { installQueueNoticePresentation } from './download-view-models';
 import type {
   InstallActionViewModel,
@@ -32,6 +28,8 @@ export type ActiveDownload = {
   item: InstallItem;
   displayName: string;
   pct: number;
+  /** Estimated whole-install fill; numeric readouts use the measured step percentage. */
+  ringPct: number;
   label: string;
   phase: string;
   activeStep: InstallProgressStepViewModel | null;
@@ -80,14 +78,27 @@ let closeQueueStream: (() => void) | null = null;
 let registryRefreshGeneration = 0;
 const retiredQueueEpochs = new Set<string>();
 type RegistryCursor = { epoch: string; revision: number };
-let reconciledRegistry: RegistryCursor | null = null;
-let registryRead: { cursor: RegistryCursor; generation: number; promise: Promise<void>; dispose: () => void } | null = null;
+const reconciledRegistry = signal<RegistryCursor | null>(null);
+let registryRead: { cursor: RegistryCursor; generation: number; promise: Promise<void>; dispose: () => void } | null =
+  null;
 let registryRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let registryReadFailures = 0;
 
 export const activeDownload = computed<ActiveDownload | null>(() => {
   const active = queueSnapshot.value?.active;
   return active ? activeDownloadFromQueue(active) : null;
+});
+
+/**
+ * The queue has moved on (an install finished) and the instances have not been re-read yet: what they say about
+ * being installed or ready is from before, so nothing should present it as an outcome.
+ */
+export const installedStateSettling = computed<boolean>(() => {
+  const snapshot = queueSnapshot.value;
+  return (
+    snapshot !== null &&
+    !sameRegistry(reconciledRegistry.value, { epoch: snapshot.queue_epoch, revision: snapshot.registry_revision })
+  );
 });
 
 export const downloadQueue = computed<DownloadQueue>(() => {
@@ -107,6 +118,41 @@ export const downloadFailures = computed<DownloadFailure[]>(() =>
   })),
 );
 
+/**
+ * Each long step's share of a whole install, in the order they run. The queue reports every step from 0 to 100 on
+ * its own, and an install has many short ones (publishing, log config, overlays) that carry no share here.
+ */
+const STEP_SHARES: Record<string, [from: number, to: number]> = {
+  version_json: [0, 3],
+  client: [3, 12],
+  libraries: [12, 35],
+  assets: [35, 80],
+  runtime: [80, 90],
+  java: [80, 90],
+  processors: [90, 98],
+  content_planning: [0, 10],
+  content_download: [10, 92],
+  content_commit: [92, 99],
+};
+
+const overall = signal<{ identity: string; pct: number } | null>(null);
+
+function updateOverallProgress(snapshot: InstallQueueStateResponse): void {
+  const active = snapshot.active;
+  if (!active) {
+    overall.value = null;
+    return;
+  }
+  const identity = JSON.stringify([snapshot.queue_epoch, active.queue_id, active.install_id, active.operation_id]);
+  const { phase_id: phase, progress_pct: step } = active.progress;
+  const previous = overall.peek();
+  let pct = previous?.identity === identity && phase !== 'queued' && phase !== 'starting' ? previous.pct : 0;
+  const share = STEP_SHARES[phase];
+  if (share) pct = Math.max(pct, Math.round(share[0] + (share[1] - share[0]) * Math.max(0, Math.min(100, step)) / 100));
+  if (active.progress.terminal && !active.progress.failed) pct = 100;
+  overall.value = { identity, pct };
+}
+
 function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDownload {
   return {
     queueId: active.queue_id,
@@ -116,6 +162,7 @@ function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDow
     item: cloneInstallItem(installItemFromQueueInstallItem(active.install_item)),
     displayName: active.label,
     pct: Math.max(0, Math.min(100, active.progress.progress_pct)),
+    ringPct: overall.value?.pct ?? 0,
     label: active.progress.label,
     phase: active.progress.phase_id,
     activeStep: active.progress.active_step ?? null,
@@ -153,7 +200,7 @@ export async function refreshInstallQueue(
     // instance changes need not advance the install queue's registry revision.
     registryRefreshGeneration += 1;
     registryRead?.dispose();
-    reconciledRegistry = null;
+    reconciledRegistry.value = null;
     if (registryRetryTimer !== undefined) clearTimeout(registryRetryTimer);
     registryRetryTimer = undefined;
   }
@@ -177,8 +224,13 @@ export async function applyInstallQueueResponse(
   options: { showNotice?: boolean; connectActive?: boolean; requireInstalledState?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
   if (options.connectActive) ensureQueueSubscription();
-  if (!response.queue_epoch || !Number.isSafeInteger(response.registry_revision) || response.registry_revision < 0 ||
-      !Number.isSafeInteger(response.revision) || response.revision < 0) {
+  if (
+    !response.queue_epoch ||
+    !Number.isSafeInteger(response.registry_revision) ||
+    response.registry_revision < 0 ||
+    !Number.isSafeInteger(response.revision) ||
+    response.revision < 0
+  ) {
     throw new Error('Install queue revision is invalid.');
   }
   const previous = queueSnapshot.value;
@@ -197,6 +249,7 @@ export async function applyInstallQueueResponse(
   }
 
   batch(() => {
+    updateOverallProgress(response);
     queueSnapshot.value = response;
     if (response.removed_instance_id) {
       const removedId = response.removed_instance_id;
@@ -233,13 +286,15 @@ async function refreshInstalledState(required = false): Promise<void> {
       return;
     }
     const cursor = { epoch: snapshot.queue_epoch, revision: snapshot.registry_revision };
-    if (sameRegistry(reconciledRegistry, cursor)) return;
+    if (sameRegistry(reconciledRegistry.peek(), cursor)) return;
     if (registryRetryTimer !== undefined) {
       if (required) throw new Error('Install state could not be refreshed. Retry startup.');
       return;
     }
-    const read = registryRead && registryRead.generation === registryRefreshGeneration && sameRegistry(registryRead.cursor, cursor)
-      ? registryRead.promise : readInstalledState(cursor);
+    const read =
+      registryRead && registryRead.generation === registryRefreshGeneration && sameRegistry(registryRead.cursor, cursor)
+        ? registryRead.promise
+        : readInstalledState(cursor);
     try {
       await read;
     } catch (error) {
@@ -249,10 +304,12 @@ async function refreshInstalledState(required = false): Promise<void> {
     if (!required) return;
     const current = queueSnapshot.value;
     if (!current || current.queue_epoch !== cursor.epoch || current.registry_revision !== cursor.revision) continue;
-    if (!sameRegistry(reconciledRegistry, cursor)) {
-      throw new Error(registryRetryTimer !== undefined
-        ? 'Launcher state changed while refreshing. Retry startup.'
-        : 'Install state refresh was interrupted. Retry startup.');
+    if (!sameRegistry(reconciledRegistry.peek(), cursor)) {
+      throw new Error(
+        registryRetryTimer !== undefined
+          ? 'Launcher state changed while refreshing. Retry startup.'
+          : 'Install state refresh was interrupted. Retry startup.',
+      );
     }
     return;
   }
@@ -276,18 +333,26 @@ function readInstalledState(cursor: RegistryCursor): Promise<void> {
         const expectedVersions = versions.value;
         const expectedConfig = config.value;
         const expectedLastInstance = lastInstanceId.value;
-        const expectedSessions = Object.entries(launchSessions.value).map(([id, session]) => [id, session.sessionId] as const);
+        const expectedSessions = Object.entries(launchSessions.value).map(
+          ([id, session]) => [id, session.sessionId] as const,
+        );
         const expectedPreparing = launchState.value.status === 'preparing' ? launchState.value.instanceId : null;
         const ownershipCurrent = (): boolean =>
           Object.keys(launchSessions.value).length === expectedSessions.length &&
           expectedSessions.every(([id, sessionId]) => launchSessions.value[id]?.sessionId === sessionId) &&
           (launchState.value.status === 'preparing' ? launchState.value.instanceId : null) === expectedPreparing;
-        const inputsCurrent = (): boolean => instances.value === expectedInstances && versions.value === expectedVersions &&
-          config.value === expectedConfig && lastInstanceId.value === expectedLastInstance && ownershipCurrent();
+        const inputsCurrent = (): boolean =>
+          instances.value === expectedInstances &&
+          versions.value === expectedVersions &&
+          config.value === expectedConfig &&
+          lastInstanceId.value === expectedLastInstance &&
+          ownershipCurrent();
         // A session may start and end during this pair of reads. Remember that
         // transition without invalidating on ordinary same-session progress ticks.
         let superseded = false;
-        stopWatching = effect(() => { if (!inputsCurrent()) superseded = true; });
+        stopWatching = effect(() => {
+          if (!inputsCurrent()) superseded = true;
+        });
         try {
           const [versionsRead, instancesRead] = await Promise.allSettled([
             api('GET', '/versions').then(versionsResponse),
@@ -302,8 +367,8 @@ function readInstalledState(cursor: RegistryCursor): Promise<void> {
             versions.value = versionsRead.value.versions;
             instances.value = instancesRead.value.instances;
             lastInstanceId.value = instancesRead.value.last_instance_id;
+            reconciledRegistry.value = cursor;
           });
-          reconciledRegistry = cursor;
           registryReadFailures = 0;
           return;
         } catch (error: unknown) {
@@ -347,8 +412,14 @@ export function retryFailedInstall(failure: DownloadFailure): void {
 export async function retryActiveInstall(expectedInstallId: string | undefined): Promise<void> {
   const active = activeDownload.value;
   const action = active?.retryAction;
-  if (!expectedInstallId || active?.installId !== expectedInstallId || activeInstallRetryPending.value ||
-      action?.action !== 'retry' || action.enabled !== true) return;
+  if (
+    !expectedInstallId ||
+    active?.installId !== expectedInstallId ||
+    activeInstallRetryPending.value ||
+    action?.action !== 'retry' ||
+    action.enabled !== true
+  )
+    return;
   activeInstallRetryPending.value = true;
   try {
     await enqueueBackendInstallItem(active.item, { retry: true, expectedInstallId });
@@ -376,12 +447,11 @@ async function enqueueBackendInstallItem(
   options: { retry?: boolean; expectedInstallId?: string } = {},
 ): Promise<InstallQueueStateResponse> {
   const request = installQueueRequestFromItem(item);
-  const path = (options.retry ? '/install/queue/retry' : '/install/queue') +
+  const path =
+    (options.retry ? '/install/queue/retry' : '/install/queue') +
     (options.expectedInstallId ? '?expected_install_id=' + encodeURIComponent(options.expectedInstallId) : '');
   try {
-    const response = installQueueStateResponse(
-      await api('POST', path, request),
-    );
+    const response = installQueueStateResponse(await api('POST', path, request));
     await applyInstallQueueResponse(response, { showNotice: true, connectActive: true });
     return response;
   } catch (error: unknown) {

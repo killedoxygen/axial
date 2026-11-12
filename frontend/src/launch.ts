@@ -424,7 +424,7 @@ function connectLaunchEvents(
   unsubscribe = subscribeApiEvents(`/launch/${encodeURIComponent(sessionId)}/events`, {
     decode: (value: unknown) => value,
     events: ['status', 'log'],
-    allowLegacyEvents: true,
+    allowBareEvents: true,
     onValue: (value, eventName) => {
       if (closed) return;
       if (eventName === 'status') onStatus(value, streamHandle);

@@ -458,6 +458,49 @@ const MOCK_SEEDS: MockSeed[] = [
   },
 ];
 
+/** The projects' own art, so the mock looks like a live catalogue. */
+const MOCK_ART: Record<string, [icon: string, cover?: string]> = {
+  'modrinth:AANobbMI': [
+    'AANobbMI/295862f4724dc3f78df3447ad6072b2dcd3ef0c9_96.webp',
+    'AANobbMI/images/d84313e6f57dc9e7896961dbd2dfc2689d482758_350.webp',
+  ],
+  'modrinth:P7dR8mSH': ['P7dR8mSH/icon.png'],
+  'modrinth:gvQqBUqZ': ['gvQqBUqZ/bcc8686c13af0143adf4285d741256af824f70b7_96.webp'],
+  'modrinth:YL57xq9U': [
+    'YL57xq9U/18d0e7f076d3d6ed5bedd472b853909aac5da202_96.webp',
+    'YL57xq9U/images/f47cea26f135d74c2d69df0a1806751818d705d3_350.webp',
+  ],
+  'modrinth:mOgUt4GM': [
+    'mOgUt4GM/5a20ed1450a0e1e79a1fe04e61bb4e5878bf1d20.png',
+    'mOgUt4GM/images/70fd54b0579f2de3ac45fa9650aca2ec8ff0882b_350.webp',
+  ],
+  'modrinth:9eGKb6K1': ['9eGKb6K1/icon.png', '9eGKb6K1/images/95490c1c7cf1be0d2981476efbc6acfe79c8b58b_350.webp'],
+  'modrinth:1KVo5zza': [
+    '1KVo5zza/d8152911f8fd5d7e9a8c499fe89045af81fe816e_96.webp',
+    '1KVo5zza/images/38f70f307f1a0b17d8ed4526d1636317e8c12d1d_350.webp',
+  ],
+  'modrinth:MdwFAVRL': [
+    '5FFgwNNP/e7f9ee2e9d361623847853fe2ddce42f519ee64f.png',
+    '5FFgwNNP/images/43765359395bb8216a238d18c02a045106d7bad4_350.webp',
+  ],
+  'modrinth:faithful32': [
+    'w0TnApzs/e8403d1fb2f55321ae74402c1e8c90a3a5670856.png',
+    'w0TnApzs/images/8326664336340fe1919056f86d8d6009d06ad2e8_350.webp',
+  ],
+  // No screenshot, like a good share of the catalogue.
+  'modrinth:barebones': ['rox3U8B6/b502bd8b2a6048f635230da8e8a66eeb4383874b_96.webp'],
+  'modrinth:complementary': [
+    'HVnmMxH1/79cb7c8123bbc54945305b2ebad6b8881efdf5f8_96.webp',
+    'HVnmMxH1/images/111e76bfa966c68b3581a93f7322588e642ce4db_350.webp',
+  ],
+  'modrinth:bsl': [
+    'Q1vvjJYV/2a611a3cb434fb52fb81fa5dace13c5d8b67e55d_96.webp',
+    'Q1vvjJYV/images/40b899ae09647c98722d67bb2288f790ae28b4fc_350.webp',
+  ],
+};
+const mockArtUrl = (path: string | undefined): string | undefined =>
+  path ? `https://cdn.modrinth.com/data/${path}` : undefined;
+
 function seedContent(seed: MockSeed): CanonicalContent {
   const projectId = seed.id.replace('modrinth:', '');
   const loaders = seed.loaders ?? (seed.kind === 'mod' || seed.kind === 'modpack' ? ['fabric'] : []);
@@ -470,6 +513,8 @@ function seedContent(seed: MockSeed): CanonicalContent {
     title: seed.title,
     author: seed.author,
     summary: seed.summary,
+    icon_url: mockArtUrl(MOCK_ART[seed.id]?.[0]),
+    cover_url: mockArtUrl(MOCK_ART[seed.id]?.[1]),
     downloads: seed.downloads,
     follows: Math.round(seed.downloads / 90),
     categories: seed.categories,
@@ -737,15 +782,24 @@ function mockCatalogItem(canonicalId: string): CanonicalContent | undefined {
     .find((item) => item.canonical_id === canonicalId);
 }
 
+function mockBuiltFor(canonicalId: string, game: string): boolean {
+  return (
+    MOCK_SEEDS.find((seed) => seed.id === canonicalId)?.versions.some((version) => version.games.includes(game)) ??
+    false
+  );
+}
+
 function mockContentSearch(request: MockRequest | undefined): ContentPage {
   const kind = (request?.searchParams.get('kind') as ContentKind | null) ?? 'mod';
   const query = (request?.searchParams.get('query') ?? '').toLowerCase();
   const categoryFilter = request?.searchParams.get('category') ?? '';
+  const game = request?.searchParams.get('game_version') ?? '';
   const instanceId = request?.searchParams.get('instance_id') ?? '';
   const installed = new Set((mockInstanceContent[instanceId] ?? []).map((entry) => entry.canonical_id));
   const items: SearchHit[] = (mockContentCatalog[kind] ?? [])
     .filter((item) => !query || item.title.toLowerCase().includes(query) || item.summary.toLowerCase().includes(query))
     .filter((item) => !categoryFilter || item.categories.includes(categoryFilter))
+    .filter((item) => !game || mockBuiltFor(item.canonical_id, game))
     .map((item) => (installed.has(item.canonical_id) ? { ...item, install_state: 'installed' as const } : item));
   return { items, offset: 0, limit: items.length, total: items.length };
 }
@@ -877,42 +931,36 @@ function mockModpackFile(body: unknown): ModpackTarget {
 }
 
 function mockContentCompatibility(selections: ContentSelection[]): ContentCompatResponse {
-  if (selections.length === 0) return { candidates: [] };
   const total = selections.length;
-  return {
-    candidates: [
-      {
+  const candidates = [MOCK_FABRIC_MC_VERSION, MOCK_FABRIC_MC_ALT]
+    .map((game) => {
+      const drops = selections
+        .filter((selection) => !mockBuiltFor(selection.canonical_id, game))
+        .map((selection) => ({
+          canonical_id: selection.canonical_id,
+          title: mockCatalogItem(selection.canonical_id)?.title ?? 'an item',
+        }));
+      const supported = total - drops.length;
+      return {
         loader: 'fabric',
         loader_label: 'Fabric',
-        game_version: MOCK_FABRIC_MC_VERSION,
-        selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_VERSION}`,
-        summary: total === 1 ? 'Works here' : `All ${total} work here`,
-        supported_count: total,
+        game_version: game,
+        selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${game}`,
+        summary:
+          drops.length > 0
+            ? `${supported} of ${total} work here`
+            : total === 1
+              ? 'Works here'
+              : `All ${total} work here`,
+        supported_count: supported,
         total_count: total,
-        complete: true,
-        drops: [],
-      },
-      {
-        loader: 'fabric',
-        loader_label: 'Fabric',
-        game_version: MOCK_FABRIC_MC_ALT,
-        selection_id: `loader_version|${FABRIC_COMPONENT_ID}|${MOCK_FABRIC_MC_ALT}`,
-        summary: `${Math.max(1, total - 1)} of ${total} work here`,
-        supported_count: Math.max(1, total - 1),
-        total_count: total,
-        complete: total === 1,
-        drops:
-          total > 1
-            ? [
-                {
-                  canonical_id: selections[total - 1].canonical_id,
-                  title: mockCatalogItem(selections[total - 1].canonical_id)?.title ?? 'an item',
-                },
-              ]
-            : [],
-      },
-    ],
-  };
+        complete: drops.length === 0,
+        drops,
+      };
+    })
+    .filter((candidate) => candidate.supported_count > 0);
+  // Stable, so the newer version leads a tie.
+  return { candidates: candidates.sort((a, b) => b.supported_count - a.supported_count) };
 }
 
 function mockModpackTarget(canonicalId: string): ModpackTarget {
@@ -1341,8 +1389,24 @@ const handlers: Record<string, Handler> = {
       throw apiError(400, 'Bad Request', { error: 'invalid plan request' });
     }
     const target = body.target as TargetRef;
-    const instanceId = target.kind === 'instance' ? target.instance_id : undefined;
-    return mockResolvePlan(instanceId, body.selections as ContentSelection[]);
+    const selections = body.selections as ContentSelection[];
+    if (target.kind === 'instance') return mockResolvePlan(target.instance_id, selections);
+    const plan = mockResolvePlan(undefined, selections);
+    return {
+      ...plan,
+      game_version: target.game_version,
+      conflicts: [
+        ...plan.conflicts,
+        ...selections
+          .filter((selection) => !mockBuiltFor(selection.canonical_id, target.game_version))
+          .map((selection) => ({
+            canonical_id: selection.canonical_id,
+            title: mockCatalogItem(selection.canonical_id)?.title,
+            kind: 'unavailable' as const,
+            detail: 'Content has no compatible version for this loader and Minecraft version.',
+          })),
+      ],
+    };
   },
   'POST /content/install': (body) => mockContentInstall(body),
   'POST /content/compatibility': (body) => {

@@ -4,16 +4,16 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as core from '../../src/dto-core';
-import * as installItems from '../../src/install-item';
-import * as launchPresenters from '../../src/launch-presenters';
-import { minecraftVersionLabel } from '../../src/version-display';
-import type { EnrichedInstance } from '../../src/types-instance';
-import type { LaunchSession } from '../../src/types-launch';
-import type { LaunchState } from '../../src/store';
-import type { ActiveDownload, DownloadFailure } from '../../src/machines/downloads';
-import type { InstallQueueInstallItemViewModel, InstallQueuedItemViewModel } from '../../src/types-install';
-import type { LoaderComponentId } from '../../src/types-loader';
+import * as core from '../src/dto-core';
+import * as installItems from '../src/install-item';
+import * as launchPresenters from '../src/launch-presenters';
+import { minecraftVersionLabel } from '../src/version-display';
+import type { EnrichedInstance } from '../src/types-instance';
+import type { LaunchSession } from '../src/types-launch';
+import type { LaunchState } from '../src/store';
+import type { ActiveDownload, DownloadFailure } from '../src/machines/downloads';
+import type { InstallQueueInstallItemViewModel, InstallQueuedItemViewModel } from '../src/types-install';
+import type { LoaderComponentId } from '../src/types-loader';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -25,6 +25,7 @@ function harness() {
     activeDownload: { value: null as ActiveDownload | null },
     downloadFailures: { value: [] as DownloadFailure[] },
     downloadQueue: { value: { items: [] as InstallQueuedItemViewModel[] } },
+    installedStateSettling: { value: false },
   };
   const filename = resolve(frontend, 'src/instance-install-status.ts');
   const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
@@ -45,7 +46,7 @@ function harness() {
     },
     { filename },
   );
-  return { downloads, ...(exports as typeof import('../../src/instance-install-status')) };
+  return { downloads, ...(exports as typeof import('../src/instance-install-status')) };
 }
 
 function target(component: LoaderComponentId): InstallQueueInstallItemViewModel {
@@ -363,8 +364,8 @@ function detailHarness(inst: EnrichedInstance) {
     },
     { filename: launchFile },
   );
-  const { LaunchSplitButton } = launchExports as typeof import('../../src/views/instance/components/launch');
-  const { InstanceDetailView } = exports as typeof import('../../src/views/instance/InstanceDetailView');
+  const { LaunchSplitButton } = launchExports as typeof import('../src/views/instance/components/launch');
+  const { InstanceDetailView } = exports as typeof import('../src/views/instance/InstanceDetailView');
   type Node = { type: unknown; props: Record<string, unknown> };
   function nodes(value: unknown): Node[] {
     if (Array.isArray(value)) return value.flatMap(nodes);
@@ -432,6 +433,7 @@ test('the real instance header follows installation and backend readiness instea
     item: installItems.installItemFromQueueInstallItem(installTarget),
     displayName: 'Minecraft',
     pct: 0,
+    ringPct: 0,
     label: 'Preparing Minecraft',
     phase: 'starting',
     activeStep: null,
@@ -529,4 +531,17 @@ test('instance details reread resources once setup releases the instance', async
   await new Promise((done) => setImmediate(done));
   assert.equal(h.resourceReads(), 2);
   h.unmount();
+});
+
+test('idle instance readiness stays settling until the installed-state refresh completes', () => {
+  const h = harness();
+  const inst = enrichedInstanceResponse(instance(null));
+  assert.equal(h.instanceInstallStatus(inst, undefined).settling, false);
+  h.downloads.installedStateSettling.value = true;
+  const pending = h.instanceInstallStatus(inst, undefined);
+  assert.equal(pending.settling, true);
+  assert.equal(pending.installing, false);
+  assert.equal(pending.state, 'idle');
+  h.downloads.installedStateSettling.value = false;
+  assert.equal(h.instanceInstallStatus(inst, undefined).settling, false);
 });

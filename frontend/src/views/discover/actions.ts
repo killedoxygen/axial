@@ -1,11 +1,9 @@
-import { getModpackTarget, installContent, planContent } from '../../content';
+import { installContent, planContent } from '../../content';
 import { applyInstallQueueResponse } from '../../machines/downloads';
 import { plural } from '../../format';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
-import { beginCreateIntent, openCreateModpack } from '../../ui-state';
 import type { ContentSelection, ResolutionPlan } from '../../types-content';
-import { gameVersion, loader } from './state';
 
 export interface AddOutcome {
   status: 'queued' | 'needs-confirmation' | 'failed' | 'superseded';
@@ -61,28 +59,4 @@ export async function commitInstall(
   const suffix = extra > 0 ? ` with ${plural(extra, 'dependency', 'dependencies')}` : '';
   toast(`Queued ${label}${suffix}`, 'success');
   return { status: 'queued', plan };
-}
-
-/** Without an exact version, the native picker chooses among versions matching the Discover filters. */
-export async function setUpModpack(canonicalId: string, versionId?: string, iconUrl?: string): Promise<boolean> {
-  const isCurrent = beginCreateIntent();
-  let target;
-  try {
-    target = await getModpackTarget(canonicalId, versionId, { gameVersion: gameVersion.value, loader: loader.value });
-  } catch (error) {
-    if (isCurrent()) toast(errMessage(error), 'error');
-    return false;
-  }
-  if (!isCurrent()) return false;
-  openCreateModpack({
-    canonical_id: canonicalId,
-    version_id: target.version_id,
-    name: target.name,
-    minecraft: target.minecraft,
-    loader: target.loader,
-    loader_label: target.loader_label,
-    selection_id: target.selection_id,
-    icon_url: iconUrl,
-  });
-  return true;
 }

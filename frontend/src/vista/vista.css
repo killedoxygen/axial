@@ -1,7 +1,7 @@
 /* World art has no frame and nothing laid over it. It is anchored to the panel's top-right corner, most of the
-   panel wide, at full strength; only its left and lower edges run out into the page. It is drawn for the pixels
-   it fills; while the window is changing size the picture it has is scaled to fit, a shallower space showing the
-   band of it about the horizon. */
+   panel wide, at full strength; only its left and lower edges run out into the page. One drawn picture serves
+   every place and size: each scales it to its width and, where it is shallower, shows the band of it that holds
+   the horizon and the ground just under it. */
 .cp-vista {
   /* Both edges ease out along one curve of many small steps; a plain ramp shows where it starts and ends. */
   --vista-left-to: 30%;
@@ -40,17 +40,21 @@
   width: 88%;
   aspect-ratio: 2.3;
   object-fit: cover;
-  object-position: right 70%;
+  object-position: right 76%;
   opacity: 0;
   -webkit-mask-image: var(--vista-left), var(--vista-foot);
   mask-image: var(--vista-left), var(--vista-foot);
   -webkit-mask-composite: source-in;
   mask-composite: intersect;
-  transition: opacity 600ms ease;
+  transition: opacity 320ms ease;
   pointer-events: none;
 }
-.cp-vista[data-ready='true'] {
+.cp-vista[data-ready] {
   opacity: 1;
+}
+/* A picture that was already drawn is simply there. */
+.cp-vista[data-ready='kept'] {
+  transition: none;
 }
 @media (prefers-reduced-motion: reduce) {
   .cp-vista {

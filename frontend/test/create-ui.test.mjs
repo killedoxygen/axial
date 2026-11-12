@@ -69,14 +69,14 @@ const bundled = await build({
   ],
 });
 /**
- * @typedef {typeof import('../../src/instance-create') & typeof import('../../src/create-presenters') &
- * typeof import('../../src/views/create/contract') & typeof import('../../src/views/create/view-model') & {
+ * @typedef {typeof import('../src/instance-create') & typeof import('../src/create-presenters') &
+ * typeof import('../src/views/create/contract') & typeof import('../src/views/create/view-model') & {
  * arrange: (response: unknown, failure?: unknown, streamFailure?: unknown) => void,
- * requests: Parameters<typeof import('../../src/api').api>[],
- * added: Parameters<typeof import('../../src/actions').addInstance>[0][],
- * queues: Parameters<typeof import('../../src/machines/downloads').applyInstallQueueResponse>[],
- * notices: Parameters<typeof import('../../src/toast').toast>[],
- * navigation: Parameters<typeof import('../../src/ui-state').navigate>[0][]
+ * requests: Parameters<typeof import('../src/api').api>[],
+ * added: Parameters<typeof import('../src/actions').addInstance>[0][],
+ * queues: Parameters<typeof import('../src/machines/downloads').applyInstallQueueResponse>[],
+ * notices: Parameters<typeof import('../src/toast').toast>[],
+ * navigation: Parameters<typeof import('../src/ui-state').navigate>[0][]
  * }} CreateTestModule
  */
 /** @type {CreateTestModule} */
@@ -531,10 +531,10 @@ test('loader options bind exact source and Minecraft identity and preserve opaqu
 
 test('loader choice uses backend Automatic, rejects disabled pins and discards stale target pins', () => {
   const parsed = ui.createLoaderBuildsResponse(builds());
-  /** @type {import('../../src/views/create/contract').CreateSourceId} */
+  /** @type {import('../src/views/create/contract').CreateSourceId} */
   const parsedSource = 'net.fabricmc.fabric-loader';
   assert.equal(parsed.source_id, parsedSource);
-  /** @param {string | null} choice @param {import('../../src/views/create/contract').CreateSourceId} [source] */
+  /** @param {string | null} choice @param {import('../src/views/create/contract').CreateSourceId} [source] */
   const select = (choice, source = parsedSource, minecraft = parsed.minecraft_version_id) =>
     ui.createLoaderSelection(parsed, source, minecraft, 'row-auto', choice);
   assert.equal(select(null), 'backend-auto+opaque');

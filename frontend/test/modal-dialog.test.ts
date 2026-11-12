@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { EnrichedInstance } from '../../src/types-instance';
+import type { EnrichedInstance } from '../src/types-instance';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -243,7 +243,7 @@ function harness(
     },
   };
   const dialogHooks = hooks();
-  const dialogs = source<typeof import('../../src/ui/Dialog')>(
+  const dialogs = source<typeof import('../src/ui/Dialog')>(
     'ui/Dialog.tsx',
     {
       'preact/hooks': dialogHooks,
@@ -255,7 +255,7 @@ function harness(
   );
   let closed = 0;
   const modalHooks = hooks();
-  const modal = source<typeof import('../../src/ui/Modal')>(
+  const modal = source<typeof import('../src/ui/Modal')>(
     'ui/Modal.tsx',
     {
       preact: { createContext: () => ({}) },
@@ -275,10 +275,10 @@ function harness(
     },
     globals,
   );
-  const calls: Parameters<typeof import('../../src/api').api>[] = [];
+  const calls: Parameters<typeof import('../src/api').api>[] = [];
   const requestEntered = heldResponse();
   const api = {
-    api: (...args: Parameters<typeof import('../../src/api').api>) => {
+    api: (...args: Parameters<typeof import('../src/api').api>) => {
       calls.push(args);
       requestEntered.resolve(undefined);
       return apiResult();
@@ -287,19 +287,19 @@ function harness(
   };
   const notices: string[] = [];
   const toast = { toast: (message: string) => notices.push(message) };
-  const utils = source<typeof import('../../src/utils')>('utils.ts', { './store': {}, './toast': toast }, globals);
-  const dto = source<typeof import('../../src/dto-contract')>('dto-contract.ts', {}, globals);
-  const resources = source<typeof import('../../src/views/instance/resources')>(
+  const utils = source<typeof import('../src/utils')>('utils.ts', { './store': {}, './toast': toast }, globals);
+  const dto = source<typeof import('../src/dto-contract')>('dto-contract.ts', {}, globals);
+  const resources = source<typeof import('../src/views/instance/resources')>(
     'views/instance/resources.ts',
     { '../../api': api, '../../dto-core': {}, '../../dto-contract': dto },
     globals,
   );
-  const mutations = source<typeof import('../../src/views/instance/bulk-actions')>(
+  const mutations = source<typeof import('../src/views/instance/bulk-actions')>(
     'views/instance/bulk-actions.ts',
     { '../../ui/Dialog': dialogs, '../../toast': toast, '../../utils': utils },
     globals,
   );
-  const actions = source<typeof import('../../src/views/instance/screenshot-actions')>(
+  const actions = source<typeof import('../src/views/instance/screenshot-actions')>(
     'views/instance/screenshot-actions.ts',
     {
       '../../api': api,
@@ -312,7 +312,7 @@ function harness(
     },
     globals,
   );
-  const atoms = source<typeof import('../../src/ui/Atoms')>(
+  const atoms = source<typeof import('../src/ui/Atoms')>(
     'ui/Atoms.tsx',
     { './Icons': { Icon: 'Icon' }, './Face': { Face: 'Face' }, './motion': { glideThumb() {}, settleWidth() {} } },
     globals,
@@ -321,7 +321,7 @@ function harness(
   let mutation: Promise<void> | undefined;
   let shot = { name: 'before.png', size: 512, modified_at: '2026-10-04T12:00:00Z' };
   const renamed: string[] = [];
-  const lightbox = source<typeof import('../../src/views/instance/components/screenshot-lightbox')>(
+  const lightbox = source<typeof import('../src/views/instance/components/screenshot-lightbox')>(
     'views/instance/components/screenshot-lightbox.tsx',
     {
       'preact/hooks': lightboxHooks,
@@ -342,7 +342,7 @@ function harness(
     globals,
   );
   const paneHooks = hooks();
-  const pane = source<typeof import('../../src/views/instance/tabs/ScreenshotsPane')>(
+  const pane = source<typeof import('../src/views/instance/tabs/ScreenshotsPane')>(
     'views/instance/tabs/ScreenshotsPane.tsx',
     {
       'preact/hooks': paneHooks,
@@ -371,7 +371,7 @@ function harness(
   let refreshes = 0;
   let paneTree: Node[] = [];
   let lightboxTree: Node[] = [];
-  let resourceState: import('../../src/views/instance/resources').ResourceLoadState = {
+  let resourceState: import('../src/views/instance/resources').ResourceLoadState = {
     status: 'ready',
     data: { ...resources.emptyResources(), screenshots: [shot, { ...shot, name: 'neighbor.png' }] },
   };

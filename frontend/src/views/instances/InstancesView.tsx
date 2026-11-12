@@ -32,7 +32,8 @@ function ListRow({
 }): JSX.Element {
   const session = launchSessions.value[inst.id];
   const install = instanceInstallStatus(inst, versionById(inst.version_id));
-  const installing = install.installing;
+  // Just after an install the row is still as it was before it; it stays busy until it is re-read.
+  const installing = install.installing || (install.settling && !inst.launch_action.launchable);
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const launchAction = inst.launch_action;
   const actionIcon =

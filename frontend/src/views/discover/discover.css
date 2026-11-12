@@ -76,6 +76,12 @@
   margin-left: -2px;
 }
 
+/* On these tabs a count is what has been picked of that kind, so it takes the accent. */
+.cp-discover-what .cp-tab-count {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .cp-discover-count {
   flex: none;
   color: var(--text-mute);
@@ -101,6 +107,48 @@
 /* The sort's caret sits on the content's right edge. */
 .cp-discover-refine > .cp-select-trigger--ghost {
   margin-right: -8px;
+}
+/* Browsing narrowed to what the picks run on: pressed while it holds, with the loader and version it means. */
+.cp-discover-fit {
+  --chip-bg: var(--fill-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--h-sm);
+  padding: 0 5px 0 10px;
+  border: 0;
+  border-radius: var(--rad-ctl);
+  background: var(--fill);
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
+}
+.cp-discover-fit:hover {
+  --chip-bg: var(--fill-3);
+  background: var(--fill-2);
+  color: var(--text);
+}
+.cp-discover-fit > svg {
+  color: var(--text-mute);
+  opacity: 0.5;
+}
+.cp-discover-fit[aria-pressed='true'] {
+  color: var(--text);
+}
+.cp-discover-fit[aria-pressed='true'] > svg {
+  color: var(--accent);
+  opacity: 1;
+}
+.cp-discover-fit .cp-chip:first-of-type {
+  margin-left: 2px;
+}
+.cp-discover-fit[aria-pressed='false'] {
+  padding-right: 11px;
 }
 .cp-discover-cats {
   display: flex;
@@ -172,6 +220,44 @@
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+}
+/* A screenshot leads the row with the project's art in its corner; with none, the art stands alone in the holder. */
+.cp-discover-list[data-covers='true'] .cp-discover-row {
+  gap: 16px;
+}
+.cp-discover-cover {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 152px;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: var(--hold-sm);
+  background: var(--chip-bg, var(--fill));
+  transition: background var(--t-quick) var(--ease-out);
+}
+.cp-discover-cover > img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition:
+    opacity var(--t-pop) var(--ease-out),
+    scale var(--t-move) var(--ease-out);
+}
+.cp-discover-cover > img[data-loaded] {
+  opacity: 1;
+}
+.cp-discover-row:is(:hover, [data-active='true']) .cp-discover-cover > img {
+  scale: 1.04;
+}
+.cp-discover-cover[data-shown='true'] .cp-art {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--bg-deep) 55%, transparent);
 }
 .cp-discover-row-name {
   display: flex;
@@ -277,18 +363,14 @@
   margin-bottom: 6px;
 }
 
-/* The staging bar: what is staged as art, how many, then where it can go. */
+/* The picks: what is staged (opens to review), what it runs on, then the one way to make it real. */
 .cp-floating-tray-position:has(> .cp-tray) {
   bottom: 16px;
 }
 .cp-tray {
+  --chip-bg: var(--fill-3);
   gap: 8px;
-  padding: 6px 6px 6px 12px;
-}
-.cp-tray .cp-floating-tray-label {
-  padding: 0 2px;
-  font-size: 13px;
-  font-weight: 600;
+  padding: 6px;
 }
 .cp-tray .cp-btn {
   font-size: 13px;
@@ -297,25 +379,81 @@
   padding: 0 12px;
 }
 .cp-tray-items {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 4px;
-}
-.cp-tray-items button {
-  --chip-bg: var(--fill-3);
-  padding: 0;
+  height: var(--h);
+  padding: 0 8px 0 6px;
   border: 0;
-  border-radius: var(--hold-xs);
+  border-radius: var(--rad-ctl);
   background: none;
+  color: var(--text);
+  font-family: inherit;
   cursor: pointer;
-  transition: opacity var(--t-quick) var(--ease-out);
+  transition: background var(--t-quick) var(--ease-out);
 }
-.cp-tray-items button:hover:not(:disabled) {
-  opacity: 0.55;
+.cp-tray-items:is(:hover, [aria-expanded='true']) {
+  background: var(--fill-3);
 }
 .cp-tray-items .cp-unit {
   height: 24px;
   background: var(--fill-3);
+}
+.cp-tray-items .cp-floating-tray-label {
+  padding: 0 2px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.cp-tray-items > svg {
+  color: var(--text-mute);
+  transition: rotate var(--t-pop) var(--ease-out);
+}
+.cp-tray-items[aria-expanded='true'] > svg {
+  rotate: 180deg;
+}
+.cp-tray-fit {
+  flex-wrap: nowrap;
+  min-height: 20px;
+  margin-right: 4px;
+}
+.cp-tray-fit:empty {
+  display: none;
+}
+
+/* Every pick, by kind, with what it would run on or why it would be left out. */
+.cp-tray-review {
+  --chip-bg: var(--fill-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: min(460px, calc(100vw - 120px));
+  padding: 6px;
+  overflow-y: auto;
+  border-radius: var(--rad-pop);
+}
+.cp-tray-review .cp-row {
+  flex: none;
+  gap: 8px;
+  margin: 0;
+  padding: 4px 4px 4px 6px;
+}
+.cp-tray-review .cp-row:hover {
+  --chip-bg: var(--fill-3);
+  background: var(--fill-2);
+}
+.cp-tray-review strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-tray-review .cp-chip {
+  flex: none;
+}
+.cp-tray-review [data-out] > :is(.cp-art, strong) {
+  opacity: 0.55;
 }
 
 /* ── One project: what it is with its action, what it does, its screenshots, its versions ── */

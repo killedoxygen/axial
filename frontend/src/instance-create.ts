@@ -28,6 +28,8 @@ export interface CreateInstanceArgs {
   initialSettings?: InitialInstanceSettings;
   setupPlanId?: string;
   modpack?: { canonicalId: string; versionId: string };
+  /** Leave the route where it is: one of several instances being created. */
+  stay?: boolean;
 }
 
 export interface CreateInstanceResult {
@@ -108,7 +110,7 @@ export async function createInstance(args: CreateInstanceArgs): Promise<CreateIn
   }
   toast(createResultToastMessage(res), createToastKind(res.view_model?.tone));
   if (queueError) toast(`Instance created, but download status could not be refreshed: ${queueError}`, 'error');
-  if (created) navigate({ name: 'instance', id: created.id });
+  if (created && !args.stay) navigate({ name: 'instance', id: created.id });
 
   return { ok: true, instance: created };
 }

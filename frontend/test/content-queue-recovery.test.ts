@@ -4,12 +4,12 @@ import { createRequire } from 'node:module';
 import { basename, dirname, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { ContentSelection, ModpackFilesPlan } from '../../src/types-content';
-import type { InstallQueueStateResponse } from '../../src/types-install';
-import type { EnrichedInstance } from '../../src/types-instance';
+import type { ContentSelection, ModpackFilesPlan } from '../src/types-content';
+import type { InstallQueueStateResponse } from '../src/types-install';
+import type { EnrichedInstance } from '../src/types-instance';
 
-type ApiCall = Parameters<typeof import('../../src/api').api>;
-type PickerProps = Parameters<typeof import('../../src/views/discover/ModpackPicker').ModpackPicker>[0];
+type ApiCall = Parameters<typeof import('../src/api').api>;
+type PickerProps = Parameters<typeof import('../src/views/discover/ModpackPicker').ModpackPicker>[0];
 type ViewNode = { type: unknown; props: Record<string, unknown> };
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const dependencies = createRequire(resolve(frontend, 'package.json'));
@@ -166,11 +166,11 @@ function harness() {
     );
     return module.exports as T;
   }
-  const client = load<typeof import('../../src/content')>('content');
-  const downloads = load<typeof import('../../src/machines/downloads')>('machines/downloads');
-  const activity = load<typeof import('../../src/content-activity')>('content-activity');
+  const client = load<typeof import('../src/content')>('content');
+  const downloads = load<typeof import('../src/machines/downloads')>('machines/downloads');
+  const activity = load<typeof import('../src/content-activity')>('content-activity');
   const { ModpackPicker } =
-    load<typeof import('../../src/views/discover/ModpackPicker')>('views/discover/ModpackPicker');
+    load<typeof import('../src/views/discover/ModpackPicker')>('views/discover/ModpackPicker');
   function render(next: Partial<PickerProps> = {}): unknown {
     props = { ...props, ...next };
     cursor = 0;
@@ -211,8 +211,8 @@ for (const readFails of [false, true]) {
   test(`lost mod update batch stops submissions and ${readFails ? 'retains uncertainty when the queue read fails' : 'observes accepted work through the queue'}`, async (t) => {
     const h = harness();
     t.after(h.dispose);
-    const mods = h.load<typeof import('../../src/views/instance/mod-actions')>('views/instance/mod-actions');
-    const bulk = h.load<typeof import('../../src/views/instance/bulk-actions')>('views/instance/bulk-actions');
+    const mods = h.load<typeof import('../src/views/instance/mod-actions')>('views/instance/mod-actions');
+    const bulk = h.load<typeof import('../src/views/instance/bulk-actions')>('views/instance/bulk-actions');
     const accepted = queue(1);
     h.io.post = async ([method, path, body]) => {
       assert.equal(method, 'POST');

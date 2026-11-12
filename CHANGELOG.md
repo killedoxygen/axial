@@ -8,6 +8,13 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+### Discover
+- Resource packs and shaders load again: a project published as more than one kind no longer fails the whole page, and says which kind it installs as
+- Anything can be picked before an instance exists, modpacks included. A modpack becomes its own instance and takes the mods, resource packs and shaders picked with it; several modpacks become an instance each
+- With a modpack picked, browsing shows only what runs on its loader and Minecraft version, and the bar names any pick that will not fit
+- Modpacks, resource packs and shaders show their screenshot in the results
+- A failed search says whether Modrinth could not be reached or sent something unreadable
+
 ### Look
 - New logo: an axolotl, in the app, the icons and the download page; it takes the accent color you pick
 

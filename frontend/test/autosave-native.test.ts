@@ -4,19 +4,19 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import * as contract from '../../src/dto-contract';
-import * as dto from '../../src/dto-core';
-import * as installDto from '../../src/dto-install';
-import * as performanceDto from '../../src/dto-performance';
-import * as installItems from '../../src/install-item';
-import * as downloadViews from '../../src/machines/download-view-models';
-import * as preferences from '../../src/preferences/local';
-import type { Config } from '../../src/types-settings';
-import type { EnrichedInstance } from '../../src/types-instance';
-import type { NativePreferencesRequest } from '../../src/native';
-import type { InstallQueueStateResponse } from '../../src/types-install';
-import type { LaunchSession } from '../../src/types-launch';
-import type { LaunchState } from '../../src/store';
+import * as contract from '../src/dto-contract';
+import * as dto from '../src/dto-core';
+import * as installDto from '../src/dto-install';
+import * as performanceDto from '../src/dto-performance';
+import * as installItems from '../src/install-item';
+import * as downloadViews from '../src/machines/download-view-models';
+import * as preferences from '../src/preferences/local';
+import type { Config } from '../src/types-settings';
+import type { EnrichedInstance } from '../src/types-instance';
+import type { NativePreferencesRequest } from '../src/native';
+import type { InstallQueueStateResponse } from '../src/types-install';
+import type { LaunchSession } from '../src/types-launch';
+import type { LaunchState } from '../src/store';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const dependencies = createRequire(resolve(frontend, 'package.json'));
@@ -264,15 +264,15 @@ function harness() {
     },
     isApiError: (error: unknown) => error instanceof Error && 'status' in error,
   };
-  const actions = source<typeof import('../../src/actions')>('actions.ts', {
+  const actions = source<typeof import('../src/actions')>('actions.ts', {
     './store': store,
     './launch-response-adapters': {},
   });
-  const readiness = source<typeof import('../../src/instance-readiness')>('instance-readiness.ts', {
+  const readiness = source<typeof import('../src/instance-readiness')>('instance-readiness.ts', {
     './api': api, './dto-core': dto, './store': store,
     './utils': { showError: (message: string) => notices.push(message) },
   }, { window: clock });
-  const downloads = source<typeof import('../../src/machines/downloads')>('machines/downloads.ts', {
+  const downloads = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
     '../api': api,
     '../utils': { errMessage: String, showError: (message: string) => notices.push(message) },
     '../toast': { toast: (message: string) => notices.push(message) },
@@ -284,7 +284,7 @@ function harness() {
     '../dto-install': installDto, '../dto-core': dto, '../install-item': installItems,
     './download-view-models': downloadViews,
   }, clock);
-  const autosave = source<typeof import('../../src/hooks/use-autosave')>('hooks/use-autosave.ts', {
+  const autosave = source<typeof import('../src/hooks/use-autosave')>('hooks/use-autosave.ts', {
     'preact/hooks': viewHooks,
     '../actions': actions,
     '../api': api,
@@ -293,7 +293,7 @@ function harness() {
     '../toast': { toast: (message: string) => notices.push(message) },
     '../utils': { errMessage: (error: Error) => error.message },
   });
-  const music = source<typeof import('../../src/music')>(
+  const music = source<typeof import('../src/music')>(
     'music.ts',
     {
       './api': { apiResourceUrl: (path: string) => path },
@@ -312,7 +312,7 @@ function harness() {
       },
     },
   );
-  const native = source<typeof import('../../src/native')>(
+  const native = source<typeof import('../src/native')>(
     'native.ts',
     { './dto-contract': contract },
     {
@@ -335,7 +335,7 @@ function harness() {
       },
     },
   );
-  const owner = source<typeof import('../../src/preferences/persistence')>(
+  const owner = source<typeof import('../src/preferences/persistence')>(
     'preferences/persistence.ts',
     {
       '../api': api,
@@ -354,7 +354,7 @@ function harness() {
     },
   );
   const primitive = (...names: string[]) => Object.fromEntries(names.map((name) => [name, name]));
-  const runtimeFields = source<typeof import('../../src/ui/RuntimeFields')>('ui/RuntimeFields.tsx', {
+  const runtimeFields = source<typeof import('../src/ui/RuntimeFields')>('ui/RuntimeFields.tsx', {
     'preact/hooks': javaHooks,
     './Select': primitive('SelectField'),
     './Icons': primitive('Icon'),
@@ -377,7 +377,7 @@ function harness() {
     },
     store: { config: configState, instances, systemInfo: signals.signal(null) },
   };
-  const launching = source<typeof import('../../src/views/settings/LaunchingSection')>(
+  const launching = source<typeof import('../src/views/settings/LaunchingSection')>(
     'views/settings/LaunchingSection.tsx',
     {
       'preact/hooks': viewHooks,
@@ -394,7 +394,7 @@ function harness() {
       '../../format': common.format,
     },
   );
-  const audio = source<typeof import('../../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
+  const audio = source<typeof import('../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
     'preact/hooks': viewHooks,
     '../../ui/Atoms': primitive('Toggle'),
     '../../ui/Slider': primitive('Slider'),
@@ -407,11 +407,11 @@ function harness() {
       saveLocalState() {},
     },
   });
-  const performanceMode = source<typeof import('../../src/views/instance/performance-mode')>(
+  const performanceMode = source<typeof import('../src/views/instance/performance-mode')>(
     'views/instance/performance-mode.ts',
     { '../../api': api, '../../store': common.store, '../../dto-performance': performanceDto },
   );
-  const settings = source<typeof import('../../src/views/instance/tabs/SettingsPane')>(
+  const settings = source<typeof import('../src/views/instance/tabs/SettingsPane')>(
     'views/instance/tabs/SettingsPane.tsx',
     {
       'preact/hooks': viewHooks,
@@ -1481,7 +1481,7 @@ function musicPlayback() {
       this.paused = true;
     }
   }
-  const { Music } = source<typeof import("../../src/music")>(
+  const { Music } = source<typeof import("../src/music")>(
     "music.ts",
     {
       "./api": { apiResourceUrl: (path: string) => path },

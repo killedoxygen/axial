@@ -4,8 +4,8 @@ import { createRequire } from 'node:module';
 import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { PendingSkinStatus } from '../../src/generated/PendingSkinStatus';
-import type { WardrobeContext } from '../../src/machines/skin-wardrobe';
+import type { PendingSkinStatus } from '../src/generated/PendingSkinStatus';
+import type { WardrobeContext } from '../src/machines/skin-wardrobe';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));
@@ -164,11 +164,11 @@ function harness(
     apiResourceUrl: (path: string) => path,
   };
   const defaults = { DEFAULT_SKINS: [{ id: 'steve', name: 'Steve', variant: 'classic', src: 'fixture.png' }] };
-  const api = source<typeof import('../../src/views/accounts/api')>('views/accounts/api.ts', {
+  const api = source<typeof import('../src/views/accounts/api')>('views/accounts/api.ts', {
     '../../api': transport,
     '../../default-skins': defaults,
   });
-  const machine = source<typeof import('../../src/machines/skin-wardrobe')>(
+  const machine = source<typeof import('../src/machines/skin-wardrobe')>(
     'machines/skin-wardrobe.ts',
     {
       '../api': transport,
@@ -210,7 +210,7 @@ function harness(
       (name) => [`./${name}`, { [name]: name }],
     ),
   );
-  const { Wardrobe } = source<typeof import('../../src/views/accounts/Wardrobe')>('views/accounts/Wardrobe.tsx', {
+  const { Wardrobe } = source<typeof import('../src/views/accounts/Wardrobe')>('views/accounts/Wardrobe.tsx', {
     ...primitives,
     '../../api': transport,
     '../../default-skins': defaults,
@@ -280,12 +280,12 @@ function inlineErrors(h: ReturnType<typeof harness>): unknown[] {
 
 function nativeSkinBoundary(invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>) {
   const globals = { window: { __TAURI__: { core: { invoke } } }, File };
-  const native = source<typeof import('../../src/native')>(
+  const native = source<typeof import('../src/native')>(
     'native.ts',
-    { './dto-contract': source<typeof import('../../src/dto-contract')>('dto-contract.ts', {}) },
+    { './dto-contract': source<typeof import('../src/dto-contract')>('dto-contract.ts', {}) },
     globals,
   );
-  const api = source<typeof import('../../src/views/accounts/api')>(
+  const api = source<typeof import('../src/views/accounts/api')>(
     'views/accounts/api.ts',
     { '../../api': {}, '../../default-skins': { DEFAULT_SKINS: [] } },
     globals,
@@ -302,7 +302,7 @@ test('native picker validation failures reach the upload hook and wardrobe notic
       throw message;
     });
     const { useSavedSkinUploadWorkflow } = source<
-      typeof import('../../src/views/accounts/use-saved-skin-upload-workflow')
+      typeof import('../src/views/accounts/use-saved-skin-upload-workflow')
     >('views/accounts/use-saved-skin-upload-workflow.ts', {
       '../../native': native,
       '../../machines/skin-wardrobe': h.machine,
@@ -662,7 +662,7 @@ for (const missingTarget of [false, true]) {
       },
     };
     const config = { value: { revision: 7, onboarding_done: false } };
-    const { finishOnboarding } = source<typeof import('../../src/views/onboarding/finish')>(
+    const { finishOnboarding } = source<typeof import('../src/views/onboarding/finish')>(
       'views/onboarding/finish.ts',
       {
         '../../api': {

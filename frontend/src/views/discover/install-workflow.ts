@@ -8,7 +8,8 @@ export interface InstallWorkflowSnapshot {
   plan: ResolutionPlan | null;
   /** Staged selections a plan without the unavailable ones would keep. */
   installable: ContentSelection[];
-  staged: number;
+  /** The selections awaiting the decision. */
+  staged: ContentSelection[];
 }
 
 /** Selections not blocked by an unavailable conflict, directly or through a
@@ -116,7 +117,7 @@ export function createInstallWorkflow(actions: InstallActions, onChange: () => v
       busy,
       plan: pending?.plan ?? null,
       installable: pending ? installableSelections(pending.selections, pending.plan) : [],
-      staged: pending?.selections.length ?? 0,
+      staged: pending?.selections ?? [],
     }),
     setTarget,
     add,

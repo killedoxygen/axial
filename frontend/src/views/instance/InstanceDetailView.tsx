@@ -155,7 +155,11 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const launchAction = inst.launch_action;
   const installStatus = instanceInstallStatus(inst, v);
   const installTarget = installStatus.target;
-  const installProgress = installStatus.progress;
+  // Between an install ending and the instance being re-read, its readiness is from before the install: the
+  // button keeps working rather than flashing that stale answer.
+  const installProgress =
+    installStatus.progress ??
+    (installStatus.settling && !inst.launch_action.launchable ? { pct: 0, label: 'Finishing up' } : null);
   const installQueued = installStatus.state === 'queued';
   const installQueuedView = installStatus.queuedItem;
   const matchingInstallFailure = installStatus.failure;

@@ -203,7 +203,7 @@ export function Slider({
   );
 }
 
-/** Two thumbs on one track; neither passes the other. */
+/** Two thumbs on one track; neither passes the other. `track` draws the span between them in place of the band. */
 export function RangeSlider({
   low,
   high,
@@ -215,6 +215,7 @@ export function RangeSlider({
   sound = false,
   ariaLabelLow,
   ariaLabelHigh,
+  track,
 }: Partial<Scale> & {
   low: number;
   high: number;
@@ -223,6 +224,7 @@ export function RangeSlider({
   sound?: string | false;
   ariaLabelLow?: string;
   ariaLabelHigh?: string;
+  track?: ComponentChildren;
 }): JSX.Element {
   const safeLow = clamp(low, min, high);
   const safeHigh = clamp(high, safeLow, max);
@@ -241,7 +243,7 @@ export function RangeSlider({
       sound={sound}
       class="cp-slider--range"
     >
-      <div class="cp-slider-band" />
+      {track ?? <div class="cp-slider-band" />}
     </Track>
   );
 }

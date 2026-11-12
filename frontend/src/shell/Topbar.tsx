@@ -161,17 +161,16 @@ function StatusPill(): JSX.Element | null {
     );
   } else if (install) {
     const queueView = downloadQueue.value.view_model;
-    const installPct = Math.round(Math.max(0, Math.min(100, install.pct)));
+    const installPct = Math.round(install.pct);
     const installName = install.displayName || install.item.versionId;
     glyph = 'downloading';
-    progress = installPct;
+    progress = install.ringPct || undefined;
     onClick = () => navigate({ name: 'downloads' });
     title = `${installName}: ${install.label}, ${installPct}%${queueView.active_queued_count_label || ''}`;
     ariaLabel = `Open downloads. ${title}`;
     content = (
       <>
         <span class="cp-status-pill-label">{installName}</span>
-        <span class="cp-status-pill-pct">{installPct}%</span>
         {queueView.queued_count > 0 && <Chip>+{queueView.queued_count}</Chip>}
       </>
     );

@@ -5,7 +5,7 @@ import { basename, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 
-// The rewrite has one authenticated API stream, not a native invoke bridge.
+// The app has one authenticated API stream, not a native invoke bridge.
 // Exercise the same ownership/recovery guarantees against that actual owner.
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const requireDependency = createRequire(resolve(frontend, 'package.json'));

@@ -5,8 +5,8 @@ export interface ApiEventOptions<T> {
   onValue(value: T, eventName: string, revision: number | null): void;
   onError?(error: unknown): void;
   events?: readonly string[];
-  /** Compatibility for retained named domain events during producer migration. */
-  allowLegacyEvents?: boolean;
+  /** Accepts events sent without a revision envelope. */
+  allowBareEvents?: boolean;
 }
 
 /** A reconnect is a fresh authenticated read, never a replay of a domain command. */
@@ -62,7 +62,7 @@ export function subscribeApiEvents<T>(path: string, options: ApiEventOptions<T>)
               }
               revision = record.revision as number;
               if (revision <= (revisions.get(name) ?? -1)) return;
-            } else if (!options.allowLegacyEvents) {
+            } else if (!options.allowBareEvents) {
               throw new Error('API event snapshot is invalid.');
             }
             const value = options.decode(enveloped ? record.value : decoded);

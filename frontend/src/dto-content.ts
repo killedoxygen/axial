@@ -44,6 +44,7 @@ function canonicalContentResponse(value: unknown): CanonicalContent {
     author: dtoString(record.author, 'Content author'),
     summary: dtoString(record.summary, 'Content summary'),
     icon_url: dtoOptionalString(record.icon_url, 'Content icon'),
+    cover_url: dtoOptionalString(record.cover_url, 'Content cover'),
     downloads: dtoNumber(record.downloads, 'Content downloads'),
     follows: dtoNumber(record.follows, 'Content follows'),
     categories: strings(record.categories, 'Content categories'),

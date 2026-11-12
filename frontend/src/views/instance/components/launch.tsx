@@ -104,7 +104,8 @@ export function LaunchSplitButton({
       icon={icon}
       busy={Boolean(progress)}
       progress={progress?.determinate ? pct : null}
-      trailing={progress?.determinate && <span class="cp-btn-note">{Math.round(pct)}%</span>}
+      // A launch being prepared reports a measured figure; an install's fill is an estimate, so it has no number.
+      trailing={preparing && progress?.determinate && <span class="cp-btn-note">{Math.round(pct)}%</span>}
       disabled={disabled}
       sound={usesInstallAction ? 'bright' : 'launchPress'}
       onClick={primaryAction}
