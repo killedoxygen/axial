@@ -7,6 +7,7 @@ import {
   musicStatusResponse,
   systemInfoResponse,
 } from './dto-core';
+import { refreshAccountsData } from './machines/accounts';
 import { refreshInstallQueue } from './machines/downloads';
 import { reconnectLaunchSession } from './launch';
 import { launchSessionsResponse } from './launch-response-adapters';
@@ -15,7 +16,6 @@ import { getNativeAppVersion, hasNativeDesktopRuntime } from './native';
 import { initializeNativePreferences, nativePreferencesHydrated } from './preferences/persistence';
 import { local } from './state';
 import { Sound, bindButtonSounds } from './sound';
-import { refreshAccountSkin } from './player-skin';
 import {
   appVersion,
   bootstrapError,
@@ -101,6 +101,8 @@ async function runApplicationBootstrap(): Promise<void> {
   const [sessionsRes] = await Promise.all([
     api('GET', '/launch/sessions').then(launchSessionsResponse),
     refreshInstallQueue({ connectActive: true, requireInstalledState: true }),
+    // Who is playing is known before the first frame, wherever the launcher opens; it never rejects.
+    refreshAccountsData(),
   ]);
   launchSessions.value = sessionsRes;
   for (const instanceId of Object.keys(sessionsRes)) {
@@ -113,7 +115,6 @@ async function runApplicationBootstrap(): Promise<void> {
   bootstrapError.value = null;
   bootstrapState.value = 'ready';
   scheduleDeferredViewWarmup();
-  refreshAccountSkin();
 
   for (const startupWarning of startupWarningMessages(statusRes.warnings)) {
     toast(startupWarning, 'info');

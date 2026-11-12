@@ -46,7 +46,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   const [recMin, recMax] = recommendedHeapRange(totalGb);
   const flushArgs = useRef<() => void>(() => {});
 
-  const { commit, saving } = useAutoSave<EnrichedInstance & { error?: string }>({
+  const { commit } = useAutoSave<EnrichedInstance & { error?: string }>({
     send: (patch) => api('PUT', `/instances/${encodeURIComponent(inst.id)}`, patch).then(enrichedInstanceResponse),
     apply: (res) => updateInstanceInList(res),
     errorLabel: 'instance settings',
@@ -184,12 +184,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
 
   return (
     <div class="cp-pane cp-settings-pane">
-      {saving && (
-        <span class="cp-instance-saving" aria-live="polite">
-          Saving…
-        </span>
-      )}
-
       {healthNotice && (
         <Notice tone={healthNotice.tone} title={healthNotice.title}>
           {healthNotice.detail && <p>{healthNotice.detail}</p>}

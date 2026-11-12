@@ -11,7 +11,6 @@ import {
   cloneInstallItem,
   installItemFromQueueInstallItem,
   installQueueRequestFromItem,
-  isSameInstallItem,
 } from '../install-item';
 import { installQueueNoticePresentation } from './download-view-models';
 import type {
@@ -123,11 +122,6 @@ function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDow
     startedAt: active.install_started_at_ms ?? null,
     retryAction: active.retry_action,
   };
-}
-
-export function isActiveInstallItem(item: InstallItem): boolean {
-  const active = activeDownload.value;
-  return active !== null && isSameInstallItem(active.item, item);
 }
 
 function ensureQueueSubscription(): void {
@@ -342,10 +336,6 @@ function scheduleRegistryRetry(delay: number): void {
 
 export function handleInstallClick(item: InstallItem): void {
   void enqueueBackendInstallItem(item).catch(showInstallQueueError);
-}
-
-export function installVersion(target: string): void {
-  if (target) handleInstallClick({ versionId: target });
 }
 
 export function retryFailedInstall(failure: DownloadFailure): void {

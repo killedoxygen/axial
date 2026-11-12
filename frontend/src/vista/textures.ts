@@ -4,7 +4,7 @@
  * distant ground from turning to noise.
  */
 
-/** A game's textures by name: sixteen rows of sixteen RGBA texels each. */
+/** A game's textures by name, as rows of RGBA texels: sixteen a side for a block, thirty-two for the sun and moon. */
 export type TexturePack = ReadonlyMap<string, Uint8Array>;
 
 const NAMES: string[] = [];
@@ -140,7 +140,12 @@ export function buildAtlas(pack: TexturePack, grass: number, foliage: number): A
     if (!source) continue;
     const base = t * TEXELS;
     const rule = TINTS[t];
-    const tint = rule === 'grass' ? grass : rule === 'foliage' ? foliage : rule;
+    // The earliest versions painted their grass and leaves green outright; only a grey texture takes a colour.
+    let vivid = 0;
+    for (let i = 0; i < 1024; i += 4)
+      vivid +=
+        Math.max(source[i]!, source[i + 1]!, source[i + 2]!) - Math.min(source[i]!, source[i + 1]!, source[i + 2]!);
+    const tint = vivid > 256 * 24 ? undefined : rule === 'grass' ? grass : rule === 'foliage' ? foliage : rule;
     for (let i = 0; i < 256; i++) {
       let r = source[i * 4]!;
       let g = source[i * 4 + 1]!;

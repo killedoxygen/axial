@@ -16,8 +16,6 @@ const SNAPSHOT_DB_NAME = 'axial-skin-snapshots';
 const SNAPSHOT_DB_VERSION = 1;
 const SNAPSHOT_STORE_NAME = 'snapshots';
 
-export type SnapshotStatus = 'idle' | 'queued' | 'loading' | 'ready' | 'error';
-
 export interface SkinSnapshotInput {
   cacheKey: string;
   src: string;

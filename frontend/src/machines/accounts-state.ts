@@ -10,7 +10,8 @@ export interface AccountsSnapshot {
   selection_revision: number | null;
 }
 
-// The shell observes this same snapshot without eagerly loading account commands.
+// Read once at startup and after every account command. Kept apart from the commands so `player-skin` can
+// observe it without importing them back.
 export const accountsSnapshot = signal<AccountsSnapshot>({
   state: 'loading',
   accounts: [],

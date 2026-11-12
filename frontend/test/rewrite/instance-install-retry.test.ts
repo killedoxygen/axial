@@ -334,7 +334,7 @@ function detailHarness(inst: EnrichedInstance) {
   const launchImports: Record<string, unknown> = {
     'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
     '../../../ui/Icons': { Icon: 'Icon' },
-    '../../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Meter: 'Meter', Ring: 'Ring' },
+    '../../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Meter: 'Meter', SplitButton: 'SplitButton' },
     '../../../ui/Face': { Face: 'Face' },
     '../../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
     '../../../ui/ContextMenu': {},
@@ -384,9 +384,9 @@ function detailHarness(inst: EnrichedInstance) {
     const control = render().find((node) => node.type === 'LaunchSplitButton');
     assert.ok(control);
     const tree = LaunchSplitButton(control.props as Parameters<typeof LaunchSplitButton>[0]);
-    const button = nodes(tree).find((node) => node.type === 'button');
+    const button = nodes(tree).find((node) => node.type === 'SplitButton');
     assert.ok(button);
-    return nodes(button).find((node) => node.type === 'span')?.props.children;
+    return button.props.children;
   }
   function status(): unknown {
     const result = render();
@@ -437,10 +437,12 @@ test('the real instance header follows installation and backend readiness instea
     activeStep: null,
     startedAt: 1,
   };
-  assert.equal(status(), 'Preparing Minecraft');
+  assert.equal(status(), undefined);
+  assert.equal(h.primaryLabel(), 'Preparing Minecraft');
   h.downloads.activeDownload.value = null;
   h.downloads.downloadQueue.value.items = [{ ...queued(installTarget), title: 'Queued install' }];
-  assert.equal(status(), 'Queued install');
+  assert.equal(status(), undefined);
+  assert.equal(h.primaryLabel(), 'Queued install');
   h.downloads.downloadQueue.value.items = [];
   h.downloads.downloadFailures.value = [failed(installTarget)];
   assert.equal(status(), 'Install failed');
@@ -458,7 +460,8 @@ test('the real instance header follows installation and backend readiness instea
   assert.equal(status(), undefined);
   assert.equal(h.primaryLabel(), 'Launch');
   store.launchState.value = { status: 'preparing', instanceId: inst.id, pct: 10, label: 'Preparing launch' };
-  assert.equal(status(), 'Preparing launch');
+  assert.equal(status(), undefined);
+  assert.equal(h.primaryLabel(), 'Preparing launch');
   store.launchSessions.value = {
     [inst.id]: {
       sessionId: 'session-1',

@@ -1,13 +1,16 @@
+/* Every page: the same frame, and one step between its parts. A page that sets its own gap still uses the step
+   between its line of tabs (or accounts) and what they show. Everything filled starts on the frame's left edge. */
 .cp-view-page {
+  --page-step: 24px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: var(--page-step);
   width: 100%;
   padding: 22px 28px 28px;
 }
 
 .cp-view-page > * {
-  animation: cp-float-up 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: cp-float-up var(--t-move) var(--ease-out) both;
 }
 .cp-view-page > *:nth-child(2) {
   animation-delay: 35ms;

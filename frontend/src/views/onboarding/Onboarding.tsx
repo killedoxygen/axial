@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useRef, useState } from 'preact/hooks';
-import { WindowControls } from '../../shell/WindowControls';
+import { WindowStrip } from '../../shell/WindowControls';
 import { Sound } from '../../sound';
 import { config } from '../../store';
 import { showOnboardingOverlay } from '../../ui-state';
@@ -59,9 +59,7 @@ export function Onboarding(): JSX.Element {
 
   return (
     <div class="cp-ob" data-phase={phase}>
-      <div class="cp-ob-chrome cp-drag">
-        <WindowControls />
-      </div>
+      <WindowStrip />
       <Stage player={identity.player} />
       <form class="cp-ob-pane" onSubmit={submit}>
         {styling && choice ? (

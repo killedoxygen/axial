@@ -5,7 +5,6 @@ import {
   FALLBACK_SKIN_ACCOUNT_KEY,
   hasSelectedSkinForAccount,
   launcherSkinAccountKey,
-  refreshAccountSkin,
   resetSelectedSkin,
   selectedSkinForAccount,
   setSelectedSkin,
@@ -395,7 +394,6 @@ export async function flushPendingApply(): Promise<void> {
     if (!isWardrobeContextCurrent(capture)) return null;
     await refreshWardrobe();
     void refreshAccountsData();
-    refreshAccountSkin();
     return commandSummary(response, 'Skin command accepted.');
   });
 }
@@ -524,7 +522,6 @@ export async function resetProfileSkin(): Promise<void> {
     const response = await api('POST', `/skin/profile/reset?${query.toString()}`, {});
     void refreshWardrobe();
     void refreshAccountsData();
-    refreshAccountSkin();
     return commandSummary(response, 'Skin command accepted.');
   });
 }
@@ -542,7 +539,6 @@ export async function resetProfileCape(): Promise<void> {
     const response = await api('POST', `/skin/cape/reset?${query.toString()}`, {});
     void refreshWardrobe();
     void refreshAccountsData();
-    refreshAccountSkin();
     return commandSummary(response, 'Skin command accepted.');
   });
 }

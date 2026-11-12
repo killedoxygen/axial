@@ -9,15 +9,10 @@
   position: relative;
 }
 .cp-instance > .cp-vista {
+  --vista-foot: linear-gradient(to bottom, #000 52%, oklch(0 0 0 / 0.55) 74%, oklch(0 0 0 / 0.15) 90%, transparent);
   width: 76%;
   height: 288px;
   aspect-ratio: auto;
-  -webkit-mask-image:
-    linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.3) 28%, #000 62%),
-    linear-gradient(to bottom, #000 34%, transparent 92%);
-  mask-image:
-    linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.3) 28%, #000 62%),
-    linear-gradient(to bottom, #000 34%, transparent 92%);
 }
 
 .cp-instance-head {
@@ -52,8 +47,8 @@
   font-family: inherit;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
 }
 .cp-pack-chip:hover {
   background: var(--fill-2);
@@ -73,46 +68,8 @@
   background: var(--fill-2);
 }
 
-/* Launch: the one solid action on the page, its menu joined on as a darker cap. */
-.cp-launch {
-  display: inline-flex;
-}
-.cp-launch > .cp-btn {
-  font-weight: 650;
-}
-.cp-launch > .cp-btn:first-child {
-  padding-right: 12px;
-  border-radius: var(--rad-ctl) 0 0 var(--rad-ctl);
-}
-.cp-launch-menu.cp-btn {
-  width: 34px;
-  padding: 0 4px 0 0;
-  border-radius: 0 var(--rad-ctl) var(--rad-ctl) 0;
-  background: oklch(from var(--solid) calc(l - 0.06) c h);
-}
-.cp-launch-menu.cp-btn:hover:not([disabled]) {
-  background: oklch(from var(--solid-hover) calc(l - 0.06) c h);
-}
-.cp-launch-menu.cp-btn > svg:first-child {
-  width: 14px;
-  height: 14px;
-  margin: 0;
-  padding: 0;
-  background: none;
-  stroke-width: 2.3;
-}
-/* While it prepares, the button keeps its colour and the ring carries the progress. */
-.cp-launch[data-busy='true'] > .cp-btn[disabled] {
-  opacity: 1;
-  cursor: progress;
-}
-.cp-launch-pct {
-  font-variant-numeric: tabular-nums;
-  opacity: 0.8;
-}
-
 .cp-instance > .cp-tabs {
-  margin: 32px 0 22px -6px;
+  margin: 32px 0 var(--page-step);
 }
 .cp-instance > .cp-notice {
   margin-bottom: 18px;
@@ -155,7 +112,7 @@
   flex-direction: column;
   min-width: 0;
   border-radius: var(--hold-lg);
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-pane[data-drop-state='active'] {
   background: var(--accent-softer);
@@ -228,29 +185,6 @@
 .cp-resource-note--error {
   color: var(--err-text);
 }
-/* Discover's own empty states still use this shape. */
-.cp-resource-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  min-height: 220px;
-  padding: 32px;
-  color: var(--text-dim);
-  text-align: center;
-}
-.cp-resource-empty strong {
-  color: var(--text);
-  font-size: 13.5px;
-  font-weight: 650;
-}
-.cp-resource-empty p {
-  max-width: 44ch;
-  margin: 0;
-  font-size: 12.5px;
-  line-height: 1.45;
-}
 
 /* Entries (mods, packs, worlds): one grid so numbers and actions line up, no header row. Each row is two calm
    lines beside the item's own art. */
@@ -270,7 +204,7 @@
   border-radius: var(--rad-row);
   color: var(--text);
   font-size: 13px;
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-entry:hover {
   --chip-bg: var(--fill-2);
@@ -343,7 +277,7 @@ strong.cp-entry-title {
 /* A row's menu stays quiet until the row is pointed at or focused. */
 .cp-entry > .cp-ibtn {
   opacity: 0.45;
-  transition: opacity 120ms ease;
+  transition: opacity var(--t-quick) var(--ease-out);
 }
 .cp-entry:is(:hover, :focus-within) > .cp-ibtn,
 .cp-entry > .cp-ibtn[aria-expanded='true'] {
@@ -384,7 +318,7 @@ strong.cp-entry-title {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  transition: scale 160ms ease;
+  transition: scale var(--t-pop) var(--ease-out);
 }
 .cp-shot-thumb:hover img {
   scale: 1.02;
@@ -394,7 +328,7 @@ strong.cp-entry-title {
   top: 10px;
   left: 10px;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: opacity var(--t-quick) var(--ease-out);
 }
 .cp-shot:is(:hover, :focus-within) > .cp-check,
 .cp-shot > .cp-check[data-selected='true'] {
@@ -511,12 +445,6 @@ strong.cp-entry-title {
   color: var(--err-text);
 }
 
-/* Settings: the shared setting rows under the instance's tabs; saving shows only while it happens. */
-.cp-instance-saving {
-  margin-bottom: 12px;
-  color: var(--text-mute);
-  font-size: 12px;
-}
 .cp-settings-pane > .cp-notice {
   margin-bottom: 18px;
 }

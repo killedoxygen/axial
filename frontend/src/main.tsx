@@ -6,13 +6,8 @@ import { local } from './state';
 import { initErrorReporting } from './error-reporting';
 import { applyTheme } from './theme';
 import { Sound, bindButtonSounds } from './sound';
-import {
-  applyDesktopChromeAttributes,
-  hasNativeDesktopRuntime,
-  installWindowDrag,
-  nativeDesktopCloseBlockedEventName,
-  onNativeEvent,
-} from './native';
+import { hasNativeDesktopRuntime, nativeDesktopCloseBlockedEventName, onNativeEvent } from './native';
+import { installWindowChrome } from './shell/window';
 import { toast } from './toast';
 import { restoreRoute } from './ui-state';
 import { dtoRecord } from './dto-contract';
@@ -21,8 +16,7 @@ import { nativePreferencesHydrated, reloadApplication } from './preferences/pers
 async function init(): Promise<void> {
   if (hasNativeDesktopRuntime()) Sound.enabled = false;
   initErrorReporting();
-  await applyDesktopChromeAttributes();
-  installWindowDrag();
+  await installWindowChrome();
 
   // Theme before anything else so the first paint is tinted correctly
   if (!hasNativeDesktopRuntime()) {

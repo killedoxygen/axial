@@ -25,9 +25,9 @@
   white-space: nowrap;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease,
-    scale 90ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-btn:hover:not([disabled]) {
   background: var(--chip-bg-hover, var(--fill-2));
@@ -161,6 +161,56 @@
   padding: 3px;
 }
 
+/* A figure after a button's words, such as how far it has got. */
+.cp-btn-note {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+/* ── Split button: the one solid action, its menu joined on as a darker cap ── */
+.cp-split {
+  --cap: 30px;
+  display: inline-flex;
+  flex: none;
+}
+.cp-split--sm {
+  --cap: 26px;
+}
+.cp-split--lg {
+  --cap: 34px;
+}
+.cp-split > .cp-btn {
+  padding-right: 12px;
+  border-radius: var(--rad-ctl) 0 0 var(--rad-ctl);
+  font-weight: 650;
+}
+/* The chevron stands in the middle of the cap's flat part: its round end is not room. */
+.cp-split-cap {
+  display: grid;
+  place-items: center;
+  width: var(--cap);
+  padding: 0 3px 0 0;
+  border: 0;
+  border-radius: 0 var(--rad-ctl) var(--rad-ctl) 0;
+  background: oklch(from var(--accent-fill) calc(l - 0.06) c h);
+  color: var(--accent-on);
+  cursor: pointer;
+  transition: background var(--t-quick) var(--ease-out);
+}
+.cp-split-cap:hover:not(:disabled) {
+  background: oklch(from var(--accent-fill-hover) calc(l - 0.06) c h);
+}
+.cp-split-cap:disabled {
+  cursor: not-allowed;
+}
+.cp-split:not([data-busy]) > .cp-split-cap:disabled {
+  opacity: 0.38;
+}
+.cp-split[data-busy] > :is(.cp-btn, .cp-split-cap):disabled {
+  opacity: 1;
+  cursor: progress;
+}
+
 .cp-ibtn {
   display: inline-flex;
   align-items: center;
@@ -175,9 +225,9 @@
   color: var(--text-dim);
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease,
-    scale 90ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-ibtn:hover:not([disabled]) {
   background: var(--fill);
@@ -215,7 +265,7 @@
   padding: 0 14px;
   border-radius: var(--rad-ctl);
   background: var(--fill);
-  transition: box-shadow 120ms ease;
+  transition: box-shadow var(--t-quick) var(--ease-out);
 }
 .cp-field:has(> svg:first-child, > .cp-face:first-child) {
   padding-left: 11px;
@@ -231,7 +281,7 @@
   width: 15px;
   height: 15px;
   color: var(--text-mute);
-  transition: color 120ms ease;
+  transition: color var(--t-quick) var(--ease-out);
 }
 .cp-field:hover > svg:first-child:not(.cp-face) {
   color: var(--text);
@@ -302,7 +352,7 @@
   border-radius: min(calc(var(--art) * 0.27), var(--hold-xl));
   background: var(--chip-bg, var(--fill));
   color: var(--text-mute);
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-art:has(img) {
   background: none;
@@ -432,7 +482,7 @@
   opacity: 0.26;
 }
 .cp-ring-run {
-  transition: stroke-dasharray 420ms cubic-bezier(0.2, 0, 0, 1);
+  transition: stroke-dasharray 420ms var(--ease-glide);
 }
 .cp-ring[data-busy='true'] .cp-ring-run {
   animation: cp-ring-run 1100ms linear infinite;
@@ -493,8 +543,8 @@
   background: var(--fill-2);
   cursor: pointer;
   transition:
-    background 160ms ease,
-    scale 90ms ease;
+    background var(--t-pop) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-toggle::after {
   content: '';
@@ -506,8 +556,8 @@
   border-radius: 3.75px;
   background: var(--text-mute);
   transition:
-    translate 160ms ease,
-    background 160ms ease;
+    translate var(--t-pop) var(--ease-out),
+    background var(--t-pop) var(--ease-out);
 }
 .cp-toggle[data-on='true'] {
   background: color-mix(in oklab, var(--accent) 32%, var(--fill));
@@ -538,8 +588,8 @@
   color: transparent;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
 }
 .cp-check:hover {
   background: oklch(from var(--fill-3) calc(l + 0.07) c h);
@@ -589,7 +639,7 @@
   height: 100%;
   border-radius: 2px;
   background: var(--accent);
-  transition: width 200ms ease;
+  transition: width var(--t-move) var(--ease-out);
 }
 .cp-meter--warn > span {
   background: var(--warn);
@@ -622,9 +672,9 @@
   white-space: nowrap;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease,
-    scale 90ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-tabs button:has(.cp-tab-count) {
   padding-right: 8px;
@@ -636,7 +686,7 @@
   width: 16px;
   height: 16px;
   color: var(--text-mute);
-  transition: color 120ms ease;
+  transition: color var(--t-quick) var(--ease-out);
 }
 .cp-tab-icon svg {
   width: 15px;
@@ -848,7 +898,7 @@
   margin: 0 -8px;
   padding: 4px 8px;
   border-radius: var(--rad-row);
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 /* In hand: under the pointer, or reached with the arrow keys. */
 .cp-row:is(:hover, [data-active='true']) {
@@ -872,7 +922,7 @@
   padding: 0 10px;
   border-radius: var(--rad-row);
   font-size: 13px;
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-tr:not(.cp-th):is(:hover, [data-selected='true']) {
   --chip-bg: var(--fill-2);
@@ -905,13 +955,28 @@
 }
 /* Hung from its target by the tip host. */
 .cp-tip--float {
-  position: fixed;
   z-index: 1400;
-  translate: -50% 0;
+  max-width: min(260px, calc(100vw - 20px));
+  overflow: hidden;
   pointer-events: none;
 }
-.cp-tip--float[data-placement='above'] {
-  translate: -50% -100%;
+.cp-tip--float[data-side='right'] {
+  animation: cp-tip-from-left var(--t-quick) var(--ease-out) both;
+}
+@keyframes cp-tip-from-left {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-tip--float {
+    animation: none;
+  }
 }
 .cp-tip .cp-kbd {
   margin-right: -4px;

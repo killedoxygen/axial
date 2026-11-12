@@ -23,6 +23,7 @@ export function Button({
   sound,
   pressed,
   busy,
+  progress,
   type = 'button',
 }: {
   children?: ComponentChildren;
@@ -38,8 +39,9 @@ export function Button({
   buttonRef?: { current: HTMLButtonElement | null };
   sound?: SoundKind | false;
   pressed?: boolean;
-  /** Still working: the ring stands in for the icon. */
+  /** Still working: the ring stands in for the icon, and with `progress` (0 to 100) shows how far. */
   busy?: boolean;
+  progress?: number | null;
   type?: 'button' | 'submit';
 }): JSX.Element {
   const cls = `cp-btn cp-btn--${size} cp-btn--${variant}${full ? ' cp-btn--full' : ''}`;
@@ -56,10 +58,50 @@ export function Button({
       data-sound={sound || undefined}
       data-sound-silent={sound === false ? 'true' : undefined}
     >
-      {busy ? <Ring /> : icon && <Icon name={icon} size={16} stroke={1.8} />}
+      {busy ? <Ring progress={progress} /> : icon && <Icon name={icon} size={16} stroke={1.8} />}
       {children != null && <span>{children}</span>}
       {trailing}
     </button>
+  );
+}
+
+/** A solid action with its menu joined on as a darker cap. While it is busy both halves keep their colour. */
+export function SplitButton({
+  children,
+  label,
+  menuLabel,
+  onMenu,
+  size = 'md',
+  busy,
+  ...button
+}: {
+  children: ComponentChildren;
+  /** Names the pair. */
+  label: string;
+  menuLabel: string;
+  onMenu: (e: MouseEvent) => void;
+  size?: BtnSize;
+  busy?: boolean;
+} & Pick<
+  Parameters<typeof Button>[0],
+  'icon' | 'progress' | 'trailing' | 'disabled' | 'sound' | 'onClick'
+>): JSX.Element {
+  return (
+    <div class={`cp-split cp-split--${size}`} role="group" aria-label={label} data-busy={busy || undefined}>
+      <Button size={size} busy={busy} {...button}>
+        {children}
+      </Button>
+      <button
+        type="button"
+        class="cp-split-cap"
+        aria-label={menuLabel}
+        aria-haspopup="menu"
+        disabled={busy}
+        onClick={onMenu}
+      >
+        <Icon name="chevron-down" size={14} stroke={2.3} />
+      </button>
+    </div>
   );
 }
 
@@ -127,29 +169,62 @@ export function Chip({
 const RING =
   'M8 1.75H10.1A4.15 4.15 0 0 1 14.25 5.9V10.1A4.15 4.15 0 0 1 10.1 14.25H5.9A4.15 4.15 0 0 1 1.75 10.1V5.9A4.15 4.15 0 0 1 5.9 1.75Z';
 
-/** Still going. With `progress` (0 to 100) the stroke runs clockwise from the top; without it a short stroke travels round. */
-export function Ring({ progress, size = 16 }: { progress?: number | null; size?: number }): JSX.Element {
+/**
+ * Still going. With `progress` (0 to 100) the stroke runs clockwise from the top; without it a short stroke travels
+ * round. With `edge` (its holder's corner radius) it is drawn slim along the holder's own edge instead of beside it.
+ */
+export function Ring({
+  progress,
+  size = 16,
+  edge,
+}: {
+  progress?: number | null;
+  size?: number;
+  edge?: number;
+}): JSX.Element {
   const busy = progress == null || !Number.isFinite(progress);
+  const run = { pathLength: 100, 'stroke-dasharray': busy ? '26 74' : `${Math.max(0, Math.min(100, progress))} 100` };
+  const inset = 0.75;
   return (
     <svg
       class="cp-ring"
       data-busy={busy || undefined}
+      data-edge={edge != null || undefined}
       width={size}
       height={size}
-      viewBox="0 0 16 16"
+      viewBox={edge != null ? `0 0 ${size} ${size}` : '0 0 16 16'}
       fill="none"
       stroke="currentColor"
-      stroke-width={size >= 20 ? 1.9 : 2.2}
+      stroke-width={edge != null ? inset * 2 : size >= 20 ? 1.9 : 2.2}
       stroke-linecap="round"
       aria-hidden="true"
     >
-      <path class="cp-ring-track" d={RING} />
-      <path
-        class="cp-ring-run"
-        d={RING}
-        pathLength={100}
-        stroke-dasharray={busy ? '26 74' : `${Math.max(0, Math.min(100, progress))} 100`}
-      />
+      {edge != null ? (
+        <>
+          <rect
+            class="cp-ring-track"
+            x={inset}
+            y={inset}
+            width={size - 2 * inset}
+            height={size - 2 * inset}
+            rx={edge - inset}
+          />
+          <rect
+            class="cp-ring-run"
+            x={inset}
+            y={inset}
+            width={size - 2 * inset}
+            height={size - 2 * inset}
+            rx={edge - inset}
+            {...run}
+          />
+        </>
+      ) : (
+        <>
+          <path class="cp-ring-track" d={RING} />
+          <path class="cp-ring-run" d={RING} {...run} />
+        </>
+      )}
     </svg>
   );
 }

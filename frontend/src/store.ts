@@ -48,7 +48,6 @@ export const launchNotices = signal<Record<string, LaunchNotice>>({});
 export type LogSeverity = 'error' | 'system' | 'info';
 export const logLines = signal(0);
 export const collapsedLogSeverity = signal<LogSeverity | null>(null);
-export const collapsedGroups = signal<Record<string, boolean>>({});
 export const bootstrapState = signal<'loading' | 'ready' | 'error'>('loading');
 export const bootstrapError = signal<string | null>(null);
 export const appVersion = signal('1.1.0');

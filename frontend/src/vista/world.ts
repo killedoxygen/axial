@@ -181,6 +181,9 @@ export interface World {
   blockLight: Uint8Array;
   skyLight: Uint8Array;
   atlas: T.Atlas;
+  /** The game's own sun and full moon, thirty-two texels a side, where the version has them. */
+  sunTexture: Uint8Array | undefined;
+  moonTexture: Uint8Array | undefined;
   /** The time of day as a turn of the sky: 0 at sunrise, a quarter at noon, a half at sunset. */
   time: number;
   /** Unit vector toward the sun, which is under the horizon at night; the moon stands opposite. */
@@ -560,12 +563,13 @@ const DARK_HOURS: Hour[] = [
   { time: 0.512, bearing: 0.06 },
   // The same hour with the sun to one side.
   { time: 0.512, bearing: 0.55 },
-  // Afterglow, the sun on the horizon.
+  // Afterglow, the sun on the horizon, ahead and then to one side.
   { time: 0.527, bearing: 0.08 },
+  { time: 0.527, bearing: 0.5 },
+  // Dusk: the sun just gone ahead, the moon rising behind.
+  { time: 0.546, bearing: 3.0 },
   // Night, the moon low ahead.
   { time: 0.6, bearing: -0.3 },
-  // Deep night, the moon high behind.
-  { time: 0.72, bearing: 2.5 },
 ];
 
 const LIGHT_HOURS: Hour[] = [
@@ -652,7 +656,12 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
     aimX = riverX(70);
   } else if (scene === 'lake') {
     const lakeX = mid + 6 * side;
-    inland = (x, z) => Math.hypot((x - lakeX) / 1.2, z - 62) - 44 - (valueNoise(x / 16, z / 16, seed + 9) - 0.5) * 24;
+    // The near shore keeps clear of the camera, which stands on it and not on an islet.
+    inland = (x, z) =>
+      Math.hypot((x - lakeX) / 1.2, z - 62) -
+      44 -
+      (valueNoise(x / 16, z / 16, seed + 9) - 0.5) * 24 +
+      Math.max(0, 26 - z) * 0.6;
     climb = (x, z, d) =>
       Math.max(0, d - 8) * 0.24 * far(x, z) + smooth((z - 110) / 60) * 16 * fbm(x / 30, z / 30, seed + 7);
     basin = [5, 14];
@@ -693,6 +702,11 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
   }
   const cameraX = Math.round(standX) + 0.5;
   const heading = Math.atan2(aimX - cameraX, 62);
+  const headX = Math.sin(heading);
+  const headZ = Math.cos(heading);
+  /** How far ahead of the camera a point lies, and how far to its right. */
+  const aheadOf = (x: number, z: number): number => (z - cameraZ) * headZ + (x - cameraX) * headX;
+  const asideOf = (x: number, z: number): number => (x - cameraX) * headZ - (z - cameraZ) * headX;
   const beach = scene === 'coast' ? 7 : 2.5;
   const flat = scene === 'marsh' ? 0 : 1;
 
@@ -759,15 +773,21 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
   let gladeX = -99;
   let gladeZ = -99;
   if (has(LAVA) && (dark || next() < biome.lava)) {
-    // The nearest shore-side land in the part of the view right of centre.
-    const wanted = 14 + next() * 6;
+    // The nearest shore-side land to either side of the view's middle.
+    const wanted = 10 + next() * 5;
     let best = Infinity;
     for (let z = cameraZ; z < cameraZ + 110; z++) {
       for (let x = 8; x < n - 8; x++) {
-        const ahead = (z - cameraZ) * Math.cos(heading) + (x - cameraX) * Math.sin(heading);
-        const aside = (x - cameraX) * Math.cos(heading) - (z - cameraZ) * Math.sin(heading);
-        if (ahead < 12 || aside < ahead * 0.15 || aside > ahead * 0.75 || ground[z * n + x]! <= sea) continue;
-        const score = Math.abs(ahead - wanted) + Math.abs(inland(x, z) - 5) * 0.6;
+        const ahead = aheadOf(x, z);
+        const aside = asideOf(x, z);
+        const wide = Math.abs(aside);
+        if (ahead < 9 || wide < ahead * 0.15 || wide > ahead * 0.92 || ground[z * n + x]! <= sea) continue;
+        // Right of centre for choice; left of it sooner than far away.
+        const score =
+          Math.abs(ahead - wanted) +
+          Math.abs(inland(x, z) - 5) * 0.6 +
+          (aside < 0 ? 6 : 0) +
+          Math.max(0, wide / ahead - 0.6) * 30;
         if (score < best) {
           best = score;
           gladeX = x;
@@ -782,7 +802,7 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
         for (let dx = -3; dx <= 3; dx++)
           foot = Math.min(foot, Math.max(sea + 1, ground[(gladeZ + dz) * n + gladeX + dx]!));
       // By night a standing frame shows where a pool lying flat would not.
-      const portal = has(OBSIDIAN) && has(NETHERRACK) && has(MAGMA) && next() < (hour.time > 0.55 ? 0.8 : 0.35);
+      const portal = has(OBSIDIAN) && has(NETHERRACK) && has(MAGMA) && next() < (hour.time > 0.54 ? 0.85 : 0.5);
       for (let dz = -8; dz <= 8; dz++) {
         for (let dx = -8; dx <= 8; dx++) {
           const i = (gladeZ + dz) * n + gladeX + dx;
@@ -799,9 +819,26 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
           const most = foot + (d < 5 ? 0 : Math.ceil((d - 5) * 0.5));
           ground[i] = d < 5 ? foot : Math.min(ground[i]!, most);
           if (portal) {
-            if (d < 4.6) groundMat[i] = rough > 0.8 ? LAVA : rough > 0.62 ? MAGMA : NETHERRACK;
+            if (d < 4.6) groundMat[i] = rough > 0.66 ? LAVA : rough > 0.5 ? MAGMA : NETHERRACK;
           } else if (d < 4.4) groundMat[i] = LAVA;
           else if (d < 5.6) groundMat[i] = STONE;
+        }
+      }
+      // Nothing between the camera and the light stands above the straight slope from the one's footing to the
+      // other's; to either side of that line the land climbs back gently, so no trench shows.
+      const eyeGround = ground[cameraZ * n + Math.floor(cameraX)]!;
+      const run = Math.hypot(gladeX - cameraX, gladeZ - cameraZ);
+      for (let z = cameraZ; z <= gladeZ + 8; z++) {
+        for (let x = 1; x < n - 1; x++) {
+          const along = ((x - cameraX) * (gladeX - cameraX) + (z - cameraZ) * (gladeZ - cameraZ)) / run;
+          const off = Math.abs((x - cameraX) * (gladeZ - cameraZ) - (z - cameraZ) * (gladeX - cameraX)) / run;
+          if (along < 0 || along > run - 4) continue;
+          const i = z * n + x;
+          const slope = Math.round(
+            eyeGround + (Math.min(eyeGround, foot) - eyeGround) * Math.min(1, along / (run - 5)),
+          );
+          const most = Math.max(sea + 1, slope) + Math.ceil(Math.max(0, off - 2 - along * 0.4) * 0.5);
+          if (ground[i]! > most) ground[i] = most;
         }
       }
       // Lava lies in the ground: where the land falls away beside it, stone holds it in.
@@ -991,8 +1028,8 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
       const i = jz * n + jx;
       if (!bare(i) || (sandy(groundMat[i]!) || groundMat[i] === TERRACOTTA) !== cactus) continue;
       // Keep the camera's footing, the view straight ahead of it and the water's edge clear.
-      const ahead = (jz - cameraZ) * Math.cos(heading) + (jx - cameraX) * Math.sin(heading);
-      const aside = Math.abs((jx - cameraX) * Math.cos(heading) - (jz - cameraZ) * Math.sin(heading));
+      const ahead = aheadOf(jx, jz);
+      const aside = Math.abs(asideOf(jx, jz));
       if (Math.hypot(jx - cameraX, jz - cameraZ) < 8 || (ahead > 0 && ahead < 32 && aside < 4 + ahead * 0.3)) continue;
       if (scene !== 'marsh' && inland(jx, jz) < 2) continue;
       if (Math.hypot(jx - gladeX, jz - gladeZ) < 7) continue;
@@ -1017,7 +1054,7 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
         continue;
       }
       const close = Math.hypot(x - cameraX, z - cameraZ);
-      if (!bare(i) || close < 3.5 || Math.hypot(x - gladeX, z - gladeZ) < 8) continue;
+      if (!bare(i) || close < 5 || Math.hypot(x - gladeX, z - gladeZ) < 8) continue;
       // Nothing grows between the camera and its light.
       const along = ((x - cameraX) * (gladeX - cameraX) + (z - cameraZ) * (gladeZ - cameraZ)) / gladeReach;
       if (
@@ -1041,7 +1078,7 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
       let roll = hash2(x, z, seed + 67);
       for (const [plant, chance] of biome.plants) {
         const odds = chance * (plant >= POPPY && plant <= ORCHID ? drift : plant <= FERN ? tuft : 1);
-        if (roll < odds && (plant !== TALL_GRASS || close > 5)) {
+        if (roll < odds && (plant !== TALL_GRASS || close > 10)) {
           addRun(x, z, g, g + (plant === TALL_GRASS ? 2 : 1), plant);
           break;
         }
@@ -1077,19 +1114,19 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
     blockLight[i] = glow;
     skyLight[i] = Math.max(0, 15 - shade);
   }
+  const spread = (from: number, to: number): void => {
+    if (from < 0 || from >= n * n) return;
+    const lamp = blockLight[from]! - 1 - Math.abs(ground[from]! - ground[to]!);
+    if (lamp > blockLight[to]!) blockLight[to] = lamp;
+    if (skyLight[from]! - 1 > skyLight[to]!) skyLight[to] = skyLight[from]! - 1;
+  };
   for (let pass = 0; pass < 4; pass++) {
     const forward = (pass & 1) === 0;
     for (let k = 0; k < n * n; k++) {
       const i = forward ? k : n * n - 1 - k;
       const x = i % n;
-      const across = forward ? (x > 0 ? i - 1 : -1) : x < n - 1 ? i + 1 : -1;
-      const along = forward ? i - n : i + n;
-      for (const from of [across, along]) {
-        if (from < 0 || from >= n * n) continue;
-        const spread = blockLight[from]! - 1 - Math.abs(ground[from]! - ground[i]!);
-        if (spread > blockLight[i]!) blockLight[i] = spread;
-        if (skyLight[from]! - 1 > skyLight[i]!) skyLight[i] = skyLight[from]! - 1;
-      }
+      spread(forward ? (x > 0 ? i - 1 : -1) : x < n - 1 ? i + 1 : -1, i);
+      spread(forward ? i - n : i + n, i);
     }
   }
 
@@ -1116,6 +1153,8 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
     blockLight,
     skyLight,
     atlas: T.buildAtlas(pack, biome.grass, biome.foliage),
+    sunTexture: pack.get('sun'),
+    moonTexture: pack.get('moon'),
     time: hour.time,
     sun: [Math.sin(bearing) * level, height, Math.cos(bearing) * level],
     camera: { x: cameraX, y: ground[cameraZ * n + Math.floor(cameraX)]! + 1.62, z: cameraZ + 0.5, yaw },

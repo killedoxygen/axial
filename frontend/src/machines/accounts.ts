@@ -5,7 +5,7 @@ import { configResponse } from '../dto-core';
 import { refreshInstanceReadiness } from '../instance-readiness';
 import { signInWithMicrosoft, type NativeMicrosoftSignInResult } from '../native';
 import { promptNewPlayerName, promptPlayerName } from '../player-name';
-import { forgetAccountSkin, moveAccountSkin, refreshAccountSkin } from '../player-skin';
+import { forgetAccountSkin, moveAccountSkin } from '../player-skin';
 import { toast } from '../toast';
 import { showConfirm } from '../ui/Dialog';
 import { config } from '../store';
@@ -68,9 +68,11 @@ async function readAccountsData(requestId: number): Promise<void> {
       selection_revision: list.selection_revision,
     };
   } catch {
+    // A read that fails takes the commands away, never the accounts already known: the shell keeps showing who
+    // is playing.
     next = {
       state: 'unavailable',
-      accounts: [],
+      accounts: accountsSnapshot.value.accounts,
       signInAvailable: false,
       revision: accountsSnapshot.value.revision,
       selection_revision: null,
@@ -79,7 +81,6 @@ async function readAccountsData(requestId: number): Promise<void> {
   // A command that finished meanwhile started a newer read.
   if (requestId !== accountsRequestId) return;
   accountsSnapshot.value = next;
-  refreshAccountSkin();
 }
 
 /** What launch readiness depends on: the settings and selection revisions and the selected account's online state. */

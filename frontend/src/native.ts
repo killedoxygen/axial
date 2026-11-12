@@ -29,6 +29,11 @@ function getTauriBinding(): TauriBinding | null {
   return window.__TAURI__ ?? null;
 }
 
+/** The desktop shell's commands; none in a browser. */
+export function nativeCommands(): TauriInvokeBinding | null {
+  return getTauriBinding()?.core ?? null;
+}
+
 export type NativeDragDropType = 'enter' | 'over' | 'drop' | 'leave';
 
 export interface NativeDragDropPayload {
@@ -104,37 +109,13 @@ export function isMacPlatform(): boolean {
   return typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent);
 }
 
-export function hasCustomWindowControls(): boolean {
-  return desktopChrome.chrome_mode === 'custom-frameless';
+export function desktopChromeMode(): DesktopChromeMode {
+  return desktopChrome.chrome_mode;
 }
 
-export function hasCustomDragRegion(): boolean {
-  return desktopChrome.chrome_mode === 'custom-frameless' || desktopChrome.chrome_mode === 'mac-overlay';
-}
-
-export async function applyDesktopChromeAttributes(): Promise<void> {
+/** Asks the desktop shell what it is running on. A browser, or a shell that will not say, stays `browser`. */
+export async function loadDesktopChrome(): Promise<void> {
   desktopChrome = await getNativeDesktopChrome().catch(() => browserDesktopChrome);
-  const root = document.documentElement;
-  root.dataset.desktopPlatform = desktopChrome.platform;
-  root.dataset.desktopChrome = desktopChrome.chrome_mode;
-  root.dataset.windowControls = hasCustomWindowControls() ? 'custom' : 'native';
-  root.dataset.windowFrame = desktopChrome.chrome_mode;
-}
-
-export function nativeInstallEventName(installId: string): string {
-  return `axial:install:${installId}:progress`;
-}
-
-export function nativeLoaderInstallEventName(installId: string): string {
-  return `axial:loader-install:${installId}:progress`;
-}
-
-export function nativeLaunchStatusEventName(sessionId: string): string {
-  return `axial:launch:${sessionId}:status`;
-}
-
-export function nativeLaunchLogEventName(sessionId: string): string {
-  return `axial:launch:${sessionId}:log`;
 }
 
 export const nativeDesktopCloseBlockedEventName = 'axial:desktop:close-blocked';
@@ -368,81 +349,6 @@ export async function openExternalURL(url: string): Promise<void> {
   }
 
   window.open(externalUrl.href, '_blank', 'noopener,noreferrer');
-}
-
-export async function windowMinimize(): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('window_minimize');
-  return true;
-}
-
-export async function windowToggleMaximize(): Promise<boolean | null> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return null;
-  const value = await tauri.core.invoke('window_toggle_maximize');
-  if (typeof value !== 'boolean') throw new Error('Native maximize response was invalid.');
-  return value;
-}
-
-export async function windowClose(): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('window_close');
-  return true;
-}
-
-export async function windowIsMaximized(): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  const value = await tauri.core.invoke('window_is_maximized');
-  if (typeof value !== 'boolean') throw new Error('Native maximize state was invalid.');
-  return value;
-}
-
-export async function windowStartDragging(): Promise<boolean> {
-  const tauri = getTauriBinding();
-  if (!tauri?.core) return false;
-  await tauri.core.invoke('window_start_dragging');
-  return true;
-}
-
-// WKWebView and WebKitGTK ignore CSS app-region, so one delegated listener moves the window.
-// `.cp-drag` drags across its whole area; `[data-window-drag-strip]` backdrops only within the top strip.
-const WINDOW_DRAG_EXCLUDED = '.cp-nodrag, button, input, select, textarea, a, [role="button"]';
-
-function windowDragStripHeight(): number {
-  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--cp-window-drag-strip-h')) || 0;
-}
-
-function isWindowDragTarget(event: MouseEvent): boolean {
-  const target = event.target;
-  if (!hasCustomDragRegion() || event.button !== 0 || !(target instanceof Element)) return false;
-  if (target.closest(WINDOW_DRAG_EXCLUDED)) return false;
-  if (target.closest('.cp-drag')) return true;
-  return target.matches('[data-window-drag-strip]') && event.clientY < windowDragStripHeight();
-}
-
-export function installWindowDrag(): void {
-  document.addEventListener('mousedown', (event) => {
-    if (!isWindowDragTarget(event)) return;
-    event.preventDefault();
-    void (event.detail === 2 ? windowToggleMaximize() : windowStartDragging());
-  });
-  // A press on a backdrop's drag strip moves the window; it must not also dismiss the overlay.
-  document.addEventListener(
-    'click',
-    (event) => {
-      if (
-        event.target instanceof Element &&
-        event.target.matches('[data-window-drag-strip]') &&
-        isWindowDragTarget(event)
-      ) {
-        event.stopPropagation();
-      }
-    },
-    true,
-  );
 }
 
 export async function windowSetResizeBackground(dark: boolean): Promise<boolean> {

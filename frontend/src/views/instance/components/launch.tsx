@@ -1,6 +1,5 @@
 import type { JSX } from 'preact';
-import { Icon } from '../../../ui/Icons';
-import { Button, IconButton, Meter, Ring } from '../../../ui/Atoms';
+import { Button, IconButton, Meter, SplitButton } from '../../../ui/Atoms';
 import { Face, type Eyes, type FaceTone } from '../../../ui/Face';
 import { DownloadFailureNotice } from '../../../ui/DownloadFailureNotice';
 import { openContextMenu, type ContextMenuItem } from '../../../ui/ContextMenu';
@@ -98,47 +97,39 @@ export function LaunchSplitButton({
         }
       : { icon: 'play', label: 'Launch now', onSelect: onLaunch };
   return (
-    <div class="cp-launch" role="group" aria-label="Instance actions" data-busy={Boolean(progress)}>
-      <button
-        class="cp-btn cp-btn--lg cp-btn--primary"
-        type="button"
-        onClick={disabled ? undefined : primaryAction}
-        data-sound={usesInstallAction ? 'bright' : 'launchPress'}
-        disabled={disabled}
-      >
-        {progress ? <Ring progress={progress.determinate ? pct : null} /> : <Icon name={icon} size={16} />}
-        <span>{label}</span>
-        {progress?.determinate && <span class="cp-launch-pct">{Math.round(pct)}%</span>}
-      </button>
-      <button
-        class="cp-btn cp-btn--lg cp-btn--primary cp-launch-menu"
-        type="button"
-        aria-label="Instance options"
-        aria-haspopup="menu"
-        disabled={Boolean(progress)}
-        onClick={(e) =>
-          openContextMenu(e, [
-            primaryMenuItem,
-            { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
-            { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
-            { label: '', onSelect: () => {}, divider: true },
-            { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
-            {
-              icon: 'folder',
-              label: 'Open resource packs folder',
-              onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks'),
-            },
-            {
-              icon: 'folder',
-              label: 'Open shader packs folder',
-              onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks'),
-            },
-          ])
-        }
-      >
-        <Icon name="chevron-down" size={14} />
-      </button>
-    </div>
+    <SplitButton
+      size="lg"
+      label="Instance actions"
+      menuLabel="Instance options"
+      icon={icon}
+      busy={Boolean(progress)}
+      progress={progress?.determinate ? pct : null}
+      trailing={progress?.determinate && <span class="cp-btn-note">{Math.round(pct)}%</span>}
+      disabled={disabled}
+      sound={usesInstallAction ? 'bright' : 'launchPress'}
+      onClick={primaryAction}
+      onMenu={(e) =>
+        openContextMenu(e, [
+          primaryMenuItem,
+          { icon: 'settings', label: 'Launch settings', onSelect: onOpenSettings },
+          { icon: 'terminal', label: 'View launch logs', onSelect: onOpenLogs },
+          { label: '', onSelect: () => {}, divider: true },
+          { icon: 'folder', label: 'Open instance folder', onSelect: () => void openInstanceFolder(inst.id) },
+          {
+            icon: 'folder',
+            label: 'Open resource packs folder',
+            onSelect: () => void openInstanceFolder(inst.id, 'resourcepacks'),
+          },
+          {
+            icon: 'folder',
+            label: 'Open shader packs folder',
+            onSelect: () => void openInstanceFolder(inst.id, 'shaderpacks'),
+          },
+        ])
+      }
+    >
+      {label}
+    </SplitButton>
   );
 }
 
@@ -175,21 +166,22 @@ export function InstallBarrierPane({
     );
   }
 
+  // The Launch button already names the step and how far it is; this says why the tabs are away, and shows it.
   const pct = installProgress ? Math.max(0, Math.min(100, Math.round(installProgress.pct))) : 0;
   const targetLabel = installLabel || installTarget;
   const heading = installQueued ? installQueuedView?.title || installLabel : 'Installing required files';
   const body = installProgress
-    ? `${installProgress.label} for ${targetLabel}.`
+    ? ''
     : installQueued
       ? installQueuedView?.summary || `${targetLabel} is waiting in the download queue.`
       : `Axial is preparing the required version files for ${targetLabel}.`;
-  const detail = installProgress ? `${pct}% complete` : installQueued ? installQueuedView?.detail || '' : '';
+  const detail = installQueued && !installProgress ? installQueuedView?.detail || '' : '';
 
   return (
     <section class="cp-install" aria-live="polite">
       <div class="cp-install-copy">
         <h2>{heading}</h2>
-        <p>{body}</p>
+        {body && <p>{body}</p>}
       </div>
       <Meter value={pct} height={6} ariaLabel={`Install progress for ${targetLabel}`} />
       <div class="cp-install-foot">

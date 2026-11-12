@@ -1,40 +1,9 @@
-import type { JSX } from 'preact';
-import { useRef } from 'preact/hooks';
+import type { ComponentChildren, JSX } from 'preact';
+import { useRef, useState } from 'preact/hooks';
 import { playSliderSound } from '../sound';
-
-export interface SliderZone {
-  from: number;
-  to: number;
-  tone: 'low' | 'sweet' | 'high' | 'extreme';
-  label?: string;
-}
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
-}
-
-function zoneStyle(zone: SliderZone, min: number, max: number): JSX.CSSProperties {
-  const range = Math.max(1e-9, max - min);
-  const from = clamp(zone.from, min, max);
-  const to = clamp(zone.to, from, max);
-  return {
-    left: `${((from - min) / range) * 100}%`,
-    width: `${((to - from) / range) * 100}%`,
-  };
-}
-
-function zonesFromRecommendation(recommended: [number, number] | undefined, min: number, max: number): SliderZone[] {
-  if (!recommended) return [];
-  const low = clamp(recommended[0], min, max);
-  const high = clamp(recommended[1], low, max);
-  const range = Math.max(1e-9, max - min);
-  const extremeFrom = clamp(max - range * 0.18, high, max);
-  const zones: SliderZone[] = [];
-  if (low > min) zones.push({ from: min, to: low, tone: 'low', label: 'Low' });
-  zones.push({ from: low, to: high, tone: 'sweet', label: 'Sweet spot' });
-  if (extremeFrom > high) zones.push({ from: high, to: extremeFrom, tone: 'high', label: 'High' });
-  if (extremeFrom < max) zones.push({ from: extremeFrom, to: max, tone: 'extreme', label: 'Extreme' });
-  return zones;
 }
 
 export function snapToStep(value: number, min: number, max: number, step: number): number {
@@ -42,6 +11,146 @@ export function snapToStep(value: number, min: number, max: number, step: number
   const snapped = Math.round((value - min) / safeStep) * safeStep + min;
   const decimals = Math.max(0, `${safeStep}`.split('.')[1]?.length ?? 0);
   return Number(clamp(snapped, min, max).toFixed(decimals));
+}
+
+interface Scale {
+  min: number;
+  max: number;
+  step: number;
+}
+
+interface Thumb {
+  value: number;
+  label?: string;
+  /** How far this thumb may go, inside the scale. */
+  floor: number;
+  ceil: number;
+}
+
+/**
+ * The track every slider is: one thumb or several. A thumb follows the pointer exactly while it is dragged and
+ * settles on the nearest step when let go; the value it reports is always a step. Each thumb's place is published
+ * as `--t0`, `--t1`… for whatever the track draws. Keys go to a hidden native range input per thumb.
+ */
+function Track({
+  min,
+  max,
+  step,
+  thumbs,
+  onChange,
+  onCommit,
+  sound,
+  class: className,
+  children,
+}: Scale & {
+  thumbs: Thumb[];
+  onChange: (thumb: number, value: number) => void;
+  onCommit: (thumb: number, value: number) => void;
+  sound: string | false;
+  class?: string;
+  children: ComponentChildren;
+}): JSX.Element {
+  const range = Math.max(1e-9, max - min);
+  const ratio = (value: number): number => (clamp(value, min, max) - min) / range;
+  const inputs = useRef<(HTMLInputElement | null)[]>([]);
+  const [drag, setDrag] = useState<{ thumb: number; at: number } | null>(null);
+
+  const move = (index: number, raw: number, commit: boolean): void => {
+    const thumb = thumbs[index]!;
+    const next = clamp(snapToStep(raw, min, max, step), thumb.floor, thumb.ceil);
+    if (next !== thumb.value) {
+      if (sound) playSliderSound(ratio(next), sound);
+      onChange(index, next);
+    }
+    if (commit) onCommit(index, next);
+  };
+
+  const pointAt = (event: JSX.TargetedPointerEvent<HTMLElement>): number => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+  };
+  /** The thumb a press takes: the nearest, and of two on the same spot the one that can go the pointer's way. */
+  const nearest = (point: number): number =>
+    thumbs.reduce((best, thumb, index) => {
+      const gap = Math.abs(ratio(thumb.value) - point);
+      const bestGap = Math.abs(ratio(thumbs[best]!.value) - point);
+      return gap < bestGap || (gap === bestGap && point > ratio(thumb.value)) ? index : best;
+    }, 0);
+
+  const place = (thumb: Thumb, index: number): number =>
+    drag?.thumb === index ? clamp(drag.at, ratio(thumb.floor), ratio(thumb.ceil)) : ratio(thumb.value);
+  const release = (event: JSX.TargetedPointerEvent<HTMLElement>): void => {
+    if (!drag) return;
+    move(drag.thumb, min + pointAt(event) * range, true);
+    setDrag(null);
+  };
+
+  return (
+    <div
+      class={className ? `cp-slider ${className}` : 'cp-slider'}
+      data-dragging={drag ? 'true' : undefined}
+      style={Object.fromEntries(thumbs.map((thumb, index) => [`--t${index}`, `${place(thumb, index) * 100}%`]))}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+        const at = pointAt(event);
+        const thumb = nearest(at);
+        inputs.current[thumb]?.focus();
+        setDrag({ thumb, at });
+        move(thumb, min + at * range, false);
+      }}
+      onPointerMove={(event) => {
+        if (!drag) return;
+        const at = pointAt(event);
+        setDrag({ thumb: drag.thumb, at });
+        move(drag.thumb, min + at * range, false);
+      }}
+      onPointerUp={release}
+      onPointerCancel={release}
+    >
+      <div class="cp-slider-track">{children}</div>
+      {thumbs.map((thumb, index) => (
+        <input
+          key={index}
+          ref={(element) => {
+            inputs.current[index] = element;
+          }}
+          type="range"
+          data-thumb={index}
+          min={min}
+          max={max}
+          step={step}
+          value={thumb.value}
+          aria-label={thumb.label}
+          onInput={(event) => move(index, parseFloat(event.currentTarget.value), false)}
+          onChange={(event) => move(index, parseFloat(event.currentTarget.value), true)}
+        />
+      ))}
+      {thumbs.map((_, index) => (
+        <div key={index} class="cp-slider-thumb" data-thumb={index} style={{ left: `var(--t${index})` }} />
+      ))}
+    </div>
+  );
+}
+
+type ZoneTone = 'low' | 'sweet' | 'high' | 'extreme';
+
+/** The scale in bands around a recommended span: below it, in it, above it, and the last stretch. */
+function zones(
+  recommended: [number, number],
+  min: number,
+  max: number,
+): { from: number; to: number; tone: ZoneTone }[] {
+  const low = clamp(recommended[0], min, max);
+  const high = clamp(recommended[1], low, max);
+  const extreme = clamp(max - (max - min) * 0.18, high, max);
+  return [
+    { from: min, to: low, tone: 'low' as const },
+    { from: low, to: high, tone: 'sweet' as const },
+    { from: high, to: extreme, tone: 'high' as const },
+    { from: extreme, to: max, tone: 'extreme' as const },
+  ].filter((zone) => zone.to > zone.from);
 }
 
 export function Slider({
@@ -54,88 +163,85 @@ export function Slider({
   recommended,
   sound = false,
   ariaLabel,
-  class: cls,
-}: {
+  class: className,
+}: Partial<Scale> & {
   value: number;
-  min?: number;
-  max?: number;
-  step?: number;
-  onChange: (v: number) => void;
-  onCommit?: (v: number) => void;
+  onChange: (value: number) => void;
+  onCommit?: (value: number) => void;
+  /** Tints the track around this span. */
   recommended?: [number, number];
   sound?: string | false;
   ariaLabel?: string;
   class?: string;
 }): JSX.Element {
-  const inputRef = useRef<HTMLInputElement | null>(null);
   const range = Math.max(1e-9, max - min);
-  const clampedValue = clamp(value, min, max);
-  const pct = ((clampedValue - min) / range) * 100;
-  const shownZones = zonesFromRecommendation(recommended, min, max).filter(
-    (zone) => clamp(zone.to, min, max) > clamp(zone.from, min, max),
-  );
-  const emit = (next: number): void => {
-    if (sound) playSliderSound((clamp(next, min, max) - min) / range, sound);
-    onChange(next);
-  };
-  const valueFromPointer = (event: PointerEvent, element: HTMLElement): number => {
-    const rect = element.getBoundingClientRect();
-    const ratio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-    return snapToStep(min + ratio * range, min, max, step);
-  };
-  const handlePointer = (event: PointerEvent, commit: boolean): void => {
-    const element = event.currentTarget as HTMLElement;
-    const next = valueFromPointer(event, element);
-    if (inputRef.current) inputRef.current.focus();
-    emit(next);
-    if (commit) onCommit?.(next);
-  };
   return (
-    <div
-      class={cls ? `cp-slider ${cls}` : 'cp-slider'}
-      style={{ ['--slider-filled' as string]: `${pct}%` }}
-      onPointerDown={(event) => {
-        if (event.button !== 0) return;
-        event.preventDefault();
-        (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-        handlePointer(event as unknown as PointerEvent, false);
-      }}
-      onPointerMove={(event) => {
-        if (!(event.currentTarget as HTMLElement).hasPointerCapture(event.pointerId)) return;
-        event.preventDefault();
-        handlePointer(event as unknown as PointerEvent, false);
-      }}
-      onPointerUp={(event) => {
-        if (!(event.currentTarget as HTMLElement).hasPointerCapture(event.pointerId)) return;
-        event.preventDefault();
-        handlePointer(event as unknown as PointerEvent, true);
-        (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
-      }}
+    <Track
+      min={min}
+      max={max}
+      step={step}
+      thumbs={[{ value: clamp(value, min, max), label: ariaLabel, floor: min, ceil: max }]}
+      onChange={(_, next) => onChange(next)}
+      onCommit={(_, next) => onCommit?.(next)}
+      sound={sound}
+      class={className}
     >
-      <div class="cp-slider-track">
-        {shownZones.map((zone, index) => (
+      {recommended &&
+        zones(recommended, min, max).map((zone) => (
           <div
-            key={`${zone.tone}-${index}`}
+            key={zone.tone}
             class="cp-slider-zone"
             data-tone={zone.tone}
-            title={zone.label}
-            style={zoneStyle(zone, min, max)}
+            style={{
+              left: `${((zone.from - min) / range) * 100}%`,
+              width: `${((zone.to - zone.from) / range) * 100}%`,
+            }}
           />
         ))}
-        <div class="cp-slider-fill" />
-      </div>
-      <input
-        ref={inputRef}
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        aria-label={ariaLabel}
-        onInput={(e: any) => emit(parseFloat(e.currentTarget.value))}
-        onChange={(e: any) => onCommit?.(parseFloat(e.currentTarget.value))}
-      />
-      <div class="cp-slider-thumb" aria-hidden="true" />
-    </div>
+      <div class="cp-slider-fill" />
+    </Track>
+  );
+}
+
+/** Two thumbs on one track; neither passes the other. */
+export function RangeSlider({
+  low,
+  high,
+  min = 0,
+  max = 100,
+  step = 1,
+  onChange,
+  onCommit,
+  sound = false,
+  ariaLabelLow,
+  ariaLabelHigh,
+}: Partial<Scale> & {
+  low: number;
+  high: number;
+  onChange: (low: number, high: number) => void;
+  onCommit?: (low: number, high: number) => void;
+  sound?: string | false;
+  ariaLabelLow?: string;
+  ariaLabelHigh?: string;
+}): JSX.Element {
+  const safeLow = clamp(low, min, high);
+  const safeHigh = clamp(high, safeLow, max);
+  const pair = (thumb: number, value: number): [number, number] => (thumb === 0 ? [value, safeHigh] : [safeLow, value]);
+  return (
+    <Track
+      min={min}
+      max={max}
+      step={step}
+      thumbs={[
+        { value: safeLow, label: ariaLabelLow, floor: min, ceil: safeHigh },
+        { value: safeHigh, label: ariaLabelHigh, floor: safeLow, ceil: max },
+      ]}
+      onChange={(thumb, value) => onChange(...pair(thumb, value))}
+      onCommit={(thumb, value) => onCommit?.(...pair(thumb, value))}
+      sound={sound}
+      class="cp-slider--range"
+    >
+      <div class="cp-slider-band" />
+    </Track>
   );
 }

@@ -58,27 +58,29 @@
   background: color-mix(in oklab, var(--err) 17%, var(--fill));
 }
 
-/* The slider spans the boundaries it can reach: from the end of the first block to the end of the last. */
-.cp-memfield-gauge > .cp-rslider {
+/* The slider spans the boundaries between blocks, the two outer edges included; a handle is a bar the width of a
+   gap, so the gauge keeps one gap free at each end for the handle that stands there. */
+.cp-memfield-gauge {
+  padding: 0 var(--gap);
+}
+.cp-memfield-gauge > .cp-slider {
   position: absolute;
-  inset: 0 calc(var(--gap) / -2) 0 calc((100% + var(--gap)) / var(--blocks) - var(--gap) / 2);
+  inset: 0 calc(var(--gap) / 2);
   width: auto;
+  height: auto;
 }
 .cp-memfield-gauge .cp-slider-track {
   display: none;
 }
-/* A handle is a bar standing in the gap between two blocks, so the blocks beside it keep their corners. */
-.cp-memfield-gauge .cp-rslider .cp-slider-thumb {
+.cp-memfield-gauge .cp-slider-thumb {
   width: var(--gap);
   height: 40px;
   border-radius: calc(var(--gap) / 2);
   scale: none;
-}
-.cp-memfield-gauge .cp-rslider:has(input:focus-visible) .cp-slider-thumb {
   outline: 0;
 }
-.cp-memfield-gauge .cp-rslider:has(.cp-rslider-input:first-of-type:focus-visible) .cp-rslider-thumb--lo,
-.cp-memfield-gauge .cp-rslider:has(.cp-rslider-input:last-of-type:focus-visible) .cp-rslider-thumb--hi {
+.cp-memfield-gauge .cp-slider:has(input[data-thumb='0']:focus-visible) .cp-slider-thumb[data-thumb='0'],
+.cp-memfield-gauge .cp-slider:has(input[data-thumb='1']:focus-visible) .cp-slider-thumb[data-thumb='1'] {
   width: 6px;
   border-radius: 3px;
   outline: 2px solid var(--bg);

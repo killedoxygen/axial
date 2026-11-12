@@ -8,7 +8,7 @@
   justify-content: center;
   padding-top: 14vh;
   background: color-mix(in oklab, var(--bg-deep) 66%, transparent);
-  animation: cp-fade-in 140ms ease;
+  animation: cp-fade-in var(--t-quick) var(--ease-out);
 }
 .cp-cmd {
   --inner: 8px;
@@ -17,7 +17,7 @@
   width: 540px;
   max-width: calc(100vw - 32px);
   padding: 6px;
-  animation: cp-float-up 160ms ease;
+  animation: cp-float-up var(--t-pop) var(--ease-out);
 }
 .cp-cmd[data-positioned='true'] {
   animation: none;

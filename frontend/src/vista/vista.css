@@ -1,18 +1,19 @@
-/* World art has no frame. It is anchored to the panel's top-right corner, most of the panel wide, and thins out
-   leftwards under the text and downwards into the page. */
+/* World art has no frame and nothing laid over it. It is anchored to the panel's top-right corner, most of the
+   panel wide, at full strength; only its left and lower edges run out into the page. The one drawn picture is
+   scaled to the space and cropped about its horizon, so the window can change size freely. */
 .cp-vista {
+  --vista-left: linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.4) 9%, oklch(0 0 0 / 0.82) 18%, #000 26%);
+  --vista-foot: linear-gradient(to bottom, #000 66%, oklch(0 0 0 / 0.6) 82%, oklch(0 0 0 / 0.18) 93%, transparent);
   position: absolute;
   top: 0;
   right: 0;
   width: 88%;
   aspect-ratio: 2.3;
+  object-fit: cover;
+  object-position: right center;
   opacity: 0;
-  -webkit-mask-image:
-    linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.35) 26%, #000 58%),
-    linear-gradient(to bottom, #000 48%, transparent 96%);
-  mask-image:
-    linear-gradient(to right, transparent 0, oklch(0 0 0 / 0.35) 26%, #000 58%),
-    linear-gradient(to bottom, #000 48%, transparent 96%);
+  -webkit-mask-image: var(--vista-left), var(--vista-foot);
+  mask-image: var(--vista-left), var(--vista-foot);
   -webkit-mask-composite: source-in;
   mask-composite: intersect;
   transition: opacity 600ms ease;

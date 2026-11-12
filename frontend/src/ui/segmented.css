@@ -17,8 +17,8 @@
   border-radius: var(--rad-ctl);
   background: var(--fill-3);
   transition:
-    translate 160ms ease,
-    width 160ms ease;
+    translate var(--t-pop) var(--ease-out),
+    width var(--t-pop) var(--ease-out);
 }
 .cp-seg > button {
   position: relative;
@@ -37,15 +37,15 @@
   font-weight: 600;
   cursor: pointer;
   transition:
-    color 120ms ease,
-    scale 90ms ease;
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-seg > button > svg {
   flex: none;
   width: 14px;
   height: 14px;
   color: var(--text-mute);
-  transition: color 120ms ease;
+  transition: color var(--t-quick) var(--ease-out);
 }
 .cp-seg > button:hover:not(:disabled),
 .cp-seg > button[data-active='true'] {

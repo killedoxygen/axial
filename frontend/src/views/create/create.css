@@ -137,8 +137,8 @@
   color: var(--text-dim);
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
 }
 .cp-cr-loader:hover:not(:disabled) {
   background: var(--fill-2);
@@ -177,8 +177,7 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 4px;
-  padding: 6px;
+  padding: 5px;
 }
 .cp-cr-versions-bar {
   display: flex;
@@ -197,6 +196,7 @@
 .cp-cr-vlist {
   display: flex;
   flex-direction: column;
+  min-height: 0;
   max-height: 160px;
   margin: 0;
   padding: 0;
@@ -283,12 +283,9 @@
   cursor: pointer;
 }
 .cp-cr-compat-list {
-  position: fixed;
-  z-index: 1300;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 240px;
   padding: 10px 12px;
   overflow-y: auto;
   font-size: 12.5px;
@@ -334,7 +331,7 @@
   font-family: inherit;
   text-align: left;
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-cr-options:hover {
   background: var(--fill);
@@ -344,7 +341,7 @@
 }
 .cp-cr-options .cp-cr-key svg {
   color: var(--text-mute);
-  transition: rotate 120ms ease;
+  transition: rotate var(--t-quick) var(--ease-out);
 }
 .cp-cr-options[aria-expanded='true'] .cp-cr-key svg {
   rotate: 90deg;

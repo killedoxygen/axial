@@ -1066,7 +1066,7 @@ function bootstrapHarness({ queueFailure = false, registryFailure = false, sessi
       './native': { getNativeAppVersion: async () => null, hasNativeDesktopRuntime: () => false },
       './preferences/persistence': {},
       './sound': {},
-      './player-skin': { refreshAccountSkin() {} },
+      './machines/accounts': { refreshAccountsData: async () => {} },
       './state': { local: { theme: 'obsidian' } },
       './store': store,
       './startup-warnings': { startupWarningMessages: () => [] },

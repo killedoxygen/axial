@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import { useLayoutEffect, useRef } from 'preact/hooks';
 import { Chip, Input, Ring } from '../../ui/Atoms';
 import { Icon } from '../../ui/Icons';
+import { Popover } from '../../ui/Popover';
 import { Segmented } from '../../ui/Segmented';
 import type { CreateDraftItem } from '../../ui-state';
 import { CompatibilityPreview } from './CompatibilityPreview';
@@ -27,7 +28,7 @@ function distinguishingTags(rows: VersionRowModel[]): (row: VersionRowModel) => 
   return (row) => row.tags.filter((tag) => rows.length < 2 || (counts.get(tag.id) ?? 0) < rows.length);
 }
 
-/** The Minecraft version as one select. Open, the list unfolds under it with its filter and channels. */
+/** The Minecraft version as one select. Open, the list floats under it with its filter and channels. */
 export function VersionPicker({
   versions,
   sourceKey,
@@ -45,6 +46,7 @@ export function VersionPicker({
 }): JSX.Element {
   const { rows, selected, loading } = versions;
   const listRef = useRef<HTMLUListElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const tagsOf = distinguishingTags(rows);
   const availableChannels = new Set(versions.availableChannels);
 
@@ -56,6 +58,7 @@ export function VersionPicker({
     <div class="cp-cr-versions">
       <button
         type="button"
+        ref={triggerRef}
         class="cp-select-trigger"
         aria-label="Minecraft version"
         aria-haspopup="listbox"
@@ -86,13 +89,11 @@ export function VersionPicker({
       </button>
 
       {open && (
-        <div
+        <Popover
+          anchor={triggerRef}
+          onDismiss={() => onOpenChange(false)}
+          fit="anchor"
           class="cp-pop cp-cr-versions-menu"
-          onKeyDown={(event) => {
-            if (event.key !== 'Escape') return;
-            event.preventDefault();
-            onOpenChange(false);
-          }}
         >
           <div class="cp-cr-versions-bar">
             <Input
@@ -162,7 +163,7 @@ export function VersionPicker({
           ) : (
             <p class="cp-cr-versions-none">{loading ? 'Loading versions…' : 'Nothing matches.'}</p>
           )}
-        </div>
+        </Popover>
       )}
     </div>
   );

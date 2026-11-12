@@ -1,10 +1,3 @@
-/* Tabs across the top, then the section's page. */
-.cp-settings {
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
-  padding: 22px 28px 28px;
-}
 .cp-settings-page {
   min-width: 0;
 }
@@ -70,7 +63,7 @@ button.cp-shortcut-keys {
   background: none;
   font: inherit;
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 button.cp-shortcut-keys:hover,
 button.cp-shortcut-keys[data-recording='true'] {

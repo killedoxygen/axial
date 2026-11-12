@@ -2,14 +2,14 @@ import type { RefObject } from 'preact';
 import { useLayoutEffect } from 'preact/hooks';
 
 const TILE_MIN = 84;
-const TILE_MAX = 124;
+const TILE_MAX = 176;
 const COLUMNS = [3, 4, 5, 6, 7, 8];
 /** What the stage keeps beside the palette. */
 const STAGE_MIN = 320;
 
 /**
  * Fits the palette to the body's height so the page ends on its bottom edge: of the column counts whose tiles stay
- * between 84 and 124px and leave the stage its room, the one whose last row ends nearest that edge without passing
+ * between 84 and 176px and leave the stage its room, the one whose last row ends nearest that edge without passing
  * it. Written to `--palette-columns` and `--palette-tile` on the body, which never grows with the palette.
  */
 export function usePaletteFit(bodyRef: RefObject<HTMLElement>, tileCount: number): void {

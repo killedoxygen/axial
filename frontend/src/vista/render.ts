@@ -1,3 +1,6 @@
+import { finishing } from './finish';
+import { Light, Shadows, Tops, clamp01, hash3 } from './light';
+import { Sky, type Ray, type View } from './sky';
 import { ANDESITE_TEX, CLAY_PLAIN, COAL_TEX, GRANITE_TEX, MIP_OFFSET, STONE_TEX, TEXELS } from './textures';
 import {
   BANDS,
@@ -52,26 +55,6 @@ const UNDER = 3;
 /** The game's own shading of a block's faces, squared as shader packs apply it: top, the two pairs of sides, underside. */
 const DIFFUSE = [1, 0.49, 0.7225, 0.0625];
 
-function hash3(x: number, y: number, z: number): number {
-  let h = Math.imul(x, 0x27d4eb2d) ^ Math.imul(y, 0x165667b1) ^ Math.imul(z, 0x9e3779b9);
-  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
-  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
-}
-
-/** A shader pack's colour setting: display red, green and blue with a strength, held squared. */
-const tint = (r: number, g: number, b: number, strength: number): [number, number, number] => [
-  ((r / 255) * strength) ** 2,
-  ((g / 255) * strength) ** 2,
-  ((b / 255) * strength) ** 2,
-];
-const blend = (a: readonly number[], b: readonly number[], t: number): [number, number, number] => [
-  a[0]! + (b[0]! - a[0]!) * t,
-  a[1]! + (b[1]! - a[1]!) * t,
-  a[2]! + (b[2]! - a[2]!) * t,
-];
-const clamp01 = (value: number): number => (value < 0 ? 0 : value > 1 ? 1 : value);
-
 export function createRenderer(world: World, width: number, height: number, horizon = 0.5): Renderer {
   const n = GRID;
   const { ground, groundMat, runs, runCount, decal, blockLight, skyLight, camera } = world;
@@ -89,40 +72,25 @@ export function createRenderer(world: World, width: number, height: number, hori
   const hasWater = world.waterLevel > 0;
   const surface = world.waterLevel - 0.14;
 
-  // The hour decides everything about the light. These are a shader pack's own settings and blends: warm and low
-  // at either end of the day, blue-white at noon, a dim blue under the moon.
-  const [sunX, sunY, sunZ] = world.sun;
-  const daylight = clamp01(sunY * 10 + 0.5);
-  const noon = Math.max(0, Math.sin(world.time * 2 * Math.PI));
-  const high = 1 - (1 - noon) ** 1.5;
-  const lowSun = [(255 / 255) * 1.2, (160 / 255) * 1.2, (80 / 255) * 1.2];
-  const highSun = [(196 / 255) * 1.4, (220 / 255) * 1.4, 1.4];
-  const moonlight = [(96 / 255) * 0.3, (192 / 255) * 0.3, 0.3];
-  const sunRoot = blend(lowSun, highSun, high);
-  const lightColor = blend(moonlight, sunRoot, daylight).map((c) => c * c);
-  const ambientColor = blend(
-    moonlight.map((c) => c * 0.6),
-    blend([0.35, (204 / 255) * 0.35, (144 / 255) * 0.35], [(120 / 255) * 0.6, (172 / 255) * 0.6, 0.6], high),
+  const light = new Light(world);
+  const {
     daylight,
-  ).map((c) => c * c);
-  const lampColor = tint(255, 212, 160, 0.85);
-  const skyBlue = tint(96, 160, 255, 1);
-  const nightBlue = moonlight.map((c) => c * c);
-  const nightHue = nightBlue.map((c) => c / Math.hypot(nightBlue[0]!, nightBlue[1]!, nightBlue[2]!));
-  const waterColor = tint(64, 160, 255, 0.35);
+    color: lightColor,
+    ambient: ambientColor,
+    lamp: lampColor,
+    nightHue,
+    water: waterColor,
+    x: lightX,
+    y: lightY,
+    z: lightZ,
+  } = light;
   const MIN_LIGHT = 0.063;
-  // The light that casts shadows: the sun while it is up, then the moon opposite it.
-  const sunUp = world.time < 0.5325 || world.time > 0.9675;
-  const lightX = sunUp ? sunX : -sunX;
-  const lightY = sunUp ? sunY : -sunY;
-  const lightZ = sunUp ? sunZ : -sunZ;
-  const lightAhead = lightX * fwdX + lightZ * fwdZ > 0;
-  const lightAzimuth = Math.atan2(lightX, lightZ) - camera.yaw;
-  const lightFlat = Math.hypot(lightX, lightZ) || 1;
-  const lightRise = Math.max(0, lightY) / lightFlat;
-  const skyExposure = 2 ** (noon * 0.75 - 0.75);
-  const sunSky = sunRoot.map((c) => c ** (4 - daylight));
-  const rays = sunUp ? 0.9 - 0.75 * noon : 0.3;
+  const view: View = { width: W, height: H, focal, horizon: hz, x: cx, y: cy, z: cz, yaw: camera.yaw };
+  const ray: Ray = { col: 0, dirX: 0, dirZ: 0, span: 1, angle: 0 };
+  const sky = new Sky(world, light, view, ray);
+  const tops = new Tops(world);
+  const { solid: solidTop, leaf: leafTop, rim } = tops;
+  const shadows = new Shadows(world, light, tops);
 
   const hdr = new Float32Array(W * H * 3);
   // Depth per pixel, so edges between near and far can be smoothed without softening the textures.
@@ -130,161 +98,17 @@ export function createRenderer(world: World, width: number, height: number, hori
   const mirror = hasWater ? new Float32Array(H * 3) : null;
   const waterDepth = new Float32Array(H);
   const waterCell = new Int32Array(H);
-  // Open sky near the light at quarter size: the source of the light shafts.
-  const qw = Math.ceil(W / 4);
-  const qh = Math.ceil(H / 4);
-  const openSky = new Float32Array(qw * qh);
-
-  // What stands in each column: the highest solid block, the highest foliage, and the highest solid block among
-  // its eight neighbours, which is all the corner shading needs to know to skip open ground.
-  const solidTop = new Uint8Array(n * n);
-  const leafTop = new Uint8Array(n * n);
-  const rim = new Uint8Array(n * n);
-  for (let i = 0; i < n * n; i++) {
-    let solid = ground[i]!;
-    let leaf = 0;
-    for (let k = 0; k < runCount[i]!; k++) {
-      const ro = (i * RUNS + k) * 3;
-      const mat = runs[ro + 2]!;
-      if (mat >= PLANT) continue;
-      if (mat >= FOLIAGE && mat < LAVA) leaf = runs[ro + 1]!;
-      else solid = Math.max(solid, runs[ro + 1]!);
-    }
-    solidTop[i] = solid;
-    leafTop[i] = leaf;
-  }
-  for (let z = 1; z < n - 1; z++) {
-    for (let x = 1; x < n - 1; x++) {
-      const i = z * n + x;
-      rim[i] = Math.max(
-        solidTop[i - 1]!,
-        solidTop[i + 1]!,
-        solidTop[i - n]!,
-        solidTop[i + n]!,
-        solidTop[i - n - 1]!,
-        solidTop[i - n + 1]!,
-        solidTop[i + n - 1]!,
-        solidTop[i + n + 1]!,
-      );
-    }
-  }
-
-  // The shadow map: the world in front of the camera as the light sees it. Along a ray of light two things stay
-  // fixed, so they index the map; each texel keeps the height of the highest thing on its ray, and a point is lit
-  // where nothing on its ray stands higher. Foliage casts the shape of its texture, gaps and all.
-  let shadowSize = 0;
-  let shadowRows = 0;
-  let shadowScale = 0;
-  let shadowSlope = 0;
-  let shadowU = 0;
-  let shadowV = 0;
-  let shadows = new Float32Array(0);
-  const towardX = lightX / lightFlat;
-  const towardZ = lightZ / lightFlat;
-  if (lightY > 0.03) {
-    shadowSlope = Math.min(14, lightFlat / lightY);
-    const x0 = Math.max(1, Math.floor(cx) - 66);
-    const x1 = Math.min(n - 1, x0 + 132);
-    const z0 = Math.max(1, Math.floor(cz) - 10);
-    const z1 = Math.min(n - 1, z0 + 140);
-    let low = 255;
-    let tall = 0;
-    for (let z = z0; z < z1; z++) {
-      for (let x = x0; x < x1; x++) {
-        const i = z * n + x;
-        if (ground[i]! < low) low = ground[i]!;
-        const most = Math.max(solidTop[i]!, leafTop[i]!);
-        if (most > tall) tall = most;
-      }
-    }
-    let uMin = Infinity;
-    let uMax = -Infinity;
-    let vMin = Infinity;
-    let vMax = -Infinity;
-    for (const [x, z] of [
-      [x0, z0],
-      [x1, z0],
-      [x0, z1],
-      [x1, z1],
-    ] as const) {
-      const u = x * towardX + z * towardZ;
-      const v = z * towardX - x * towardZ;
-      uMin = Math.min(uMin, u - tall * shadowSlope);
-      uMax = Math.max(uMax, u - low * shadowSlope);
-      vMin = Math.min(vMin, v);
-      vMax = Math.max(vMax, v);
-    }
-    shadowU = uMin;
-    shadowV = vMin;
-    shadowScale = Math.min(4, Math.sqrt(1_000_000 / ((uMax - uMin) * (vMax - vMin))));
-    shadowSize = Math.ceil((uMax - uMin) * shadowScale) + 2;
-    shadowRows = Math.ceil((vMax - vMin) * shadowScale) + 2;
-    shadows = new Float32Array(shadowSize * shadowRows).fill(-1);
-    // Each block is sampled finely enough to leave no texel uncovered, and each sample's whole height is cast at
-    // once: along its ray it is a run of texels, highest first.
-    const fine = Math.ceil(shadowScale * 1.5);
-    const cast = (px: number, pz: number, from: number, to: number): void => {
-      const along = px * towardX + pz * towardZ - shadowU;
-      const row = Math.floor((pz * towardX - px * towardZ - shadowV) * shadowScale) * shadowSize;
-      const first = Math.floor((along - to * shadowSlope) * shadowScale);
-      const last = Math.floor((along - from * shadowSlope) * shadowScale);
-      for (let u = first; u <= last; u++) {
-        const y = u === first ? to : (along - u / shadowScale) / shadowSlope;
-        if (y > shadows[row + u]!) shadows[row + u] = y;
-      }
-    };
-    for (let z = z0; z < z1; z++) {
-      for (let x = x0; x < x1; x++) {
-        const i = z * n + x;
-        const g = ground[i]!;
-        // Below the lowest neighbour a column's side is buried, and casts nothing that is not already cast.
-        const buried = Math.max(g - 12, Math.min(g, ground[i - 1]!, ground[i + 1]!, ground[i - n]!, ground[i + n]!));
-        const count = runCount[i]!;
-        for (let s = 0; s < fine * fine; s++) {
-          const fx = ((s % fine) + 0.5) / fine;
-          const fz = (Math.floor(s / fine) + 0.5) / fine;
-          cast(x + fx, z + fz, buried, g);
-          for (let k = 0; k < count; k++) {
-            const ro = (i * RUNS + k) * 3;
-            const mat = runs[ro + 2]!;
-            if (mat >= PLANT) continue;
-            if (mat >= FOLIAGE && mat < LAVA) {
-              const texel = (FACES[mat * 3]! * TEXELS + Math.floor(fz * 16) * 16 + Math.floor(fx * 16)) * 4;
-              if (atlas[texel + 3]! < 0.5) continue;
-            }
-            cast(x + fx, z + fz, runs[ro]!, runs[ro + 1]!);
-          }
-        }
-      }
-    }
-  }
-  /** How much of the light reaches a point: the four texels round it, each lit or not, blended. */
-  const lit = (x: number, y: number, z: number): number => {
-    if (shadowSize === 0) return 0;
-    const u = (x * towardX + z * towardZ - y * shadowSlope - shadowU) * shadowScale - 0.5;
-    const v = (z * towardX - x * towardZ - shadowV) * shadowScale - 0.5;
-    const iu = Math.floor(u);
-    const iv = Math.floor(v);
-    // Beyond the map the world is too far for its shadows to read.
-    if (iu < 0 || iv < 0 || iu >= shadowSize - 1 || iv >= shadowRows - 1) return 1;
-    const fu = u - iu;
-    const fv = v - iv;
-    const at = iv * shadowSize + iu;
-    const level = y + 0.06;
-    return (
-      (level >= shadows[at]! ? (1 - fu) * (1 - fv) : 0) +
-      (level >= shadows[at + 1]! ? fu * (1 - fv) : 0) +
-      (level >= shadows[at + shadowSize]! ? (1 - fu) * fv : 0) +
-      (level >= shadows[at + shadowSize + 1]! ? fu * fv : 0)
-    );
-  };
-
-  // Rock is not one stone: veins of andesite and granite run through it.
+  // Rock is not one stone: veins of andesite and granite run through it, and coal shows here and there, in a
+  // version that has them. One that does not is plain stone throughout.
+  const known = (tex: number): number => (atlas[tex * TEXELS * 4 + 3]! > 0 ? tex : STONE_TEX);
+  const andesite = known(ANDESITE_TEX);
+  const granite = known(GRANITE_TEX);
+  const coal = known(COAL_TEX);
   const veins = new Uint8Array(n * n);
   for (let z = 0; z < n; z++) {
     for (let x = 0; x < n; x++) {
       const vein = valueNoise(x / 7, z / 7, world.seed + 201);
-      veins[z * n + x] = vein > 0.74 ? ANDESITE_TEX : vein < 0.2 ? GRANITE_TEX : STONE_TEX;
+      veins[z * n + x] = vein > 0.74 ? andesite : vein < 0.2 ? granite : STONE_TEX;
     }
   }
 
@@ -347,7 +171,6 @@ export function createRenderer(world: World, width: number, height: number, hori
   const pathFace = new Uint8Array(4 * n);
 
   // Per-column state the shading closures read.
-  let col = 0;
   let dirX = 0;
   let dirZ = 0;
   let span = 1;
@@ -362,102 +185,10 @@ export function createRenderer(world: World, width: number, height: number, hori
   let hi = 0;
 
   const skyTap = new Float32Array(3);
-  const cloudAt = (x: number, z: number): number =>
-    valueNoise(x, z * 1.25, world.seed + 71) * 0.56 +
-    valueNoise(x * 2.3 + 5, z * 2.9, world.seed + 73) * 0.29 +
-    valueNoise(x * 5.3, z * 6.1 + 3, world.seed + 75) * 0.15;
-
-  /**
-   * The sky's own colour in a direction, without sun, moon or cloud: `up` is how steeply the direction climbs and
-   * `toSun` how nearly it points at the sun, both as cosines. Blue thinning toward the horizon by day, the sun's
-   * colour spreading along the horizon when it is low, a faint blue at night.
-   */
-  const skyColor = (out: Float32Array, up: number, toSun: number): void => {
-    const lift = up > 0 ? up : 0;
-    const gradient = Math.exp(-(1 - (1 - lift) ** (1.5 - 0.5 * toSun)) / 0.35);
-    const sunward = ((toSun * 0.5 + 0.5) * (1 - lift)) ** (2 - daylight) * (1 - noon * 0.6) ** 3;
-    const mix = 1 - (1 - sunward) * (1 - (1 - lift) ** 2.5 * 0.125);
-    const night = Math.exp(-lift / 0.65) * 0.0884;
-    for (let c = 0; c < 3; c++) {
-      const blue = skyBlue[c]! * gradient;
-      const day = (blue / Math.sqrt(blue * blue + 1)) * skyExposure * daylight;
-      const both = Math.sqrt(day * (1 - mix)) * (1 - mix) + Math.sqrt(sunSky[c]! * gradient) * mix;
-      const dark = nightBlue[c]! * night;
-      out[c] = dark + (both * both - dark) * daylight * daylight;
-    }
-  };
-
-  const skyInto = (out: Float32Array, o: number, row: number, record: boolean): void => {
-    const v = (hz - row - 0.5) / focal;
-    const length = Math.sqrt(span + v * v);
-    const up = Math.max(0, v) / length;
-    const toSun = (dirX * sunX + Math.max(0, v) * sunY + dirZ * sunZ) / length;
-    skyColor(skyTap, up, toSun);
-    let r = skyTap[0]!;
-    let g = skyTap[1]!;
-    let b = skyTap[2]!;
-    const da = angle - lightAzimuth;
-    const dv = Math.max(0, v) - lightRise;
-    const halo = lightAhead ? Math.exp(-(da * da * 1.4 + dv * dv * 6)) : 0;
-    if (daylight < 1 && v > 0.03) {
-      const star = hash3(col >> 1, Math.floor(row) >> 1, world.seed);
-      if (star > 0.996) {
-        const k = (0.2 + hash3(col, Math.floor(row), 7) * 0.5) * Math.min(1, v * 4) * (1 - daylight);
-        r += k;
-        g += k;
-        b += k * 1.1;
-      }
-    }
-    // The sun is a soft-rimmed disc far brighter than white, so that it blooms; the moon a smaller, paler one.
-    if (toSun > 0.99) {
-      const disc = clamp01((toSun - 0.993) / 0.007) ** 3 * 3.5 + toSun ** 192 * 0.15;
-      const fade = clamp01(up * 12);
-      r += sunRoot[0]! * sunRoot[0]! * disc * fade * daylight;
-      g += sunRoot[1]! * sunRoot[1]! * disc * fade * daylight;
-      b += sunRoot[2]! * sunRoot[2]! * disc * fade * daylight;
-    } else if (toSun < -0.995) {
-      const disc = (clamp01((-toSun - 0.997) / 0.003) ** 3 * 1.6 + toSun ** 256 * 0.05) * (1 - daylight);
-      r += disc * 0.75;
-      g += disc * 0.85;
-      b += disc;
-    }
-    // Clouds on a plane overhead: lit by the light on the side toward it and at their rims, by the sky in their
-    // thick middles.
-    if (v > 0.015) {
-      const d = 70 / v;
-      if (d < 1800) {
-        const wx = (cx + dirX * d) / 130;
-        const wz = (cz + dirZ * d) / 130;
-        const puff = cloudAt(wx, wz);
-        if (puff > 0.52) {
-          const cover =
-            Math.min(1, (puff - 0.52) * 7) * Math.min(1, v * 10) * Math.max(0, 1 - d / 1800) * (0.35 + 0.65 * daylight);
-          const thick = cloudAt(wx + towardX * 0.1, wz + towardZ * 0.1);
-          const toLight = sunUp ? toSun : -toSun;
-          const glare = (toLight * 0.5 + 0.5) ** 6;
-          const bright = clamp01(1.15 - (thick - 0.47) * 3.4) * (1 - Math.min(1, (puff - 0.52) * 4.5) * 0.5);
-          const shown = bright + (1 - bright) * (1 - cover * cover) * glare * 0.5;
-          const dim = 0.5 - 0.25 * (1 - daylight);
-          for (let c = 0; c < 3; c++) {
-            const base = ambientColor[c]! * (0.3 * daylight + 0.5);
-            const cloud = (base + (lightColor[c]! * (0.85 + 1.15 * glare) - base) * shown) * dim;
-            if (c === 0) r += (cloud - r) * cover * cover;
-            else if (c === 1) g += (cloud - g) * cover * cover;
-            else b += (cloud - b) * cover * cover;
-          }
-        }
-      }
-    }
-    if (record && row >= 0 && row < H) openSky[(row >> 2) * qw + (col >> 2)] += halo / 16;
-    out[o] = r;
-    out[o + 1] = g;
-    out[o + 2] = b;
-  };
-
   // How much of a far thing the air hides: a thin haze that thickens at night, tabled by distance.
   const hazes = new Float32Array(FAR + 2);
   for (let depth = 0; depth < hazes.length; depth++) {
-    let fog = (depth / 1024) * (4 - 3 * daylight);
+    let fog = (depth / 1024) * (2.5 - 1.5 * daylight);
     if (fog > 0.5) fog = (fog - 0.5) * 0.25 + 0.5;
     hazes[depth] = 1 - Math.exp(-2 * fog ** (0.35 * daylight + 1.25));
   }
@@ -468,6 +199,28 @@ export function createRenderer(world: World, width: number, height: number, hori
     return edge > 0 ? fog + (1 - fog) * (edge > 1 ? 1 : edge) : fog;
   };
 
+  /** How dark an inner corner is where two sides and the block diagonally between them meet, as the game has it. */
+  const meet = (first: number, second: number, blocked: boolean): number =>
+    (1 + first + second + (first + second < 1 || blocked ? 0.2 : 1)) / 4;
+  /**
+   * The light on a surface in one colour: the sky's and the sun's or moon's, a lamp's by the packs' curve, the
+   * least the game allows, and the surface's own glow in its own hue.
+   */
+  const lightOn = (
+    c: number,
+    value: number,
+    sky: number,
+    direct: number,
+    boost: number,
+    curve: number,
+    floor: number,
+    hue: number,
+    shine: number,
+  ): number =>
+    (ambientColor[c]! * sky + (lightColor[c]! - ambientColor[c]! * sky) * direct) * boost +
+    lampColor[c]! * curve * curve +
+    floor +
+    (value * hue + (1 - value * hue) * shine * 0.5) * shine * 2.2;
   /**
    * Textures and lights one surface point, writing it at `o` in `out`. Returns false where the texture is a gap,
    * so the caller leaves the pixel for whatever lies behind.
@@ -505,7 +258,7 @@ export function createRenderer(world: World, width: number, height: number, hori
     if (mat === TERRACOTTA || tex === CLAY_PLAIN) tex = BANDS[by % BANDS.length]!;
     else if (tex === STONE_TEX && inside) {
       const shift = by >> 2;
-      tex = hash3(bx, by, bz) > 0.965 ? COAL_TEX : veins[((bz + shift * 7) % n) * n + ((bx + shift * 5) % n)]!;
+      tex = hash3(bx, by, bz) > 0.965 ? coal : veins[((bz + shift * 7) % n) * n + ((bx + shift * 5) % n)]!;
     }
     // The step from one size of texture to the next is scattered, so it never shows as a line across the ground.
     scatter = (Math.imul(scatter, 1664525) + 1013904223) | 0;
@@ -577,13 +330,15 @@ export function createRenderer(world: World, width: number, height: number, hori
           const east = solidTop[fi + 1]! > high ? 0.2 : 1;
           const north = solidTop[fi - n]! > high ? 0.2 : 1;
           const south = solidTop[fi + n]! > high ? 0.2 : 1;
-          const meet = (first: number, second: number, diagonal: number): number =>
-            (1 + first + second + (first + second < 1 || solidTop[diagonal]! > high ? 0.2 : 1)) / 4;
           const px = wx - bx;
           const pz = wz - bz;
           corner *=
-            (meet(west, north, fi - n - 1) * (1 - px) + meet(east, north, fi - n + 1) * px) * (1 - pz) +
-            (meet(west, south, fi + n - 1) * (1 - px) + meet(east, south, fi + n + 1) * px) * pz;
+            (meet(west, north, solidTop[fi - n - 1]! > high) * (1 - px) +
+              meet(east, north, solidTop[fi - n + 1]! > high) * px) *
+              (1 - pz) +
+            (meet(west, south, solidTop[fi + n - 1]! > high) * (1 - px) +
+              meet(east, south, solidTop[fi + n + 1]! > high) * px) *
+              pz;
         }
       } else if (face !== UNDER && !plant && mat < FOLIAGE) {
         // On a side: the block under the air in front, and the ones to either hand of it.
@@ -594,8 +349,6 @@ export function createRenderer(world: World, width: number, height: number, hori
         if (under < 1 || lowLeft > by - 0.5 || lowRight > by - 0.5) {
           const leftSide = lowLeft > by + 0.5 ? 0.2 : 1;
           const rightSide = lowRight > by + 0.5 ? 0.2 : 1;
-          const meet = (first: number, second: number, diagonal: boolean): number =>
-            (1 + first + second + (first + second < 1 || diagonal ? 0.2 : 1)) / 4;
           const across2 = face === SIDE_X ? wz - Math.floor(wz) : wx - Math.floor(wx);
           const rise = wy - by;
           corner *=
@@ -619,7 +372,7 @@ export function createRenderer(world: World, width: number, height: number, hori
       facing += (1 - facing) * Math.sqrt(soft) * 0.7;
       facing += (1 - facing) * through;
     }
-    let shadow = facing > 0 ? lit(wx + nx * 0.08, wy + (face === TOP ? 0.02 : 0), wz + nz * 0.08) : 0;
+    let shadow = facing > 0 ? shadows.lit(wx + nx * 0.08, wy + (face === TOP ? 0.02 : 0), wz + nz * 0.08) : 0;
     shadow *= shadow + (1 - shadow) * soft;
     const direct = shadow * facing;
     const sky2 = sky * sky;
@@ -633,21 +386,10 @@ export function createRenderer(world: World, width: number, height: number, hori
     const cornerShade = corner * (1 - flatten) + flatten;
     const fall = balance * faceShade * cornerShade * cornerShade;
     const boost = sky2 * (1 + through * shadow);
-    const red =
-      (ambientColor[0]! * sky + (lightColor[0]! - ambientColor[0]! * sky) * direct) * boost +
-      lampColor[0] * curve * curve +
-      MIN_LIGHT * (1 - sky2) +
-      (r * hue + (1 - r * hue) * shine * 0.5) * shine * 4;
-    const green =
-      (ambientColor[1]! * sky + (lightColor[1]! - ambientColor[1]! * sky) * direct) * boost +
-      lampColor[1] * curve * curve +
-      MIN_LIGHT * (1 - sky2) +
-      (g * hue + (1 - g * hue) * shine * 0.5) * shine * 4;
-    const blue =
-      (ambientColor[2]! * sky + (lightColor[2]! - ambientColor[2]! * sky) * direct) * boost +
-      lampColor[2] * curve * curve +
-      MIN_LIGHT * (1 - sky2) +
-      (b * hue + (1 - b * hue) * shine * 0.5) * shine * 4;
+    const floor = MIN_LIGHT * (1 - sky2);
+    const red = lightOn(0, r, sky, direct, boost, curve, floor, hue, shine);
+    const green = lightOn(1, g, sky, direct, boost, curve, floor, hue, shine);
+    const blue = lightOn(2, b, sky, direct, boost, curve, floor, hue, shine);
     r *= red * fall;
     g *= green * fall;
     b *= blue * fall;
@@ -670,8 +412,93 @@ export function createRenderer(world: World, width: number, height: number, hori
     return true;
   };
 
+  // The column being drawn, and the span of it being filled: what the span is made of and where it lies.
+  const stride = W * 3;
+  let column = 0;
+  let base = 0;
+  let enter = NEAR;
+  let exit = NEAR;
+  let waterLo = H;
+  let waterHi = 0;
+  // The foliage the ray just came through, so leaves behind leaves read as the inside of a crown.
+  let leafLo = 0;
+  let leafHi = 0;
+  let sMat = 0;
+  let sFace = 0;
+  let sX = 0;
+  let sZ = 0;
+  let sDepth = 0;
+  let sScale = 0;
+  let sLip = -1;
+  let sFoot = 0;
+  let sInner = 1;
+  let sAcross = -1;
+  let sLow = 0;
+  let sHigh = 0;
+  let sRise = 0;
+  let sOver = 0;
+  let sCell = 0;
+  let sSlant = false;
+
+  /**
+   * Fills the rows a span covers from screen height `top` to `bottom`. Each row takes all of what is left of its
+   * pixel inside the span, and only the covered fraction where the span begins and ends; `point` shades the
+   * middle of what the row covers and returns its depth, or zero where the texture is a gap.
+   */
+  const fill = (top: number, bottom: number, point: (at: number, row: number, share: number) => number): void => {
+    const to = Math.min(hi, Math.ceil(bottom));
+    for (let row = Math.max(lo, Math.floor(top)); row < to; row++) {
+      const upper = row > top ? row : top;
+      const lower = row + 1 < bottom ? row + 1 : bottom;
+      const cover = lower - upper;
+      const rest = left[row]!;
+      const share = cover < rest ? (cover > 0.004 ? cover : 0) : rest;
+      if (share === 0) continue;
+      const depth = point((upper + lower) / 2, row, share);
+      if (depth === 0) continue;
+      left[row] = rest - share < 0.004 ? 0 : rest - share;
+      if (share >= 0.5 || depths[row * W + column] === 0) depths[row * W + column] = depth;
+    }
+  };
+  /** A point on an upright face of a block. A negative `sInner` asks whether foliage stands in front of it. */
+  const wall = (at: number, row: number, share: number): number => {
+    const wy = cy - (at - hz) / sScale;
+    const inner = sInner < 0 ? (wy > leafLo && wy < leafHi ? 0.55 : 1) : sInner;
+    return shade(hdr, row * stride + base, sMat, sFace, sX, wy, sZ, sDepth, sScale / 16, sLip, sFoot, inner, -1, share)
+      ? sDepth
+      : 0;
+  };
+  /** A point on one of a plant's two cut-outs. */
+  const sprite = (at: number, row: number, share: number): number => {
+    const wy = Math.min(sHigh - 0.001, Math.max(sLow, cy - (at - hz) / sScale));
+    return shade(hdr, row * stride + base, sMat, SIDE_Z, sX, wy, sZ, sDepth, sScale / 16, -1, sLow, 1, sAcross, share)
+      ? sDepth
+      : 0;
+  };
+  /** A point on a top seen from above or an underside seen from below; open water is only noted, for the mirror. */
+  const level = (at: number, row: number, share: number): number => {
+    const depth = Math.min(exit, Math.max(enter, (sRise * focal) / (at - hz)));
+    // A ground plane seen at a slant stretches each pixel over more texels along the view than across it.
+    const texel = sSlant
+      ? Math.sqrt((focal / depth) * ((Math.abs(sRise) * focal) / (depth * depth))) / 16
+      : focal / depth / 16;
+    const wpx = cx + dirX * depth;
+    const wpz = cz + dirZ * depth;
+    const o = row * stride + base;
+    // What lies on the surface hides it where its texture is not a gap.
+    if (sOver !== 0 && shade(hdr, o, sOver, TOP, wpx, sHigh, wpz, depth, texel, -1, 0, 1, -1, share)) return depth;
+    if (sMat === WATER) {
+      waterShare[row] += share;
+      waterDepth[row] = depth;
+      waterCell[row] = sCell;
+      if (row < waterLo) waterLo = row;
+      if (row >= waterHi) waterHi = row + 1;
+      return depth;
+    }
+    return shade(hdr, o, sMat, sFace, wpx, sHigh, wpz, depth, texel, -1, 0, sInner, -1, share) ? depth : 0;
+  };
+
   const drawColumn = (x: number): void => {
-    col = x;
     scatter = Math.imul(x + 1, 0x9e3779b1);
     const u = (x + 0.5 - W / 2) / focal;
     angle = Math.atan(u);
@@ -685,15 +512,20 @@ export function createRenderer(world: World, width: number, height: number, hori
     const edgeZ = dirZ > 0 ? (n - 1 - cz) / dirZ : dirZ < 0 ? (1 - cz) / dirZ : FAR;
     reach = Math.min(FAR, edgeX, edgeZ);
     // The air takes the colour of the sky at the horizon that way.
-    skyColor(skyTap, 0, (dirX * sunX + dirZ * sunZ) / Math.sqrt(span));
+    ray.col = x;
+    ray.dirX = dirX;
+    ray.dirZ = dirZ;
+    ray.span = span;
+    ray.angle = angle;
+    sky.color(skyTap, 0, (dirX * light.sun[0] + dirZ * light.sun[2]) / Math.sqrt(span));
     fogR = skyTap[0]!;
     fogG = skyTap[1]!;
     fogB = skyTap[2]!;
     left.fill(1);
     lo = 0;
     hi = H;
-    const base = x * 3;
-    const stride = W * 3;
+    column = x;
+    base = x * 3;
 
     // Walk the grid along this column's line, keeping the path for the mirror pass.
     let ix = Math.floor(cx + dirX * NEAR);
@@ -704,33 +536,18 @@ export function createRenderer(world: World, width: number, height: number, hori
     const deltaZ = dirZ !== 0 ? Math.abs(1 / dirZ) : Infinity;
     let nextX = dirX !== 0 ? (ix + (dirX > 0 ? 1 : 0) - cx) / dirX : Infinity;
     let nextZ = dirZ !== 0 ? (iz + (dirZ > 0 ? 1 : 0) - cz) / dirZ : Infinity;
-    let enter = NEAR;
+    enter = NEAR;
     let face = SIDE_Z;
     let steps = 0;
     let foot = 0;
-    let waterLo = H;
-    let waterHi = 0;
+    waterLo = H;
+    waterHi = 0;
     // The foliage the ray just came through, so leaves behind leaves read as the inside of a crown.
-    let leafLo = 0;
-    let leafHi = 0;
-
-    /**
-     * Takes a pixel's share of a span that runs from screen height `top` to `bottom`: all of what is left of the
-     * pixel inside the span, and only the covered fraction on the rows where the span begins and ends.
-     */
-    const take = (row: number, top: number, bottom: number): number => {
-      const cover = (row + 1 < bottom ? row + 1 : bottom) - (row > top ? row : top);
-      const rest = left[row]!;
-      return cover < rest ? (cover > 0.004 ? cover : 0) : rest;
-    };
-    const took = (row: number, share: number, depth: number): void => {
-      const rest = left[row]! - share;
-      left[row] = rest < 0.004 ? 0 : rest;
-      if (share >= 0.5 || depths[row * W + x] === 0) depths[row * W + x] = depth;
-    };
+    leafLo = 0;
+    leafHi = 0;
 
     while (ix >= 0 && iz >= 0 && ix < n && iz < n && enter < FAR && lo < hi) {
-      const exit = Math.min(nextX, nextZ);
+      exit = Math.min(nextX, nextZ);
       const ci = iz * n + ix;
       pathCell[steps] = ci;
       pathEnter[steps] = enter;
@@ -743,7 +560,6 @@ export function createRenderer(world: World, width: number, height: number, hori
       const groundTop = wet ? surface : groundMat[ci] === LAVA ? g - 0.12 : g;
       const scaleIn = focal / enter;
       const scaleOut = focal / exit;
-      const texelIn = scaleIn / 16;
       const count = runCount[ci]!;
       const wx = cx + dirX * enter;
       const wz = cz + dirZ * enter;
@@ -752,215 +568,107 @@ export function createRenderer(world: World, width: number, height: number, hori
       let plantAt = -1;
 
       // Faces toward the camera first: they hide the tops behind them.
+      sFace = face;
+      sX = wx;
+      sZ = wz;
+      sDepth = enter;
+      sScale = scaleIn;
+      sFoot = foot;
+      sInner = -1;
       for (let k = -1; k < count; k++) {
         let y0 = 0;
         let y1 = groundTop;
-        let mat = groundMat[ci]!;
+        sMat = groundMat[ci]!;
         if (k >= 0) {
           const ro = (ci * RUNS + k) * 3;
           y0 = runs[ro]!;
           y1 = runs[ro + 1]!;
-          mat = runs[ro + 2]!;
-          if (mat >= PLANT) {
+          sMat = runs[ro + 2]!;
+          if (sMat >= PLANT) {
             plantAt = ro;
             continue;
           }
-          if (mat >= FOLIAGE && mat < LAVA) {
+          if (sMat >= FOLIAGE && sMat < LAVA) {
             if (nextLeafHi === 0) nextLeafLo = y0;
             nextLeafHi = y1;
           }
         }
         // Of the ground's side only what stands above the column in front is exposed.
         if (k < 0 && (y1 <= foot || (y0 = foot) < 0)) continue;
-        const top = hz - (y1 - cy) * scaleIn;
-        const bottom = hz - (y0 - cy) * scaleIn;
-        const to = Math.min(hi, Math.ceil(bottom));
-        for (let row = Math.max(lo, Math.floor(top)); row < to; row++) {
-          const share = take(row, top, bottom);
-          if (share === 0) continue;
-          const at = ((row > top ? row : top) + (row + 1 < bottom ? row + 1 : bottom)) / 2;
-          const wy = cy - (at - hz) / scaleIn;
-          const inner = wy > leafLo && wy < leafHi ? 0.55 : 1;
-          if (
-            shade(
-              hdr,
-              row * stride + base,
-              mat,
-              face,
-              wx,
-              wy,
-              wz,
-              enter,
-              texelIn,
-              k < 0 ? g : -1,
-              foot,
-              inner,
-              -1,
-              share,
-            )
-          )
-            took(row, share, enter);
-        }
+        sLip = k < 0 ? g : -1;
+        fill(hz - (y1 - cy) * scaleIn, hz - (y0 - cy) * scaleIn, wall);
       }
       // A plant is two cut-outs crossing the cell corner to corner; the ray meets each once.
-      if (plantAt >= 0 && texelIn > 0.16) {
+      if (plantAt >= 0 && scaleIn / 16 > 0.16) {
         const sumD = dirX + dirZ;
         const difD = dirX - dirZ;
         const tA = difD !== 0 ? (ix - cx - (iz - cz)) / difD : -1;
         const tB = sumD !== 0 ? (1 + ix + iz - cx - cz) / sumD : -1;
+        sMat = runs[plantAt + 2]!;
+        sLow = runs[plantAt]!;
+        sHigh = runs[plantAt + 1]!;
         for (let pass = 0; pass < 2; pass++) {
           const t = pass === 0 ? Math.min(tA, tB) : Math.max(tA, tB);
           if (t <= enter || t >= exit) continue;
-          const px = cx + dirX * t;
-          const across = px - ix;
-          if (across < 0 || across > 1) continue;
-          const pz = cz + dirZ * t;
-          const scale = focal / t;
-          const y0 = runs[plantAt]!;
-          const y1 = runs[plantAt + 1]!;
-          const top = hz - (y1 - cy) * scale;
-          const bottom = hz - (y0 - cy) * scale;
-          const to = Math.min(hi, Math.ceil(bottom));
-          for (let row = Math.max(lo, Math.floor(top)); row < to; row++) {
-            const share = take(row, top, bottom);
-            if (share === 0) continue;
-            const at = ((row > top ? row : top) + (row + 1 < bottom ? row + 1 : bottom)) / 2;
-            const wy = Math.min(y1 - 0.001, Math.max(y0, cy - (at - hz) / scale));
-            if (
-              shade(
-                hdr,
-                row * stride + base,
-                runs[plantAt + 2]!,
-                SIDE_Z,
-                px,
-                wy,
-                pz,
-                t,
-                scale / 16,
-                -1,
-                y0,
-                1,
-                across,
-                share,
-              )
-            )
-              took(row, share, t);
-          }
+          sX = cx + dirX * t;
+          sAcross = sX - ix;
+          if (sAcross < 0 || sAcross > 1) continue;
+          sZ = cz + dirZ * t;
+          sDepth = t;
+          sScale = focal / t;
+          fill(hz - (sHigh - cy) * sScale, hz - (sLow - cy) * sScale, sprite);
         }
       }
       // Then tops seen from above and undersides seen from below.
+      sCell = ci;
+      sSlant = true;
       for (let k = -1; k < count; k++) {
         let y0 = 0;
         let y1 = groundTop;
-        let mat = wet ? WATER : groundMat[ci]!;
+        sMat = wet ? WATER : groundMat[ci]!;
         if (k >= 0) {
           const ro = (ci * RUNS + k) * 3;
           y0 = runs[ro]!;
           y1 = runs[ro + 1]!;
-          mat = runs[ro + 2]!;
-          if (mat >= PLANT || mat === VINE) continue;
+          sMat = runs[ro + 2]!;
+          if (sMat >= PLANT || sMat === VINE) continue;
         }
-        const over = k < 0 ? decal[ci]! : 0;
         const above = cy > y1;
         if (!above && (k < 0 || cy >= y0)) continue;
         // The face's far edge and near edge on screen: a top lies below the horizon, an underside above it.
-        const rise = above ? cy - y1 : cy - y0;
-        const top = hz + rise * (above ? scaleOut : scaleIn);
-        const bottom = hz + rise * (above ? scaleIn : scaleOut);
-        const to = Math.min(hi, Math.ceil(bottom));
-        for (let row = Math.max(lo, Math.floor(top)); row < to; row++) {
-          const share = take(row, top, bottom);
-          if (share === 0) continue;
-          const at = ((row > top ? row : top) + (row + 1 < bottom ? row + 1 : bottom)) / 2;
-          const depth = Math.min(exit, Math.max(enter, (rise * focal) / (at - hz)));
-          // A ground plane seen at a slant stretches each pixel over more texels along the view than across it.
-          const texel = Math.sqrt((focal / depth) * ((Math.abs(rise) * focal) / (depth * depth))) / 16;
-          const wpx = cx + dirX * depth;
-          const wpz = cz + dirZ * depth;
-          // What lies on the surface hides it where its texture is not a gap.
-          if (
-            over !== 0 &&
-            above &&
-            shade(hdr, row * stride + base, over, TOP, wpx, y1, wpz, depth, texel, -1, 0, 1, -1, share)
-          ) {
-            took(row, share, depth);
-            continue;
-          }
-          if (mat === WATER) {
-            took(row, share, depth);
-            waterShare[row] += share;
-            waterDepth[row] = depth;
-            waterCell[row] = ci;
-            if (row < waterLo) waterLo = row;
-            if (row >= waterHi) waterHi = row + 1;
-            continue;
-          }
-          if (
-            shade(
-              hdr,
-              row * stride + base,
-              mat,
-              above ? TOP : UNDER,
-              wpx,
-              above ? y1 : y0,
-              wpz,
-              depth,
-              texel,
-              -1,
-              0,
-              above ? 1 : 0.8,
-              -1,
-              share,
-            )
-          )
-            took(row, share, depth);
-        }
+        sRise = above ? cy - y1 : cy - y0;
+        sHigh = above ? y1 : y0;
+        sFace = above ? TOP : UNDER;
+        sInner = above ? 1 : 0.8;
+        sOver = k < 0 && above ? decal[ci]! : 0;
+        fill(hz + sRise * (above ? scaleOut : scaleIn), hz + sRise * (above ? scaleIn : scaleOut), level);
       }
       // Foliage is seen from inside too: the far faces of a leafy block close the gaps of its near ones.
+      sOver = 0;
+      sSlant = false;
+      sInner = 0.55;
+      sLip = -1;
+      sFoot = 0;
       for (let k = nextLeafHi === 0 ? count : 0; k < count; k++) {
         const ro = (ci * RUNS + k) * 3;
-        const mat = runs[ro + 2]!;
-        if (mat < FOLIAGE || mat >= LAVA) continue;
+        sMat = runs[ro + 2]!;
+        if (sMat < FOLIAGE || sMat >= LAVA) continue;
         const y0 = runs[ro]!;
         const y1 = runs[ro + 1]!;
         // Its far side, then its top from below or its underside from above.
-        for (let pass = 0; pass < 2; pass++) {
-          if (pass === 1 && (mat === VINE || (cy >= y0 && cy <= y1))) break;
-          const rise = cy - (cy < y0 ? y1 : y0);
-          const a = pass === 0 ? hz - (y1 - cy) * scaleOut : hz + rise * scaleIn;
-          const b = pass === 0 ? hz - (y0 - cy) * scaleOut : hz + rise * scaleOut;
-          const top = a < b ? a : b;
-          const bottom = a < b ? b : a;
-          const to = Math.min(hi, Math.ceil(bottom));
-          for (let row = Math.max(lo, Math.floor(top)); row < to; row++) {
-            const share = take(row, top, bottom);
-            if (share === 0) continue;
-            const at = ((row > top ? row : top) + (row + 1 < bottom ? row + 1 : bottom)) / 2;
-            const depth = pass === 0 ? exit : Math.min(exit, Math.max(enter, (rise * focal) / (at - hz)));
-            const wy = pass === 0 ? cy - (at - hz) / scaleOut : cy - rise;
-            const side = pass === 1 ? UNDER : nextX < nextZ ? SIDE_X : SIDE_Z;
-            const o = row * stride + base;
-            if (
-              shade(
-                hdr,
-                o,
-                mat,
-                side,
-                cx + dirX * depth,
-                wy,
-                cz + dirZ * depth,
-                depth,
-                focal / depth / 16,
-                -1,
-                0,
-                0.55,
-                -1,
-                share,
-              )
-            )
-              took(row, share, depth);
-          }
-        }
+        sFace = nextX < nextZ ? SIDE_X : SIDE_Z;
+        sX = cx + dirX * exit;
+        sZ = cz + dirZ * exit;
+        sDepth = exit;
+        sScale = scaleOut;
+        fill(hz - (y1 - cy) * scaleOut, hz - (y0 - cy) * scaleOut, wall);
+        if (sMat === VINE || (cy >= y0 && cy <= y1)) continue;
+        sRise = cy - (cy < y0 ? y1 : y0);
+        sHigh = cy - sRise;
+        sFace = UNDER;
+        const a = hz + sRise * scaleIn;
+        const b = hz + sRise * scaleOut;
+        fill(a < b ? a : b, a < b ? b : a, level);
       }
       while (lo < hi && left[lo] === 0) lo++;
       while (hi > lo && left[hi - 1] === 0) hi--;
@@ -985,7 +693,8 @@ export function createRenderer(world: World, width: number, height: number, hori
         const share = left[row]!;
         if (share === 0) continue;
         const depth = Math.min(FAR * 3, ((cy - surface) * focal) / (row + 0.5 - hz));
-        took(row, share, depth);
+        left[row] = 0;
+        if (share >= 0.5 || depths[row * W + x] === 0) depths[row * W + x] = depth;
         waterShare[row] += share;
         waterDepth[row] = depth;
         waterCell[row] = pathCell[steps - 1]!;
@@ -996,7 +705,7 @@ export function createRenderer(world: World, width: number, height: number, hori
     for (let row = lo; row < hi; row++) {
       const share = left[row]!;
       if (share === 0) continue;
-      skyInto(skyTap, 0, row, true);
+      sky.into(skyTap, 0, row, true);
       const o = row * stride + base;
       hdr[o] += skyTap[0]! * share;
       hdr[o + 1] += skyTap[1]! * share;
@@ -1092,7 +801,7 @@ export function createRenderer(world: World, width: number, height: number, hori
       }
     }
     for (let row = waterLo; row < waterHi; row++) {
-      if (!mirrored[row] && waterDepth[row] !== 0) skyInto(m, row * 3, 2 * hz - row - 1, false);
+      if (!mirrored[row] && waterDepth[row] !== 0) sky.into(m, row * 3, 2 * hz - row - 1, false);
     }
     // Water: the swell tilts the surface, which bends the reflection, opens or closes the view of the bed, and
     // catches the sun as a broken path of light.
@@ -1119,9 +828,9 @@ export function createRenderer(world: World, width: number, height: number, hori
       const from = Math.round(hz + climb * focal);
       const o = row * stride + base;
       if (from >= waterLo && from < waterHi && waterDepth[from] !== 0) skyTap.set(m.subarray(from * 3, from * 3 + 3));
-      else skyInto(skyTap, 0, hz - climb * focal, false);
+      else sky.into(skyTap, 0, hz - climb * focal, false);
       // Waves too fine to see still scatter the light: the rougher the water, the wider and fainter its glitter.
-      const sunlit = lit(wx, surface + 0.05, wz);
+      const sunlit = shadows.lit(wx, surface + 0.05, wz);
       const toLight = rx * lightX + ry * lightY + rz * lightZ;
       const gloss = 1 / (0.008 + chop * 2.5);
       const sparkle = toLight > 0.5 ? toLight ** gloss * (0.5 + gloss * 0.018) * sunlit : 0;
@@ -1189,139 +898,6 @@ export function createRenderer(world: World, width: number, height: number, hori
         if (step.done) return step.value;
       }
     },
-    *finishing() {
-      // Edges that run up the picture fall exactly between columns, hard but never stepped. Soften them a little
-      // where something near ends against something far; span ends were already given their exact coverage.
-      const line = new Float32Array(W * 3);
-      for (let y = 0; y < H; y++) {
-        line.set(hdr.subarray(y * W * 3, (y + 1) * W * 3));
-        for (let x = 1; x < W - 1; x++) {
-          const i = y * W + x;
-          const d = depths[i]!;
-          const gap = Math.max(Math.abs(depths[i - 1]! - d), Math.abs(depths[i + 1]! - d));
-          if (gap < d * 0.12 + 0.3) continue;
-          for (let c = 0; c < 3; c++) {
-            hdr[i * 3 + c] = line[x * 3 + c]! * 0.6 + (line[(x - 1) * 3 + c]! + line[(x + 1) * 3 + c]!) * 0.2;
-          }
-        }
-      }
-      yield;
-      // Bloom: the whole picture blurred at quarter size, to be laid back over itself at a fifth.
-      const soft = new Float32Array(qw * qh * 3);
-      for (let y = 0; y < H; y++) {
-        for (let x = 0; x < W; x++) {
-          const o = (y * W + x) * 3;
-          const b = ((y >> 2) * qw + (x >> 2)) * 3;
-          soft[b] += hdr[o]! / 16;
-          soft[b + 1] += hdr[o + 1]! / 16;
-          soft[b + 2] += hdr[o + 2]! / 16;
-        }
-      }
-      const scratch = new Float32Array(soft.length);
-      const blur = (src: Float32Array, dst: Float32Array, step: number, radius: number): void => {
-        const length = step === 3 ? qw : qh;
-        const lines = step === 3 ? qh : qw;
-        const lineStride = step === 3 ? qw * 3 : 3;
-        for (let row = 0; row < lines; row++) {
-          for (let c = 0; c < 3; c++) {
-            const start = row * lineStride + c;
-            let sum = 0;
-            for (let i = -radius; i <= radius; i++) sum += src[start + Math.min(length - 1, Math.max(0, i)) * step]!;
-            for (let i = 0; i < length; i++) {
-              dst[start + i * step] = sum / (radius * 2 + 1);
-              sum +=
-                src[start + Math.min(length - 1, i + radius + 1) * step]! -
-                src[start + Math.max(0, i - radius) * step]!;
-            }
-          }
-        }
-      };
-      for (const radius of [1, 2, 5]) {
-        blur(soft, scratch, 3, radius);
-        blur(scratch, soft, qw * 3, radius);
-      }
-
-      yield;
-      // Light shafts: open sky near the light, smeared away from it, so trunks and crowns cut dark gaps in the haze.
-      const shafts = new Float32Array(qw * qh);
-      if (lightAhead && lightY > 0) {
-        const sx = (W / 2 + Math.tan(lightAzimuth) * focal) / 4;
-        const sy = (hz - lightRise * focal) / 4;
-        const taps = 24;
-        for (let y = 0; y < qh; y++) {
-          for (let x = 0; x < qw; x++) {
-            const stepX = ((sx - x) / taps) * 0.95;
-            const stepY = ((sy - y) / taps) * 0.95;
-            let sum = 0;
-            let weight = 1;
-            for (let k = 0; k < taps; k++) {
-              const px = Math.round(x + stepX * k);
-              const py = Math.round(y + stepY * k);
-              if (px >= 0 && py >= 0 && px < qw && py < qh) sum += openSky[py * qw + px]! * weight;
-              weight *= 0.95;
-            }
-            shafts[y * qw + x] = (sum / taps) * rays * 0.08;
-          }
-        }
-      }
-
-      yield;
-      // The shader packs' tone curve: brighten fourfold, let the brightest colours drift toward white, roll off
-      // smoothly, then to display values.
-      const curve = new Float32Array(4097);
-      for (let i = 0; i <= 4096; i++) {
-        const value = i / 256;
-        curve[i] = value / Math.sqrt(value * value + 1);
-      }
-      const display = new Uint8Array(1025);
-      for (let i = 0; i <= 1024; i++) display[i] = Math.round(255 * (i / 1024) ** (1 / 2.2));
-      // The inverse of the drift toward white, which gives the colour back after the roll-off.
-      const [p, q, s] = [1.0428, -0.033, -0.0098];
-      const mid = 1.0659;
-      const out = new Uint8ClampedArray(W * H * 4);
-      for (let y = 0; y < H; y++) {
-        if ((y & 63) === 63) yield;
-        const gy = Math.max(0, (y - 1.5) / 4);
-        const y0 = Math.min(qh - 1, gy | 0);
-        const y1 = Math.min(qh - 1, y0 + 1);
-        const fy = gy - y0;
-        for (let x = 0; x < W; x++) {
-          const gx = Math.max(0, (x - 1.5) / 4);
-          const x0 = Math.min(qw - 1, gx | 0);
-          const x1 = Math.min(qw - 1, x0 + 1);
-          const fx = gx - x0;
-          const a = y0 * qw + x0;
-          const b = y0 * qw + x1;
-          const c = y1 * qw + x0;
-          const d = y1 * qw + x1;
-          const o = (y * W + x) * 3;
-          const shaft =
-            shafts[a]! +
-            (shafts[b]! - shafts[a]!) * fx +
-            (shafts[c]! + (shafts[d]! - shafts[c]!) * fx - shafts[a]! - (shafts[b]! - shafts[a]!) * fx) * fy;
-          let r = 0;
-          let g = 0;
-          let bl = 0;
-          for (let ch = 0; ch < 3; ch++) {
-            const upper = soft[a * 3 + ch]! + (soft[b * 3 + ch]! - soft[a * 3 + ch]!) * fx;
-            const lower = soft[c * 3 + ch]! + (soft[d * 3 + ch]! - soft[c * 3 + ch]!) * fx;
-            const value = (hdr[o + ch]! * 0.8 + (upper + (lower - upper) * fy) * 0.2 + lightColor[ch]! * shaft) * 4;
-            if (ch === 0) r = value;
-            else if (ch === 1) g = value;
-            else bl = value;
-          }
-          const tr = curve[Math.min(4096, ((r * 0.96 + g * 0.03 + bl * 0.01) * 256) | 0)]!;
-          const tg = curve[Math.min(4096, ((r * 0.03 + g * 0.94 + bl * 0.03) * 256) | 0)]!;
-          const tb = curve[Math.min(4096, ((r * 0.01 + g * 0.03 + bl * 0.96) * 256) | 0)]!;
-          const noise = (hash3(x, y, 5) - 0.5) * 1.6;
-          const pxl = (y * W + x) * 4;
-          out[pxl] = display[(clamp01(tr * p + tg * q + tb * s) * 1024) | 0]! + noise;
-          out[pxl + 1] = display[(clamp01(tr * q + tg * mid + tb * q) * 1024) | 0]! + noise;
-          out[pxl + 2] = display[(clamp01(tr * s + tg * q + tb * p) * 1024) | 0]! + noise;
-          out[pxl + 3] = 255;
-        }
-      }
-      return out;
-    },
+    finishing: () => finishing(hdr, depths, view, sky, light),
   };
 }

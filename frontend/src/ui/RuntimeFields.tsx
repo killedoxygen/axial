@@ -2,6 +2,7 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { SelectField } from './Select';
 import { Icon } from './Icons';
+import { Popover } from './Popover';
 import { api } from '../api';
 import { dtoArray, dtoRecord, dtoString } from '../dto-contract';
 import type { JavaSelection } from '../generated/JavaSelection';
@@ -204,7 +205,10 @@ export function JvmArgsInput({
   const tokens = useMemo(() => tokenize(value), [value]);
   const [draft, setDraft] = useState('');
   const [focused, setFocused] = useState(false);
+  // Dismissed suggestions return with the next keystroke or focus.
+  const [dismissed, setDismissed] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const boxRef = useRef<HTMLDivElement | null>(null);
 
   const commit = (next: string[]): void => onChange(next.join(' '));
 
@@ -227,11 +231,11 @@ export function JvmArgsInput({
 
   const suggestions = useMemo(() => {
     const q = draft.trim().toLowerCase();
-    if (!focused) return [];
+    if (!focused || dismissed) return [];
     const pool = SUGGESTIONS.filter((s) => !tokens.includes(s.insert));
     if (!q) return pool.slice(0, 6);
     return pool.filter((s) => s.insert.toLowerCase().includes(q) || s.label.toLowerCase().includes(q)).slice(0, 6);
-  }, [draft, focused, tokens]);
+  }, [draft, dismissed, focused, tokens]);
 
   const applySuggestion = (suggestion: Suggestion): void => {
     if (suggestion.template) {
@@ -246,7 +250,11 @@ export function JvmArgsInput({
   return (
     <div class="cp-ovr-field cp-ovr-args">
       {label && <span>{label}</span>}
-      <div class={`cp-argbox${focused ? ' cp-argbox--focus' : ''}`} data-disabled={disabled ? 'true' : 'false'}>
+      <div
+        ref={boxRef}
+        class={`cp-argbox${focused ? ' cp-argbox--focus' : ''}`}
+        data-disabled={disabled ? 'true' : 'false'}
+      >
         <div class="cp-argbox-tokens" onMouseDown={() => inputRef.current?.focus()}>
           {tokens.map((token, index) => {
             const info = classifyArg(token);
@@ -283,8 +291,14 @@ export function JvmArgsInput({
             spellcheck={false}
             disabled={disabled}
             aria-label="Add JVM argument"
-            onInput={(event) => setDraft((event.currentTarget as HTMLInputElement).value)}
-            onFocus={() => setFocused(true)}
+            onInput={(event) => {
+              setDismissed(false);
+              setDraft((event.currentTarget as HTMLInputElement).value);
+            }}
+            onFocus={() => {
+              setDismissed(false);
+              setFocused(true);
+            }}
             onBlur={() => {
               window.setTimeout(() => setFocused(false), 120);
               addToken(draft);
@@ -303,7 +317,16 @@ export function JvmArgsInput({
           />
         </div>
         {suggestions.length > 0 && (
-          <div class="cp-pop cp-menu cp-argbox-suggest" role="listbox">
+          // Keyed by the token count, so it re-hangs when the box wraps to another line.
+          <Popover
+            key={tokens.length}
+            anchor={boxRef}
+            fit="anchor"
+            gap={4}
+            onDismiss={() => setDismissed(true)}
+            class="cp-pop cp-menu"
+            role="listbox"
+          >
             {suggestions.map((suggestion) => (
               <button
                 key={suggestion.insert}
@@ -316,7 +339,7 @@ export function JvmArgsInput({
                 <span>{suggestion.desc}</span>
               </button>
             ))}
-          </div>
+          </Popover>
         )}
       </div>
     </div>

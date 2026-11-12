@@ -169,7 +169,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
     installProgress,
     preparing,
   });
-  // Status only when it says something the Launch button does not: ready and install are the button itself.
+  // Status only when it says something the Launch button does not: ready, install and progress are the button itself.
   const failureTitle = launchAction.primary_action === 'install' ? matchingInstallFailure?.viewModel.title : undefined;
   const quiet = launchAction.launchable || (launchAction.primary_action === 'install' && !failureTitle);
   const status = session ? (
@@ -180,9 +180,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
     ) : (
       <Status busy>{sessionLabel}</Status>
     )
-  ) : launchPresentation.progress || installQueued ? (
-    <Status busy>{launchPresentation.label}</Status>
-  ) : quiet ? null : failureTitle ? (
+  ) : quiet || launchPresentation.progress || installQueued ? null : failureTitle ? (
     <Status eyes="x" tone="err">
       {failureTitle}
     </Status>

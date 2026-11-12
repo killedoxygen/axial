@@ -6,6 +6,6 @@ export type BlockTexture = {
  */
 name: string, 
 /**
- * Sixteen rows of sixteen RGBA texels, base64.
+ * Square RGBA texels, base64: sixteen a side for a block, thirty-two for the sun and the moon.
  */
 rgba: string, };

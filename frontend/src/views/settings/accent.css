@@ -21,9 +21,11 @@
   background: var(--swatch);
   cursor: pointer;
 }
+/* A ring of its own colour, drawn as a shadow: every engine rounds a shadow, not every one rounds an outline. */
 .cp-swatch[data-active='true'] {
-  outline: 1.5px solid var(--swatch);
-  outline-offset: 2px;
+  box-shadow:
+    0 0 0 2px var(--bg),
+    0 0 0 3.5px var(--swatch);
 }
 .cp-hue {
   flex: none;

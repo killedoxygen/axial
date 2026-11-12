@@ -732,5 +732,17 @@ export function paintedTextures(): Map<string, Uint8Array> {
     }
     pack.set(name, rgba);
   }
+  // The sun and the moon: a bright square on black, thirty-two texels a side.
+  for (const [name, half, color] of [
+    ['sun', 8, [255, 244, 200]],
+    ['moon', 7, [214, 222, 236]],
+  ] as const) {
+    const rgba = new Uint8Array(4096);
+    for (let i = 0; i < 1024; i++) {
+      const inside = Math.max(Math.abs((i & 31) - 15.5), Math.abs((i >> 5) - 15.5)) < half;
+      rgba.set(inside ? [...color, 255] : [0, 0, 0, 255], i * 4);
+    }
+    pack.set(name, rgba);
+  }
   return pack;
 }

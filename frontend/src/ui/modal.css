@@ -3,7 +3,7 @@
   inset: 0;
   z-index: 900;
   background: color-mix(in oklab, var(--bg-deep) 62%, transparent);
-  animation: cp-fade-in 220ms ease both;
+  animation: cp-fade-in var(--t-move) var(--ease-out) both;
 }
 .cp-modal-panel {
   position: fixed;
@@ -16,7 +16,7 @@
   margin: auto;
   outline: none;
   transform-origin: center;
-  animation: cp-modal-in 340ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: cp-modal-in 340ms var(--ease-out) both;
 }
 @keyframes cp-modal-in {
   from {

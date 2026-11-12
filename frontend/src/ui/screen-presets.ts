@@ -38,8 +38,3 @@ export function buildWindowPresets(max: ScreenSize): WindowPresetSpec[] {
   return [...fits, DEFAULT_PRESET];
 }
 
-export function nextWindowPreset(presets: WindowPresetSpec[], currentId: string): WindowPresetSpec {
-  if (presets.length === 0) return DEFAULT_PRESET;
-  const i = presets.findIndex((p) => p.id === currentId);
-  return presets[(i + 1) % presets.length]!;
-}

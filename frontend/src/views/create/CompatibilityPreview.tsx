@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
-import { createPortal } from 'preact/compat';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import { Icon } from '../../ui/Icons';
+import { Popover } from '../../ui/Popover';
 import { tipProps } from '../../ui/Tip';
 import type { CreateDraftItem } from '../../ui-state';
 import type { CompatCandidate } from '../../types-content';
@@ -30,7 +30,6 @@ export function CompatibilityPreview({
 }): JSX.Element | null {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
   const dropped = new Set(candidate.drops.map((item) => item.canonical_id));
   const working = draft.filter((item) => !dropped.has(item.canonical_id));
   const notWorking = draft.filter((item) => dropped.has(item.canonical_id));
@@ -39,30 +38,6 @@ export function CompatibilityPreview({
   const visible = items.slice(0, 3);
   const overflow = items.slice(visible.length);
   const label = showingFits ? 'Works' : "Doesn't work";
-  const rect = open ? triggerRef.current?.getBoundingClientRect() : null;
-  const popoverTop = rect
-    ? rect.bottom + 250 > window.innerHeight
-      ? Math.max(8, rect.top - 246)
-      : rect.bottom + 6
-    : 0;
-
-  useEffect(() => {
-    if (!open) return;
-    const close = (): void => setOpen(false);
-    const closeOutside = (event: PointerEvent): void => {
-      const target = event.target as Node;
-      if (triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
-      close();
-    };
-    window.addEventListener('resize', close);
-    window.addEventListener('scroll', close, true);
-    document.addEventListener('pointerdown', closeOutside);
-    return () => {
-      window.removeEventListener('resize', close);
-      window.removeEventListener('scroll', close, true);
-      document.removeEventListener('pointerdown', closeOutside);
-    };
-  }, [open]);
 
   if (notWorking.length === 0) return null;
 
@@ -94,28 +69,27 @@ export function CompatibilityPreview({
           +{overflow.length}
         </button>
       )}
-      {open && rect
-        ? createPortal(
-            <div
-              ref={popoverRef}
-              class="cp-pop cp-cr-compat-list"
-              role="tooltip"
-              style={{ top: `${popoverTop}px`, right: `${window.innerWidth - rect.right}px` }}
-              onClick={(event) => event.stopPropagation()}
-            >
-              <strong>{label}</strong>
-              {items.map((item) => (
-                <span key={item.canonical_id} class="cp-cr-compat-item">
-                  <span class="cp-cr-compat-icon">
-                    <PickIcon item={item} missing={!showingFits} />
-                  </span>
-                  {item.title}
-                </span>
-              ))}
-            </div>,
-            document.body,
-          )
-        : null}
+      {open && (
+        <Popover
+          anchor={triggerRef}
+          onDismiss={() => setOpen(false)}
+          align="end"
+          maxHeight={240}
+          class="cp-pop cp-cr-compat-list"
+          role="tooltip"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <strong>{label}</strong>
+          {items.map((item) => (
+            <span key={item.canonical_id} class="cp-cr-compat-item">
+              <span class="cp-cr-compat-icon">
+                <PickIcon item={item} missing={!showingFits} />
+              </span>
+              {item.title}
+            </span>
+          ))}
+        </Popover>
+      )}
     </span>
   );
 }

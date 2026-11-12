@@ -2,6 +2,7 @@ import './base.css';
 import './ui/atoms.css';
 import './ui/segmented.css';
 import './ui/choice-pills.css';
+import './shell/chrome.css';
 import './shell/shell.css';
 import './shell/rail-icons.css';
 import './shell/update-card.css';

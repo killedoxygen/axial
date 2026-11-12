@@ -25,20 +25,8 @@ import { reportRenderError } from './error-reporting';
 import { reloadApplication } from './preferences/persistence';
 
 type DevLabViewComponent = (typeof import('./views/dev-lab/DevLabView'))['DevLabView'];
-type CommandPaletteComponent = (typeof import('./ui/CommandPalette'))['CommandPalette'];
-type AccountSwitcherComponent = (typeof import('./views/accounts/AccountSwitcher'))['AccountSwitcher'];
 
-let loadedCommandPalette: CommandPaletteComponent | null = null;
-let loadedAccountSwitcher: AccountSwitcherComponent | null = null;
-
-const deferredViewPreloads: (() => Promise<void>)[] = [
-  async () => {
-    loadedCommandPalette ??= (await import('./ui/CommandPalette')).CommandPalette;
-  },
-  async () => {
-    loadedAccountSwitcher ??= (await import('./views/accounts/AccountSwitcher')).AccountSwitcher;
-  },
-];
+const deferredViewPreloads: (() => Promise<void>)[] = [];
 
 /* Warm every lazily loaded view during idle time so the first navigation (or
    first New Instance) renders synchronously instead of hitting a chunk load.
@@ -61,6 +49,10 @@ const ContentDetailRoute = createRouteLoader(
 );
 
 const CreateOverlay = createRouteLoader(async () => (await import('./views/create/CreateView')).CreateView);
+const CommandPaletteOverlay = createOverlayLoader(async () => (await import('./ui/CommandPalette')).CommandPalette);
+const AccountSwitcherOverlay = createOverlayLoader(
+  async () => (await import('./views/accounts/AccountSwitcher')).AccountSwitcher,
+);
 
 const AccountsRoute = createRouteLoader(async () => (await import('./views/accounts/AccountsView')).AccountsView);
 
@@ -79,12 +71,17 @@ const loadDevLabView = __AXIAL_ENABLE_DEV_LAB__
 const DevLabRouteView = loadDevLabView ? createRouteLoader(loadDevLabView) : null;
 
 function createPageRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
-  return createRouteLoader(load, true);
+  return createRouteLoader(load, { restoresViewScroll: true });
+}
+
+/** An overlay shows nothing until its code arrives; a route says it is loading. */
+function createOverlayLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
+  return createRouteLoader(load, { silent: true });
 }
 
 function createRouteLoader<P extends object>(
   load: () => Promise<ComponentType<P>>,
-  restoresViewScroll = false,
+  { restoresViewScroll = false, silent = false } = {},
 ): ComponentType<P> {
   let loadedView: ComponentType<P> | null = null;
 
@@ -92,7 +89,7 @@ function createRouteLoader<P extends object>(
     loadedView ??= await load();
   });
 
-  return function LazyRouteView(props: P): JSX.Element {
+  return function LazyRouteView(props: P): JSX.Element | null {
     const [View, setView] = useState<ComponentType<P> | null>(() => loadedView);
     const [failed, setFailed] = useState(false);
 
@@ -113,7 +110,7 @@ function createRouteLoader<P extends object>(
       };
     }, [View]);
 
-    if (!View) return <RouteLoadingFallback failed={failed} />;
+    if (!View) return silent ? null : <RouteLoadingFallback failed={failed} />;
     const content = h(View, props);
     return restoresViewScroll ? <RouteScrollReady>{content}</RouteScrollReady> : content;
   };
@@ -146,46 +143,6 @@ function RouteLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Ele
 function DevLabRoute(): JSX.Element {
   if (!DevLabRouteView || !devMode.value) return <SettingsRoute />;
   return <DevLabRouteView />;
-}
-
-function LazyCommandPalette(): JSX.Element | null {
-  const [CommandPaletteView, setCommandPaletteView] = useState<CommandPaletteComponent | null>(
-    () => loadedCommandPalette,
-  );
-
-  useEffect(() => {
-    if (CommandPaletteView) return;
-    let mounted = true;
-    void import('./ui/CommandPalette').then((module) => {
-      loadedCommandPalette = module.CommandPalette;
-      if (mounted) setCommandPaletteView(() => module.CommandPalette);
-    });
-    return () => {
-      mounted = false;
-    };
-  }, [CommandPaletteView]);
-
-  return CommandPaletteView ? <CommandPaletteView /> : null;
-}
-
-function LazyAccountSwitcher(): JSX.Element | null {
-  const [AccountSwitcherView, setAccountSwitcherView] = useState<AccountSwitcherComponent | null>(
-    () => loadedAccountSwitcher,
-  );
-
-  useEffect(() => {
-    if (AccountSwitcherView) return;
-    let mounted = true;
-    void import('./views/accounts/AccountSwitcher').then((module) => {
-      loadedAccountSwitcher = module.AccountSwitcher;
-      if (mounted) setAccountSwitcherView(() => module.AccountSwitcher);
-    });
-    return () => {
-      mounted = false;
-    };
-  }, [AccountSwitcherView]);
-
-  return AccountSwitcherView ? <AccountSwitcherView /> : null;
 }
 
 function CurrentView(): JSX.Element {
@@ -259,13 +216,13 @@ function AppContent(): JSX.Element {
         <CurrentView />
       </AppFrame>
       {createOpen.value && <CreateOverlay />}
-      {accountSwitcherOpen.value && <LazyAccountSwitcher />}
+      {accountSwitcherOpen.value && <AccountSwitcherOverlay />}
       {showOnboardingOverlay.value && <OnboardingOverlay />}
       <DialogHost />
       <ContextMenuHost />
       <ToastHost />
       <TipHost />
-      {commandPaletteOpen.value && <LazyCommandPalette />}
+      {commandPaletteOpen.value && <CommandPaletteOverlay />}
       <BootSplash />
     </>
   );

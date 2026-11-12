@@ -1,16 +1,13 @@
 import type { JSX } from 'preact';
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { useDismiss } from '../../hooks/use-dismiss';
 import { accountsNotice, accountsOp, accountsSnapshot, selectAccount } from '../../machines/accounts';
 import { Notice } from '../../ui/Atoms';
 import { openContextMenu } from '../../ui/ContextMenu';
 import { Icon } from '../../ui/Icons';
+import { Popover } from '../../ui/Popover';
 import { tipProps } from '../../ui/Tip';
 import { AccountHead, AccountKindChip, AccountKindMark, accountName } from './account-face';
 import { AccountAdders, AccountList, accountMenuItems, ACCOUNTS_UNAVAILABLE, accountSwitch } from './account-rows';
-
-const POP_WIDTH = 280;
-const POP_GUTTER = 28;
 
 /**
  * The accounts on one line, never two. Each is a pill (head, name, kind) while they all fit; when they do not, the
@@ -25,16 +22,11 @@ export function AccountRow(): JSX.Element {
 
   const rowRef = useRef<HTMLDivElement>(null);
   const [layout, setLayout] = useState({ compact: false, hidden: 0 });
-  const [open, setOpen] = useState<{ kind: 'more' | 'add'; end: boolean } | null>(null);
+  const [open, setOpen] = useState<'more' | 'add' | null>(null);
+  const moreRef = useRef<HTMLButtonElement>(null);
+  const addRef = useRef<HTMLButtonElement>(null);
   const close = (): void => setOpen(null);
-  // The list hangs from its button's left edge, or from its right edge where it would leave the window.
-  const toggle = (kind: 'more' | 'add', button: HTMLElement): void =>
-    setOpen(
-      open?.kind === kind
-        ? null
-        : { kind, end: button.getBoundingClientRect().left + POP_WIDTH > window.innerWidth - POP_GUTTER },
-    );
-  useDismiss(rowRef, open !== null, close);
+  const toggle = (kind: 'more' | 'add'): void => setOpen(open === kind ? null : kind);
 
   // The last `hidden` accounts that are not the active one sit behind "+N".
   const idle = accounts.filter((account) => !account.active);
@@ -119,38 +111,40 @@ export function AccountRow(): JSX.Element {
         })}
         <span class="cp-accounts-anchor" data-more hidden={layout.hidden === 0}>
           <button
+            ref={moreRef}
             type="button"
             class="cp-account cp-account-more"
             aria-haspopup="listbox"
-            aria-expanded={open?.kind === 'more'}
+            aria-expanded={open === 'more'}
             aria-label={`${layout.hidden} more accounts`}
-            onClick={(event) => toggle('more', event.currentTarget)}
+            onClick={() => toggle('more')}
           >
             +{layout.hidden}
           </button>
-          {open?.kind === 'more' && (
-            <div class="cp-pop cp-menu cp-accounts-pop" data-end={open.end}>
+          {open === 'more' && (
+            <Popover anchor={moreRef} onDismiss={close} class="cp-pop cp-menu cp-accounts-pop">
               <AccountList accounts={[...behind]} label="More accounts" onSwitched={close} />
-            </div>
+            </Popover>
           )}
         </span>
         <span class="cp-accounts-anchor">
           <button
+            ref={addRef}
             type="button"
             class="cp-account cp-account-add"
             aria-haspopup="menu"
-            aria-expanded={open?.kind === 'add'}
-            onClick={(event) => toggle('add', event.currentTarget)}
+            aria-expanded={open === 'add'}
+            onClick={() => toggle('add')}
           >
             <span class="cp-account-glyph">
               <Icon name="plus" size={14} />
             </span>
             Add account
           </button>
-          {open?.kind === 'add' && (
-            <div class="cp-pop cp-menu cp-accounts-pop" data-end={open.end}>
+          {open === 'add' && (
+            <Popover anchor={addRef} onDismiss={close} class="cp-pop cp-menu cp-accounts-pop">
               <AccountAdders onDone={close} />
-            </div>
+            </Popover>
           )}
         </span>
       </div>

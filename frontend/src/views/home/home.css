@@ -93,8 +93,8 @@
   height: 120px;
   border-radius: var(--hold-xl);
   transition:
-    scale 160ms ease,
-    background 120ms ease;
+    scale var(--t-pop) var(--ease-out),
+    background var(--t-quick) var(--ease-out);
 }
 .cp-home-item:hover .cp-home-cover {
   scale: 1.03;

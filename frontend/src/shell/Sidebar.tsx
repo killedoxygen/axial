@@ -5,7 +5,8 @@ import { Kbd, Ring } from '../ui/Atoms';
 import { Icon, type IconName } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
-import { useDismiss } from '../hooks/use-dismiss';
+import { Popover } from '../ui/Popover';
+import { hideTip, tipProps } from '../ui/Tip';
 import { route, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
 import { launchSessions, config, instances, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
@@ -20,17 +21,6 @@ import type { Instance } from '../types-instance';
 import { shortcutHint } from '../shortcuts';
 import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
 
-type RailTip = {
-  label: string;
-  top: number;
-};
-
-type RailTooltipController = {
-  show: (label: string, target: HTMLElement) => void;
-  hide: () => void;
-};
-type RailTipEvent = JSX.TargetedEvent<HTMLElement>;
-
 function isRouteActive(target: Route, current: Route): boolean {
   if (target.name !== current.name) return false;
   if ('id' in target || 'id' in current) return 'id' in target && 'id' in current && target.id === current.id;
@@ -41,16 +31,6 @@ function recentTime(inst: Instance): number {
   const lastPlayed = inst.last_played_at ? Date.parse(inst.last_played_at) : 0;
   const created = Date.parse(inst.created_at);
   return Math.max(Number.isFinite(lastPlayed) ? lastPlayed : 0, Number.isFinite(created) ? created : 0);
-}
-
-function railTipAttrs(label: string, tooltip: RailTooltipController) {
-  return {
-    'data-rail-label': label,
-    onMouseEnter: (e: RailTipEvent) => tooltip.show(label, e.currentTarget),
-    onMouseLeave: tooltip.hide,
-    onFocus: (e: RailTipEvent) => tooltip.show(label, e.currentTarget),
-    onBlur: tooltip.hide,
-  };
 }
 
 function RailIcon({ name, size = 20 }: { name: IconName; size?: number }): JSX.Element {
@@ -94,13 +74,11 @@ function RailButton({
   label,
   target,
   accent,
-  tooltip,
 }: {
   icon: IconName;
   label: string;
   target: Route;
   accent?: boolean;
-  tooltip: RailTooltipController;
 }): JSX.Element {
   const current = route.value;
   const active =
@@ -114,18 +92,18 @@ function RailButton({
       data-accent={accent}
       data-icon={icon}
       onClick={() => {
-        tooltip.hide();
+        hideTip();
         navigate(target);
       }}
       aria-label={label}
-      {...railTipAttrs(label, tooltip)}
+      {...tipProps(label, 'right')}
     >
       <RailIcon name={icon} />
     </button>
   );
 }
 
-function RailTray({ tooltip }: { tooltip: RailTooltipController }): JSX.Element {
+function RailTray(): JSX.Element {
   const current = route.value;
   const list = [...instances.value].sort((a, b) => recentTime(b) - recentTime(a) || a.name.localeCompare(b.name));
   return (
@@ -141,6 +119,11 @@ function RailTray({ tooltip }: { tooltip: RailTooltipController }): JSX.Element 
             const install = instanceInstallStatus(inst, version);
             const installing = install.installing;
             const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
+            const label = installing
+              ? `${inst.name}: ${installLabel}`
+              : session
+                ? `${inst.name}: ${sessionLabel}`
+                : inst.name;
             return (
               <button
                 key={inst.id}
@@ -150,23 +133,18 @@ function RailTray({ tooltip }: { tooltip: RailTooltipController }): JSX.Element 
                 data-session-active={Boolean(session)}
                 data-installing={installing}
                 onClick={() => {
-                  tooltip.hide();
+                  hideTip();
                   navigate({ name: 'instance', id: inst.id });
                 }}
                 onContextMenu={(e) => {
-                  tooltip.hide();
+                  hideTip();
                   openInstanceContextMenu(e, inst);
                 }}
-                aria-label={
-                  installing ? `${inst.name}: ${installLabel}` : session ? `${inst.name}: ${sessionLabel}` : inst.name
-                }
-                {...railTipAttrs(
-                  installing ? `${inst.name}: ${installLabel}` : session ? `${inst.name}: ${sessionLabel}` : inst.name,
-                  tooltip,
-                )}
+                aria-label={label}
+                {...tipProps(label, 'right')}
               >
                 <InstanceTile inst={inst} className="cp-rail-tile-art" />
-                {installing && <Ring size={44} progress={install.progress?.pct} />}
+                {installing && <Ring size={44} edge={12} progress={install.progress?.pct} />}
                 {session && !installing && <span class="cp-rail-tile-dot" aria-hidden="true" />}
               </button>
             );
@@ -178,11 +156,11 @@ function RailTray({ tooltip }: { tooltip: RailTooltipController }): JSX.Element 
         data-accent="true"
         data-icon="plus"
         onClick={() => {
-          tooltip.hide();
+          hideTip();
           openCreate();
         }}
         aria-label="New instance"
-        {...railTipAttrs('New instance', tooltip)}
+        {...tipProps('New instance', 'right')}
       >
         <RailIcon name="plus" />
       </button>
@@ -238,7 +216,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
   );
 
   return (
-    <div class="cp-userm cp-pop cp-menu" role="menu">
+    <>
       {account && (
         <div class="cp-userm-me">
           <AccountHead account={account} />
@@ -281,76 +259,67 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
         }}
         right={<Kbd>{shortcutHint('open-settings')}</Kbd>}
       />
-    </div>
+    </>
   );
 }
 
-function UserTrigger({ tooltip }: { tooltip: RailTooltipController }): JSX.Element {
+function UserTrigger(): JSX.Element {
   const [open, setOpen] = useState(false);
   const username = (accountDisplayName.value || config.value?.username || 'Player').slice(0, 24);
-  const rootRef = useRef<HTMLDivElement>(null);
-
-  useDismiss(rootRef, open, () => setOpen(false));
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const close = (): void => setOpen(false);
 
   return (
-    <div class="cp-user-shell" ref={rootRef}>
-      {open && <UserMenu onClose={() => setOpen(false)} />}
+    <>
+      {open && (
+        <Popover
+          anchor={triggerRef}
+          side="right"
+          align="end"
+          gap={10}
+          onDismiss={close}
+          class="cp-userm cp-pop cp-menu"
+          role="menu"
+        >
+          <UserMenu onClose={close} />
+        </Popover>
+      )}
       <button
+        ref={triggerRef}
         class="cp-rail-user"
         type="button"
         data-open={open}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => {
-          tooltip.hide();
+          hideTip();
           setOpen((o) => !o);
         }}
         onPointerEnter={() => {
           void import('../views/accounts/AccountSwitcher');
         }}
         aria-label={`${username}, account menu`}
-        {...railTipAttrs(username, tooltip)}
+        {...tipProps(username, 'right')}
       >
         <PlayerHeadPreview textureSrc={accountSkinSrc.value ?? undefined} size={34} radius={10} />
       </button>
-    </div>
+    </>
   );
 }
 
 export function Sidebar(): JSX.Element {
-  const [tip, setTip] = useState<RailTip | null>(null);
-  const railRef = useRef<HTMLElement>(null);
-  const tooltip: RailTooltipController = {
-    show: (label, target) => {
-      const railRect = railRef.current?.getBoundingClientRect();
-      const targetRect = target.getBoundingClientRect();
-      const top = railRect ? targetRect.top - railRect.top + targetRect.height / 2 : targetRect.height / 2;
-      setTip({ label, top });
-    },
-    hide: () => setTip(null),
-  };
-
   return (
-    <aside class="cp-rail" ref={railRef}>
+    <aside class="cp-rail">
       <div class="cp-rail-brand" aria-hidden="true">
         <Logo className="cp-logo" size={34} />
       </div>
-      <RailButton icon="home" label="Home" target={{ name: 'home' }} tooltip={tooltip} />
-      <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
-      <RailButton icon="compass" label="Discover" target={{ name: 'discover' }} tooltip={tooltip} />
-      <RailTray tooltip={tooltip} />
+      <RailButton icon="home" label="Home" target={{ name: 'home' }} />
+      <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} />
+      <RailButton icon="compass" label="Discover" target={{ name: 'discover' }} />
+      <RailTray />
       <div class="cp-rail-spacer" />
-      <RailButton icon="settings" label="Settings" target={{ name: 'settings' }} tooltip={tooltip} />
-      <UserTrigger tooltip={tooltip} />
-      {tip && (
-        <div
-          class="cp-rail-tip cp-tip"
-          style={{ '--cp-rail-tip-top': `${tip.top}px` } as JSX.CSSProperties}
-          aria-hidden="true"
-        >
-          {tip.label}
-        </div>
-      )}
+      <RailButton icon="settings" label="Settings" target={{ name: 'settings' }} />
+      <UserTrigger />
     </aside>
   );
 }

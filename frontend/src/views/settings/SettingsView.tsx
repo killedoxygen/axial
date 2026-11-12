@@ -26,7 +26,7 @@ export function SettingsView(): JSX.Element {
   const [section, setSection] = useState<SectionId>('appearance');
 
   return (
-    <div class="cp-settings">
+    <div class="cp-view-page">
       <Tabs
         tabs={SECTIONS}
         active={section}

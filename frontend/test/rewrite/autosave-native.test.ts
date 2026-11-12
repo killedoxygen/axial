@@ -358,6 +358,7 @@ function harness() {
     'preact/hooks': javaHooks,
     './Select': primitive('SelectField'),
     './Icons': primitive('Icon'),
+    './Popover': primitive('Popover'),
     '../api': api,
     '../dto-contract': contract,
   });

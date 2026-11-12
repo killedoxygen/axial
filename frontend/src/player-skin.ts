@@ -1,4 +1,4 @@
-import { signal } from '@preact/signals';
+import { computed, signal } from '@preact/signals';
 import { apiResourceUrl } from './api';
 import { DEFAULT_SKINS } from './default-skins';
 import { accountsSnapshot, activeAccount } from './machines/accounts-state';
@@ -6,8 +6,25 @@ import { local, saveLocalState, canEditPreferences } from './state';
 import { config } from './store';
 import type { LauncherAccount, MinecraftCape } from './views/accounts/types';
 
-export const accountSkinSrc = signal<string | null>(null);
-export const accountDisplayName = signal('Player');
+/** Bumped whenever a skin chosen in Axial changes; `local` itself is not observable. */
+const skinChoices = signal(0);
+
+/** Who is playing, as the shell shows them. Derived, so it can never fall behind the accounts or the choices. */
+const player = computed(() => {
+  skinChoices.value;
+  const fallbackName = config.value?.username?.trim() || 'Player';
+  const account = activeAccount(accountsSnapshot.value);
+  const profile = account?.kind === 'microsoft' ? account.minecraft_profile : null;
+  if (!account || (account.kind === 'microsoft' && !profile)) {
+    return { name: fallbackName, skin: selectedSkinTextureSrc(selectedSkinForAccount(FALLBACK_SKIN_ACCOUNT_KEY)) };
+  }
+  return {
+    name: profile?.name.trim() || account.display_name.trim() || fallbackName,
+    skin: accountSkinTextureSrc(account),
+  };
+});
+export const accountSkinSrc = computed(() => player.value.skin);
+export const accountDisplayName = computed(() => player.value.name);
 
 const DEFAULT_SELECTED_SKIN = 'default:steve';
 export const FALLBACK_SKIN_ACCOUNT_KEY = 'account:fallback';
@@ -69,7 +86,7 @@ export function setSelectedSkin(value: string, accountKey?: string): void {
     local.selectedSkin = next;
   }
   saveLocalState();
-  refreshAccountSkin();
+  skinChoices.value += 1;
 }
 
 export function resetSelectedSkin(accountKey?: string): void {
@@ -85,6 +102,7 @@ export function moveAccountSkin(fromAccountId: string, toAccountId: string): voi
   if (chosen === undefined) return;
   local.selectedSkinsByAccount = { ...rest, [to]: chosen };
   saveLocalState();
+  skinChoices.value += 1;
 }
 
 /** Drops the skin chosen for an account that no longer exists. */
@@ -94,18 +112,7 @@ export function forgetAccountSkin(accountId: string): void {
   const { [key]: _removed, ...rest } = local.selectedSkinsByAccount;
   local.selectedSkinsByAccount = rest;
   saveLocalState();
-}
-
-export function refreshAccountSkin(): void {
-  const fallbackName = config.value?.username || 'Player';
-  const account = activeAccount(accountsSnapshot.value);
-  const profile = account?.kind === 'microsoft' ? account.minecraft_profile : null;
-  if (!account || (account.kind === 'microsoft' && !profile)) {
-    applyNoAccountHead(fallbackName);
-    return;
-  }
-  accountDisplayName.value = profile?.name.trim() || account.display_name.trim() || fallbackName;
-  accountSkinSrc.value = accountSkinTextureSrc(account);
+  skinChoices.value += 1;
 }
 
 /** The skin texture an account shows: its Minecraft profile skin, or the look chosen for it in Axial. */
@@ -113,11 +120,6 @@ export function accountSkinTextureSrc(account: LauncherAccount): string | null {
   return account.kind === 'microsoft'
     ? profileSkinTextureSrc(account)
     : selectedSkinTextureSrc(selectedSkinForAccount(launcherSkinAccountKey(account.account_id)));
-}
-
-function applyNoAccountHead(displayName = 'Player'): void {
-  accountDisplayName.value = displayName.trim() || 'Player';
-  accountSkinSrc.value = selectedSkinTextureSrc(selectedSkinForAccount(FALLBACK_SKIN_ACCOUNT_KEY));
 }
 
 function validSelectedSkin(value: string | undefined): string {

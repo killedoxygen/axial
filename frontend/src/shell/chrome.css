@@ -1,0 +1,81 @@
+/* The window's chrome: what `shell/window.ts` learns from the desktop shell, as layout.
+   `--chrome-h` is the band along the window's top edge: the top bar, the strip an overlay is dragged by, and on
+   macOS the row the traffic lights sit in. */
+:root {
+  --chrome-h: 46px;
+}
+
+/* macOS: the traffic lights float over the head of the rail, centred on its axis and on the top bar's line
+   (their position is set where the window is built), so the rail starts under them. */
+html[data-desktop-chrome='mac-overlay'] .cp-rail {
+  padding-top: var(--chrome-h);
+}
+
+/* A surface over the whole frame keeps a strip to drag the window by, with the window's buttons at its end. */
+.cp-window-strip {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 1;
+  display: flex;
+  justify-content: flex-end;
+  height: var(--chrome-h);
+}
+
+/* ── Window buttons, where there is no system frame ── */
+.cp-winctrls {
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+.cp-winctrl {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition:
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
+}
+.cp-winctrl:hover {
+  color: var(--text);
+}
+
+/* Windows: caption buttons, square and flush with the window's top right corner. */
+html[data-desktop-platform='windows'] .cp-winctrls {
+  align-self: stretch;
+  align-items: stretch;
+}
+html[data-desktop-platform='windows'] .cp-topbar > .cp-winctrls {
+  margin: 0 -10px 0 2px;
+}
+html[data-desktop-platform='windows'] .cp-winctrl {
+  width: 46px;
+}
+html[data-desktop-platform='windows'] .cp-winctrl:hover {
+  background: var(--fill-2);
+}
+html[data-desktop-platform='windows'] .cp-winctrl[data-close]:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
+/* Linux: round buttons with room between them. */
+html[data-desktop-platform='linux'] .cp-winctrls {
+  gap: 8px;
+  padding: 0 11px 0 6px;
+}
+html[data-desktop-platform='linux'] .cp-topbar > .cp-winctrls {
+  padding-right: 1px;
+}
+html[data-desktop-platform='linux'] .cp-winctrl {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--fill);
+}
+html[data-desktop-platform='linux'] .cp-winctrl:hover {
+  background: var(--fill-3);
+}

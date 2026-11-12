@@ -1,7 +1,4 @@
 /* Downloads: what is installing now leads, then what needs you, then what waits. */
-.cp-downloads {
-  gap: 28px;
-}
 .cp-downloads--empty {
   justify-content: center;
   min-height: 100%;

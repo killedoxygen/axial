@@ -1,19 +1,12 @@
 import type { JSX } from 'preact';
-import { createPortal } from 'preact/compat';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon } from './Icons';
+import { Popover } from './Popover';
 
 export interface SelectFieldOption<T extends string = string> {
   value: T;
   label: string;
   disabled?: boolean;
-}
-
-interface PopoverPlacement {
-  left: number;
-  top: number;
-  minWidth: number;
-  maxHeight: number;
 }
 
 export function SelectField<T extends string>({
@@ -36,7 +29,6 @@ export function SelectField<T extends string>({
 }): JSX.Element {
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(-1);
-  const [placement, setPlacement] = useState<PopoverPlacement | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const typeahead = useRef<{ buffer: string; timer: number }>({ buffer: '', timer: 0 });
@@ -105,12 +97,6 @@ export function SelectField<T extends string>({
   };
 
   const onListKeyDown = (e: KeyboardEvent): void => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      closeList();
-      return;
-    }
     if (e.key === 'Tab') {
       closeList(false);
       return;
@@ -144,57 +130,7 @@ export function SelectField<T extends string>({
   };
 
   useLayoutEffect(() => {
-    if (!open) {
-      setPlacement(null);
-      return;
-    }
-    const trigger = triggerRef.current;
-    const list = listRef.current;
-    if (!trigger || !list) return;
-    const rect = trigger.getBoundingClientRect();
-    const gap = 6;
-    const margin = 10;
-    const spaceBelow = window.innerHeight - rect.bottom - gap - margin;
-    const spaceAbove = rect.top - gap - margin;
-    const contentHeight = list.scrollHeight;
-    const openUp = contentHeight > spaceBelow && spaceAbove > spaceBelow;
-    const maxHeight = Math.min(320, Math.max(96, openUp ? spaceAbove : spaceBelow));
-    const height = Math.min(contentHeight, maxHeight);
-    setPlacement({
-      left: Math.max(margin, Math.min(rect.left, window.innerWidth - rect.width - margin)),
-      top: openUp ? Math.max(margin, rect.top - gap - height) : rect.bottom + gap,
-      minWidth: rect.width,
-      maxHeight,
-    });
-  }, [open, options.length]);
-
-  useLayoutEffect(() => {
-    if (open && placement) listRef.current?.focus();
-  }, [open, placement]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (e: PointerEvent): void => {
-      const target = e.target as Node;
-      if (listRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
-      closeList(false);
-    };
-    const onOutsideScroll = (e: Event): void => {
-      if (listRef.current?.contains(e.target as Node)) return;
-      closeList(false);
-    };
-    const onWindowChange = (): void => closeList(false);
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('scroll', onOutsideScroll, true);
-    window.addEventListener('resize', onWindowChange);
-    window.addEventListener('blur', onWindowChange);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('scroll', onOutsideScroll, true);
-      window.removeEventListener('resize', onWindowChange);
-      window.removeEventListener('blur', onWindowChange);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (open) listRef.current?.focus();
   }, [open]);
 
   useEffect(() => {
@@ -224,50 +160,40 @@ export function SelectField<T extends string>({
           <Icon name="chevron-down" size={14} stroke={2} />
         </span>
       </button>
-      {open &&
-        createPortal(
-          <div
-            ref={listRef}
-            class="cp-select-content cp-pop"
-            role="listbox"
-            tabIndex={-1}
-            aria-label={ariaLabel}
-            style={
-              placement
-                ? {
-                    position: 'fixed',
-                    left: placement.left,
-                    top: placement.top,
-                    minWidth: placement.minWidth,
-                    maxHeight: placement.maxHeight,
-                  }
-                : { position: 'fixed', left: 0, top: 0, visibility: 'hidden' }
-            }
-            onKeyDown={onListKeyDown}
-          >
-            <div class="cp-select-viewport cp-menu">
-              {options.map((option, index) => (
-                <div
-                  key={option.value}
-                  class="cp-select-item cp-menu-item"
-                  role="option"
-                  data-index={index}
-                  aria-selected={option.value === value}
-                  data-state={option.value === value ? 'checked' : 'unchecked'}
-                  data-highlighted={index === highlighted ? '' : undefined}
-                  data-disabled={option.disabled ? '' : undefined}
-                  onPointerEnter={() => {
-                    if (!option.disabled) setHighlighted(index);
-                  }}
-                  onClick={() => commit(index)}
-                >
-                  <span class="cp-select-item-label">{option.label}</span>
-                </div>
-              ))}
-            </div>
-          </div>,
-          document.body,
-        )}
+      {open && (
+        <Popover
+          anchor={triggerRef}
+          popoverRef={listRef}
+          onDismiss={() => closeList(false)}
+          fit="min-anchor"
+          class="cp-pop cp-select-content"
+          role="listbox"
+          tabIndex={-1}
+          aria-label={ariaLabel}
+          onKeyDown={onListKeyDown}
+        >
+          <div class="cp-select-viewport cp-menu">
+            {options.map((option, index) => (
+              <div
+                key={option.value}
+                class="cp-select-item cp-menu-item"
+                role="option"
+                data-index={index}
+                aria-selected={option.value === value}
+                data-state={option.value === value ? 'checked' : 'unchecked'}
+                data-highlighted={index === highlighted ? '' : undefined}
+                data-disabled={option.disabled ? '' : undefined}
+                onPointerEnter={() => {
+                  if (!option.disabled) setHighlighted(index);
+                }}
+                onClick={() => commit(index)}
+              >
+                <span class="cp-select-item-label">{option.label}</span>
+              </div>
+            ))}
+          </div>
+        </Popover>
+      )}
     </>
   );
 }

@@ -15,6 +15,14 @@ import type { NativePreferencesRequest } from '../../src/native';
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
 const tick = (): Promise<void> => new Promise((done) => setImmediate(done));
+function computed<T>(read: () => T) {
+  return {
+    get value() {
+      return read();
+    },
+  };
+}
+
 function signal<T>(value: T) {
   return { value };
 }
@@ -38,7 +46,7 @@ function source<T>(path: string, imports: Record<string, unknown>, globals: Reco
       Error,
       URLSearchParams,
       require(id: string): unknown {
-        if (id === '@preact/signals') return { signal };
+        if (id === '@preact/signals') return { signal, computed };
         if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
         throw new Error(`Unreviewed preference dependency: ${id}`);
       },
@@ -581,10 +589,9 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
           deferredCalls.push('buttons');
         },
       },
-      './player-skin': {
-        refreshAccountSkin() {
+      './machines/accounts': {
+        async refreshAccountsData() {
           deferredCalls.push('skin');
-          h.skin.refreshAccountSkin();
         },
       },
       './startup-warnings': { startupWarningMessages: () => [] },
@@ -632,7 +639,7 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
   assert.equal(h.ui.route.value.name, 'settings');
   assert.equal(h.Sound.enabled, false);
   assert.deepEqual(h.soundCalls, ['warmup:false']);
-  assert.deepEqual(deferredCalls, ['buttons', 'views', 'skin', 'updater']);
+  assert.deepEqual(deferredCalls, ['buttons', 'skin', 'views', 'updater']);
   assert.ok(h.css.size > 0);
   assert.equal(h.writes.length, 0);
   assert.equal(h.storageReads(), 0);

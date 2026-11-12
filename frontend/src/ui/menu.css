@@ -5,6 +5,11 @@
   box-shadow: var(--shadow-pop);
   color: var(--text);
 }
+.cp-popover {
+  position: fixed;
+  z-index: 1300;
+  box-sizing: border-box;
+}
 .cp-menu {
   display: flex;
   flex-direction: column;
@@ -28,7 +33,7 @@
   text-align: left;
   cursor: pointer;
   user-select: none;
-  transition: background 100ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-menu-item > svg {
   flex: none;
@@ -57,7 +62,5 @@
   height: 6px;
 }
 .cp-ctx-host {
-  position: fixed;
-  z-index: 1300;
-  animation: cp-float-up 120ms ease;
+  animation: cp-float-up var(--t-quick) var(--ease-out);
 }

@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { startApplicationBootstrap } from '../bootstrap';
 import { bootstrapError, bootstrapState } from '../store';
 import { Logo } from '../ui/Logo';
+import { WindowStrip } from './WindowControls';
 
 const MIN_DISPLAY_MS = 500;
 const FILL_SETTLE_MS = 240;
@@ -74,6 +75,7 @@ export function BootSplash(): JSX.Element | null {
       role={state === 'error' ? 'alert' : 'status'}
       aria-live={state === 'error' ? 'assertive' : 'polite'}
     >
+      <WindowStrip />
       <div class="cp-boot-stack">
         <Logo className="cp-boot-logo" motion="assembly" size={64} style={bootLogoStyle(progress)} />
         {state === 'error' ? (

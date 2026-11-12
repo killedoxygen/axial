@@ -16,9 +16,9 @@
   font-weight: 600;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease,
-    scale 90ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-pills > button:hover:not(:disabled):not([data-active='true']) {
   background: var(--fill-2);

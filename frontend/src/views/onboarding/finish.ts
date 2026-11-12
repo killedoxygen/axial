@@ -12,7 +12,7 @@ import {
   selectAccount,
 } from '../../machines/accounts';
 import { Music } from '../../music';
-import { launcherSkinAccountKey, refreshAccountSkin, setSelectedSkin } from '../../player-skin';
+import { launcherSkinAccountKey, setSelectedSkin } from '../../player-skin';
 import { config, systemInfo } from '../../store';
 import { getMemoryRecommendation } from '../../utils';
 import { saveLookupSkin } from '../accounts/api';
@@ -108,7 +108,6 @@ export async function finishOnboarding(choice: Choice, preferences: Preferences)
         console.warn('Could not seed profile skin after onboarding Microsoft sign-in.', err);
       }
     }
-    refreshAccountSkin();
     await complete();
   } catch (err: unknown) {
     // Earlier commands may have committed even when a later step failed.

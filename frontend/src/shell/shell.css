@@ -1,15 +1,4 @@
-:root {
-  --cp-window-titlebar-safe-h: 0px;
-  --cp-window-drag-strip-h: 36px;
-}
-
-html[data-desktop-chrome='mac-overlay'] {
-  --cp-window-titlebar-safe-h: 38px;
-  --cp-window-drag-strip-h: 40px;
-}
-
 .cp-frame {
-  --cp-topbar-h: 46px;
   --cp-rail-w: 72px;
   width: 100%;
   height: 100%;
@@ -30,7 +19,7 @@ html[data-desktop-chrome='mac-overlay'] {
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  padding: calc(10px + var(--cp-window-titlebar-safe-h)) 0 12px;
+  padding: 10px 0 12px;
 }
 .cp-rail-brand {
   width: 44px;
@@ -45,9 +34,6 @@ html[data-desktop-chrome='mac-overlay'] {
   width: 34px;
   height: 34px;
   display: block;
-}
-html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
-  display: none;
 }
 .cp-mark {
   overflow: visible;
@@ -81,9 +67,9 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   color: var(--text-mute);
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease,
-    scale 90ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-out);
 }
 .cp-rail-btn:hover,
 .cp-rail-user:is(:hover, [data-open='true']) {
@@ -149,7 +135,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   border-radius: var(--hold);
   background: transparent;
   cursor: pointer;
-  transition: scale 90ms ease;
+  transition: scale var(--t-press) var(--ease-out);
 }
 .cp-rail-tile:active {
   scale: 0.92;
@@ -161,8 +147,8 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   opacity: 0.62;
   filter: saturate(0.85);
   transition:
-    opacity 160ms ease,
-    filter 160ms ease;
+    opacity var(--t-pop) var(--ease-out),
+    filter var(--t-pop) var(--ease-out);
 }
 .cp-rail-tile:hover .cp-rail-tile-art,
 .cp-rail-tile[data-active='true'] .cp-rail-tile-art {
@@ -172,13 +158,14 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 .cp-rail-tile[data-active='true'] {
   background: var(--fill-3);
 }
-/* Installing: the cover dims and the ring runs round it. */
+/* Installing: the cover dims and the ring runs along the tile's own edge, where the current one has its fill. */
 .cp-rail-tile[data-installing='true'] .cp-rail-tile-art {
   opacity: 0.42;
   filter: saturate(0.55);
 }
 .cp-rail-tile > .cp-ring {
   position: absolute;
+  inset: 0;
 }
 /* Running: an accent eye on the corner. */
 .cp-rail-tile-dot {
@@ -200,32 +187,10 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   min-height: 8px;
 }
 
-.cp-rail-tip {
-  position: absolute;
-  left: calc(var(--cp-rail-w) - 8px);
-  top: var(--cp-rail-tip-top, 0);
-  z-index: 70;
-  max-width: min(260px, calc(100vw - 88px));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  pointer-events: none;
-  translate: 0 -50%;
-  animation: cp-rail-tip-in 120ms cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-
-.cp-user-shell {
-  position: relative;
-  z-index: 1;
-  flex-shrink: 0;
-}
 .cp-userm {
-  position: absolute;
-  bottom: 0;
-  left: calc(100% + 10px);
-  z-index: 40;
   width: 240px;
   transform-origin: left bottom;
-  animation: cp-userm-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: cp-userm-in var(--t-pop) var(--ease-out) both;
 }
 .cp-userm .cp-menu-item {
   padding: 0 8px 0 11px;
@@ -266,7 +231,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
-  height: var(--cp-topbar-h);
+  height: var(--chrome-h);
   padding: 0 10px 0 6px;
 }
 .cp-topbar-nav {
@@ -328,8 +293,8 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   font-weight: 500;
   cursor: pointer;
   transition:
-    background 120ms ease,
-    color 120ms ease;
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
 }
 .cp-topbar-search:hover {
   background: var(--fill);
@@ -381,7 +346,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   transition:
     background 320ms ease,
     color 320ms ease,
-    scale 90ms ease;
+    scale var(--t-press) var(--ease-out);
 }
 .cp-status-pill[data-tone='accent'] {
   background: var(--accent-soft);
@@ -410,14 +375,14 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  transition: width 380ms cubic-bezier(0.32, 0.72, 0, 1);
+  transition: width 380ms var(--ease-glide);
 }
 .cp-status-pill-swap {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   width: max-content;
-  animation: cp-status-swap-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: cp-status-swap-in var(--t-move) var(--ease-out) both;
 }
 @keyframes cp-status-swap-in {
   from {
@@ -462,8 +427,8 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   background: var(--tile);
   color: var(--text-dim);
   transition:
-    background 160ms ease,
-    color 160ms ease;
+    background var(--t-pop) var(--ease-out),
+    color var(--t-pop) var(--ease-out);
 }
 .cp-music-widget--on {
   background: var(--accent-soft);
@@ -480,7 +445,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   background: transparent;
   color: inherit;
   cursor: pointer;
-  transition: background 140ms ease;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-music-btn:hover {
   background: color-mix(in oklab, currentColor 12%, transparent);
@@ -513,14 +478,14 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   display: grid;
   grid-template-columns: 1fr;
   min-width: 0;
-  transition: grid-template-columns 420ms cubic-bezier(0.32, 0.72, 0, 1);
+  transition: grid-template-columns 420ms var(--ease-glide);
 }
 .cp-update-collapse .cp-update-dock-wrap {
   min-width: 0;
   transform-origin: left center;
   transition:
-    opacity 200ms ease 60ms,
-    scale 380ms cubic-bezier(0.32, 0.72, 0, 1);
+    opacity var(--t-move) var(--ease-out) 60ms,
+    scale 380ms var(--ease-glide);
 }
 .cp-update-collapse[data-collapsed='true'] {
   grid-template-columns: 0fr;
@@ -557,7 +522,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
   cursor: pointer;
-  transition: scale 90ms ease;
+  transition: scale var(--t-press) var(--ease-out);
 }
 .cp-update-dock:is(:hover, [data-open='true']) {
   background-color: color-mix(in oklab, var(--accent) 10%, transparent);
@@ -576,24 +541,12 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
     transform: none;
   }
 }
-@keyframes cp-rail-tip-in {
-  from {
-    opacity: 0;
-    transform: translateX(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
 /* An unfocused window stops its ambient motion. */
 .cp-topbar[data-calm='true'] :is(.cp-ring-run, .cp-music-eq > span, .cp-boot-bar-fill) {
   animation-play-state: paused;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .cp-rail-tip,
   .cp-userm,
   .cp-status-pill,
   .cp-status-pill-swap,
@@ -604,36 +557,6 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
     animation: none !important;
     transition: none !important;
   }
-}
-
-.cp-winctrls {
-  display: inline-flex;
-  gap: 2px;
-  margin-left: 2px;
-}
-.cp-winctrl {
-  width: 30px;
-  height: 30px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  border-radius: var(--hold-xs);
-  cursor: pointer;
-  transition:
-    background 120ms,
-    color 120ms;
-  font: inherit;
-}
-.cp-winctrl:hover {
-  background: var(--fill);
-  color: var(--text);
-}
-.cp-winctrl--close:hover {
-  background: color-mix(in oklab, var(--err) 15%, transparent);
-  color: var(--err-text);
 }
 
 .cp-main {
@@ -679,7 +602,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   align-items: center;
   gap: 18px;
   width: min(360px, 80vw);
-  animation: cp-boot-enter 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: cp-boot-enter 480ms var(--ease-out) both;
 }
 .cp-boot-logo {
   display: block;
@@ -688,7 +611,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
 .cp-boot-logo.cp-mark--assembly .cp-mark-left,
 .cp-boot-logo.cp-mark--assembly .cp-mark-right {
   transition:
-    opacity 220ms ease-out,
+    opacity var(--t-move) var(--ease-out),
     transform 220ms cubic-bezier(0.3, 1.36, 0.35, 1);
 }
 .cp-boot-logo.cp-mark--assembly .cp-mark-face {
@@ -713,7 +636,7 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   height: 100%;
   border-radius: inherit;
   background: var(--accent);
-  transition: width 220ms ease-out;
+  transition: width var(--t-move) var(--ease-out);
 }
 .cp-boot-label {
   font-size: 13px;
