@@ -35,7 +35,7 @@ function MicrosoftSignIn({ identity }: { identity: IdentityState }): JSX.Element
           {identity.signInError}
         </p>
       ) : (
-        <p class="cp-ob-note">{identity.signInUnavailable ?? 'Opens your browser. Axial never sees your password.'}</p>
+        identity.signInUnavailable && <p class="cp-ob-note">{identity.signInUnavailable}</p>
       )}
       <Button variant="ghost" size="lg" onClick={identity.playOffline}>
         Play offline instead

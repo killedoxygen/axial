@@ -12,21 +12,6 @@
   animation: cp-ob-enter 320ms var(--ease-out) both;
 }
 
-/* Where the launcher owns the frame, the window's buttons get the band above the panels and the progress dots
-   sit on its line. */
-html:is([data-desktop-chrome='mac-overlay'], [data-desktop-chrome='custom-frameless']) .cp-ob {
-  padding-top: var(--chrome-h);
-}
-
-html:is([data-desktop-chrome='mac-overlay'], [data-desktop-chrome='custom-frameless']) .cp-ob-dots {
-  margin-top: calc((var(--chrome-h) + 6px) / -2);
-}
-
-.cp-ob[data-phase='leaving'] {
-  animation: cp-ob-leave 560ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
-  pointer-events: none;
-}
-
 @keyframes cp-ob-enter {
   from {
     opacity: 0;
@@ -54,6 +39,31 @@ html:is([data-desktop-chrome='mac-overlay'], [data-desktop-chrome='custom-framel
   background: var(--tile);
 }
 
+/* macOS: the panel is cut away around the traffic lights, which sit in the notch on the window's own colour. */
+html[data-desktop-chrome='mac-overlay'] .cp-ob-stage::before {
+  --w: 60px;
+  --h: calc(var(--chrome-h) - 12px);
+  --r: 16px;
+  --cut: linear-gradient(var(--bg), var(--bg));
+  --corner: radial-gradient(circle at 100% 100%, transparent var(--r), var(--bg) calc(var(--r) + 0.5px));
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  width: calc(var(--w) + var(--r));
+  height: calc(var(--h) + var(--r));
+  pointer-events: none;
+  background:
+    var(--corner) var(--w) 0 / var(--r) var(--r),
+    var(--corner) 0 var(--h) / var(--r) var(--r),
+    radial-gradient(circle at 0 0, var(--bg) var(--r), transparent calc(var(--r) + 0.5px)) calc(var(--w) - var(--r))
+      calc(var(--h) - var(--r)) / var(--r) var(--r),
+    var(--cut) 0 0 / var(--w) calc(var(--h) - var(--r)),
+    var(--cut) 0 0 / calc(var(--w) - var(--r)) var(--h);
+  background-repeat: no-repeat;
+}
+
 .cp-ob-stage .cp-skin-three {
   width: 100%;
   height: 100%;
@@ -76,6 +86,7 @@ html:is([data-desktop-chrome='mac-overlay'], [data-desktop-chrome='custom-framel
 }
 
 .cp-ob-pane {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -117,14 +128,20 @@ html:is([data-desktop-chrome='mac-overlay'], [data-desktop-chrome='custom-framel
   align-items: stretch;
   width: min(440px, 100%);
   min-height: 0;
-  padding-top: clamp(16px, 12vh, 88px);
+  padding-top: clamp(24px, 20vh, 180px);
   overflow-y: auto;
   animation: cp-ob-rise 360ms var(--ease-out) both;
 }
 
-.cp-ob-body > .cp-mark {
-  flex: none;
-  margin-bottom: 20px;
+/* The mark holds the corner opposite the window's buttons. */
+.cp-ob-pane > .cp-mark {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+}
+
+html[data-desktop-chrome='custom-frameless'] .cp-ob-pane > .cp-mark {
+  top: var(--chrome-h);
 }
 
 .cp-ob-heading {
@@ -356,7 +373,7 @@ html:is([data-desktop-chrome='mac-overlay'], [data-desktop-chrome='custom-framel
   }
 
   .cp-ob-body {
-    padding-top: clamp(12px, 6vh, 40px);
+    padding-top: clamp(16px, 8vh, 64px);
   }
 
   .cp-ob-heading h1 {

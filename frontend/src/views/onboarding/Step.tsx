@@ -34,13 +34,13 @@ export function Step({
 }): JSX.Element {
   return (
     <>
+      <Logo size={44} />
       <div class="cp-ob-dots" role="img" aria-label={`Step ${index + 1} of ${STEP_COUNT}`}>
         {Array.from({ length: STEP_COUNT }, (_, dot) => (
           <span key={dot} data-state={dot === index ? 'current' : dot < index ? 'done' : 'ahead'} />
         ))}
       </div>
       <div class="cp-ob-body" key={view}>
-        <Logo size={28} />
         <header class="cp-ob-heading">
           {/* Stands in for the stage when the window is too small to show it. */}
           {player && <PlayerHeadPreview class="cp-ob-head" textureSrc={player.src} size={56} radius={12} />}
