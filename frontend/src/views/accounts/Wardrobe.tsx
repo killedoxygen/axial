@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useMemo, useRef } from 'preact/hooks';
 import { apiResourceUrl } from '../../api';
-import { DEFAULT_SKINS } from '../../default-skins';
+import { DEFAULT_SKINS, type DefaultSkin } from '../../default-skins';
 import {
   applySkin,
   cancelPendingApply,
@@ -209,8 +209,40 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
   ].filter((text): text is string => Boolean(text));
 
   const editingSkin = edit.editKey ? (savedByKey.get(edit.editKey) ?? null) : null;
+  const defaultTile = (skin: DefaultSkin): JSX.Element => {
+    const saved = savedDefaultSkin(skin, skins);
+    return (
+      <WearTile
+        key={skin.id}
+        name={skin.name}
+        title={skin.name}
+        worn={Boolean(saved && isWorn(saved))}
+        inHand={inHandDefault?.id === skin.id || Boolean(saved && savedInHand === saved)}
+        queued={Boolean(saved && queuedKey === saved.texture_key)}
+        onSelect={() => selectDefaultSkin(skin.id)}
+      >
+        <SkinSnapshotImg
+          cacheKey={`default:${skin.id}`}
+          src={skin.src}
+          variant={skin.variant}
+          alt={`${skin.name} skin`}
+        />
+      </WearTile>
+    );
+  };
+  // Steve and Alex stand in the grid; the other built-in skins wait behind "+N" unless one is worn or in hand.
+  const [inlineDefaults, stashedDefaults] = DEFAULT_SKINS.reduce<[DefaultSkin[], DefaultSkin[]]>(
+    ([inline, stashed], skin, index) => {
+      const saved = savedDefaultSkin(skin, skins);
+      const held = inHandDefault?.id === skin.id || Boolean(saved && (isWorn(saved) || savedInHand === saved));
+      (index < 2 || held ? inline : stashed).push(skin);
+      return [inline, stashed];
+    },
+    [[], []],
+  );
+
   const [skinLimit, capeLimit] = usePaletteFit(bodyRef, [
-    1 + (profileTile ? 1 : 0) + ownSkins.length + DEFAULT_SKINS.length,
+    1 + (profileTile ? 1 : 0) + ownSkins.length + inlineDefaults.length + (stashedDefaults.length > 0 ? 1 : 0),
     capes.length > 0 ? 1 + capes.length : 0,
   ]);
 
@@ -267,7 +299,7 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
             ))}
           </div>
 
-          <WearGrid label="Skins" limit={skinLimit}>
+          <WearGrid label="Skins" limit={skinLimit} stashed={stashedDefaults.map(defaultTile)}>
             <WearTile
               add
               name={upload.uploadDragActive ? 'Drop to add' : 'Add skin'}
@@ -320,27 +352,7 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
                 />
               </WearTile>
             ))}
-            {DEFAULT_SKINS.map((skin) => {
-              const saved = savedDefaultSkin(skin, skins);
-              return (
-                <WearTile
-                  key={skin.id}
-                  name={skin.name}
-                  title={skin.name}
-                  worn={Boolean(saved && isWorn(saved))}
-                  inHand={inHandDefault?.id === skin.id || Boolean(saved && savedInHand === saved)}
-                  queued={Boolean(saved && queuedKey === saved.texture_key)}
-                  onSelect={() => selectDefaultSkin(skin.id)}
-                >
-                  <SkinSnapshotImg
-                    cacheKey={`default:${skin.id}`}
-                    src={skin.src}
-                    variant={skin.variant}
-                    alt={`${skin.name} skin`}
-                  />
-                </WearTile>
-              );
-            })}
+            {inlineDefaults.map(defaultTile)}
           </WearGrid>
 
           {capes.length > 0 && (

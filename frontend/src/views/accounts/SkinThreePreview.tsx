@@ -227,6 +227,8 @@ async function setupScene(
         fitPadding: current.fitPadding,
       }),
     );
+    // A resize clears the canvas; draw now so no frame goes blank, even while the loop is paused.
+    draw();
   }
 
   // Staged mode splits the model at a rising plane: outline above, skin below.
@@ -392,7 +394,6 @@ async function setupScene(
       resize();
       if (staged) assembled = 0;
       else if (!instant) pulseStart = performance.now();
-      if (paused) draw();
     },
     dispose: () => {
       disposed = true;

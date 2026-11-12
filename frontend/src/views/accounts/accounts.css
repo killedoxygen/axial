@@ -3,6 +3,9 @@
 .cp-view-page.cp-accounts-page {
   gap: 0;
   height: 100%;
+  /* The page fits the view by construction; anything let out past it (the figure's canvas) must not make the
+     view scroll, or the scrollbar would change the room the palette is fitted to. */
+  overflow: clip;
 }
 
 /* ── The account line: a pill each in the tab grammar. Compact, the ones not played as are their heads alone. ── */
@@ -78,10 +81,6 @@
 }
 .cp-account:not([aria-selected='true']) .cp-account-kind {
   opacity: 0.7;
-}
-.cp-account > svg {
-  margin-left: -2px;
-  color: var(--accent);
 }
 .cp-accounts-line[data-compact='true'] .cp-account[role='tab']:not([aria-selected='true']) {
   justify-content: center;
@@ -399,6 +398,8 @@
   align-items: center;
   justify-content: flex-end;
   min-width: 0;
+  /* The canvas is let out past the figure; it never reaches over the palette. */
+  overflow: clip;
 }
 .cp-stage > :is(.cp-status, .cp-empty) {
   margin: auto;
@@ -406,7 +407,7 @@
 .cp-stage-figure {
   position: relative;
   flex: 1 1 0;
-  min-height: 300px;
+  min-height: 0;
   max-width: 100%;
   aspect-ratio: 0.58;
 }

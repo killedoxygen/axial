@@ -107,7 +107,6 @@ export function AccountRow(): JSX.Element {
                   <AccountKindMark account={account} />
                 </span>
               )}
-              {account.active && <Icon name="check" size={13} stroke={2.6} />}
             </button>
           );
         })}

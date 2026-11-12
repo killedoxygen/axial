@@ -72,13 +72,15 @@ export function WearTile({
 }
 
 /**
- * Wearables as a grid of at most `limit` tiles. When there are more, the last place goes to "+N", which opens the
- * rest in a popover; it carries the marks of what it holds, so the one worn or in hand is never lost from sight.
+ * Wearables as a grid of at most `limit` tiles. When there are more, or some are `stashed`, the last place goes to
+ * "+N", which opens the rest in a popover; it carries the marks of what it holds, so the one worn or in hand is
+ * never lost from sight.
  */
 export function WearGrid({
   label,
   role = 'group',
   limit = Infinity,
+  stashed,
   note,
   children,
   ...props
@@ -86,17 +88,20 @@ export function WearGrid({
   label: string;
   role?: 'group' | 'radiogroup';
   limit?: number;
+  /** Tiles that always wait behind "+N", after any that do not fit. */
+  stashed?: ComponentChildren;
   /** A line under the tiles, outside the count. */
   note?: ComponentChildren;
   children: ComponentChildren;
 } & Pick<JSX.HTMLAttributes<HTMLDivElement>, 'title' | 'aria-busy' | 'aria-disabled'>): JSX.Element {
   const tiles = toChildArray(children) as VNode<WearTileProps>[];
-  const stacked = tiles.length > limit;
+  const stash = toChildArray(stashed) as VNode<WearTileProps>[];
+  const stacked = stash.length > 0 || tiles.length > limit;
   const shown = stacked ? tiles.slice(0, Math.max(0, limit - 1)) : tiles;
   return (
     <div class="cp-wear-grid" role={role} aria-label={label} {...props}>
       {shown}
-      {stacked && <WearMore tiles={tiles.slice(shown.length)} label={label} />}
+      {stacked && <WearMore tiles={[...tiles.slice(shown.length), ...stash]} label={label} />}
       {note}
     </div>
   );
