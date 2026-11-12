@@ -1,13 +1,18 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { addFloorSpotlight, addSceneLighting, buildSkinModel, modelBounds, type SkinModelBounds } from './skin-model';
+import {
+  addFloorSpotlight,
+  addSceneLighting,
+  buildSkinModel,
+  modelBounds,
+  type SkinModelBounds,
+  type SkinModelParts,
+} from './skin-model';
 import { loadThree, type ThreeModule } from './skin-three-loader';
 import { loadOptionalBitmap, loadSkinBitmap } from './skin-textures';
 import type { SkinVariant } from './types';
 
 type SkinPreviewSide = 'front' | 'back';
-type SkinThreeCapeState = 'loading' | 'none' | 'loaded' | 'omitted';
-type SkinThreeFitState = 'pending' | 'fitted';
 const CLICK_PULSE_DURATION_MS = 420;
 const DRAG_THRESHOLD_PX = 4;
 const FIT_FOV_DEGREES = 34;
@@ -40,8 +45,8 @@ export interface SkinThreePreviewProps {
 }
 
 interface SceneHandle {
-  renderer: import('three').WebGLRenderer;
   setBuilt: (built: boolean) => void;
+  setLook: (look: SkinLook) => Promise<void>;
   dispose: () => void;
 }
 
@@ -116,20 +121,38 @@ function estimateOverlayHeightPx(props: SkinThreePreviewProps): number {
   return props.nametag ? NAMETAG_HEIGHT_PX : 0;
 }
 
+/** What a figure wears; the rest of the scene outlives it. */
+interface SkinLook {
+  src: string;
+  capeSrc?: string;
+  variant: SkinVariant;
+}
+
+interface LoadedLook {
+  skin: ImageBitmap;
+  cape: ImageBitmap | null;
+  variant: SkinVariant;
+}
+
+function lookKey(look: SkinLook): string {
+  return `${look.src}|${look.capeSrc ?? ''}|${look.variant}`;
+}
+
+async function loadLook(look: SkinLook): Promise<LoadedLook> {
+  const [skin, cape] = await Promise.all([loadSkinBitmap(look.src), loadOptionalBitmap(look.capeSrc, 'cape')]);
+  return { skin, cape, variant: look.variant };
+}
+
 async function setupScene(
   canvas: HTMLCanvasElement,
-  props: SkinThreePreviewProps,
-  setReady: (ready: boolean) => void,
-  setInteracting: (interacting: boolean) => void,
-  setCapeState: (state: SkinThreeCapeState) => void,
-  setFitState: (state: SkinThreeFitState) => void,
+  props: () => SkinThreePreviewProps,
   setFitMetrics: (metrics: SkinThreeFitMetrics) => void,
+  setError: (error: boolean) => void,
 ): Promise<SceneHandle> {
+  const first = props();
   const THREE = await loadThree();
   const disposables: Array<() => void> = [];
-  const skinBitmap = await loadSkinBitmap(props.src);
-  const capeBitmap = await loadOptionalBitmap(props.capeSrc, 'cape');
-  setCapeState(props.capeSrc ? (capeBitmap ? 'loaded' : 'omitted') : 'none');
+  const firstLook = await loadLook(first);
   const renderer = new THREE.WebGLRenderer({
     canvas,
     alpha: true,
@@ -145,18 +168,38 @@ async function setupScene(
   const floor = addFloorSpotlight(THREE, scene, disposables);
 
   const group = new THREE.Group();
-  group.rotation.y = props.side === 'back' ? Math.PI - 0.22 : 0.22;
+  group.rotation.y = first.side === 'back' ? Math.PI - 0.22 : 0.22;
   scene.add(group);
 
-  const parts = buildSkinModel({
-    THREE,
-    group,
-    skinBitmap,
-    capeBitmap,
-    variant: props.variant,
-    showOuterLayers: props.showOuterLayers,
-    disposables,
-  });
+  // The figure itself: rebuilt in place when the look changes, so the scene, its motion and the canvas stay.
+  let worn: { key: string; parts: SkinModelParts; release: () => void } | null = null;
+  let bounds: SkinModelBounds = modelBounds({ variant: first.variant, showOuterLayers: first.showOuterLayers });
+  const wear = (key: string, look: LoadedLook): void => {
+    const body = new THREE.Group();
+    group.add(body);
+    const owned: Array<() => void> = [() => group.remove(body)];
+    const parts = buildSkinModel({
+      THREE,
+      group: body,
+      skinBitmap: look.skin,
+      capeBitmap: look.cape,
+      variant: look.variant,
+      showOuterLayers: first.showOuterLayers,
+      disposables: owned,
+    });
+    worn?.release();
+    worn = {
+      key,
+      parts,
+      release: () => {
+        owned.forEach((dispose) => dispose());
+        look.skin.close();
+        look.cape?.close();
+      },
+    };
+    bounds = modelBounds({ variant: look.variant, showOuterLayers: first.showOuterLayers });
+  };
+  wear(lookKey(first), firstLook);
 
   let frame = 0;
   let dragging = false;
@@ -166,33 +209,28 @@ async function setupScene(
   let dragStartX = 0;
   let dragStartRotation = 0;
   let modelRotation = group.rotation.y;
-  let clickPulseStart = -CLICK_PULSE_DURATION_MS;
-  let interactionTimeout: number | null = null;
-  const bounds = modelBounds({
-    variant: props.variant,
-    showOuterLayers: props.showOuterLayers,
-  });
+  let pulseStart = -CLICK_PULSE_DURATION_MS;
 
   function resize(): void {
     const rect = canvas.getBoundingClientRect();
     const width = Math.max(1, Math.round(rect.width));
     const height = Math.max(1, Math.round(rect.height));
     renderer.setSize(width, height, false);
+    const current = props();
     setFitMetrics(
       fitCameraToCanvas({
         THREE,
         camera,
         canvas,
         bounds,
-        overlayHeightPx: estimateOverlayHeightPx(props),
-        fitPadding: props.fitPadding,
+        overlayHeightPx: estimateOverlayHeightPx(current),
+        fitPadding: current.fitPadding,
       }),
     );
-    setFitState('fitted');
   }
 
   // Staged mode splits the model at a rising plane: outline above, skin below.
-  const staged = props.built !== undefined;
+  const staged = first.built !== undefined;
   const outline = new THREE.MeshLambertMaterial({ color: cssColor(THREE, canvas) });
   disposables.push(() => outline.dispose());
   const above = [new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)];
@@ -231,7 +269,8 @@ async function setupScene(
       assembled = THREE.MathUtils.clamp(assembled + (built ? step : -2 * step), 0, 1);
       lastTime = time;
     }
-    const pulseElapsed = time - clickPulseStart;
+    const parts = worn!.parts;
+    const pulseElapsed = time - pulseStart;
     const pulseProgress =
       pulseElapsed >= 0 && pulseElapsed < CLICK_PULSE_DURATION_MS ? pulseElapsed / CLICK_PULSE_DURATION_MS : 1;
     const pulse = pulseProgress < 1 ? Math.sin(pulseProgress * Math.PI) : 0;
@@ -279,7 +318,6 @@ async function setupScene(
   resizeObserver.observe(canvas);
   resize();
   render();
-  setReady(true);
 
   const onPointerDown = (event: PointerEvent): void => {
     dragging = true;
@@ -302,29 +340,13 @@ async function setupScene(
     group.rotation.y = modelRotation;
     draw();
   };
-
-  const startClickPulse = (): void => {
-    clickPulseStart = performance.now();
-    setInteracting(true);
-    if (interactionTimeout !== null) {
-      window.clearTimeout(interactionTimeout);
-    }
-    interactionTimeout = window.setTimeout(() => {
-      interactionTimeout = null;
-      setInteracting(false);
-    }, CLICK_PULSE_DURATION_MS);
-  };
-
   const onPointerUp = (event: PointerEvent): void => {
     dragging = false;
     if (canvas.hasPointerCapture(event.pointerId)) {
       canvas.releasePointerCapture(event.pointerId);
     }
-    if (!hasDragged) {
-      startClickPulse();
-    }
+    if (!hasDragged) pulseStart = performance.now();
   };
-
   const onPointerCancel = (event: PointerEvent): void => {
     dragging = false;
     hasDragged = false;
@@ -338,12 +360,42 @@ async function setupScene(
   canvas.addEventListener('pointerup', onPointerUp);
   canvas.addEventListener('pointercancel', onPointerCancel);
 
+  let disposed = false;
+  let wanted = 0;
   return {
-    renderer,
     setBuilt: (next) => {
       built = next;
     },
+    // Only the latest look is put on, the moment its textures are in: the old one stays until then, so there is
+    // no empty frame. The change lands with the same small bounce as a click; a staged figure rebuilds instead.
+    setLook: async (look) => {
+      const key = lookKey(look);
+      const ticket = ++wanted;
+      if (key === worn?.key) {
+        setError(false);
+        return;
+      }
+      let loaded: LoadedLook;
+      try {
+        loaded = await loadLook(look);
+      } catch {
+        if (ticket === wanted && !disposed) setError(true);
+        return;
+      }
+      if (ticket !== wanted || disposed) {
+        loaded.skin.close();
+        loaded.cape?.close();
+        return;
+      }
+      wear(key, loaded);
+      setError(false);
+      resize();
+      if (staged) assembled = 0;
+      else if (!instant) pulseStart = performance.now();
+      if (paused) draw();
+    },
     dispose: () => {
+      disposed = true;
       window.cancelAnimationFrame(frame);
       resizeObserver.disconnect();
       intersectionObserver.disconnect();
@@ -352,13 +404,9 @@ async function setupScene(
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointercancel', onPointerCancel);
-      if (interactionTimeout !== null) {
-        window.clearTimeout(interactionTimeout);
-      }
+      worn?.release();
       disposables.forEach((dispose) => dispose());
       renderer.dispose();
-      skinBitmap.close();
-      capeBitmap?.close();
     },
   };
 }
@@ -366,60 +414,43 @@ async function setupScene(
 export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [ready, setReady] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [interacting, setInteracting] = useState(false);
-  const [capeState, setCapeState] = useState<SkinThreeCapeState>(props.capeSrc ? 'loading' : 'none');
-  const [fitState, setFitState] = useState<SkinThreeFitState>('pending');
+  const [error, setError] = useState(false);
   const [fitMetrics, setFitMetrics] = useState<SkinThreeFitMetrics>({ overlayTopPx: 10 });
   const handleRef = useRef<SceneHandle | null>(null);
+  const propsRef = useRef(props);
+  propsRef.current = props;
   const built = props.built === true;
-  const builtRef = useRef(built);
-  builtRef.current = built;
 
   useEffect(() => {
     handleRef.current?.setBuilt(built);
   }, [built]);
 
+  // One scene for the component's life; a new look is put on in it.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
     let active = true;
     setReady(false);
-    setError(null);
-    setInteracting(false);
-    setCapeState(props.capeSrc ? 'loading' : 'none');
-    setFitState('pending');
+    setError(false);
+    const guard =
+      <T,>(set: (value: T) => void) =>
+      (value: T): void => {
+        if (active) set(value);
+      };
 
-    void setupScene(
-      canvas,
-      props,
-      (nextReady) => {
-        if (active) setReady(nextReady);
-      },
-      (nextInteracting) => {
-        if (active) setInteracting(nextInteracting);
-      },
-      (nextCapeState) => {
-        if (active) setCapeState(nextCapeState);
-      },
-      (nextFitState) => {
-        if (active) setFitState(nextFitState);
-      },
-      (nextFitMetrics) => {
-        if (active) setFitMetrics(nextFitMetrics);
-      },
-    )
-      .then((nextHandle) => {
+    void setupScene(canvas, () => propsRef.current, guard(setFitMetrics), guard(setError))
+      .then((handle) => {
         if (!active) {
-          nextHandle.dispose();
+          handle.dispose();
           return;
         }
-        nextHandle.setBuilt(builtRef.current);
-        handleRef.current = nextHandle;
+        handle.setBuilt(propsRef.current.built === true);
+        handleRef.current = handle;
+        void handle.setLook(propsRef.current);
+        setReady(true);
       })
-      .catch((err: unknown) => {
-        if (!active) return;
-        setError(err instanceof Error ? err.message : '3D preview failed');
+      .catch(() => {
+        if (active) setError(true);
       });
 
     return () => {
@@ -427,15 +458,16 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
       handleRef.current?.dispose();
       handleRef.current = null;
     };
-  }, [props.src, props.capeSrc, props.variant, props.side, props.showOuterLayers]);
+  }, [props.side, props.showOuterLayers]);
+
+  useEffect(() => {
+    void handleRef.current?.setLook(props);
+  }, [props.src, props.capeSrc, props.variant]);
 
   return (
     <div
       class="cp-skin-three"
-      data-skin-three-preview={ready ? 'ready' : error ? 'error' : 'loading'}
-      data-skin-three-interaction={interacting ? 'active' : 'idle'}
-      data-skin-three-cape={capeState}
-      data-skin-three-fit={fitState}
+      data-skin-three-preview={error ? 'error' : ready ? 'ready' : 'loading'}
       aria-label={`${props.name} 3D skin preview`}
       style={
         {
@@ -444,7 +476,6 @@ export function SkinThreePreview(props: SkinThreePreviewProps): JSX.Element {
       }
     >
       <canvas ref={canvasRef} aria-hidden="true" />
-      {!ready && !error && <div class="cp-skin-three__status">Preparing 3D preview...</div>}
       {error && <div class="cp-skin-three__status">3D preview unavailable</div>}
       {props.nametag && (
         <div class="cp-skin-three__overlays">

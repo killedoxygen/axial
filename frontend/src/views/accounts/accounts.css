@@ -239,6 +239,30 @@
   font-size: 12px;
 }
 
+/* "+N": the tiles that do not fit, behind one more tile; they open as a grid of their own. */
+.cp-wear-more {
+  display: grid;
+  min-width: 0;
+}
+.cp-wear-count {
+  color: var(--text-dim);
+  font-size: 17px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.cp-wear:hover:not(:disabled) .cp-wear-count {
+  color: var(--text);
+}
+.cp-wear-pop {
+  padding: 12px;
+  overflow-y: auto;
+}
+.cp-wear-pop .cp-wear-grid {
+  --palette-gap: 8px;
+  --palette-columns: 4;
+  --palette-tile: 84px;
+}
+
 /* A wearable: a holder, then its name. */
 .cp-wear {
   position: relative;
@@ -435,7 +459,13 @@
   width: 100%;
   height: 100%;
   cursor: grab;
+  opacity: 0;
   touch-action: none;
+  transition: opacity var(--t-move) var(--ease-out);
+}
+/* It appears once, when its first frame is drawn; later skins are put on in place. */
+.cp-skin-three[data-skin-three-preview='ready'] canvas {
+  opacity: 1;
 }
 .cp-skin-three canvas:active {
   cursor: grabbing;

@@ -44,29 +44,12 @@ export function LazySkinThreePreview(props: SkinThreePreviewProps): JSX.Element 
   return Preview ? (
     h(Preview, props)
   ) : (
-    <SkinThreePreviewFallback name={props.name} capeSrc={props.capeSrc} failed={failed} />
-  );
-}
-
-function SkinThreePreviewFallback({
-  name,
-  capeSrc,
-  failed,
-}: {
-  name: string;
-  capeSrc?: string;
-  failed: boolean;
-}): JSX.Element {
-  return (
     <div
       class="cp-skin-three"
       data-skin-three-preview={failed ? 'error' : 'loading'}
-      data-skin-three-interaction="idle"
-      data-skin-three-cape={capeSrc ? 'loading' : 'none'}
-      data-skin-three-fit="pending"
-      aria-label={`${name} 3D skin preview`}
+      aria-label={`${props.name} 3D skin preview`}
     >
-      <div class="cp-skin-three__status">{failed ? '3D preview unavailable' : 'Preparing 3D preview...'}</div>
+      {failed && <div class="cp-skin-three__status">3D preview unavailable</div>}
     </div>
   );
 }

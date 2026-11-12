@@ -1,25 +1,15 @@
-import type { ComponentChildren, JSX } from 'preact';
+import { toChildArray, type ComponentChildren, type JSX, type VNode } from 'preact';
+import { useRef, useState } from 'preact/hooks';
 import { Ring } from '../../ui/Atoms';
 import { openContextMenu, type ContextMenuItem } from '../../ui/ContextMenu';
 import { Icon } from '../../ui/Icons';
+import { Popover } from '../../ui/Popover';
 
 /**
  * Anything that can be worn, as one tile: a holder, then its name. The one worn has the neutral fill and the check;
  * the one in hand but not worn is outlined; a queued change carries the ring.
  */
-export function WearTile({
-  name,
-  title,
-  worn = false,
-  inHand = false,
-  queued = false,
-  add = false,
-  disabled,
-  menuItems,
-  role,
-  onSelect,
-  children,
-}: {
+interface WearTileProps {
   name: string;
   title?: string;
   worn?: boolean;
@@ -33,7 +23,21 @@ export function WearTile({
   role?: 'radio';
   onSelect: () => void;
   children: ComponentChildren;
-}): JSX.Element {
+}
+
+export function WearTile({
+  name,
+  title,
+  worn = false,
+  inHand = false,
+  queued = false,
+  add = false,
+  disabled,
+  menuItems,
+  role,
+  onSelect,
+  children,
+}: WearTileProps): JSX.Element {
   const menu = menuItems && menuItems.length > 0 ? menuItems : null;
   return (
     <button
@@ -64,5 +68,64 @@ export function WearTile({
         )
       )}
     </button>
+  );
+}
+
+/**
+ * Wearables as a grid of at most `limit` tiles. When there are more, the last place goes to "+N", which opens the
+ * rest in a popover; it carries the marks of what it holds, so the one worn or in hand is never lost from sight.
+ */
+export function WearGrid({
+  label,
+  role = 'group',
+  limit = Infinity,
+  note,
+  children,
+  ...props
+}: {
+  label: string;
+  role?: 'group' | 'radiogroup';
+  limit?: number;
+  /** A line under the tiles, outside the count. */
+  note?: ComponentChildren;
+  children: ComponentChildren;
+} & Pick<JSX.HTMLAttributes<HTMLDivElement>, 'title' | 'aria-busy' | 'aria-disabled'>): JSX.Element {
+  const tiles = toChildArray(children) as VNode<WearTileProps>[];
+  const stacked = tiles.length > limit;
+  const shown = stacked ? tiles.slice(0, Math.max(0, limit - 1)) : tiles;
+  return (
+    <div class="cp-wear-grid" role={role} aria-label={label} {...props}>
+      {shown}
+      {stacked && <WearMore tiles={tiles.slice(shown.length)} label={label} />}
+      {note}
+    </div>
+  );
+}
+
+function WearMore({ tiles, label }: { tiles: VNode<WearTileProps>[]; label: string }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const anchor = useRef<HTMLDivElement>(null);
+  const close = (): void => setOpen(false);
+  return (
+    <div ref={anchor} class="cp-wear-more">
+      <WearTile
+        name="More"
+        title={`${tiles.length} more`}
+        worn={tiles.some((tile) => tile.props.worn)}
+        inHand={tiles.some((tile) => tile.props.inHand)}
+        queued={tiles.some((tile) => tile.props.queued)}
+        onSelect={() => setOpen(!open)}
+      >
+        <span class="cp-wear-count">+{tiles.length}</span>
+      </WearTile>
+      {open && (
+        <Popover anchor={anchor} onDismiss={close} class="cp-pop cp-wear-pop">
+          {/* A choice made here closes the list, as in the account row's "+N". */}
+          <div class="cp-wear-grid" role="group" aria-label={`More ${label.toLowerCase()}`} onClick={close}>
+            {tiles}
+          </div>
+        </Popover>
+      )}
+    </div>
   );
 }

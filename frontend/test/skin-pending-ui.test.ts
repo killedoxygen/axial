@@ -210,6 +210,7 @@ function harness(
       (name) => [`./${name}`, { [name]: name }],
     ),
   );
+  primitives['./WearTile'] = { WearTile: 'WearTile', WearGrid: 'WearGrid' };
   const { Wardrobe } = source<typeof import('../src/views/accounts/Wardrobe')>('views/accounts/Wardrobe.tsx', {
     ...primitives,
     '../../api': transport,
@@ -221,7 +222,7 @@ function harness(
     './api': api,
     './types': { NO_CAPE_VALUE: '__none' },
     './skin-menu': { savedSkinMenuItems: () => [] },
-    './use-palette-fit': { usePaletteFit() {} },
+    './use-palette-fit': { usePaletteFit: () => [Infinity, Infinity] },
     './use-saved-skin-edit-workflow': { useSavedSkinEditWorkflow: () => ({ editReplacementDrop: {} }) },
     './use-saved-skin-lookup-workflow': { useSavedSkinLookupWorkflow: () => ({}) },
     './use-saved-skin-upload-workflow': { useSavedSkinUploadWorkflow: () => ({ uploadDrop: {} }) },

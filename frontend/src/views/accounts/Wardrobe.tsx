@@ -52,7 +52,7 @@ import { useSavedSkinEditWorkflow } from './use-saved-skin-edit-workflow';
 import { useSavedSkinLookupWorkflow } from './use-saved-skin-lookup-workflow';
 import { useSavedSkinNativeDragDrop } from './use-saved-skin-native-drag-drop';
 import { useSavedSkinUploadWorkflow } from './use-saved-skin-upload-workflow';
-import { WearTile } from './WearTile';
+import { WearGrid, WearTile } from './WearTile';
 
 /**
  * The active account's skins and capes: a narrow palette at the left (the player lookup, the skins, the capes of
@@ -209,7 +209,10 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
   ].filter((text): text is string => Boolean(text));
 
   const editingSkin = edit.editKey ? (savedByKey.get(edit.editKey) ?? null) : null;
-  usePaletteFit(bodyRef, 1 + (profileTile ? 1 : 0) + ownSkins.length + DEFAULT_SKINS.length + capes.length);
+  const [skinLimit, capeLimit] = usePaletteFit(bodyRef, [
+    1 + (profileTile ? 1 : 0) + ownSkins.length + DEFAULT_SKINS.length,
+    capes.length > 0 ? 1 + capes.length : 0,
+  ]);
 
   return (
     <>
@@ -264,7 +267,7 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
             ))}
           </div>
 
-          <div class="cp-wear-grid" role="group" aria-label="Skins">
+          <WearGrid label="Skins" limit={skinLimit}>
             <WearTile
               add
               name={upload.uploadDragActive ? 'Drop to add' : 'Add skin'}
@@ -338,7 +341,7 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
                 </WearTile>
               );
             })}
-          </div>
+          </WearGrid>
 
           {capes.length > 0 && (
             <CapePicker
@@ -346,6 +349,7 @@ export function Wardrobe({ skinActionDisabledReason }: { skinActionDisabledReaso
               value={(capeSkin ?? wornSkin)?.cape_id ?? NO_CAPE_VALUE}
               busy={op?.kind === 'cape'}
               locked={capeSkin ? undefined : 'Save or wear this skin to choose its cape'}
+              limit={capeLimit}
               onChange={(value) =>
                 capeSkin && void changeSavedSkinCape(capeSkin, value === NO_CAPE_VALUE ? null : value)
               }

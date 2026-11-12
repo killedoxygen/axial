@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { Icon } from '../../ui/Icons';
 import { capeFileUrl } from './api';
 import { NO_CAPE_VALUE, type MinecraftCape } from './types';
-import { WearTile } from './WearTile';
+import { WearGrid, WearTile } from './WearTile';
 
 const isActive = (cape: MinecraftCape): boolean => cape.state.toLowerCase() === 'active';
 
@@ -12,6 +12,7 @@ export function CapePicker({
   value,
   busy = false,
   locked,
+  limit,
   onChange,
 }: {
   capes: MinecraftCape[];
@@ -19,19 +20,25 @@ export function CapePicker({
   busy?: boolean;
   /** Why the cape cannot be changed right now. */
   locked?: string;
+  /** How many tiles fit; the rest go behind "+N". */
+  limit?: number;
   onChange: (value: string) => void;
 }): JSX.Element {
   const sorted = [...capes].sort(
     (left, right) => Number(isActive(right)) - Number(isActive(left)) || left.id.localeCompare(right.id),
   );
   return (
-    <div
-      class="cp-wear-grid"
+    <WearGrid
+      label="Capes"
       role="radiogroup"
-      aria-label="Cape"
+      limit={limit}
       aria-busy={busy || undefined}
       aria-disabled={locked ? true : undefined}
       title={locked}
+      note={
+        value !== NO_CAPE_VALUE &&
+        !capes.some((cape) => cape.id === value) && <p class="cp-wear-note">The saved cape is not on this profile.</p>
+      }
     >
       <WearTile
         role="radio"
@@ -61,9 +68,6 @@ export function CapePicker({
           </span>
         </WearTile>
       ))}
-      {value !== NO_CAPE_VALUE && !capes.some((cape) => cape.id === value) && (
-        <p class="cp-wear-note">The saved cape is not on this profile.</p>
-      )}
-    </div>
+    </WearGrid>
   );
 }
