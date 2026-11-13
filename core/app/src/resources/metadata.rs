@@ -118,164 +118,274 @@ pub(crate) fn is_png(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x89PNG\r\n\x1a\n")
 }
 
-type Archive<'a> = zip::ZipArchive<BufReader<RangeReader<'a>>>;
+type Tree = serde_json::Value;
 
-fn mod_metadata(archive: &mut Archive<'_>) -> (ContentFileMetadata, Option<String>) {
-    if let Some(bytes) = entry_bytes(archive, "fabric.mod.json", METADATA_MAX_BYTES) {
-        return fabric_metadata(&bytes);
-    }
-    if let Some(bytes) = entry_bytes(archive, "quilt.mod.json", METADATA_MAX_BYTES) {
-        return quilt_metadata(&bytes);
-    }
-    for path in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
-        if let Some(bytes) = entry_bytes(archive, path, METADATA_MAX_BYTES) {
-            let (mut metadata, icon) = forge_metadata(&String::from_utf8_lossy(&bytes));
-            if metadata.version.is_none() {
-                metadata.version = entry_bytes(archive, "META-INF/MANIFEST.MF", METADATA_MAX_BYTES)
-                    .and_then(|manifest| {
-                        implementation_version(&String::from_utf8_lossy(&manifest))
-                    });
-            }
-            return (metadata, icon);
-        }
-    }
-    (ContentFileMetadata::default(), None)
+/// A file in a jar that describes the mod inside: where it is, how it is written, and where its
+/// facts sit once read.
+struct Manifest {
+    path: &'static str,
+    parse: fn(&[u8]) -> Option<Tree>,
+    facts: for<'a> fn(&'a Tree) -> Facts<'a>,
 }
 
-fn fabric_metadata(bytes: &[u8]) -> (ContentFileMetadata, Option<String>) {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return (ContentFileMetadata::default(), None);
-    };
-    let authors = value["authors"]
-        .as_array()
-        .map(|authors| {
-            authors
-                .iter()
-                .filter_map(|author| author.as_str().or_else(|| author["name"].as_str()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    (
-        ContentFileMetadata {
-            title: value["name"]
-                .as_str()
-                .and_then(|text| clean(text, TITLE_CHARS)),
-            version: value["version"]
-                .as_str()
-                .and_then(|text| clean(text, VERSION_CHARS)),
-            authors: clean_authors(authors),
-            description: value["description"]
-                .as_str()
-                .and_then(|text| clean(text, DESCRIPTION_CHARS)),
-            icon: false,
-        },
-        icon_path(&value["icon"]),
-    )
+/// Every loader's manifest, in the order they speak for a jar that carries several. The jar's own
+/// comes last: it knows only the version a build left as a placeholder elsewhere.
+const MANIFESTS: [Manifest; 6] = [
+    Manifest {
+        path: "fabric.mod.json",
+        parse: lenient_json,
+        facts: fabric,
+    },
+    Manifest {
+        path: "quilt.mod.json",
+        parse: lenient_json,
+        facts: quilt,
+    },
+    Manifest {
+        path: "META-INF/neoforge.mods.toml",
+        parse: toml,
+        facts: forge,
+    },
+    Manifest {
+        path: "META-INF/mods.toml",
+        parse: toml,
+        facts: forge,
+    },
+    Manifest {
+        path: "mcmod.info",
+        parse: lenient_json,
+        facts: legacy_forge,
+    },
+    Manifest {
+        path: "META-INF/MANIFEST.MF",
+        parse: jar_manifest,
+        facts: build,
+    },
+];
+
+/// What one manifest says, as written. `icons` are the places it names art, best first.
+#[derive(Default)]
+struct Facts<'a> {
+    id: Option<&'a str>,
+    title: Option<&'a str>,
+    version: Option<&'a str>,
+    authors: Vec<&'a str>,
+    description: Option<&'a str>,
+    icons: Vec<&'a str>,
 }
 
-fn quilt_metadata(bytes: &[u8]) -> (ContentFileMetadata, Option<String>) {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return (ContentFileMetadata::default(), None);
-    };
-    let loader = &value["quilt_loader"];
-    let metadata = &loader["metadata"];
-    let authors = metadata["contributors"]
-        .as_object()
-        .map(|contributors| contributors.keys().map(String::as_str).collect())
-        .unwrap_or_default();
-    (
-        ContentFileMetadata {
-            title: metadata["name"]
-                .as_str()
-                .and_then(|text| clean(text, TITLE_CHARS)),
-            version: loader["version"]
-                .as_str()
-                .and_then(|text| clean(text, VERSION_CHARS)),
-            authors: clean_authors(authors),
-            description: metadata["description"]
-                .as_str()
-                .and_then(|text| clean(text, DESCRIPTION_CHARS)),
-            icon: false,
-        },
-        icon_path(&metadata["icon"]),
-    )
-}
-
-/// Reads single-line string keys from the first `[[mods]]` table. Values the
-/// loader substitutes at build time (`${...}`) are not display text.
-fn forge_metadata(text: &str) -> (ContentFileMetadata, Option<String>) {
-    let mut section = Section::Root;
+/// Describe a mod from its manifests and name its icon. Each fact is the first manifest's that
+/// states it, and the icon is the first named place that holds a file, so a manifest that is
+/// unreadable, incomplete or wrong about its art costs only what it alone knew.
+fn mod_metadata<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> (ContentFileMetadata, Option<String>) {
     let mut metadata = ContentFileMetadata::default();
     let mut icon = None;
-    let mut root_icon = None;
-    for line in text.lines().take(4096) {
-        let line = line.trim();
-        if line.starts_with('[') {
-            section = match (section, line) {
-                (Section::Root, "[[mods]]") => Section::Mod,
-                _ => Section::Other,
-            };
-            continue;
+    let mut ids = Vec::new();
+    for manifest in &MANIFESTS {
+        let settled = metadata.title.is_some()
+            && metadata.version.is_some()
+            && metadata.description.is_some()
+            && !metadata.authors.is_empty()
+            && icon.is_some();
+        if settled {
+            break;
         }
-        let Some((key, value)) = toml_string(line) else {
+        let Some(tree) = entry_bytes(archive, manifest.path, METADATA_MAX_BYTES)
+            .and_then(|bytes| (manifest.parse)(&bytes))
+        else {
             continue;
         };
-        match (section, key) {
-            (Section::Root, "logoFile") => root_icon = relative_png(&value),
-            (Section::Root, "authors") if metadata.authors.is_empty() => {
-                metadata.authors = clean_authors(value.split(',').collect());
-            }
-            (Section::Mod, "displayName") => metadata.title = clean(&value, TITLE_CHARS),
-            (Section::Mod, "version") => metadata.version = clean(&value, VERSION_CHARS),
-            (Section::Mod, "authors") => {
-                metadata.authors = clean_authors(value.split(',').collect());
-            }
-            (Section::Mod, "description") => {
-                metadata.description = clean(&value, DESCRIPTION_CHARS);
-            }
-            (Section::Mod, "logoFile") => icon = relative_png(&value),
-            _ => {}
+        let facts = (manifest.facts)(&tree);
+        state(&mut metadata.title, facts.title, TITLE_CHARS);
+        state(&mut metadata.version, facts.version, VERSION_CHARS);
+        state(
+            &mut metadata.description,
+            facts.description,
+            DESCRIPTION_CHARS,
+        );
+        if metadata.authors.is_empty() {
+            metadata.authors = clean_authors(facts.authors);
         }
+        icon = icon.or_else(|| held(archive, facts.icons.into_iter().map(str::to_owned)));
+        ids.extend(facts.id.map(str::to_owned));
     }
-    (metadata, icon.or(root_icon))
+    // Mods that name no art usually keep it where the other loaders' builds do.
+    let usual = ids
+        .iter()
+        .map(|id| format!("assets/{id}/icon.png"))
+        .chain(["icon.png".to_owned()]);
+    let icon = icon.or_else(|| held(archive, usual));
+    (metadata, icon)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
-    Root,
-    Mod,
-    Other,
+fn state(fact: &mut Option<String>, text: Option<&str>, max_chars: usize) {
+    if fact.is_none() {
+        *fact = text.and_then(|text| clean(text, max_chars));
+    }
 }
 
-fn toml_string(line: &str) -> Option<(&str, String)> {
-    let (key, rest) = line.split_once('=')?;
-    let key = key.trim();
-    let rest = rest.trim_start();
-    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    if rest.starts_with("'''") || rest.starts_with("\"\"\"") {
-        return None;
+/// The first safe PNG path the archive holds a file at.
+fn held<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    places: impl IntoIterator<Item = String>,
+) -> Option<String> {
+    places
+        .into_iter()
+        .filter_map(|place| relative_png(&place))
+        .find(|path| entry_exists(archive, path))
+}
+
+fn fabric(tree: &Tree) -> Facts<'_> {
+    Facts {
+        id: tree["id"].as_str(),
+        title: tree["name"].as_str(),
+        version: tree["version"].as_str(),
+        authors: people(&tree["authors"]),
+        description: tree["description"].as_str(),
+        icons: sized(&tree["icon"]),
     }
-    let mut value = String::new();
-    let mut chars = rest[1..].chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if quote == '"' => value.push(chars.next()?),
-            c if c == quote => return Some((key, value)),
-            c => value.push(c),
+}
+
+fn quilt(tree: &Tree) -> Facts<'_> {
+    let loader = &tree["quilt_loader"];
+    let about = &loader["metadata"];
+    Facts {
+        id: loader["id"].as_str(),
+        title: about["name"].as_str(),
+        version: loader["version"].as_str(),
+        authors: people(&about["contributors"]),
+        description: about["description"].as_str(),
+        icons: sized(&about["icon"]),
+    }
+}
+
+/// Forge and NeoForge describe the first of the file's mods. What that mod leaves out may be
+/// stated for the whole file, and its square icon is preferred to its wider logo.
+fn forge(tree: &Tree) -> Facts<'_> {
+    let about = &tree["mods"][0];
+    let id = about["modId"].as_str();
+    let stated = |key: &str| about[key].as_str().or_else(|| tree[key].as_str());
+    Facts {
+        id,
+        title: about["displayName"].as_str(),
+        version: about["version"].as_str(),
+        authors: [&about["authors"], &tree["authors"]]
+            .into_iter()
+            .map(people)
+            .find(|names| !names.is_empty())
+            .unwrap_or_default(),
+        description: about["description"].as_str(),
+        icons: [
+            stated("iconFile"),
+            id.and_then(|id| tree["modproperties"][id]["catalogueImageIcon"].as_str()),
+            stated("logoFile"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    }
+}
+
+/// Forge before 1.13: a list of mods, sometimes wrapped with the list's own version.
+fn legacy_forge(tree: &Tree) -> Facts<'_> {
+    let about = &tree.get("modList").unwrap_or(tree)[0];
+    Facts {
+        id: about["modid"].as_str(),
+        title: about["name"].as_str(),
+        version: about["version"].as_str(),
+        authors: people(&about["authorList"]),
+        description: about["description"].as_str(),
+        icons: about["logoFile"].as_str().into_iter().collect(),
+    }
+}
+
+/// What the build recorded about the jar itself.
+fn build(tree: &Tree) -> Facts<'_> {
+    Facts {
+        version: tree["Implementation-Version"].as_str(),
+        ..Facts::default()
+    }
+}
+
+/// Names however a manifest lists them: one string with commas, a list of names or of people, or
+/// a table keyed by name.
+fn people(value: &Tree) -> Vec<&str> {
+    match value {
+        Tree::String(names) => names.split(',').collect(),
+        Tree::Array(list) => list
+            .iter()
+            .filter_map(|one| one.as_str().or_else(|| one["name"].as_str()))
+            .collect(),
+        Tree::Object(roles) => roles.keys().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// An icon given as one path, or as paths keyed by size: the largest first.
+fn sized(value: &Tree) -> Vec<&str> {
+    match value {
+        Tree::String(path) => vec![path],
+        Tree::Object(sizes) => {
+            let mut sizes: Vec<(u32, &str)> = sizes
+                .iter()
+                .filter_map(|(size, path)| Some((size.parse().ok()?, path.as_str()?)))
+                .collect();
+            sizes.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
+            sizes.into_iter().map(|(_, path)| path).collect()
         }
+        _ => Vec::new(),
     }
-    None
 }
 
-fn implementation_version(manifest: &str) -> Option<String> {
-    manifest
-        .lines()
-        .find_map(|line| line.strip_prefix("Implementation-Version:"))
-        .and_then(|value| clean(value, VERSION_CHARS))
+/// The game and its loaders read these files leniently, and mods ship line breaks typed straight
+/// into a description. Strict JSON refuses a raw control character in a string, so a file that
+/// fails is read once more with those escaped.
+pub(crate) fn lenient_json(bytes: &[u8]) -> Option<Tree> {
+    if let Ok(value) = serde_json::from_slice(bytes) {
+        return Some(value);
+    }
+    let mut escaped = Vec::with_capacity(bytes.len() + 64);
+    let (mut quoted, mut slash) = (false, false);
+    for &byte in bytes {
+        if quoted && byte < 0x20 {
+            escaped.extend_from_slice(format!("\\u{byte:04x}").as_bytes());
+            slash = false;
+            continue;
+        }
+        if !quoted {
+            quoted = byte == b'"';
+        } else if slash {
+            slash = false;
+        } else if byte == b'\\' {
+            slash = true;
+        } else if byte == b'"' {
+            quoted = false;
+        }
+        escaped.push(byte);
+    }
+    serde_json::from_slice(&escaped).ok()
+}
+
+fn toml(bytes: &[u8]) -> Option<Tree> {
+    toml::from_str(&String::from_utf8_lossy(bytes)).ok()
+}
+
+/// A jar's own manifest: `Name: value` lines, of which the first block describes the jar.
+fn jar_manifest(bytes: &[u8]) -> Option<Tree> {
+    let text = String::from_utf8_lossy(bytes);
+    Some(
+        text.lines()
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_owned(), Tree::from(value.trim())))
+            .collect(),
+    )
 }
 
 fn pack_metadata(bytes: &[u8]) -> ContentFileMetadata {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+    let Some(value) = lenient_json(bytes) else {
         return ContentFileMetadata::default();
     };
     let mut description = String::new();
@@ -314,19 +424,6 @@ pub(crate) fn pack_directory_metadata(mcmeta: Option<&[u8]>, icon: bool) -> Cont
     ContentFileMetadata {
         icon,
         ..mcmeta.map(pack_metadata).unwrap_or_default()
-    }
-}
-
-/// Fabric and Quilt accept a path or a size-keyed map; prefer the largest.
-fn icon_path(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(path) => relative_png(path),
-        serde_json::Value::Object(sizes) => sizes
-            .iter()
-            .filter_map(|(size, path)| Some((size.parse::<u32>().ok()?, path.as_str()?)))
-            .max_by_key(|(size, _)| *size)
-            .and_then(|(_, path)| relative_png(path)),
-        _ => None,
     }
 }
 
@@ -383,11 +480,15 @@ fn clean(text: &str, max_chars: usize) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-fn entry_exists(archive: &mut Archive<'_>, path: &str) -> bool {
+fn entry_exists<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, path: &str) -> bool {
     archive.index_for_name(path).is_some()
 }
 
-fn entry_bytes(archive: &mut Archive<'_>, path: &str, max: u64) -> Option<Vec<u8>> {
+fn entry_bytes<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    path: &str,
+    max: u64,
+) -> Option<Vec<u8>> {
     let entry = archive.by_name(path).ok()?;
     if !entry.is_file() || entry.size() > max {
         return None;
@@ -478,37 +579,104 @@ pub(crate) mod tests {
         bytes.into_inner()
     }
 
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    /// A mod jar's description and the icon it resolves to.
+    fn described(entries: &[(&str, &[u8])]) -> (ContentFileMetadata, Option<String>) {
+        mod_metadata(&mut zip::ZipArchive::new(io::Cursor::new(jar(entries))).unwrap())
+    }
+
     #[test]
-    fn loader_metadata_yields_bounded_display_text_and_safe_icon_paths() {
-        let (fabric, icon) = fabric_metadata(
-            br#"{"name":"\u00a7aSodium","version":"0.6.13+mc1.21.4",
-                "authors":["JellySquid",{"name":"IMS"}],"icon":{"64":"a/s.png","128":"a/l.png"}}"#,
-        );
+    fn every_loader_manifest_yields_bounded_display_text_and_a_held_icon() {
+        // The largest icon a manifest names is not in the jar; the next is.
+        let (fabric, icon) = described(&[
+            (
+                "fabric.mod.json",
+                br#"{"id":"sodium","name":"\u00a7aSodium","version":"0.6.13+mc1.21.4",
+                    "authors":["JellySquid",{"name":"IMS"}],"icon":{"64":"a/s.png","128":"a/l.png"}}"#,
+            ),
+            ("a/s.png", PNG),
+        ]);
         assert_eq!(fabric.title.as_deref(), Some("Sodium"));
         assert_eq!(fabric.version.as_deref(), Some("0.6.13+mc1.21.4"));
         assert_eq!(fabric.authors, ["JellySquid", "IMS"]);
-        assert_eq!(icon.as_deref(), Some("a/l.png"));
+        assert_eq!(icon.as_deref(), Some("a/s.png"));
 
-        let (quilt, icon) = quilt_metadata(
-            br#"{"quilt_loader":{"version":"1.2.0","metadata":{"name":"Q",
-                "contributors":{"Ada":"Owner"},"icon":"../escape.png"}}}"#,
+        // A line break typed into a description does not cost the rest of the file.
+        let (loose, icon) = described(&[
+            (
+                "fabric.mod.json",
+                b"{\"name\":\"EMF\",\"description\":\"One \\\"line\\\"\nand\tanother\",\"icon\":\"icon.png\"}",
+            ),
+            ("icon.png", PNG),
+        ]);
+        assert_eq!(loose.title.as_deref(), Some("EMF"));
+        assert_eq!(
+            loose.description.as_deref(),
+            Some("One \"line\" and another")
         );
+        assert_eq!(icon.as_deref(), Some("icon.png"));
+
+        // An unsafe icon path is passed over for the place such art is usually kept.
+        let (quilt, icon) = described(&[
+            (
+                "quilt.mod.json",
+                br#"{"quilt_loader":{"id":"q","version":"1.2.0","metadata":{"name":"Q",
+                    "contributors":{"Ada":"Owner"},"icon":"../escape.png"}}}"#,
+            ),
+            ("assets/q/icon.png", PNG),
+        ]);
         assert_eq!(
             (quilt.title.as_deref(), quilt.version.as_deref()),
             (Some("Q"), Some("1.2.0"))
         );
         assert_eq!(quilt.authors, ["Ada"]);
-        assert_eq!(icon, None);
+        assert_eq!(icon.as_deref(), Some("assets/q/icon.png"));
 
-        let (forge, icon) = forge_metadata(
-            "modLoader=\"javafml\"\nlogoFile=\"root.png\"\n[[mods]]\nmodId=\"create\"\n\
-             version=\"${file.jarVersion}\"\ndisplayName=\"Create\" # name\n\
-             authors=\"simibubi, Kryppers\"\n[[dependencies.create]]\ndisplayName=\"Other\"\n",
-        );
+        // Forge's template comments its tables, descriptions span lines, and a version the
+        // build was to fill in is the jar's own.
+        let (forge, icon) = described(&[
+            (
+                "META-INF/mods.toml",
+                b"modLoader=\"javafml\" #mandatory\nlogoFile=\"root.png\"\n\
+                  authors=\"simibubi, Kryppers\"\n[[mods]] #mandatory\nmodId=\"create\"\n\
+                  version=\"${file.jarVersion}\"\ndisplayName=\"Create\" # name\n\
+                  description='''\nBuild\n[things]\n'''\n[[dependencies.create]]\nmodId=\"forge\"\n",
+            ),
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\r\nImplementation-Version: 6.0.4\r\n\r\n\
+                  Name: other\r\nImplementation-Version: 9\r\n",
+            ),
+            ("root.png", PNG),
+        ]);
         assert_eq!(forge.title.as_deref(), Some("Create"));
-        assert_eq!(forge.version, None);
+        assert_eq!(forge.version.as_deref(), Some("6.0.4"));
         assert_eq!(forge.authors, ["simibubi", "Kryppers"]);
+        assert_eq!(forge.description.as_deref(), Some("Build [things]"));
         assert_eq!(icon.as_deref(), Some("root.png"));
+
+        // A broken manifest and a missing icon each cost only themselves.
+        let (neoforge, icon) = described(&[
+            ("fabric.mod.json", b"{\"name\":\"Cut"),
+            (
+                "META-INF/neoforge.mods.toml",
+                b"[[mods]]\nmodId=\"iris\"\ndisplayName=\"Iris\"\nversion=\"1.0\"\n\
+                  iconFile=\"gone.png\"\nlogoFile=\"logo.png\"\n",
+            ),
+            ("logo.png", PNG),
+        ]);
+        assert_eq!(neoforge.title.as_deref(), Some("Iris"));
+        assert_eq!(icon.as_deref(), Some("logo.png"));
+
+        let (legacy, icon) = described(&[(
+            "mcmod.info",
+            br#"[{"modid":"jei","name":"Just Enough Items","version":"4.24",
+                "authorList":["mezz"],"logoFile":""}]"#,
+        )]);
+        assert_eq!(legacy.title.as_deref(), Some("Just Enough Items"));
+        assert_eq!(legacy.authors, ["mezz"]);
+        assert_eq!(icon, None);
 
         let long = format!("{}\n\u{7}tail", "x".repeat(400));
         let cleaned = clean(&long, TITLE_CHARS).unwrap();

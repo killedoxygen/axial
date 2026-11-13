@@ -285,7 +285,7 @@ fn fabric(
     budget: &mut usize,
 ) -> Option<Declared> {
     let metadata = read_entry(archive, "fabric.mod.json", MAX_METADATA_BYTES)?;
-    let json: serde_json::Value = serde_json::from_slice(&metadata).ok()?;
+    let json = crate::resources::metadata::lenient_json(&metadata)?;
     let id = json.get("id")?.as_str()?.to_string();
     let version = json
         .get("version")
