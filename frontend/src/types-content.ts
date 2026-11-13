@@ -228,6 +228,7 @@ export interface ContentUpdate {
   current_version_id: string;
   latest_version_id: string;
   latest_version_number: string;
+  latest_channel: ReleaseChannel;
   /** The modpack that installed this file; bulk updates leave it alone. */
   pack?: { canonical_id: string; title?: string };
 }

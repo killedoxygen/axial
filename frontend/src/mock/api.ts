@@ -659,7 +659,7 @@ const mockModMetadata: Record<string, ContentFileMetadata> = {
   },
   'appleskin-fabric-mc1.21.5-3.0.6.jar': {
     title: 'AppleSkin',
-    version: '3.0.6+mc1.21.5',
+    version: '3.1.0-beta.2+mc1.21.5',
     authors: ['squeek502'],
     icon: true,
   },
@@ -1124,6 +1124,7 @@ function mockContentUpdates(instanceId: string): ContentUpdatesResponse {
         current_version_id: entry.version_id,
         latest_version_id: latestId,
         latest_version_number: latest.number,
+        latest_channel: latest.channel,
       },
     ];
   });

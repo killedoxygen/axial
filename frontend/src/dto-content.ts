@@ -26,6 +26,7 @@ import type {
 } from './types-content';
 
 const CONTENT_KINDS = ['mod', 'modpack', 'resource_pack', 'shader_pack'] as const;
+const RELEASE_CHANNELS = ['release', 'beta', 'alpha'] as const;
 const LOADER_KEYS = ['vanilla', 'fabric', 'quilt', 'forge', 'neoforge'] as const;
 
 function strings(value: unknown, label: string): string[] {
@@ -105,7 +106,7 @@ export function contentDetailResponse(value: unknown): ContentDetail {
         version_number: dtoString(item.version_number, 'Content version number'),
         game_versions: strings(item.game_versions, 'Content version game versions'),
         loaders: strings(item.loaders, 'Content version loaders'),
-        channel: dtoEnum(item.channel, 'Content release channel', ['release', 'beta', 'alpha'] as const),
+        channel: dtoEnum(item.channel, 'Content release channel', RELEASE_CHANNELS),
         published: dtoOptionalString(item.published, 'Content publication time'),
         downloads: dtoNumber(item.downloads, 'Content version downloads'),
         files: dtoArray(item.files, 'Content files').map((file) => {
@@ -300,6 +301,7 @@ export function contentUpdatesResponse(value: unknown): ContentUpdatesResponse {
         current_version_id: dtoString(entry.current_version_id, 'Content current version'),
         latest_version_id: dtoString(entry.latest_version_id, 'Content latest version'),
         latest_version_number: dtoString(entry.latest_version_number, 'Content latest version number'),
+        latest_channel: dtoEnum(entry.latest_channel, 'Content latest release channel', RELEASE_CHANNELS),
         ...(entry.pack === undefined ? {} : { pack: updatePack(entry.pack) }),
       };
     }),

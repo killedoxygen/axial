@@ -1258,6 +1258,7 @@ pub struct AvailableUpdate {
     pub current_version_id: String,
     pub latest_version_id: String,
     pub latest_version_number: String,
+    pub latest_channel: ReleaseChannel,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// The modpack that installed this exact file. Its members are coupled to
@@ -1349,6 +1350,7 @@ pub async fn available_updates(
                 current_version_id: entry.version_id().to_string(),
                 latest_version_id: version.id.clone(),
                 latest_version_number: version.version_number.clone(),
+                latest_channel: version.channel,
                 title: entry.title().map(str::to_string),
                 pack: manifest.installing_pack(entry).map(|pack| UpdatePack {
                     canonical_id: pack.canonical_id().clone(),
@@ -1360,26 +1362,30 @@ pub async fn available_updates(
     Ok(updates)
 }
 
-/// The version an installed entry should move to, if any. Ranking is local and
-/// deterministic: stable releases outrank prereleases, then publication time
-/// and provider version id break ties. Provider response order has no authority.
+/// The version an installed entry should move to, if any: the newest one at
+/// least as stable as the installed one. A stable install is never offered a
+/// prerelease, and a prerelease is never offered an older stable release.
+/// An installed version the provider no longer lists moves to the best listed
+/// one. Ranking is local and deterministic; provider response order has no
+/// authority.
 pub fn newer_version<'a>(
     versions: &'a [ContentVersion],
     current_version_id: &str,
 ) -> Option<&'a ContentVersion> {
-    let picked = pick_version(versions, None)?;
-    if picked.id == current_version_id {
-        return None;
-    }
-    match versions
+    let Some(current) = versions
         .iter()
         .find(|version| version.id == current_version_id)
-    {
-        Some(current) => {
-            (compare_version_rank(picked, current) == Ordering::Greater).then_some(picked)
-        }
-        None => Some(picked),
-    }
+    else {
+        return pick_version(versions, None);
+    };
+    versions
+        .iter()
+        .filter(|version| version.primary_file().is_some())
+        .filter(|version| {
+            release_channel_rank(version.channel) >= release_channel_rank(current.channel)
+        })
+        .filter(|version| compare_version_age(version, current) == Ordering::Greater)
+        .max_by(|left, right| compare_version_age(left, right))
 }
 
 /// Whether moving to this version would introduce a declared incompatibility
@@ -1487,10 +1493,17 @@ fn version_matches_target(
     version_matches_filter(version, &target.filter_for(kind))
 }
 
+/// Stable releases outrank prereleases, then the newer version wins.
 fn compare_version_rank(left: &ContentVersion, right: &ContentVersion) -> Ordering {
     release_channel_rank(left.channel)
         .cmp(&release_channel_rank(right.channel))
-        .then_with(|| left.published.cmp(&right.published))
+        .then_with(|| compare_version_age(left, right))
+}
+
+/// Publication time, then provider version id.
+fn compare_version_age(left: &ContentVersion, right: &ContentVersion) -> Ordering {
+    left.published
+        .cmp(&right.published)
         .then_with(|| left.id.cmp(&right.id))
 }
 
@@ -1966,17 +1979,17 @@ mod tests {
                 {
                     "canonical_id": "modrinth:root", "kind": "mod",
                     "current_version_id": "v1", "latest_version_id": "v2",
-                    "latest_version_number": "v2", "title": "Installed title"
+                    "latest_version_number": "v2", "latest_channel": "release", "title": "Installed title"
                 },
                 {
                     "canonical_id": "modrinth:textures", "kind": "resource_pack",
                     "current_version_id": "v1", "latest_version_id": "v2",
-                    "latest_version_number": "v2"
+                    "latest_version_number": "v2", "latest_channel": "release"
                 },
                 {
                     "canonical_id": "modrinth:shaders", "kind": "shader_pack",
                     "current_version_id": "v1", "latest_version_id": "v2",
-                    "latest_version_number": "v2"
+                    "latest_version_number": "v2", "latest_channel": "release"
                 }
             ])
         );
@@ -2092,7 +2105,7 @@ mod tests {
                 json!([{
                     "canonical_id": "modrinth:root", "kind": "mod",
                     "current_version_id": "v1", "latest_version_id": "v2",
-                    "latest_version_number": "v2", "title": "Installed title"
+                    "latest_version_number": "v2", "latest_channel": "release", "title": "Installed title"
                 }])
             );
             assert_eq!(fixture.request_count("/v2/project/root/version"), 1);
@@ -3101,6 +3114,18 @@ mod tests {
         assert!(newer_version(&[], "old-gone").is_none());
         let beta_current = versions(&[("beta-2", Beta, true), ("rel-1", Release, true)]);
         assert_eq!(newer_version(&beta_current, "beta-2").unwrap().id, "rel-1");
+
+        let mut channels = versions(&[
+            ("rel-1", Release, true),
+            ("beta-2", Beta, true),
+            ("beta-3", Beta, true),
+        ]);
+        for (version, day) in channels.iter_mut().zip(1..) {
+            version.published = Some(format!("2026-01-0{day}T00:00:00Z"));
+        }
+        assert!(newer_version(&channels, "rel-1").is_none());
+        assert_eq!(newer_version(&channels, "beta-2").unwrap().id, "beta-3");
+        assert!(newer_version(&channels, "beta-3").is_none());
     }
 
     #[test]

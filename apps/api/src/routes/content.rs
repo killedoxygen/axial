@@ -826,7 +826,8 @@ mod tests {
                 json!({"updates":[{
                     "canonical_id":"modrinth:updateable", "kind":"resource_pack",
                     "current_version_id":"v1", "latest_version_id":"updateable-v2",
-                    "latest_version_number":"2.0", "title":"Installed updateable"
+                    "latest_version_number":"2.0", "latest_channel":"release",
+                    "title":"Installed updateable"
                 }]})
             );
             let mut paths = fixture.paths.lock().unwrap().clone();

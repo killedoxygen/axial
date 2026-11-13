@@ -268,6 +268,7 @@ for (const readFails of [false, true]) {
         kind: 'mod',
         current_version_id: 'old',
         latest_version_id: `pinned-${index}`,
+        latest_channel: 'release',
         latest_version_number: 'new',
       })),
     );

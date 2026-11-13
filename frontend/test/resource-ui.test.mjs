@@ -405,6 +405,7 @@ test('failed mod update queue preserves accepted batch count without resubmittin
       current_version_id: 'current',
       latest_version_id: `v${index}`,
       latest_version_number: `v${index}`,
+      latest_channel: /** @type {const} */ ('release'),
     })),
   );
   assert.deepEqual(
@@ -522,6 +523,7 @@ test('update all leaves modpack members alone and a single member update asks fi
     current_version_id: 'current',
     latest_version_id: `${id}-next`,
     latest_version_number: 'next',
+    latest_channel: /** @type {const} */ ('release'),
     ...(member ? { pack: { canonical_id: 'modrinth:pack', title: 'Pack' } } : {}),
   });
   assert.deepEqual(
