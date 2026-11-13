@@ -363,6 +363,11 @@ fn is_media_path(path: &str) -> bool {
         || matches!(parts.as_slice(), ["", "api", "v1", "skins", key, "file"] if media_segment(key))
         || matches!(parts.as_slice(), ["", "api", "v1", "instances", id, "screenshots", name, "file"]
             if media_segment(id) && media_segment(name))
+        || matches!(
+            parts.as_slice(),
+            ["", "api", "v1", "instances", id, "mods" | "resourcepacks" | "worlds", name, "icon"]
+                if media_segment(id) && media_segment(name)
+        )
 }
 
 fn media_segment(segment: &str) -> bool {
@@ -690,6 +695,20 @@ mod tests {
             .unwrap();
         assert!(authority.authenticate_ticket(&Method::GET, &media_uri));
         assert!(authority.authenticate_ticket(&Method::GET, &media_uri));
+        for art in [
+            "mods/sodium.jar/icon",
+            "resourcepacks/pack.zip/icon",
+            "worlds/New%20World/icon",
+        ] {
+            let art_uri = format!("/api/v1/instances/id/{art}?{TICKET_QUERY}={}", media.ticket)
+                .parse::<Uri>()
+                .unwrap();
+            assert!(authority.authenticate_ticket(&Method::GET, &art_uri));
+        }
+        let listing_uri = format!("/api/v1/instances/id/mods?{TICKET_QUERY}={}", media.ticket)
+            .parse::<Uri>()
+            .unwrap();
+        assert!(!authority.authenticate_ticket(&Method::GET, &listing_uri));
         let control_uri = format!("/api/v1/status?{TICKET_QUERY}={}", media.ticket)
             .parse::<Uri>()
             .unwrap();

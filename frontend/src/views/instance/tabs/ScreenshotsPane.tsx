@@ -9,7 +9,7 @@ import { formatBytes, fmtDayLabel, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
+import { PaneDoing, ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
 import { ScreenshotLightbox } from '../components/screenshot-lightbox';
 import { deleteScreenshots, screenshotFileUrl, screenshotMenuItems } from '../screenshot-actions';
 import { resourceMutationState } from '../bulk-actions';
@@ -125,14 +125,14 @@ export function ScreenshotsPane({
               label: SCREENSHOT_SORT_LABELS[item],
             }))}
           />
-          <span class="cp-head-fill" />
+          <PaneDoing instanceId={inst.id} />
           {totalBytes > 0 && <Chip tone="bare">{formatBytes(totalBytes)}</Chip>}
           <IconButton icon="refresh" tooltip="Refresh" onClick={onRefresh} />
           <IconButton icon="folder" tooltip="Open screenshots" onClick={openFolder} />
         </div>
       )}
       <ResourceStatus state={resources} onRetry={onRefresh} />
-      <ResourceMutationStatus instanceId={inst.id} />
+      <ResourceMutationStatus instanceId={inst.id} refusalOnly />
       {empty ? (
         <Empty
           title="No screenshots yet"

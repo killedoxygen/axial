@@ -286,6 +286,8 @@ function detailHarness(inst: EnrichedInstance) {
     '../../instance-readiness': readinessExports,
     '../../launch-presenters': launchPresenters,
     './mod-provenance-cache': { cachedModProvenance: () => null },
+    './listing-cache': { lastListing: () => null, readListing: () => () => undefined },
+    '../../content-activity': { contentRevision: { value: 0 } },
     './components/pack-origin': { PackChips: 'PackChips' },
     './resources': {
       fetchInstanceResources: async () => {

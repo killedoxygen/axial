@@ -2,6 +2,11 @@ import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import { Icon, type IconName } from './Icons';
 
+function show(image: HTMLImageElement): void {
+  if (image.naturalWidth <= 64) image.dataset.pixel = 'true';
+  image.dataset.loaded = 'true';
+}
+
 /**
  * A project's own art in a holder, or the glyph that stands for its kind when it has none or it fails to load.
  * Small pixel art stays crisp.
@@ -17,11 +22,11 @@ export function Art({ url, icon, size }: { url?: string; icon: IconName; size?: 
           loading="lazy"
           decoding="async"
           draggable={false}
-          onLoad={(event) => {
-            const image = event.currentTarget;
-            if (image.naturalWidth <= 64) image.dataset.pixel = 'true';
-            image.dataset.loaded = 'true';
+          ref={(image) => {
+            // Art the browser already holds is there from the first frame, not faded in again.
+            if (image?.complete && image.naturalWidth > 0) show(image);
           }}
+          onLoad={(event) => show(event.currentTarget)}
           onError={() => setFailed(url)}
         />
       ) : (

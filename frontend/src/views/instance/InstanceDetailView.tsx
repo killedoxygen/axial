@@ -4,6 +4,7 @@ import { Button, Chip, Empty, IconButton, Status, Tabs, type TabItem } from '../
 import { artSeedFor } from '../../ui/InstanceVisual';
 import { Vista } from '../../vista/Vista';
 import { openContextMenu } from '../../ui/ContextMenu';
+import { contentRevision } from '../../content-activity';
 import { instances, launchNotices, launchSessions, launchState, versionById } from '../../store';
 import { navigate, resetViewScroll } from '../../ui-state';
 import { selectInstance } from '../../actions';
@@ -23,6 +24,7 @@ import {
 } from '../../launch-presenters';
 import type { EnrichedInstance } from '../../types-instance';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
+import { lastListing, readListing } from './listing-cache';
 import { LOG_RESOURCE_POLL_MS } from './logs';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
 import { ModsPane } from './tabs/ModsPane';
@@ -70,7 +72,10 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const inst = instances.value.find((i) => i.id === id);
   const [selectedTab, setSelectedTab] = useState<TabSelection>(null);
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
-  const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
+  const [resources, setResources] = useState<ResourceLoadState>(() => ({
+    status: 'loading',
+    data: lastListing(id, 'resources'),
+  }));
   const resourceRequest = useRef(0);
   const [now, setNow] = useState(() => Date.now());
   const session = inst ? launchSessions.value[inst.id] : undefined;
@@ -96,8 +101,10 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
         retry: false,
       }).catch(() => {});
     }
+    const keep = readListing(inst.id, 'resources');
     void fetchInstanceResources(inst.id)
       .then((data) => {
+        keep(data);
         if (request === resourceRequest.current) setResources({ status: 'ready', data });
       })
       .catch((err) => {
@@ -120,6 +127,15 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
       if (timer) window.clearInterval(timer);
     };
   }, [inst?.id, processLive, inst?.launch_action.state_id]);
+
+  // Installs, updates and removals change the instance's files whichever tab is open.
+  const revision = contentRevision.value;
+  const readRevision = useRef(revision);
+  useEffect(() => {
+    if (readRevision.current === revision) return;
+    readRevision.current = revision;
+    reloadResources();
+  }, [revision]);
 
   useEffect(() => {
     if (!playing) return;

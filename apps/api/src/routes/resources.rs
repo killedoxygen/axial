@@ -41,7 +41,9 @@ pub fn router(state: Resources) -> Router {
         )
         .route(
             "/api/v1/instances/{id}/mods/{name}/icon",
-            file(|state, id, name| Ok(("image/png", state.mod_icon(id, name)?))),
+            file(ART_CACHE, |state, id, name| {
+                Ok(("image/png", state.mod_icon(id, name)?))
+            }),
         )
         .route(
             "/api/v1/instances/{id}/resourcepacks",
@@ -55,7 +57,9 @@ pub fn router(state: Resources) -> Router {
         )
         .route(
             "/api/v1/instances/{id}/resourcepacks/{name}/icon",
-            file(|state, id, name| Ok(("image/png", state.pack_icon(id, name)?))),
+            file(ART_CACHE, |state, id, name| {
+                Ok(("image/png", state.pack_icon(id, name)?))
+            }),
         )
         .route(
             "/api/v1/instances/{id}/shaderpacks",
@@ -99,7 +103,7 @@ pub fn router(state: Resources) -> Router {
         )
         .route(
             "/api/v1/instances/{id}/screenshots/{name}/file",
-            file(|state, id, name| {
+            file("no-store", |state, id, name| {
                 let media = state.screenshot(id, name)?;
                 Ok((media.content_type, media.bytes))
             }),
@@ -117,7 +121,7 @@ pub fn router(state: Resources) -> Router {
         )
         .route(
             "/api/v1/instances/{id}/worlds/{name}/icon",
-            file(|state, id, name| {
+            file(ART_CACHE, |state, id, name| {
                 let icon = state.world_icon(id, name)?;
                 Ok((icon.content_type, icon.bytes))
             }),
@@ -157,12 +161,16 @@ fn listing<T: Serialize + Send + 'static>(
 type FileRead =
     fn(&ResourceService, &InstanceId, &str) -> Result<(&'static str, Vec<u8>), ResourceError>;
 
-fn file(read: FileRead) -> MethodRouter<Resources> {
+/// A list's art is requested again for every row that scrolls into view. The
+/// page names the file's revision in the address, so one address is one picture.
+const ART_CACHE: &str = "private, max-age=86400, immutable";
+
+fn file(cache: &'static str, read: FileRead) -> MethodRouter<Resources> {
     get(
         move |State(state): State<Resources>, Path((raw, name)): Path<(String, String)>| async move {
             let (content_type, bytes) =
                 blocking(state, &raw, move |state, id| read(state, id, &name)).await?;
-            Ok::<Response, ApiError>(media(content_type, "no-store", bytes))
+            Ok::<Response, ApiError>(media(content_type, cache, bytes))
         },
     )
 }

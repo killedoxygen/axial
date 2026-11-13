@@ -1,5 +1,5 @@
-/* An instance reads from the top-left like Home: its name as display type, its facts, Launch; behind them stands
-   its world, as wide as Home's and shallower, running out behind the tabs. Then the tabs and the pane, flat on the panel. */
+/* An instance reads from the top-left like Home: its name as display type, its facts, Launch; then the tabs and
+   the pane, flat on the panel. Its world stands across the top of the panel, behind none of them. */
 .cp-view-page.cp-instance {
   position: relative;
   gap: 0;
@@ -8,11 +8,35 @@
 .cp-instance > :not(.cp-vista) {
   position: relative;
 }
+/* The view keeps its scrollbar's place whether a tab is long or short, so the page is one width on every tab. */
+.cp-view:has(> .cp-route > .cp-instance) {
+  overflow-y: scroll;
+}
 .cp-instance > .cp-vista {
-  --vista-foot-from: 56%;
-  width: 88%;
-  min-height: 272px;
-  aspect-ratio: 4.2;
+  /* The name, the facts and Launch keep nearly bare panel; the picture is whole from just past them, and gone by
+     the pane's first row. */
+  --vista-left-from: 260px;
+  --vista-left-to: 620px;
+  --vista-left-floor: 0.06;
+  --vista-foot-from: 30%;
+  /* So does the tabs' row, in a long low lens. */
+  --vista-clear: radial-gradient(
+    ellipse 1000px 70px at 0 236px,
+    oklch(0 0 0 / 0) 68%,
+    oklch(0 0 0 / 0.06) 71.2%,
+    oklch(0 0 0 / 0.15) 74.4%,
+    oklch(0 0 0 / 0.28) 77.6%,
+    oklch(0 0 0 / 0.43) 80.8%,
+    oklch(0 0 0 / 0.59) 84%,
+    oklch(0 0 0 / 0.74) 87.2%,
+    oklch(0 0 0 / 0.86) 90.4%,
+    oklch(0 0 0 / 0.94) 93.6%,
+    oklch(0 0 0 / 0.985) 96.8%,
+    oklch(0 0 0 / 1) 100%
+  );
+  width: 100%;
+  height: 312px;
+  aspect-ratio: auto;
 }
 
 .cp-instance-head {
@@ -172,6 +196,17 @@
   font-size: 11px;
   font-weight: 500;
 }
+/* The toolbar's free space says what is being done to the files. */
+.cp-pane-doing {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 8px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* A line about the pane's state: loading, a refusal, a cut. */
 .cp-resource-note {
   display: flex;
@@ -185,26 +220,40 @@
 .cp-resource-note--error {
   color: var(--err-text);
 }
+/* A wait is said only once it has lasted, so a quick read never flashes a line. */
+.cp-resource-note--wait {
+  animation: cp-fade-in var(--t-pop) var(--ease-out) 400ms backwards;
+}
 
-/* Entries (mods, packs, worlds): one grid so numbers and actions line up, no header row. Each row is two calm
-   lines beside the item's own art. */
+/* Entries (mods, packs, worlds): no header row. Each row is two calm lines beside the item's own art, then its
+   update, its figure and its menu. The figure's column has one width and the update stands before it, so every
+   row is laid out by itself: nothing moves when an update turns up, and rows out of sight are not drawn. */
 .cp-entries {
-  display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) auto auto 28px;
-  gap: 2px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .cp-entry {
-  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: subgrid;
+  grid-template-columns: 36px minmax(0, 1fr) auto 96px 28px;
+  gap: 12px;
   align-items: center;
-  min-height: 52px;
+  height: 52px;
   margin: 0 -10px;
-  padding: 6px 10px;
+  padding: 0 10px;
   border-radius: var(--rad-row);
   color: var(--text);
   font-size: 13px;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 52px;
   transition: background var(--t-quick) var(--ease-out);
+}
+/* A list with no figures gives their column to the names. */
+.cp-entries[data-figures='false'] > .cp-entry {
+  grid-template-columns: 36px minmax(0, 1fr) auto 28px;
+}
+.cp-entries[data-figures='false'] .cp-entry-num {
+  display: none;
 }
 .cp-entry:hover {
   --chip-bg: var(--fill-2);
@@ -254,15 +303,22 @@ strong.cp-entry-title {
 }
 .cp-entry-num {
   justify-self: end;
+  max-width: 100%;
+  overflow: hidden;
   color: var(--text-mute);
   font-family: var(--font-mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* A prerelease is named after its number, in the colour of a caution. */
+.cp-entry-pre {
+  margin-left: 0.6ch;
+  color: var(--warn-text);
 }
 /* The update carries the version it leads to. */
 .cp-entry-update.cp-btn {
-  justify-self: stretch;
   gap: 4px;
   padding: 0 11px 0 8px;
   font-family: var(--font-mono);

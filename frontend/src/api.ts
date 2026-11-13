@@ -10,6 +10,8 @@ const WEB_API_BASE = normalizeApiBaseUrl(__AXIAL_WEB_API_BASE__ ?? '');
 let apiBaseUrl = WEB_API_BASE;
 let apiCapability = __AXIAL_TEST_API_CAPABILITY__.trim();
 let mediaTicket = '';
+/** Advances whenever resource addresses change, so memoised ones are rebuilt. */
+export let mediaTicketEpoch = 0;
 let mediaTicketRefreshAt = 0;
 let mediaTicketRefreshTimer: number | undefined;
 let mediaTicketRefreshPromise: Promise<void> | null = null;
@@ -151,6 +153,7 @@ async function refreshMediaTicket(): Promise<void> {
 async function refreshMediaTicketNow(): Promise<void> {
   const grant = await mintTicket('media');
   mediaTicket = grant.ticket;
+  mediaTicketEpoch += 1;
   const refreshDelay = Math.max(1, grant.expires_in_seconds - 60) * 1000;
   mediaTicketRefreshAt = Date.now() + refreshDelay;
   if (typeof window !== 'undefined') {

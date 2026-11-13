@@ -19,6 +19,7 @@ import {
   type ModProvenance,
 } from './mod-provenance-cache';
 import { requireResourceCommandSuccess } from './resources';
+import { versionLabel, versionText } from './version-label';
 const CONTENT_INSTALL_BATCH_LIMIT = 40;
 
 export { cachedModProvenance, type ModProvenance } from './mod-provenance-cache';
@@ -26,7 +27,8 @@ export { cachedModProvenance, type ModProvenance } from './mod-provenance-cache'
 /** Provenance and update state for an instance's mods, keyed by filename and
  * canonical id. Names land as soon as the listing does; the update check is
  * best-effort and streams in as a second snapshot so it never delays them.
- * Snapshots are cached per instance so revisiting the tab paints instantly. */
+ * Snapshots are cached per instance so revisiting the tab paints instantly;
+ * the updates last found stay until the next check answers. */
 export async function fetchModProvenance(
   instanceId: string,
   onData: (provenance: ModProvenance) => void,
@@ -34,7 +36,7 @@ export async function fetchModProvenance(
   const generation = beginModProvenanceRefresh(instanceId);
   const cached = cachedModProvenance(instanceId);
   if (cached) {
-    const refreshing: ModProvenance = { ...cached, updates: new Map(), updateError: undefined };
+    const refreshing: ModProvenance = { ...cached, updateError: undefined };
     cacheModProvenance(instanceId, refreshing);
     onData(refreshing);
   }
@@ -43,7 +45,12 @@ export async function fetchModProvenance(
   const entries = new Map(
     content.entries.filter((entry) => entry.kind === 'mod').map((entry) => [entry.filename, entry]),
   );
-  const listed: ModProvenance = { entries, managed: content.entries, packs: content.packs ?? [], updates: new Map() };
+  const listed: ModProvenance = {
+    entries,
+    managed: content.entries,
+    packs: content.packs ?? [],
+    updates: cached?.updates ?? new Map(),
+  };
   cacheModProvenance(instanceId, listed);
   onData(listed);
   try {
@@ -58,10 +65,29 @@ export async function fetchModProvenance(
     onData(checked);
   } catch (err) {
     if (!isCurrentModProvenanceRefresh(instanceId, generation)) return;
-    const failed: ModProvenance = { ...listed, updateError: `Could not check mod updates: ${errMessage(err)}` };
+    const failed: ModProvenance = {
+      ...listed,
+      updates: new Map(),
+      updateError: `Could not check mod updates: ${errMessage(err)}`,
+    };
     cacheModProvenance(instanceId, failed);
     onData(failed);
   }
+}
+
+/** The update for a managed file, unless it was found for a version the file has since left. */
+export function updateFor(
+  provenance: ModProvenance | null,
+  entry: InstanceContentEntry | undefined,
+): ContentUpdate | undefined {
+  const update = entry && provenance?.updates.get(entry.canonical_id);
+  return update && update.current_version_id === entry.version_id ? update : undefined;
+}
+
+/** "Update to 0.7.3", in the words a row uses for that version. */
+export function updateMenuLabel(inst: EnrichedInstance, update: ContentUpdate): string {
+  const game = inst.version_display.minecraft_label;
+  return `Update to ${versionText(versionLabel(update.latest_version_number, game, update.latest_channel))}`;
 }
 
 /** Updates "Update all" applies. Modpack members stay coupled to their pack:
@@ -346,7 +372,7 @@ export function modMenuItems(
   if (update) {
     items.push({
       icon: 'arrow-up',
-      label: `Update to ${update.latest_version_number}`,
+      label: updateMenuLabel(inst, update),
       onSelect: () => void applyModUpdates(inst, [update]),
     });
   }

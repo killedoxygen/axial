@@ -9,7 +9,7 @@ import type { EnrichedInstance } from '../../types-instance';
 import type { InstancePackInfo } from '../../generated/InstancePackInfo';
 import { openInstanceFolder } from './instance-actions';
 import { confirmDeleteItems, partialFailureMessage, runResourceMutation } from './bulk-actions';
-import { applyModUpdates } from './mod-actions';
+import { applyModUpdates, updateMenuLabel } from './mod-actions';
 import { requireResourceCommandSuccess, type PackFolder } from './resources';
 
 export interface PackRow {
@@ -90,7 +90,7 @@ export function packMenuItems(
   if (update) {
     items.push({
       icon: 'arrow-up',
-      label: `Update to ${update.latest_version_number}`,
+      label: updateMenuLabel(inst, update),
       onSelect: () => void applyModUpdates(inst, [update]),
     });
   }

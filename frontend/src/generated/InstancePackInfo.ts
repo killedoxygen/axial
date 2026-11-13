@@ -7,7 +7,8 @@ export type InstancePackInfo = { name: string,
  */
 directory: boolean, size?: number, 
 /**
- * RFC 3339 UTC, or empty when the filesystem supplies no timestamp.
+ * RFC 3339 UTC. A folder reports its `pack.png`, the one file served from it. Empty without
+ * that file or when the filesystem supplies no timestamp.
  */
 modified_at: string, 
 /**

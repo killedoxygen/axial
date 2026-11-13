@@ -2,23 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  compareContentRows,
-  contentRowMatches,
+  compareEntries,
+  entryMatches,
   fileDisplayName,
-  type ContentRowView,
-} from '../src/views/instance/components/content-row';
+  type EntryView,
+} from '../src/views/instance/components/entries';
 import { packMembership } from '../src/views/instance/components/pack-origin';
 
-function row(title: string, fileName: string, overrides: Partial<ContentRowView> = {}): ContentRowView {
-  return {
-    key: fileName,
-    title,
-    fileName,
-    details: [],
-    fallbackIcon: 'puzzle',
-    enabled: true,
-    ...overrides,
-  };
+function row(title: string, fileName: string, overrides: Partial<EntryView> = {}): EntryView {
+  return { key: fileName, title, fileName, icon: 'puzzle', ...overrides };
 }
 
 test('installed content is ordered by display title regardless of case, numbering or filename', () => {
@@ -31,20 +23,21 @@ test('installed content is ordered by display title regardless of case, numberin
     row('Fabric API', 'a-fabric.jar'),
   ];
   assert.deepEqual(
-    rows.sort(compareContentRows).map((view) => view.fileName),
+    rows.sort(compareEntries).map((view) => view.fileName),
     ['zzz.jar', 'a-fabric.jar', 'z-fabric.jar', 'c.jar', 'b.jar', 'aaa.jar'],
   );
 });
 
 test('search matches titles, filenames, details and pack names, and files fall back to their base name', () => {
   const view = row('Sodium', 'sodium-fabric-0.7.2.jar', {
-    details: ['0.7.2', 'JellySquid, IMS'],
+    num: { text: '0.7.2' },
+    byline: 'JellySquid, IMS',
     pack: 'Fabulously Optimized',
   });
   for (const query of ['', 'SODIUM', 'fabric-0.7', 'jellysquid', 'fabulously']) {
-    assert.equal(contentRowMatches(view, query), true, query);
+    assert.equal(entryMatches(view, query), true, query);
   }
-  assert.equal(contentRowMatches(view, 'lithium'), false);
+  assert.equal(entryMatches(view, 'lithium'), false);
   assert.equal(fileDisplayName('handmade-patch.jar.disabled'), 'handmade-patch');
   assert.equal(fileDisplayName('Faithful 32x.ZIP'), 'Faithful 32x');
   assert.equal(fileDisplayName('Unpacked tweaks'), 'Unpacked tweaks');

@@ -357,7 +357,7 @@
   color: var(--text-mute);
   transition: background var(--t-quick) var(--ease-out);
 }
-.cp-art:has(img) {
+.cp-art:has(img[data-loaded]) {
   background: none;
 }
 /* Art fades in once it has loaded, over its holder, so a list filling with art never flickers. */

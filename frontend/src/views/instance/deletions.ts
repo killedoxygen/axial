@@ -8,6 +8,7 @@ import type { DeleteIntent } from '../../generated/DeleteIntent';
 import { instances } from '../../store';
 import { errMessage } from '../../utils';
 import { clearModProvenance } from './mod-provenance-cache';
+import { forgetListings } from './listing-cache';
 
 type DeletionIdentity = Omit<DeletionSnapshot, 'status'>;
 export type DeletionObservation = DeletionIdentity & {
@@ -102,6 +103,7 @@ async function reconcile(result: DeletionSnapshot): Promise<DeletionSnapshot> {
   if (result.status === 'removed') {
     removeInstance(result.instance_id);
     clearModProvenance(result.instance_id);
+    forgetListings(result.instance_id);
     forget(result.operation_id);
   } else if (result.status === 'aborted') {
     try {

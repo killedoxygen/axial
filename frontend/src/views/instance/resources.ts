@@ -15,10 +15,13 @@ import type { ContentFileMetadata } from '../../generated/ContentFileMetadata';
 import type { InstanceModMetadata } from '../../generated/InstanceModMetadata';
 import type { InstancePackInfo } from '../../generated/InstancePackInfo';
 
-export type ResourceLoadState =
-  | { status: 'loading'; data: InstanceResourceSummary | null; error?: undefined }
-  | { status: 'ready'; data: InstanceResourceSummary; error?: undefined }
-  | { status: 'error'; data: InstanceResourceSummary | null; error: string };
+/** A listing and how its last read went. What was read before stays while it is read again. */
+export type LoadState<T> =
+  | { status: 'loading'; data: T | null; error?: undefined }
+  | { status: 'ready'; data: T; error?: undefined }
+  | { status: 'error'; data: T | null; error: string };
+
+export type ResourceLoadState = LoadState<InstanceResourceSummary>;
 
 export function emptyResources(): InstanceResourceSummary {
   return {
@@ -56,12 +59,17 @@ export async function fetchPacks(id: string, folder: PackFolder): Promise<Instan
   return instancePacksResponse(await api('GET', `/instances/${encodeURIComponent(id)}/${folder}`));
 }
 
-export function modIconUrl(instanceId: string, name: string): string {
-  return apiResourceUrl(`/instances/${encodeURIComponent(instanceId)}/mods/${encodeURIComponent(name)}/icon`);
-}
+/** The folders whose files carry their own art. */
+export type ArtFolder = 'mods' | 'resourcepacks' | 'worlds';
 
-export function resourcePackIconUrl(instanceId: string, name: string): string {
-  return apiResourceUrl(`/instances/${encodeURIComponent(instanceId)}/resourcepacks/${encodeURIComponent(name)}/icon`);
+/**
+ * The address of a file's own art. It names the file's revision, so it is kept once fetched and asked for again
+ * only when the file changes.
+ */
+export function fileArtUrl(instanceId: string, folder: ArtFolder, name: string, revision: string): string {
+  return apiResourceUrl(
+    `/instances/${encodeURIComponent(instanceId)}/${folder}/${encodeURIComponent(name)}/icon?v=${encodeURIComponent(revision)}`,
+  );
 }
 
 function contentFileMetadataResponse(value: unknown, label: string): ContentFileMetadata {

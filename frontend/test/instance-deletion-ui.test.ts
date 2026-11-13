@@ -174,6 +174,7 @@ function harness() {
       },
     },
     './mod-provenance-cache': { clearModProvenance: (id: string) => cleared.push(id) },
+    './listing-cache': { forgetListings: () => undefined },
   };
   const helper = source<typeof import('../src/views/instance/deletions')>(
     'views/instance/deletions.ts',

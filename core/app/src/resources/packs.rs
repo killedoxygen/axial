@@ -48,7 +48,8 @@ pub struct InstancePackInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub size: Option<u64>,
-    /// RFC 3339 UTC, or empty when the filesystem supplies no timestamp.
+    /// RFC 3339 UTC. A folder reports its `pack.png`, the one file served from it. Empty without
+    /// that file or when the filesystem supplies no timestamp.
     pub modified_at: String,
     /// Disabled archives carry a `.disabled` suffix and are hidden from the game.
     pub enabled: bool,
@@ -85,15 +86,15 @@ pub(crate) fn list_packs(
                 let Ok(directory) = parent.open_directory(&name) else {
                     continue;
                 };
-                let metadata = match folder {
+                let (metadata, modified_at) = match folder {
                     PackFolder::ResourcePacks => directory_metadata(&directory, &mut budget),
-                    PackFolder::ShaderPacks => ContentFileMetadata::default(),
+                    PackFolder::ShaderPacks => Default::default(),
                 };
                 packs.push(InstancePackInfo {
                     name: name.as_str().into(),
                     directory: true,
                     size: None,
-                    modified_at: String::new(),
+                    modified_at,
                     enabled: true,
                     metadata,
                 });
@@ -176,7 +177,11 @@ pub(crate) fn pack_icon(game: &ScopedDirectory, name: &str) -> Result<Vec<u8>, R
     icon.ok_or(ResourceError::NotFound)
 }
 
-fn directory_metadata(directory: &ScopedDirectory, budget: &mut ReadBudget) -> ContentFileMetadata {
+/// What a pack folder says about itself, and when its icon last changed.
+fn directory_metadata(
+    directory: &ScopedDirectory,
+    budget: &mut ReadBudget,
+) -> (ContentFileMetadata, String) {
     let mcmeta = budget
         .take(MCMETA_MAX_BYTES)
         .then(|| {
@@ -187,8 +192,17 @@ fn directory_metadata(directory: &ScopedDirectory, budget: &mut ReadBudget) -> C
         .flatten();
     let icon = directory
         .open_file(&PortableName::new_exact("pack.png").expect("fixed portable name"))
-        .is_ok();
-    pack_directory_metadata(mcmeta.as_deref(), icon)
+        .ok();
+    let modified_at = icon
+        .as_ref()
+        .and_then(|file| file.revision().ok())
+        .and_then(|revision| revision.modified_at_ns().ok())
+        .map(timestamp)
+        .unwrap_or_default();
+    (
+        pack_directory_metadata(mcmeta.as_deref(), icon.is_some()),
+        modified_at,
+    )
 }
 
 fn open_folder(game: &ScopedDirectory, folder: PackFolder) -> io::Result<ScopedDirectory> {
@@ -246,6 +260,8 @@ mod tests {
             br#"{"pack":{"description":"Loose"}}"#,
         )
         .unwrap();
+        std::fs::create_dir(packs.join("Painted")).unwrap();
+        std::fs::write(packs.join("Painted/pack.png"), b"\x89PNG\r\n\x1a\nloose").unwrap();
         let shaders = physical.join("shaderpacks");
         std::fs::create_dir(&shaders).unwrap();
         std::fs::write(shaders.join("Complementary.zip"), b"zip").unwrap();
@@ -271,8 +287,16 @@ mod tests {
             vec![
                 ("Faithful.zip", false, true, Some("32x"), true),
                 ("Old.zip.disabled", false, false, None, false),
+                ("Painted", true, true, None, true),
                 ("Unpacked", true, true, Some("Loose"), false),
             ]
+        );
+        // A folder's icon address needs a revision; a folder without one has none.
+        assert!(chrono::DateTime::parse_from_rfc3339(&listed[2].modified_at).is_ok());
+        assert_eq!(listed[3].modified_at, "");
+        assert_eq!(
+            pack_icon(&root, "Painted").unwrap(),
+            b"\x89PNG\r\n\x1a\nloose"
         );
         assert_eq!(
             pack_icon(&root, "Faithful.zip").unwrap(),
