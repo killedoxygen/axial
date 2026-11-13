@@ -1,7 +1,8 @@
 /* Home reads from the top-left like every page: the hello where a page title sits, the last-played instance as
-   display type with its facts and Play, then the library as one shelf of covers. Behind the lead stands that
-   instance's world. */
+   display type with its facts and Play, and along the panel's foot the library as one shelf of covers. Behind the
+   lead stands that instance's world. */
 .cp-home {
+  --home-cover: clamp(120px, 20vh, 200px);
   position: relative;
   gap: 0;
   min-height: 100%;
@@ -9,6 +10,10 @@
 }
 .cp-home > :not(.cp-vista) {
   position: relative;
+}
+/* The picture stops short of the shelf. */
+.cp-home > .cp-vista {
+  max-height: calc(100% - 96px - var(--home-cover));
 }
 .cp-home-hello {
   display: flex;
@@ -55,7 +60,8 @@
 
 .cp-home-shelf {
   min-width: 0;
-  margin-top: clamp(40px, 8vh, 72px);
+  margin-top: auto;
+  padding-top: clamp(40px, 8vh, 72px);
 }
 .cp-home-shelf .cp-head {
   margin-bottom: 12px;
@@ -68,12 +74,13 @@
   align-items: flex-start;
   gap: 28px;
 }
+/* A cover is the instance's tile until its own world is drawn over it. */
 .cp-home-item {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   flex: none;
-  width: 120px;
+  width: calc(var(--home-cover) * 1.6);
   padding: 0;
   border: 0;
   border-radius: var(--hold-xl);
@@ -87,14 +94,26 @@
   outline-offset: 3px;
 }
 .cp-home-cover {
+  position: relative;
   display: grid;
   place-items: center;
-  width: 120px;
-  height: 120px;
+  overflow: hidden;
+  width: 100%;
+  height: var(--home-cover);
   border-radius: var(--hold-xl);
   transition:
     scale var(--t-pop) var(--ease-out),
     background var(--t-quick) var(--ease-out);
+}
+.cp-home-cover > :is(.cp-tile, .cp-vista) {
+  width: 100%;
+  height: 100%;
+}
+.cp-home-cover > .cp-vista {
+  aspect-ratio: auto;
+  object-position: center;
+  -webkit-mask-image: none;
+  mask-image: none;
 }
 .cp-home-item:hover .cp-home-cover {
   scale: 1.03;

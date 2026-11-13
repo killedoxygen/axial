@@ -1,24 +1,29 @@
 /* World art has no frame and nothing laid over it. It is anchored to the panel's top-right corner, most of the
    panel wide, at full strength; only its left and lower edges run out into the page. One drawn picture serves
    every place and size: each scales it to its width and, where it is shallower, shows the band of it that holds
-   the horizon and the ground just under it. */
+   the sky's light, the horizon and the ground just under it. */
 .cp-vista {
   /* Both edges ease out along one curve of many small steps; a plain ramp shows where it starts and ends. */
+  --vista-left-from: 0%;
   --vista-left-to: 30%;
+  /* How much of the picture is still there left of that. */
+  --vista-left-floor: 0;
+  /* A page's own mask, for room it clears inside the picture. */
+  --vista-clear: linear-gradient(#000 0 0);
   --vista-foot-from: 52%;
   --vista-left: linear-gradient(
     to right,
-    oklch(0 0 0 / 0) calc(var(--vista-left-to) * 0),
-    oklch(0 0 0 / 0.06) calc(var(--vista-left-to) * 0.1),
-    oklch(0 0 0 / 0.15) calc(var(--vista-left-to) * 0.2),
-    oklch(0 0 0 / 0.28) calc(var(--vista-left-to) * 0.3),
-    oklch(0 0 0 / 0.43) calc(var(--vista-left-to) * 0.4),
-    oklch(0 0 0 / 0.59) calc(var(--vista-left-to) * 0.5),
-    oklch(0 0 0 / 0.74) calc(var(--vista-left-to) * 0.6),
-    oklch(0 0 0 / 0.86) calc(var(--vista-left-to) * 0.7),
-    oklch(0 0 0 / 0.94) calc(var(--vista-left-to) * 0.8),
-    oklch(0 0 0 / 0.985) calc(var(--vista-left-to) * 0.9),
-    oklch(0 0 0 / 1) calc(var(--vista-left-to) * 1)
+    oklch(0 0 0 / 0) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0),
+    oklch(0 0 0 / 0.06) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.1),
+    oklch(0 0 0 / 0.15) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.2),
+    oklch(0 0 0 / 0.28) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.3),
+    oklch(0 0 0 / 0.43) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.4),
+    oklch(0 0 0 / 0.59) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.5),
+    oklch(0 0 0 / 0.74) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.6),
+    oklch(0 0 0 / 0.86) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.7),
+    oklch(0 0 0 / 0.94) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.8),
+    oklch(0 0 0 / 0.985) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 0.9),
+    oklch(0 0 0 / 1) calc(var(--vista-left-from) + (var(--vista-left-to) - var(--vista-left-from)) * 1)
   );
   --vista-foot: linear-gradient(
     to bottom,
@@ -40,12 +45,15 @@
   width: 88%;
   aspect-ratio: 2.3;
   object-fit: cover;
-  object-position: right 76%;
+  object-position: right 38%;
   opacity: 0;
-  -webkit-mask-image: var(--vista-left), var(--vista-foot);
-  mask-image: var(--vista-left), var(--vista-foot);
-  -webkit-mask-composite: source-in;
-  mask-composite: intersect;
+  --vista-mask:
+    var(--vista-foot), linear-gradient(oklch(0 0 0 / var(--vista-left-floor)) 0 0), var(--vista-left),
+    var(--vista-clear);
+  -webkit-mask-image: var(--vista-mask);
+  mask-image: var(--vista-mask);
+  -webkit-mask-composite: source-in, source-over, source-in;
+  mask-composite: intersect, add, intersect;
   transition: opacity 320ms ease;
   pointer-events: none;
 }

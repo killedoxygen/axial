@@ -15,7 +15,6 @@ import { instanceInstallStatus } from '../../instance-install-status';
 import { openInstanceContextMenu } from '../instance/instance-menu';
 import type { EnrichedInstance } from '../../types-instance';
 
-const COVER = 120;
 const GAP = 28;
 const SHELF_LIMIT = 6;
 
@@ -98,7 +97,12 @@ function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JS
     const row = rowRef.current;
     if (!row) return undefined;
     const measure = (): void =>
-      setFit(Math.max(1, Math.min(SHELF_LIMIT, Math.floor((row.clientWidth + GAP) / (COVER + GAP)) - 1)));
+      setFit(
+        Math.max(
+          1,
+          Math.min(SHELF_LIMIT, Math.floor((row.clientWidth + GAP) / (row.lastElementChild!.clientWidth + GAP)) - 1),
+        ),
+      );
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(row);
@@ -128,7 +132,14 @@ function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JS
             onClick={() => navigate({ name: 'instance', id: inst.id })}
             onContextMenu={(e) => openInstanceContextMenu(e, inst)}
           >
-            <InstanceTile inst={inst} className="cp-home-cover" />
+            <span class="cp-home-cover">
+              <InstanceTile inst={inst} />
+              <Vista
+                seed={artSeedFor(inst)}
+                version={inst.version_id}
+                installing={instanceInstallStatus(inst, versionById(inst.version_id)).installing}
+              />
+            </span>
             <span class="cp-home-title" title={inst.name}>
               {inst.name}
             </span>
