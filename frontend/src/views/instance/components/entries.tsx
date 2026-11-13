@@ -43,8 +43,8 @@ function Version({ label }: { label: VersionLabel }): JSX.Element {
 }
 
 /**
- * A list row: art (its selection mark on hover), name and a quiet second line, an update, a figure, a menu. It is
- * drawn again only when its own facts change, so a long list stays cheap to select in and to refresh.
+ * A list row: art (its selection mark on the corner on hover), name and a quiet second line, an update, a figure,
+ * a menu. It is drawn again only when its own facts change, so a long list stays cheap to select in and to refresh.
  */
 const Entry = memo(function Entry({
   view,

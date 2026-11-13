@@ -31,7 +31,8 @@
   animation: cp-enter var(--t-pop) var(--ease-out) backwards;
 }
 
-/* A list row's first cell: the item's art, which its selection mark replaces on hover, on focus and once chosen. */
+/* A list row's first cell: the item's art, which stays put. Its selection mark sits on the corner on hover, on focus
+   and once chosen, as it does on a cover or a screenshot. */
 .cp-lead {
   flex: none;
   display: grid;
@@ -48,13 +49,18 @@
   border-radius: var(--hold-sm);
 }
 .cp-lead > .cp-check {
+  position: relative;
+  place-self: start;
+  margin: -3px 0 0 -3px;
   opacity: 0;
+}
+/* The mark is small, so a little of the art around it answers too. */
+.cp-lead > .cp-check::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
 }
 :is(.cp-tr, .cp-entry):is(:hover, :focus-within) .cp-lead > .cp-check,
 .cp-lead > .cp-check[data-selected='true'] {
   opacity: 1;
-}
-:is(.cp-tr, .cp-entry):is(:hover, :focus-within) .cp-lead:has(> .cp-check) > :first-child,
-.cp-lead:has(> .cp-check[data-selected='true']) > :first-child {
-  opacity: 0;
 }
