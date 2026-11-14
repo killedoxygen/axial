@@ -5,7 +5,7 @@ import { Button, Chip } from '../../ui/Atoms';
 import { Face } from '../../ui/Face';
 import { Icon } from '../../ui/Icons';
 import { InstanceTile, artSeedFor } from '../../ui/InstanceVisual';
-import { Vista } from '../../vista/Vista';
+import { Vista, warmVistas } from '../../vista/Vista';
 import { selectInstance } from '../../actions';
 import { fmtRelative } from '../../format';
 import { launchGame } from '../../launch';
@@ -24,6 +24,39 @@ function greetingFor(date: Date): string {
   if (h < 12) return 'Good morning';
   if (h < 18) return 'Good afternoon';
   return 'Good evening';
+}
+
+/** Last played first; the first leads Home. */
+function recentFirst(all: EnrichedInstance[]): EnrichedInstance[] {
+  const played = (inst: EnrichedInstance): number =>
+    inst.last_played_at ? new Date(inst.last_played_at).getTime() : 0;
+  return [...all].sort((a, b) => played(b) - played(a));
+}
+
+const installing = (inst: EnrichedInstance): boolean =>
+  instanceInstallStatus(inst, versionById(inst.version_id)).installing;
+
+const scene = (inst: EnrichedInstance): { seed: number; version: string } => ({
+  seed: artSeedFor(inst),
+  version: inst.version_id,
+});
+
+/**
+ * Has the lead's picture ready, so Home's first frame holds it, and the library's drawn behind it while no game
+ * is starting or running: that work can wait. Reads the signals the pictures follow.
+ */
+export function warmHome(): Promise<void> {
+  return warmVistas(
+    recentFirst(instances.value)
+      .filter((inst) => !installing(inst))
+      .map(scene),
+    launchState.value.status !== 'idle' || Object.keys(launchSessions.value).length > 0,
+  );
+}
+
+/** An instance's world, once its version's files are there. */
+function World({ inst }: { inst: EnrichedInstance }): JSX.Element {
+  return <Vista {...scene(inst)} installing={installing(inst)} />;
 }
 
 /** The last-played instance: its name as display type, its facts, and the way in. */
@@ -75,9 +108,7 @@ function Lead({ inst }: { inst: EnrichedInstance }): JSX.Element {
         ) : (
           <Button
             size="lg"
-            icon={
-              session || busy ? undefined : action.primary_action === 'install' ? 'download' : 'alert'
-            }
+            icon={session || busy ? undefined : action.primary_action === 'install' ? 'download' : 'alert'}
             title={action.primary_action === 'blocked' ? action.disabled_reason : undefined}
             onClick={open}
           >
@@ -134,11 +165,7 @@ function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JS
           >
             <span class="cp-home-cover">
               <InstanceTile inst={inst} />
-              <Vista
-                seed={artSeedFor(inst)}
-                version={inst.version_id}
-                installing={instanceInstallStatus(inst, versionById(inst.version_id)).installing}
-              />
+              <World inst={inst} />
             </span>
             <span class="cp-home-title" title={inst.name}>
               {inst.name}
@@ -159,15 +186,7 @@ function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JS
 export function HomeView(): JSX.Element {
   const all = instances.value;
   const username = config.value?.username;
-  const recent = useMemo(
-    () =>
-      [...all].sort((a, b) => {
-        const ta = a.last_played_at ? new Date(a.last_played_at).getTime() : 0;
-        const tb = b.last_played_at ? new Date(b.last_played_at).getTime() : 0;
-        return tb - ta;
-      }),
-    [all],
-  );
+  const recent = useMemo(() => recentFirst(all), [all]);
   const lead = recent[0];
 
   if (!lead) {
@@ -183,11 +202,7 @@ export function HomeView(): JSX.Element {
   }
   return (
     <div class="cp-view-page cp-home">
-      <Vista
-        seed={artSeedFor(lead)}
-        version={lead.version_id}
-        installing={instanceInstallStatus(lead, versionById(lead.version_id)).installing}
-      />
+      <World inst={lead} />
       <h1 class="cp-home-hello">
         {greetingFor(new Date())}
         {username ? `, ${username}` : ''}.

@@ -1,6 +1,6 @@
-/* Home reads from the top-left like every page: the hello where a page title sits, the last-played instance as
-   display type with its facts and Play, and along the panel's foot the library as one shelf of covers. Behind the
-   lead stands that instance's world. */
+/* Home reads from the top-left like every page: the hello where a page title sits, then, at the panel's foot, the
+   last-played instance as display type with its facts and Play, standing on the library's one shelf of covers.
+   That instance's world fills the panel above the shelf, whatever the window's shape. */
 .cp-home {
   --home-cover: clamp(120px, 20vh, 200px);
   position: relative;
@@ -11,9 +11,10 @@
 .cp-home > :not(.cp-vista) {
   position: relative;
 }
-/* The picture stops short of the shelf. */
+/* The picture stops short of the shelf: its heading, covers, titles and the page's foot. */
 .cp-home > .cp-vista {
-  max-height: calc(100% - 96px - var(--home-cover));
+  height: calc(100% - 96px - var(--home-cover));
+  aspect-ratio: auto;
 }
 .cp-home-hello {
   display: flex;
@@ -30,7 +31,8 @@
   flex-direction: column;
   align-items: flex-start;
   min-width: 0;
-  margin-top: clamp(84px, 15vh, 150px);
+  margin-top: auto;
+  padding-top: 24px;
 }
 /* Pulled left by the first letter's side bearing, so its stem shares the chips' and the buttons' edge. */
 .cp-home-name {
@@ -38,10 +40,10 @@
   margin: 0 0 0 -3px;
   overflow: hidden;
   color: var(--text);
-  font-size: 56px;
+  font-size: clamp(48px, 4vw, 84px);
   font-weight: 700;
   letter-spacing: -0.028em;
-  line-height: 64px;
+  line-height: 1.14;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
@@ -60,8 +62,7 @@
 
 .cp-home-shelf {
   min-width: 0;
-  margin-top: auto;
-  padding-top: clamp(40px, 8vh, 72px);
+  padding-top: clamp(28px, 5vh, 56px);
 }
 .cp-home-shelf .cp-head {
   margin-bottom: 12px;

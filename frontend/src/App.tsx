@@ -1,9 +1,10 @@
 import { h } from 'preact';
+import { effect } from '@preact/signals';
 import type { ComponentChildren, ComponentType, JSX } from 'preact';
 import { useEffect, useErrorBoundary, useLayoutEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { BootSplash } from './shell/BootSplash';
-import { HomeView } from './views/home/HomeView';
+import { HomeView, warmHome } from './views/home/HomeView';
 import { Button, Empty } from './ui/Atoms';
 import { DialogHost } from './ui/Dialog';
 import { ContextMenuHost } from './ui/ContextMenu';
@@ -228,6 +229,8 @@ function AppErrorBoundary({ children }: { children: ComponentChildren }): JSX.El
 }
 
 function AppContent(): JSX.Element {
+  // The pictures are ready again whenever the library or the colour mode changes, whichever page is open.
+  useEffect(() => effect(() => void warmHome()), []);
   useShortcuts();
   return (
     <>

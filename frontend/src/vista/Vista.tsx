@@ -2,8 +2,26 @@ import type { JSX } from 'preact';
 import { useLayoutEffect, useRef } from 'preact/hooks';
 import { themeSignal } from '../theme';
 
-/** The drawing loads on first use, off the app's start-up path. Once loaded it can show a kept picture at once. */
-let studio: typeof import('./draw') | undefined;
+/** The pictures are their own chunk, off the app's first script. Once loaded they show a kept picture at once. */
+let pictures: typeof import('./pictures') | undefined;
+const noop = (): void => undefined;
+const loading = (): Promise<typeof import('./pictures')> => import('./pictures').then((loaded) => (pictures = loaded));
+
+/**
+ * Has the first scene's picture, in the colour mode of the moment, ready before the place that shows it is on
+ * screen, and the rest drawn in the background unless the machine is `busy`. Never rejects.
+ */
+export function warmVistas(scenes: { seed: number; version: string }[], busy: boolean): Promise<void> {
+  const { dark } = themeSignal.value;
+  return loading().then(
+    (loaded) =>
+      loaded.warm(
+        scenes.map((scene) => ({ ...scene, dark })),
+        busy,
+      ),
+    noop,
+  );
+}
 
 /**
  * An instance's world, drawn from its art seed with its own version's block textures: sunset to night in dark mode,
@@ -25,23 +43,16 @@ export function Vista({
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || installing) return undefined;
-    let stop: (() => void) | null | undefined;
+    let stop: (() => void) | undefined;
+    let over = false;
     const start = (): void => {
-      if (stop !== null) stop = studio!.show(canvas, seed, version, dark);
+      if (!over) stop = pictures!.show(canvas, { seed, version, dark });
     };
-    if (studio) start();
-    else {
-      void import('./draw').then(
-        (loaded) => {
-          studio = loaded;
-          start();
-        },
-        () => undefined,
-      );
-    }
+    if (pictures) start();
+    else loading().then(start, noop);
     return () => {
+      over = true;
       stop?.();
-      stop = null;
     };
   }, [seed, version, installing, dark]);
 

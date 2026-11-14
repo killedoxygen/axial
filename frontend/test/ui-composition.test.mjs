@@ -1072,9 +1072,10 @@ function bootstrapHarness({ queueFailure = false, registryFailure = false, sessi
       './startup-warnings': { startupWarningMessages: () => [] },
       './theme': { applyConfigTheme() {} },
       './toast': { toast() {} },
-      './ui-state': { showOnboardingOverlay: signal(false) },
+      './ui-state': { route: signal({ name: 'home' }), showOnboardingOverlay: signal(false) },
       './updater': { scheduleAutoUpdateCheck() {} },
       './utils': { errMessage: /** @param {Error} error */ (error) => error.message },
+      './views/home/HomeView': { warmHome: async () => {} },
     },
     { window: { requestIdleCallback() {}, addEventListener() {} } },
   );

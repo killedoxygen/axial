@@ -2,24 +2,37 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { paintedTextures } from '../src/mock/block-textures';
-import { createRenderer } from '../src/vista/render';
-import { buildWorld } from '../src/vista/world';
+import * as packing from '../src/vista/drawing/packing';
+import { createRenderer } from '../src/vista/drawing/render';
+import { Sheet } from '../src/vista/drawing/strips';
+import { buildWorld } from '../src/vista/drawing/world';
 
 const pack = paintedTextures();
 
-function picture(seed: number, dark: boolean, width = 208, height = 90): Uint8ClampedArray {
-  const renderer = createRenderer(buildWorld(seed, dark, pack)!, width, height);
-  renderer.columns(0, width);
-  return renderer.finish();
+/** A picture drawn as the workers draw it: each renderer takes strips, then finishes its own for the one sheet. */
+function picture(seed: number, dark: boolean, strips: [number, number][][] = [[[0, 208]]]): Uint8ClampedArray {
+  const sheet = new Sheet(208, 90);
+  const renderers = strips.map((own) => {
+    const renderer = createRenderer(buildWorld(seed, dark, pack)!, sheet.width, sheet.height);
+    for (const [from, to] of own) sheet.lay(renderer.draw(from, to));
+    return renderer;
+  });
+  for (const renderer of renderers) {
+    for (const strip of renderer.finish(sheet.soft, sheet.open)) sheet.set(strip);
+  }
+  return sheet.pixels;
 }
 
-test('a seed always draws the same world, and columns may be drawn in any batches', () => {
+test('a seed always draws the same world, however its columns are shared out', () => {
   const whole = picture(4242, true);
-  const renderer = createRenderer(buildWorld(4242, true, pack)!, 208, 90);
-  renderer.columns(120, 208);
-  renderer.columns(0, 64);
-  renderer.columns(64, 120);
-  assert.deepEqual(renderer.finish(), whole);
+  const shared = picture(4242, true, [
+    [
+      [120, 208],
+      [0, 64],
+    ],
+    [[64, 120]],
+  ]);
+  assert.deepEqual(shared, whole);
   assert.notDeepEqual(picture(4243, true), whole);
 });
 
@@ -45,4 +58,11 @@ test('a version shows only what it has, and nothing without the ground to stand 
   const old = new Map([...pack].filter(([name]) => !name.includes('cherry') && name !== 'pink_petals'));
   for (let seed = 1; seed <= 40; seed++) assert.ok(buildWorld(seed, true, old), `seed ${seed} builds no world`);
   assert.equal(buildWorld(1, true, new Map()), null);
+});
+
+test('a packed picture unpacks to itself, at a fraction of the size', () => {
+  const pixels = picture(4242, true);
+  const file = packing.pack(pixels, 208, 90);
+  assert.ok(file.length < pixels.length / 2);
+  assert.deepEqual(packing.unpack(file), { pixels, width: 208, height: 90 });
 });

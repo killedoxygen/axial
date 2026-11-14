@@ -31,10 +31,10 @@ const STAR = [0.26, 0.38, 0.52] as const;
 
 /** The sky of one hour: its colour in every direction, then stars, the sun or moon, and clouds. */
 export class Sky {
-  /** Open sky near the light at quarter size: the source of the light shafts. */
-  readonly open: Float32Array;
-  readonly quarterWidth: number;
-  readonly quarterHeight: number;
+  /** Where open sky near the light is noted at quarter size, the source of the light shafts: the strip being drawn. */
+  open = new Float32Array(0);
+  openWidth = 0;
+  openFrom = 0;
   /** Where the light stands from straight ahead, and whether it is in front of the camera at all. */
   readonly azimuth: number;
   readonly ahead: boolean;
@@ -59,9 +59,6 @@ export class Sky {
     private readonly ray: Ray,
   ) {
     this.seed = world.seed;
-    this.quarterWidth = Math.ceil(view.width / 4);
-    this.quarterHeight = Math.ceil(view.height / 4);
-    this.open = new Float32Array(this.quarterWidth * this.quarterHeight);
     this.azimuth = Math.atan2(light.x, light.z) - view.yaw;
     this.ahead = light.x * Math.sin(view.yaw) + light.z * Math.cos(view.yaw) > 0;
     const [sunX, sunY, sunZ] = light.sun;
@@ -198,7 +195,8 @@ export class Sky {
         b = lay(b, 2);
       }
     }
-    if (record && row >= 0 && row < view.height) this.open[(row >> 2) * this.quarterWidth + (col >> 2)] += halo / 16;
+    if (record && row >= 0 && row < view.height)
+      this.open[(row >> 2) * this.openWidth + (col >> 2) - this.openFrom] += halo / 16;
     out[o] = r;
     out[o + 1] = g;
     out[o + 2] = b;

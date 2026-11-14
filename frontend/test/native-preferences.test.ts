@@ -604,6 +604,7 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
         },
       },
       './utils': { errMessage: (error: Error) => error.message },
+      './views/home/HomeView': { warmHome: async () => {} },
     },
     {
       window: {

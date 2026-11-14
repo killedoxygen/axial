@@ -32,6 +32,7 @@ import { toast } from './toast';
 import { route, showOnboardingOverlay } from './ui-state';
 import { scheduleAutoUpdateCheck } from './updater';
 import { errMessage } from './utils';
+import { warmHome } from './views/home/HomeView';
 
 let apiInitialized = false;
 let activeAttempt: Promise<void> | null = null;
@@ -110,6 +111,9 @@ async function runApplicationBootstrap(): Promise<void> {
   }
 
   applyConfigTheme(configRes);
+
+  // Home's picture belongs to its first frame.
+  if (route.value.name === 'home') await warmHome();
 
   Music.applyConfig(configRes);
   bootstrapError.value = null;

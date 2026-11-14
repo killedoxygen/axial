@@ -1,6 +1,7 @@
-import { finishing } from './finish';
+import { bloom, quartered, shafts, soften, tone } from './finish';
 import { Light, Shadows, Tops, clamp01, hash3 } from './light';
 import { Sky, type Ray, type View } from './sky';
+import { quarter, type Quarter, type Strip } from './strips';
 import { ANDESITE_TEX, CLAY_PLAIN, COAL_TEX, GRANITE_TEX, MIP_OFFSET, STONE_TEX, TEXELS } from './textures';
 import {
   BANDS,
@@ -34,14 +35,14 @@ import {
  * each inner corner is laid over the lot. Shadows come from a map of the world seen from the light.
  */
 export interface Renderer {
-  readonly width: number;
-  readonly height: number;
-  /** Draws screen columns `from` up to `to`. Columns are independent, so the caller may spread them over frames. */
-  columns(from: number, to: number): void;
-  /** Light shafts, bloom, edge smoothing, tone and dither. Call once every column is drawn. */
-  finish(): Uint8ClampedArray<ArrayBuffer>;
-  /** The same finishing work in short steps, for a caller that must not hold the thread; the last step returns the picture. */
-  finishing(): Generator<void, Uint8ClampedArray<ArrayBuffer>>;
+  /**
+   * Draws screen columns `from` up to `to` and keeps their light. Columns are independent, so renderers of one
+   * scene may share a picture between them in any strips that begin on a multiple of four. Returns what the strip
+   * gives the whole picture's bloom and light shafts.
+   */
+  draw(from: number, to: number): Quarter;
+  /** With the whole picture's bloom and shaft sources, turns each strip drawn into display pixels and lets it go. */
+  finish(soft: Float32Array, open: Float32Array): Strip[];
 }
 
 const NEAR = 0.2;
@@ -92,9 +93,16 @@ export function createRenderer(world: World, width: number, height: number, hori
   const { solid: solidTop, leaf: leafTop, rim } = tops;
   const shadows = new Shadows(world, light, tops);
 
-  const hdr = new Float32Array(W * H * 3);
-  // Depth per pixel, so edges between near and far can be smoothed without softening the textures.
-  const depths = new Float32Array(W * H);
+  // The strip being drawn: its light, and depth per pixel, so edges between near and far can be smoothed without
+  // softening the textures. It starts at column `origin`, is `wide` columns across, and holds a column of margin
+  // on each side for that smoothing; only its own columns are `noted` for the light shafts.
+  let hdr = new Float32Array(0);
+  let depths = new Float32Array(0);
+  let origin = 0;
+  let wide = 0;
+  let stride = 0;
+  let noted = true;
+  const held: { origin: number; wide: number; from: number; to: number; hdr: Float32Array }[] = [];
   const mirror = hasWater ? new Float32Array(H * 3) : null;
   const waterDepth = new Float32Array(H);
   const waterCell = new Int32Array(H);
@@ -413,7 +421,6 @@ export function createRenderer(world: World, width: number, height: number, hori
   };
 
   // The column being drawn, and the span of it being filled: what the span is made of and where it lies.
-  const stride = W * 3;
   let column = 0;
   let base = 0;
   let enter = NEAR;
@@ -457,7 +464,7 @@ export function createRenderer(world: World, width: number, height: number, hori
       const depth = point((upper + lower) / 2, row, share);
       if (depth === 0) continue;
       left[row] = rest - share < 0.004 ? 0 : rest - share;
-      if (share >= 0.5 || depths[row * W + column] === 0) depths[row * W + column] = depth;
+      if (share >= 0.5 || depths[row * wide + column] === 0) depths[row * wide + column] = depth;
     }
   };
   /** A point on an upright face of a block. A negative `sInner` asks whether foliage stands in front of it. */
@@ -524,8 +531,8 @@ export function createRenderer(world: World, width: number, height: number, hori
     left.fill(1);
     lo = 0;
     hi = H;
-    column = x;
-    base = x * 3;
+    column = x - origin;
+    base = column * 3;
 
     // Walk the grid along this column's line, keeping the path for the mirror pass.
     let ix = Math.floor(cx + dirX * NEAR);
@@ -694,7 +701,7 @@ export function createRenderer(world: World, width: number, height: number, hori
         if (share === 0) continue;
         const depth = Math.min(FAR * 3, ((cy - surface) * focal) / (row + 0.5 - hz));
         left[row] = 0;
-        if (share >= 0.5 || depths[row * W + x] === 0) depths[row * W + x] = depth;
+        if (share >= 0.5 || depths[row * wide + column] === 0) depths[row * wide + column] = depth;
         waterShare[row] += share;
         waterDepth[row] = depth;
         waterCell[row] = pathCell[steps - 1]!;
@@ -705,12 +712,12 @@ export function createRenderer(world: World, width: number, height: number, hori
     for (let row = lo; row < hi; row++) {
       const share = left[row]!;
       if (share === 0) continue;
-      sky.into(skyTap, 0, row, true);
+      sky.into(skyTap, 0, row, noted);
       const o = row * stride + base;
       hdr[o] += skyTap[0]! * share;
       hdr[o + 1] += skyTap[1]! * share;
       hdr[o + 2] += skyTap[2]! * share;
-      if (share >= 0.5 || depths[row * W + x] === 0) depths[row * W + x] = FAR * 4;
+      if (share >= 0.5 || depths[row * wide + column] === 0) depths[row * wide + column] = FAR * 4;
     }
 
     if (waterLo >= waterHi) return;
@@ -885,19 +892,35 @@ export function createRenderer(world: World, width: number, height: number, hori
     waterShare.fill(0, waterLo, waterHi);
   };
 
+  const qw = quarter(W);
+  const qh = quarter(H);
   return {
-    width: W,
-    height: H,
-    columns(from, to) {
-      for (let x = from; x < to; x++) drawColumn(x);
-    },
-    finish() {
-      const steps = this.finishing();
-      for (;;) {
-        const step = steps.next();
-        if (step.done) return step.value;
+    draw(from, to) {
+      origin = Math.max(0, from - 1);
+      wide = Math.min(W, to + 1) - origin;
+      stride = wide * 3;
+      hdr = new Float32Array(wide * H * 3);
+      depths = new Float32Array(wide * H);
+      sky.openFrom = from >> 2;
+      sky.openWidth = quarter(to) - sky.openFrom;
+      const open = (sky.open = new Float32Array(sky.openWidth * qh));
+      for (let x = origin; x < origin + wide; x++) {
+        noted = x >= from && x < to;
+        drawColumn(x);
       }
+      const strip = { origin, wide, from, to, hdr };
+      soften(strip, depths, W, H);
+      held.push(strip);
+      return { from, to, soft: quartered(strip, H), open };
     },
-    finishing: () => finishing(hdr, depths, view, sky, light),
+    finish(soft, open) {
+      const glow = bloom(soft, qw, qh);
+      const rays = shafts(open, qw, qh, view, sky, light);
+      return held.splice(0).map((strip) => ({
+        from: strip.from,
+        to: strip.to,
+        pixels: tone(strip, view, glow, rays, light),
+      }));
+    },
   };
 }
