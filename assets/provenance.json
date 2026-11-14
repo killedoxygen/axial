@@ -334,6 +334,98 @@
       ]
     },
     {
+      "id": "minecraft-default-skins",
+      "source": {
+        "kind": "upstream",
+        "locator": "https://textures.minecraft.net/texture",
+        "revision": "java-1-19-3"
+      },
+      "rights": {
+        "basis": "minecraft-usage-guidelines",
+        "evidence": {
+          "locator": "docs/ICON-ASSETS.md",
+          "sha256": null
+        },
+        "current_policy": "https://www.minecraft.net/en-us/usage-guidelines",
+        "reviewed_at": "2026-11-15"
+      },
+      "refresh": "Fetch each texture by its content hash and keep the file name, variant and hash together.",
+      "files": [
+        {
+          "path": "frontend/static/skins/alex.png",
+          "mode": "100644",
+          "sha256": "46acd06e8483b176e8ea39fc12fe105eb3a2a4970f5100057e9d84d4b60bdfa7",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/46acd06e8483b176e8ea39fc12fe105eb3a2a4970f5100057e9d84d4b60bdfa7",
+          "upstream_sha256": "46acd06e8483b176e8ea39fc12fe105eb3a2a4970f5100057e9d84d4b60bdfa7"
+        },
+        {
+          "path": "frontend/static/skins/ari.png",
+          "mode": "100644",
+          "sha256": "6ac6ca262d67bcfb3dbc924ba8215a18195497c780058a5749de674217721892",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/6ac6ca262d67bcfb3dbc924ba8215a18195497c780058a5749de674217721892",
+          "upstream_sha256": "6ac6ca262d67bcfb3dbc924ba8215a18195497c780058a5749de674217721892"
+        },
+        {
+          "path": "frontend/static/skins/efe.png",
+          "mode": "100644",
+          "sha256": "fece7017b1bb13926d1158864b283b8b930271f80a90482f174cca6a17e88236",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/fece7017b1bb13926d1158864b283b8b930271f80a90482f174cca6a17e88236",
+          "upstream_sha256": "fece7017b1bb13926d1158864b283b8b930271f80a90482f174cca6a17e88236"
+        },
+        {
+          "path": "frontend/static/skins/kai.png",
+          "mode": "100644",
+          "sha256": "e5cdc3243b2153ab28a159861be643a4fc1e3c17d291cdd3e57a7f370ad676f3",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/e5cdc3243b2153ab28a159861be643a4fc1e3c17d291cdd3e57a7f370ad676f3",
+          "upstream_sha256": "e5cdc3243b2153ab28a159861be643a4fc1e3c17d291cdd3e57a7f370ad676f3"
+        },
+        {
+          "path": "frontend/static/skins/makena.png",
+          "mode": "100644",
+          "sha256": "7cb3ba52ddd5cc82c0b050c3f920f87da36add80165846f479079663805433db",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/7cb3ba52ddd5cc82c0b050c3f920f87da36add80165846f479079663805433db",
+          "upstream_sha256": "7cb3ba52ddd5cc82c0b050c3f920f87da36add80165846f479079663805433db"
+        },
+        {
+          "path": "frontend/static/skins/noor.png",
+          "mode": "100644",
+          "sha256": "6c160fbd16adbc4bff2409e70180d911002aebcfa811eb6ec3d1040761aea6dd",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/6c160fbd16adbc4bff2409e70180d911002aebcfa811eb6ec3d1040761aea6dd",
+          "upstream_sha256": "6c160fbd16adbc4bff2409e70180d911002aebcfa811eb6ec3d1040761aea6dd"
+        },
+        {
+          "path": "frontend/static/skins/steve.png",
+          "mode": "100644",
+          "sha256": "31f477eb1a7beee631c2ca64d06f8f68fa93a3386d04452ab27f43acdf1b60cb",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/31f477eb1a7beee631c2ca64d06f8f68fa93a3386d04452ab27f43acdf1b60cb",
+          "upstream_sha256": "31f477eb1a7beee631c2ca64d06f8f68fa93a3386d04452ab27f43acdf1b60cb"
+        },
+        {
+          "path": "frontend/static/skins/sunny.png",
+          "mode": "100644",
+          "sha256": "a3bd16079f764cd541e072e888fe43885e711f98658323db0f9a6045da91ee7a",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/a3bd16079f764cd541e072e888fe43885e711f98658323db0f9a6045da91ee7a",
+          "upstream_sha256": "a3bd16079f764cd541e072e888fe43885e711f98658323db0f9a6045da91ee7a"
+        },
+        {
+          "path": "frontend/static/skins/zuri.png",
+          "mode": "100644",
+          "sha256": "f5dddb41dcafef616e959c2817808e0be741c89ffbfed39134a13e75b811863d",
+          "generator": null,
+          "locator": "https://textures.minecraft.net/texture/f5dddb41dcafef616e959c2817808e0be741c89ffbfed39134a13e75b811863d",
+          "upstream_sha256": "f5dddb41dcafef616e959c2817808e0be741c89ffbfed39134a13e75b811863d"
+        }
+      ]
+    },
+    {
       "id": "snd-kit-01",
       "source": {
         "kind": "upstream",

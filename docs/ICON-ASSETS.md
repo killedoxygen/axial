@@ -112,17 +112,26 @@ The Worlds empty state uses the repository-authored masks
 `frontend/static/worlds-empty-accent.svg`. Keep their shared view box and
 separate base/accent geometry so theme colors remain CSS-owned.
 
+## Default skins
+
+`frontend/static/skins/` holds Minecraft's nine default player skins: Steve,
+Alex, Ari, Efe, Kai, Makena, Noor, Sunny and Zuri. Each PNG is byte-exact with
+Mojang's texture of the same SHA-256 at `https://textures.minecraft.net/texture/`,
+so its hash is its upstream address. They are Mojang's artwork, shipped only so
+the skin library and player heads have the game's own defaults offline, under
+the Minecraft Usage Guidelines.
+
 ## Third-party assets
 
 `assets/provenance.json` is the strict source, rights, revision, mode, refresh,
 generator, and exact-hash inventory for retained delivery assets. It covers the
 tracked desktop icons, frontend font files and notices, SND kit files, loader
-marks, Worlds empty-state masks, interface icon notice, favicon, and
-Microsoft authentication symbol.
+marks, Worlds empty-state masks, interface icon notice, favicon, default
+skins, and Microsoft authentication symbol.
 
 The Microsoft symbol is the byte-exact asset published with Microsoft identity
 branding guidance. It is used only inside Microsoft authentication controls;
 the policy record is not a general software-license claim. SND terms must be
 reviewed again whenever the pinned kit is refreshed. Runtime-downloaded media,
-including account skins, is owned by its runtime media contract rather than
+including account skins other than the bundled defaults, is owned by its runtime media contract rather than
 this static delivery inventory.
