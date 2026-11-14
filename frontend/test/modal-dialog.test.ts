@@ -348,6 +348,7 @@ function harness(
       'preact/hooks': paneHooks,
       '../../../ui/Icons': { Icon: 'Icon' },
       '../../../ui/Atoms': atoms,
+      '../../../ui/Rows': { RowId: 'RowId', RowMenu: 'RowMenu' },
       '../../../ui/Segmented': { Segmented: 'Segmented' },
       '../../../ui/ContextMenu': {},
       '../../../ui/SelectionActionTray': {
@@ -357,11 +358,7 @@ function harness(
       '../../../ui/selection': source('ui/selection.ts', { 'preact/hooks': paneHooks }, globals),
       '../../../format': source('format.ts', {}, globals),
       '../instance-actions': {},
-      '../components/resource-bits': {
-        ResourceEmpty: 'ResourceEmpty',
-        ResourceStatus: 'ResourceStatus',
-        ResourceMutationStatus: 'ResourceMutationStatus',
-      },
+      '../components/pane': { Pane: 'Pane', PaneBar: 'PaneBar' },
       '../components/screenshot-lightbox': lightbox,
       '../screenshot-actions': actions,
       '../bulk-actions': mutations,

@@ -50,6 +50,7 @@ export function InstanceCard({
         <InstanceTile inst={inst} />
         {onToggleSelect && (
           <SelectionCheckbox
+            over
             selected={selected === true}
             label={selectionToggleLabel(selected === true, inst.name)}
             onToggle={(e) => {

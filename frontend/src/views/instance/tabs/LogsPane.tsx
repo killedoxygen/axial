@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
-import { Button, Chip, Empty, IconButton } from '../../../ui/Atoms';
+import { Button, Chip, Empty } from '../../../ui/Atoms';
 import { Segmented } from '../../../ui/Segmented';
 import { SelectField } from '../../../ui/Select';
 import { formatBytes, fmtRelative } from '../../../format';
@@ -20,7 +20,7 @@ import {
 } from '../logs';
 import type { LogFilter } from '../logs';
 import { openInstanceFolder } from '../instance-actions';
-import { ResourceStatus } from '../components/resource-bits';
+import { Pane, PaneBar } from '../components/pane';
 import { LogLines } from '../components/log-line';
 
 type LogsPaneProps = {
@@ -104,47 +104,55 @@ function InstanceLogsPane({ inst, resources, processLive, onRefresh }: LogsPaneP
   const openFolder = (): void => void openInstanceFolder(inst.id, 'logs');
 
   return (
-    <div class="cp-pane">
-      {!empty && (
-        <div class="cp-pane-bar">
-          <SelectField
-            value={selected}
-            onChange={setSelected}
-            ariaLabel="Log file"
-            options={[
-              ...(sessionLog ? [{ value: sessionLog, label: 'Session output' }] : []),
-              ...sortedLogs.map((log) => ({
-                value: log.name,
-                label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
-              })),
-            ]}
-          />
-          {isLive && (
-            <Chip tone="accent" icon="play">
-              Live
-            </Chip>
-          )}
-          <Segmented<LogFilter>
-            role="tablist"
-            ariaLabel="Filter log lines"
-            value={filter}
-            onChange={setFilter}
-            options={(Object.keys(LOG_FILTER_LABELS) as LogFilter[]).map((item) => ({
-              value: item,
-              label: LOG_FILTER_LABELS[item],
-            }))}
-          />
-          <span class="cp-head-fill" />
-          {selectedEntry && (
-            <Chip tone="bare">
-              {formatBytes(selectedEntry.size)}, {fmtRelative(selectedEntry.modified_at)}
-            </Chip>
-          )}
-          <IconButton icon="refresh" tooltip="Refresh" onClick={refresh} />
-          <IconButton icon="folder" tooltip="Open folder" onClick={openFolder} />
-        </div>
-      )}
-      {!sessionSelected && <ResourceStatus state={resources} onRetry={refresh} />}
+    <Pane
+      instanceId={inst.id}
+      bar={
+        !empty && (
+          <PaneBar
+            instanceId={inst.id}
+            fact={
+              selectedEntry && (
+                <Chip tone="bare">
+                  {formatBytes(selectedEntry.size)}, {fmtRelative(selectedEntry.modified_at)}
+                </Chip>
+              )
+            }
+            onRefresh={refresh}
+            onOpenFolder={openFolder}
+          >
+            <SelectField
+              value={selected}
+              onChange={setSelected}
+              ariaLabel="Log file"
+              options={[
+                ...(sessionLog ? [{ value: sessionLog, label: 'Session output' }] : []),
+                ...sortedLogs.map((log) => ({
+                  value: log.name,
+                  label: isCurrentLog(log.name) ? `${log.name} (latest)` : log.name,
+                })),
+              ]}
+            />
+            {isLive && (
+              <Chip tone="accent" icon="play">
+                Live
+              </Chip>
+            )}
+            <Segmented<LogFilter>
+              role="tablist"
+              ariaLabel="Filter log lines"
+              value={filter}
+              onChange={setFilter}
+              options={(Object.keys(LOG_FILTER_LABELS) as LogFilter[]).map((item) => ({
+                value: item,
+                label: LOG_FILTER_LABELS[item],
+              }))}
+            />
+          </PaneBar>
+        )
+      }
+      state={!sessionSelected && resources}
+      onRetry={refresh}
+    >
       {empty ? (
         <Empty
           title="No logs yet"
@@ -181,6 +189,6 @@ function InstanceLogsPane({ inst, resources, processLive, onRefresh }: LogsPaneP
           )}
         </>
       ) : null}
-    </div>
+    </Pane>
   );
 }

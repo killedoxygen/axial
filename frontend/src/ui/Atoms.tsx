@@ -116,6 +116,7 @@ export function IconButton({
   disabled,
   danger,
   variant,
+  class: extra,
 }: {
   icon: IconName;
   onClick?: (e: MouseEvent) => void;
@@ -126,9 +127,10 @@ export function IconButton({
   disabled?: boolean;
   danger?: boolean;
   variant?: 'overlay';
+  class?: string;
 }): JSX.Element {
   const inner = Math.round(size / 2);
-  const cls = `cp-ibtn${active ? ' cp-ibtn--active' : ''}${danger ? ' cp-ibtn--danger' : ''}${variant ? ` cp-ibtn--${variant}` : ''}`;
+  const cls = `cp-ibtn${active ? ' cp-ibtn--active' : ''}${danger ? ' cp-ibtn--danger' : ''}${variant ? ` cp-ibtn--${variant}` : ''}${extra ? ` ${extra}` : ''}`;
   return (
     <button
       class={cls}

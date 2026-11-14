@@ -2,16 +2,17 @@ import type { ComponentChildren, JSX, Ref } from 'preact';
 import { memo } from 'preact/compat';
 import { useCallback, useMemo, useRef, useState } from 'preact/hooks';
 import { Icon, type IconName } from '../../../ui/Icons';
-import { Chip, Empty, IconButton, Input } from '../../../ui/Atoms';
+import { Chip, Empty, Input } from '../../../ui/Atoms';
 import { Art } from '../../../ui/Art';
+import { RowId, RowLead, RowMenu } from '../../../ui/Rows';
 import { openContextMenu, type ContextMenuItem } from '../../../ui/ContextMenu';
-import { SelectionActionTray, SelectionCheckbox, type SelectionAction } from '../../../ui/SelectionActionTray';
-import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../../ui/selection';
+import { SelectionActionTray, type SelectionAction } from '../../../ui/SelectionActionTray';
+import { selectionMenuItem, useSelection } from '../../../ui/selection';
 import { settleChildren } from '../../../ui/motion';
 import { resourceMutationState } from '../bulk-actions';
 import type { LoadState } from '../resources';
 import { versionText, type VersionLabel } from '../version-label';
-import { PaneDoing, ResourceMutationStatus, ResourceStatus } from './resource-bits';
+import { Pane, PaneBar } from './pane';
 
 /** One row of a pane's list: a mod, a pack, a world. */
 export interface EntryView {
@@ -42,75 +43,87 @@ function Version({ label }: { label: VersionLabel }): JSX.Element {
   );
 }
 
-/**
- * A list row: art (its selection mark on the corner on hover), name and a quiet second line, an update, a figure,
- * a menu. It is drawn again only when its own facts change, so a long list stays cheap to select in and to refresh.
- */
-const Entry = memo(function Entry({
-  view,
-  selected,
-  busy,
-  onToggle,
-  onMenu,
-  onUpdate,
-}: {
+const sameLabel = (left?: VersionLabel, right?: VersionLabel): boolean =>
+  left === right || (left !== undefined && right !== undefined && left.text === right.text && left.pre === right.pre);
+
+/** Whether two rows are drawn alike. A listing read again gives new rows that mostly say what the last ones did. */
+function sameEntry(left: EntryView, right: EntryView): boolean {
+  return (
+    left === right ||
+    (left.key === right.key &&
+      left.title === right.title &&
+      left.fileName === right.fileName &&
+      left.byline === right.byline &&
+      left.artUrl === right.artUrl &&
+      left.icon === right.icon &&
+      left.disabled === right.disabled &&
+      left.folder === right.folder &&
+      sameLabel(left.num, right.num) &&
+      sameLabel(left.update, right.update))
+  );
+}
+
+interface EntryProps {
   view: EntryView;
   selected: boolean;
   busy: boolean;
   onToggle: (key: string) => void;
   onMenu: (event: MouseEvent, key: string) => void;
   onUpdate: (key: string) => void;
-}): JSX.Element {
-  const { num, update } = view;
-  const menu = (event: MouseEvent): void => onMenu(event, view.key);
-  return (
-    <div class="cp-entry" data-disabled={view.disabled === true} data-selected={selected} onContextMenu={menu}>
-      <span class="cp-lead">
-        <Art url={view.artUrl} icon={view.icon} />
-        <SelectionCheckbox
-          selected={selected}
-          label={selectionToggleLabel(selected, view.title)}
-          onToggle={(event) => {
-            event.stopPropagation();
-            onToggle(view.key);
-          }}
-        />
-      </span>
-      <span class="cp-entry-id">
-        <span class="cp-entry-title">
-          <strong title={view.fileName}>{view.title}</strong>
+}
+
+/**
+ * A list row: art with its selection mark, name and a quiet second line, an update, a figure, a menu. It is drawn
+ * again only when what it shows changes, so a long list stays cheap to select in, to refresh and to poll.
+ */
+const Entry = memo(
+  function Entry({ view, selected, busy, onToggle, onMenu, onUpdate }: EntryProps): JSX.Element {
+    const { num, update } = view;
+    const menu = (event: MouseEvent): void => onMenu(event, view.key);
+    return (
+      <div class="cp-row cp-entry" data-disabled={view.disabled === true} data-selected={selected} onContextMenu={menu}>
+        <RowLead name={view.title} selected={selected} onToggle={() => onToggle(view.key)}>
+          <Art url={view.artUrl} icon={view.icon} />
+        </RowLead>
+        <RowId title={view.title} tip={view.fileName} byline={view.byline}>
           {view.disabled && <Chip>Disabled</Chip>}
           {view.folder && <Chip icon="folder">Folder</Chip>}
+        </RowId>
+        {update ? (
+          <button
+            type="button"
+            class="cp-btn cp-btn--sm cp-btn--soft cp-entry-update"
+            title={`Update to ${versionText(update)}`}
+            aria-label={`Update ${view.title} to ${versionText(update)}`}
+            disabled={busy}
+            onClick={(event) => {
+              event.stopPropagation();
+              onUpdate(view.key);
+            }}
+          >
+            <Icon name="arrow-up" size={12} />
+            <span>
+              <Version label={update} />
+            </span>
+          </button>
+        ) : (
+          <span />
+        )}
+        <span class="cp-entry-num" title={num && versionText(num)}>
+          {num && <Version label={num} />}
         </span>
-        {view.byline && <span class="cp-entry-by">{view.byline}</span>}
-      </span>
-      {update ? (
-        <button
-          type="button"
-          class="cp-btn cp-btn--sm cp-btn--soft cp-entry-update"
-          title={`Update to ${versionText(update)}`}
-          aria-label={`Update ${view.title} to ${versionText(update)}`}
-          disabled={busy}
-          onClick={(event) => {
-            event.stopPropagation();
-            onUpdate(view.key);
-          }}
-        >
-          <Icon name="arrow-up" size={12} />
-          <span>
-            <Version label={update} />
-          </span>
-        </button>
-      ) : (
-        <span />
-      )}
-      <span class="cp-entry-num" title={num && versionText(num)}>
-        {num && <Version label={num} />}
-      </span>
-      <IconButton icon="dots" size={28} tooltip="More" onClick={menu} />
-    </div>
-  );
-});
+        <RowMenu onOpen={menu} />
+      </div>
+    );
+  },
+  (last, next) =>
+    last.selected === next.selected &&
+    last.busy === next.busy &&
+    last.onToggle === next.onToggle &&
+    last.onMenu === next.onMenu &&
+    last.onUpdate === next.onUpdate &&
+    sameEntry(last.view, next.view),
+);
 
 /** The one action for every pending update, carrying how many. */
 function UpdateAll({
@@ -168,9 +181,8 @@ export function fileDisplayName(name: string): string {
 const entryKey = (view: EntryView): string => view.key;
 
 /**
- * A pane that lists an instance's files: one toolbar line (search, a filter, the pending updates, then refresh,
- * the folder and the pane's own tools), the rows, and the tray for what is selected. Every such tab is this pane,
- * so they share one layout and nothing moves when the tab changes or its facts arrive.
+ * A pane that lists an instance's files: search, a filter and the pending updates on its toolbar, the rows, and the
+ * tray for what is selected.
  */
 export function EntryPane({
   instanceId,
@@ -180,7 +192,7 @@ export function EntryPane({
   expected,
   onRefresh,
   onOpenFolder,
-  folderTip = 'Open folder',
+  folderTip,
   filter,
   shown,
   updates,
@@ -243,30 +255,33 @@ export function EntryPane({
   const isEmpty = none && settled && state.status !== 'error';
 
   return (
-    <div class="cp-pane" {...surface}>
+    <Pane
+      instanceId={instanceId}
+      surface={surface}
+      bar={
+        !isEmpty &&
+        !(waiting && expected === 0) && (
+          <PaneBar
+            instanceId={instanceId}
+            onRefresh={onRefresh}
+            onOpenFolder={onOpenFolder}
+            folderTip={folderTip}
+            tools={tools}
+          >
+            <Input value={q} onChange={setQ} placeholder={`Search ${noun}s`} icon="search" />
+            {filter}
+            {updates && updates.count > 0 && (
+              <UpdateAll count={updates.count} noun={noun} note={updates.note} disabled={busy} onClick={updates.all} />
+            )}
+          </PaneBar>
+        )
+      }
+      state={(expected !== 0 || state.status === 'error') && state}
+      noun={`${noun}s`}
+      onRetry={onRefresh}
+      note={note}
+    >
       {children}
-      {!isEmpty && !(waiting && expected === 0) && (
-        <div class="cp-pane-bar">
-          <Input value={q} onChange={setQ} placeholder={`Search ${noun}s`} icon="search" />
-          {filter}
-          {updates && updates.count > 0 && (
-            <UpdateAll count={updates.count} noun={noun} note={updates.note} disabled={busy} onClick={updates.all} />
-          )}
-          <PaneDoing instanceId={instanceId} />
-          <IconButton icon="refresh" tooltip="Refresh" onClick={onRefresh} />
-          <IconButton icon="folder" tooltip={folderTip} onClick={onOpenFolder} />
-          {tools}
-        </div>
-      )}
-      {(expected !== 0 || state.status === 'error') && (
-        <ResourceStatus state={state} noun={`${noun}s`} onRetry={onRefresh} />
-      )}
-      <ResourceMutationStatus instanceId={instanceId} refusalOnly />
-      {note && (
-        <div class="cp-resource-note cp-resource-note--error" role="alert">
-          {note}
-        </div>
-      )}
       {isEmpty ? (
         <Empty title={empty.title} actions={empty.actions}>
           {empty.hint}
@@ -274,7 +289,7 @@ export function EntryPane({
       ) : none ? null : visible.length === 0 ? (
         <Empty title={`No ${noun}s match`}>Try a different search or filter.</Empty>
       ) : (
-        <div class="cp-entries" data-settles data-figures={figures} ref={(list) => settleChildren(list)}>
+        <div class="cp-rows cp-entries" data-settles data-figures={figures} ref={(list) => settleChildren(list)}>
           {visible.map((view) => (
             <Entry
               key={view.key}
@@ -293,6 +308,6 @@ export function EntryPane({
         itemLabel={noun}
         actions={actions(selection.selectedItems, selection.clear)}
       />
-    </div>
+    </Pane>
   );
 }

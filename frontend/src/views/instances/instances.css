@@ -90,8 +90,6 @@
   position: absolute;
   top: 10px;
   left: 10px;
-  opacity: 0;
-  transition: opacity var(--t-quick) var(--ease-out);
 }
 .cp-cover-play {
   position: absolute;
@@ -107,8 +105,7 @@
   opacity: 0;
   transition: opacity var(--t-quick) var(--ease-out);
 }
-.cp-cover:is(:hover, :focus-within) :is(.cp-check, .cp-cover-play),
-.cp-cover-art > .cp-check[data-selected='true'] {
+.cp-cover:is(:hover, :focus-within) .cp-cover-play {
   opacity: 1;
 }
 .cp-cover-name {

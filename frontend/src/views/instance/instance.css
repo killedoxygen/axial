@@ -225,28 +225,19 @@
   animation: cp-fade-in var(--t-pop) var(--ease-out) 400ms backwards;
 }
 
-/* Entries (mods, packs, worlds): no header row. Each row is two calm lines beside the item's own art, then its
+/* Entries (mods, packs, worlds): rows with no header. Each is two calm lines beside the item's own art, then its
    update, its figure and its menu. The figure's column has one width and the update stands before it, so every
-   row is laid out by itself: nothing moves when an update turns up, and rows out of sight are not drawn. */
-.cp-entries {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
+   row is laid out by itself and nothing moves when an update turns up. Every row is drawn, on screen or not: art
+   is then fetched ahead of the scroll and is there when its row arrives. */
 .cp-entry {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr) auto 96px 28px;
   gap: 12px;
-  align-items: center;
   height: 52px;
   margin: 0 -10px;
   padding: 0 10px;
-  border-radius: var(--rad-row);
   color: var(--text);
   font-size: 13px;
-  content-visibility: auto;
-  contain-intrinsic-size: auto 52px;
-  transition: background var(--t-quick) var(--ease-out);
 }
 /* A list with no figures gives their column to the names. */
 .cp-entries[data-figures='false'] > .cp-entry {
@@ -255,51 +246,8 @@
 .cp-entries[data-figures='false'] .cp-entry-num {
   display: none;
 }
-.cp-entry:hover {
-  --chip-bg: var(--fill-2);
-  --chip-bg-hover: var(--fill-3);
-  background: var(--fill);
-}
-.cp-entry[data-selected='true'] {
-  --chip-bg: var(--fill-2);
-  --chip-bg-hover: var(--fill-3);
-  background: color-mix(in oklab, var(--accent) 9%, var(--fill));
-}
 .cp-entry[data-disabled='true']:not([data-selected='true']) {
   opacity: 0.55;
-}
-.cp-entry-id {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-.cp-entry-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-.cp-entry-title strong,
-strong.cp-entry-title {
-  min-width: 0;
-  overflow: hidden;
-  font-size: 13.5px;
-  font-weight: 600;
-  line-height: 18px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.cp-entry-title .cp-chip {
-  flex: none;
-}
-.cp-entry-by {
-  overflow: hidden;
-  color: var(--text-dim);
-  font-size: 12.5px;
-  line-height: 17px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .cp-entry-num {
   justify-self: end;
@@ -329,15 +277,6 @@ strong.cp-entry-title {
   width: 12px;
   height: 12px;
   stroke-width: 2.4;
-}
-/* A row's menu stays quiet until the row is pointed at or focused. */
-.cp-entry > .cp-ibtn {
-  opacity: 0.45;
-  transition: opacity var(--t-quick) var(--ease-out);
-}
-.cp-entry:is(:hover, :focus-within) > .cp-ibtn,
-.cp-entry > .cp-ibtn[aria-expanded='true'] {
-  opacity: 1;
 }
 
 /* Screenshots: groups by day, each a grid of shots with a caption under the picture. */
@@ -383,12 +322,6 @@ strong.cp-entry-title {
   position: absolute;
   top: 10px;
   left: 10px;
-  opacity: 0;
-  transition: opacity var(--t-quick) var(--ease-out);
-}
-.cp-shot:is(:hover, :focus-within) > .cp-check,
-.cp-shot > .cp-check[data-selected='true'] {
-  opacity: 1;
 }
 .cp-shot[data-selected='true'] .cp-shot-thumb {
   outline: 2px solid var(--accent);
@@ -400,7 +333,7 @@ strong.cp-entry-title {
   gap: 8px;
   padding-top: 8px;
 }
-.cp-shot-caption > .cp-entry-id {
+.cp-shot-caption > .cp-row-id {
   flex: 1;
 }
 

@@ -1,6 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
-import { Button, Chip, Empty, IconButton } from '../../../ui/Atoms';
+import { Button, Chip, Empty } from '../../../ui/Atoms';
+import { RowId, RowMenu } from '../../../ui/Rows';
 import { Segmented } from '../../../ui/Segmented';
 import { openContextMenu } from '../../../ui/ContextMenu';
 import { SelectionActionTray, SelectionCheckbox } from '../../../ui/SelectionActionTray';
@@ -9,7 +10,7 @@ import { formatBytes, fmtDayLabel, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
 import type { ResourceLoadState } from '../resources';
 import { openInstanceFolder } from '../instance-actions';
-import { PaneDoing, ResourceMutationStatus, ResourceStatus } from '../components/resource-bits';
+import { Pane, PaneBar } from '../components/pane';
 import { ScreenshotLightbox } from '../components/screenshot-lightbox';
 import { deleteScreenshots, screenshotFileUrl, screenshotMenuItems } from '../screenshot-actions';
 import { resourceMutationState } from '../bulk-actions';
@@ -112,27 +113,33 @@ export function ScreenshotsPane({
   const openFolder = (): void => void openInstanceFolder(inst.id, 'screenshots');
 
   return (
-    <div class="cp-pane">
-      {!empty && (
-        <div class="cp-pane-bar">
-          <Segmented<ScreenshotSort>
-            role="tablist"
-            ariaLabel="Sort screenshots"
-            value={sort}
-            onChange={setSort}
-            options={(Object.keys(SCREENSHOT_SORT_LABELS) as ScreenshotSort[]).map((item) => ({
-              value: item,
-              label: SCREENSHOT_SORT_LABELS[item],
-            }))}
-          />
-          <PaneDoing instanceId={inst.id} />
-          {totalBytes > 0 && <Chip tone="bare">{formatBytes(totalBytes)}</Chip>}
-          <IconButton icon="refresh" tooltip="Refresh" onClick={onRefresh} />
-          <IconButton icon="folder" tooltip="Open screenshots" onClick={openFolder} />
-        </div>
-      )}
-      <ResourceStatus state={resources} onRetry={onRefresh} />
-      <ResourceMutationStatus instanceId={inst.id} refusalOnly />
+    <Pane
+      instanceId={inst.id}
+      bar={
+        !empty && (
+          <PaneBar
+            instanceId={inst.id}
+            fact={totalBytes > 0 && <Chip tone="bare">{formatBytes(totalBytes)}</Chip>}
+            onRefresh={onRefresh}
+            onOpenFolder={openFolder}
+            folderTip="Open screenshots"
+          >
+            <Segmented<ScreenshotSort>
+              role="tablist"
+              ariaLabel="Sort screenshots"
+              value={sort}
+              onChange={setSort}
+              options={(Object.keys(SCREENSHOT_SORT_LABELS) as ScreenshotSort[]).map((item) => ({
+                value: item,
+                label: SCREENSHOT_SORT_LABELS[item],
+              }))}
+            />
+          </PaneBar>
+        )
+      }
+      state={resources}
+      onRetry={onRefresh}
+    >
       {empty ? (
         <Empty
           title="No screenshots yet"
@@ -171,6 +178,7 @@ export function ScreenshotsPane({
                       <img src={screenshotFileUrl(inst, shot.name)} alt="" loading="lazy" />
                     </button>
                     <SelectionCheckbox
+                      over
                       selected={selection.isSelected(shot.name)}
                       label={selectionToggleLabel(selection.isSelected(shot.name), shot.name)}
                       onToggle={(e) => {
@@ -179,19 +187,14 @@ export function ScreenshotsPane({
                       }}
                     />
                     <div class="cp-shot-caption">
-                      <span class="cp-entry-id">
-                        <strong class="cp-entry-title" title={shot.name}>
-                          {shot.name}
-                        </strong>
-                        <span class="cp-entry-by">
-                          {formatBytes(shot.size)}, {fmtRelative(shot.modified_at)}
-                        </span>
-                      </span>
-                      <IconButton
-                        icon="dots"
-                        size={28}
-                        tooltip={`Screenshot actions for ${shot.name}`}
-                        onClick={(e) => openContextMenu(e, menuItems(shot))}
+                      <RowId
+                        title={shot.name}
+                        tip={shot.name}
+                        byline={`${formatBytes(shot.size)}, ${fmtRelative(shot.modified_at)}`}
+                      />
+                      <RowMenu
+                        label={`Screenshot actions for ${shot.name}`}
+                        onOpen={(e) => openContextMenu(e, menuItems(shot))}
                       />
                     </div>
                   </div>
@@ -219,6 +222,6 @@ export function ScreenshotsPane({
           { label: 'Delete', icon: 'trash', danger: true, disabled: busy, onClick: () => void deleteSelected() },
         ]}
       />
-    </div>
+    </Pane>
   );
 }

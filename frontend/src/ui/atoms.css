@@ -401,6 +401,7 @@
   font-weight: 600;
   line-height: 1;
   white-space: nowrap;
+  transition: background var(--t-quick) var(--ease-out);
 }
 .cp-chip svg {
   flex: none;
@@ -610,6 +611,18 @@
 }
 .cp-check:disabled {
   opacity: 0.38;
+}
+/* A mark laid over art waits out of sight until what it stands on is pointed at or focused, or it is chosen. */
+.cp-check--over {
+  opacity: 0;
+  transition:
+    opacity var(--t-quick) var(--ease-out),
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out);
+}
+:is(.cp-row, .cp-tr, .cp-cover, .cp-shot):is(:hover, :focus-within) .cp-check--over,
+.cp-check--over[data-selected='true'] {
+  opacity: 1;
 }
 /* Radio: a round head whose eye opens when chosen. */
 .cp-radio {
@@ -913,7 +926,29 @@
 .cp-head-fill {
   flex: 1;
 }
-/* An open row: no container and no rule. The hover fill spans the row so it reads as one line at any width. */
+/* ── Rows. Every line of a list is one surface: no container and no rule. It lights as a whole while it is in
+   hand (under the pointer, or reached with the arrow keys), and once chosen it carries a breath of accent, so
+   chosen never reads as a hover. A `.cp-row` lays its cells out in a line; a `.cp-tr` takes its table's columns.
+   Whatever a row holds (chips, art, its mark, its menu) answers in the same time as the row. ── */
+.cp-row,
+.cp-tr {
+  border-radius: var(--rad-row);
+  transition: background var(--t-quick) var(--ease-out);
+}
+:is(.cp-row, .cp-tr:not(.cp-th)):is(:hover, [data-active='true'], [data-selected='true']) {
+  --chip-bg: var(--fill-2);
+  --chip-bg-hover: var(--fill-3);
+  background: var(--fill);
+}
+:is(.cp-row, .cp-tr:not(.cp-th))[data-selected='true'] {
+  background: color-mix(in oklab, var(--accent) 9%, var(--fill));
+}
+/* A list: its rows one under another, a hair apart, so the fills never touch. */
+.cp-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
 .cp-row {
   display: flex;
   align-items: center;
@@ -921,16 +956,8 @@
   min-height: 40px;
   margin: 0 -8px;
   padding: 4px 8px;
-  border-radius: var(--rad-row);
-  transition: background var(--t-quick) var(--ease-out);
 }
-/* In hand: under the pointer, or reached with the arrow keys. */
-.cp-row:is(:hover, [data-active='true']) {
-  --chip-bg: var(--fill-2);
-  --chip-bg-hover: var(--fill-3);
-  background: var(--fill);
-}
-/* A table: one grid sets the columns, rows are subgrids that light as a whole. */
+/* A table: one grid sets the columns, rows are subgrids. */
 .cp-table {
   display: grid;
   column-gap: 16px;
@@ -944,18 +971,79 @@
   min-height: 40px;
   margin: 0 -10px;
   padding: 0 10px;
-  border-radius: var(--rad-row);
   font-size: 13px;
-  transition: background var(--t-quick) var(--ease-out);
 }
-.cp-tr:not(.cp-th):is(:hover, [data-selected='true']) {
-  --chip-bg: var(--fill-2);
-  --chip-bg-hover: var(--fill-3);
-  background: var(--fill);
+/* A row's first cell: the item's art, which stays put, with its selection mark on the corner. */
+.cp-lead {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
 }
-/* Selected carries a breath of accent, so it never reads as a hover. */
-.cp-tr:not(.cp-th)[data-selected='true'] {
-  background: color-mix(in oklab, var(--accent) 9%, var(--fill));
+.cp-lead > * {
+  grid-area: 1 / 1;
+}
+.cp-lead > .cp-tile {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--hold-sm);
+}
+.cp-lead > .cp-check {
+  position: relative;
+  place-self: start;
+  margin: -3px 0 0 -3px;
+}
+/* The mark is small, so a little of the art around it answers too. */
+.cp-lead > .cp-check::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+}
+/* What a row is: its name with the facts that qualify it, over one quiet line. */
+.cp-row-id {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.cp-row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cp-row-title > strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-row-title > .cp-chip {
+  flex: none;
+}
+.cp-row-by {
+  overflow: hidden;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A row's menu stays quiet until the row is in hand. */
+.cp-row-more {
+  opacity: 0.45;
+  transition:
+    opacity var(--t-quick) var(--ease-out),
+    background var(--t-quick) var(--ease-out),
+    color var(--t-quick) var(--ease-out),
+    scale var(--t-press) var(--ease-spring);
+}
+:is(.cp-row, .cp-tr, .cp-shot):is(:hover, :focus-within, [data-active='true']) .cp-row-more {
+  opacity: 1;
 }
 .cp-th {
   min-height: 28px;

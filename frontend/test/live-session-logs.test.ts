@@ -110,7 +110,7 @@ function nodes(value: unknown): Node[] {
   if (Array.isArray(value)) return value.flatMap(nodes);
   if (value && typeof value === 'object' && 'props' in value) {
     const node = value as Node;
-    return [node, ...nodes(node.props.children)];
+    return [node, ...nodes(node.props.bar), ...nodes(node.props.children)];
   }
   return [];
 }
@@ -215,7 +215,7 @@ function harness() {
           folders.push(args);
         },
       },
-      '../components/resource-bits': { ResourceEmpty: 'ResourceEmpty', ResourceStatus: 'ResourceStatus' },
+      '../components/pane': { Pane: 'Pane', PaneBar: 'PaneBar' },
       '../components/log-line': { LogLines: 'LogLines' },
     },
     { window: clock },
@@ -272,10 +272,7 @@ test('the active Logs pane shows session output while the file inventory is excl
   assert.equal(node(tree, 'LogLines').props.text, 'Game started');
   assert.equal(node(tree, 'SelectField').props.value, 'session:session-1');
   assert.match(JSON.stringify(node(tree, 'SelectField').props.options), /Session output/);
-  assert.equal(
-    nodes(tree).some((entry) => entry.type === 'ResourceStatus'),
-    false,
-  );
+  assert.equal(node(tree, 'Pane').props.state, false);
   assert.equal(text(node(tree, 'Chip')), 'Live');
   assert.equal([...h.intervals.values()][0].delay, 2500);
   h.read(async () => history('New output'));
@@ -291,16 +288,12 @@ test('the active Logs pane shows session output while the file inventory is excl
   );
   (filter.props.onChange as (value: string) => void)('errors');
   assert.equal(node(h.render(), 'LogLines').props.filter, 'errors');
-  const refresh = nodes(tree).find((entry) => entry.type === 'IconButton' && entry.props.tooltip === 'Refresh');
-  assert.ok(refresh);
-  (refresh.props.onClick as () => void)();
+  (node(tree, 'PaneBar').props.onRefresh as () => void)();
   h.render();
   await flush();
   assert.equal(h.refreshes(), 1);
   assert.equal(h.calls.length, 3);
-  const folder = nodes(tree).find((entry) => entry.type === 'IconButton' && entry.props.tooltip === 'Open folder');
-  assert.ok(folder);
-  (folder.props.onClick as () => void)();
+  (node(tree, 'PaneBar').props.onOpenFolder as () => void)();
   assert.deepEqual(h.folders, [['instance-1', 'logs']]);
   h.unmount();
   assert.equal(h.intervals.size, 0);

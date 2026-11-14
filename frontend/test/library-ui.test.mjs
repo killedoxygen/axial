@@ -97,6 +97,16 @@ const parts = /** @type {Parts} */ (
 );
 
 const facts = loadSource('src/ui/InstanceFacts.tsx', { './Atoms': parts, '../launch-presenters': presenters });
+const rows = /** @type {{ RowLead: (props: object) => unknown, RowMenu: (props: object) => unknown }} */ (
+  loadSource('src/ui/Rows.tsx', {
+    './Atoms': parts,
+    './SelectionActionTray': parts,
+    './selection': {
+      /** @param {boolean} selected @param {string} name */
+      selectionToggleLabel: (selected, name) => `${selected ? 'Deselect' : 'Select'} ${name}`,
+    },
+  })
+);
 
 /** @param {unknown} tree @param {(node: ViewNode) => boolean} predicate @returns {ViewNode[]} */
 function nodes(tree, predicate) {
@@ -262,6 +272,7 @@ function libraryHarness(initialInstances = []) {
     },
     '../../ui/InstanceFacts': facts,
     '../../ui/InstanceVisual': { ...parts, guardedInstanceHue: () => 40, artSeedFor: () => 0 },
+    '../../ui/Rows': rows,
     '../../ui/Segmented': parts,
     '../../ui/motion': { settleChildren() {} },
     '../../ui/SelectionActionTray': parts,
@@ -528,11 +539,12 @@ test('list rows preserve backend labels, keyboard access and independent selecti
   row.props.onKeyDown(event('ArrowDown'));
   assert.equal(h.calls.navigations.length, 2);
   const selectEvent = event();
-  ofType(row, parts.SelectionCheckbox)[0].props.onToggle(selectEvent);
+  const lead = rows.RowLead(ofType(row, rows.RowLead)[0].props);
+  ofType(lead, parts.SelectionCheckbox)[0].props.onToggle(selectEvent);
   assert.equal(selectEvent.stopped, 1);
   assert.ok(h.selectedIds.has('row'));
   const menuEvent = event();
-  const overflow = ofType(row, parts.IconButton)[0];
+  const overflow = ofType(rows.RowMenu(ofType(row, rows.RowMenu)[0].props), parts.IconButton)[0];
   assert.equal(overflow.props.tooltip, 'Actions for Instance row');
   overflow.props.onClick(menuEvent);
   assert.equal(menuEvent.stopped, 1);

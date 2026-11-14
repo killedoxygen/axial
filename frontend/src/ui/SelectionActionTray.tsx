@@ -59,21 +59,22 @@ export function SelectionActionTray({
 export function SelectionCheckbox({
   selected,
   mixed = false,
+  over = false,
   label,
   onToggle,
-  className,
 }: {
   selected: boolean;
   /** Some, not all, of what it stands for is selected. */
   mixed?: boolean;
+  /** Laid over art: out of sight until what it stands on is pointed at or focused, or it is chosen. */
+  over?: boolean;
   label: string;
   onToggle: (e: MouseEvent) => void;
-  className?: string;
 }): JSX.Element {
   return (
     <button
       type="button"
-      class={className ? `cp-check ${className}` : 'cp-check'}
+      class={over ? 'cp-check cp-check--over' : 'cp-check'}
       data-selected={selected || mixed}
       aria-pressed={mixed ? 'mixed' : selected}
       aria-label={label}

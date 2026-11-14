@@ -2,13 +2,14 @@ import type { JSX } from 'preact';
 import { SessionChip } from '../../ui/InstanceFacts';
 import { useCallback, useState } from 'preact/hooks';
 import { InstanceTile } from '../../ui/InstanceVisual';
-import { Button, Empty, IconButton, Input } from '../../ui/Atoms';
+import { Button, Empty, Input } from '../../ui/Atoms';
 import { Segmented } from '../../ui/Segmented';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard, openOnKey } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { SelectionActionTray, SelectionCheckbox } from '../../ui/SelectionActionTray';
-import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
+import { RowLead, RowMenu } from '../../ui/Rows';
+import { SelectionActionTray } from '../../ui/SelectionActionTray';
+import { selectionMenuItem, useSelection } from '../../ui/selection';
 import { instances, versionById, launchSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
 import { navigate, openCreate } from '../../ui-state';
@@ -55,17 +56,9 @@ function ListRow({
       onContextMenu={onContextMenu}
     >
       <span class="cp-library-name">
-        <span class="cp-lead">
+        <RowLead name={inst.name} selected={selected} onToggle={onToggleSelect}>
           <InstanceTile inst={inst} />
-          <SelectionCheckbox
-            selected={selected}
-            label={selectionToggleLabel(selected, inst.name)}
-            onToggle={(e) => {
-              e.stopPropagation();
-              onToggleSelect(e);
-            }}
-          />
-        </span>
+        </RowLead>
         <strong>{inst.name}</strong>
         {session && <SessionChip session={session} />}
       </span>
@@ -92,15 +85,7 @@ function ListRow({
         >
           {installing ? installLabel : launchAction.primary_action === 'launch' ? 'Play' : launchAction.label}
         </Button>
-        <IconButton
-          icon="dots"
-          size={28}
-          tooltip={`Actions for ${inst.name}`}
-          onClick={(e) => {
-            e.stopPropagation();
-            onContextMenu(e);
-          }}
-        />
+        <RowMenu label={`Actions for ${inst.name}`} onOpen={onContextMenu} />
       </span>
     </div>
   );
