@@ -126,14 +126,18 @@ function placeInDocument(element: HTMLElement): { x: number; y: number } {
   return { x, y };
 }
 
-const seats = new WeakMap<HTMLElement, { width: number; at: WeakMap<Element, { x: number; y: number }> }>();
+const seats = new WeakMap<
+  HTMLElement,
+  { width: number; height: number; origin: { x: number; y: number }; at: WeakMap<Element, { x: number; y: number }> }
+>();
 /** More rows than this moving at once is a new list, not a rearrangement. */
 const SETTLE_LIMIT = 60;
 
 /**
  * Lets the items of a list glide to their new places when it is reordered or one of them goes, instead of
  * jumping. Given as the list's `ref`: it runs after every render, compares each child's place with the last one,
- * and moves by transform only. A list that changed width is being laid out again, not rearranged.
+ * and moves by transform only. A list that changed width is being laid out again, not rearranged; nor is one
+ * that kept its size while something outside it carried it, items and all, to a new place.
  */
 export function settleChildren(list: HTMLElement | null): void {
   if (!list) return;
@@ -154,8 +158,12 @@ export function settleChildren(list: HTMLElement | null): void {
     if (was && (was.x !== now.x || was.y !== now.y)) moved.push([child, was.x - now.x, was.y - now.y]);
   }
   const width = list.offsetWidth;
-  seats.set(list, { width, at });
+  const height = list.offsetHeight;
+  seats.set(list, { width, height, origin, at });
   if (!before || before.width !== width || moved.length === 0 || moved.length > SETTLE_LIMIT || reduced()) return;
+  // Carried: same size, and every item that moved went exactly as far as the list itself did.
+  const { x: fromX, y: fromY } = before.origin;
+  if (before.height === height && moved.every(([, x, y]) => x === fromX - origin.x && y === fromY - origin.y)) return;
   const timing = { duration: parseFloat(token('--t-move')), easing: token('--ease-glide') };
   for (const [child, x, y] of moved) child.animate([{ translate: `${x}px ${y}px` }, { translate: '0 0' }], timing);
 }

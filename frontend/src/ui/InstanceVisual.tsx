@@ -30,6 +30,11 @@ function tileHue(inst: VisualInstance, theme: Theme): number {
   return resolveTileHue(artSeedFor(inst) % 360, theme);
 }
 
+/** The tile's hue, for what stands around the tile and draws its marks in the tile's colours. */
+export function useTileHue(inst: VisualInstance): number {
+  return tileHue(inst, useTheme());
+}
+
 function isLoaderKey(value: string | undefined): value is LoaderKey {
   return value === 'vanilla' || value === 'fabric' || value === 'quilt' || value === 'forge' || value === 'neoforge';
 }

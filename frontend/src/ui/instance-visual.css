@@ -12,10 +12,17 @@
     color-mix(in oklab, var(--fill) 84%, oklch(0.45 0.14 var(--cp-tile-h)))
   );
 }
+/* The tile's ink, and the deep tone that reads on that ink in either theme. What a tile stands in
+   (`.cp-tile-ground`) shares them, for marks laid on the tile. */
+.cp-tile,
+.cp-tile-ground {
+  --cp-tile-ink: color-mix(in oklab, var(--text-mute) 52%, oklch(0.62 0.13 var(--cp-tile-h)));
+  --cp-tile-deep: oklch(0.26 0.045 var(--cp-tile-h));
+}
 .cp-tile-glyph {
   width: clamp(20px, 42cqmin, 80px);
   height: clamp(20px, 42cqmin, 80px);
-  color: color-mix(in oklab, var(--text-mute) 52%, oklch(0.62 0.13 var(--cp-tile-h)));
+  color: var(--cp-tile-ink);
 }
 .cp-tile-glyph--mask {
   background-color: currentColor;

@@ -77,7 +77,7 @@
   margin-bottom: 10px;
   border-radius: var(--hold-xl);
   overflow: hidden;
-  transition: scale var(--t-press) var(--ease-spring);
+  transition: scale var(--t-pop) var(--ease-out);
 }
 .cp-cover-art > .cp-tile {
   position: absolute;
@@ -86,27 +86,60 @@
 .cp-cover[data-installing='true'] .cp-tile {
   opacity: 0.52;
 }
+/* The cover's marks are drawn in its tile's ink. An unchosen one is an empty, quieter box, so it never reads
+   as chosen. */
 .cp-cover-art > .cp-check {
   position: absolute;
   top: 10px;
   left: 10px;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--rad-chip);
+  background: color-mix(in oklab, var(--cp-tile-ink) 50%, transparent);
+  color: transparent;
 }
+.cp-cover-art > .cp-check:hover {
+  background: color-mix(in oklab, var(--cp-tile-ink) 78%, transparent);
+  color: transparent;
+}
+.cp-cover-art > .cp-check[data-selected='true'] {
+  background: var(--cp-tile-ink);
+  color: var(--cp-tile-deep);
+}
+.cp-cover-art > .cp-check svg {
+  width: 13px;
+  height: 13px;
+}
+.cp-cover[data-selected='true'] .cp-cover-art {
+  outline: 2px solid var(--cp-tile-ink);
+  outline-offset: 2px;
+}
+/* A cover in hand grows a little, as Home's covers do. */
+:where(.cp-cover):hover .cp-cover-art {
+  scale: 1.03;
+}
+/* What the cover will do. */
 .cp-cover-play {
   position: absolute;
-  right: 8px;
-  bottom: 8px;
+  right: 10px;
+  bottom: 10px;
   display: grid;
   place-items: center;
-  width: var(--h);
-  height: var(--h);
+  width: var(--h-sm);
+  height: var(--h-sm);
   border-radius: var(--rad-ctl);
-  background: var(--accent-fill);
-  color: var(--accent-on);
+  background: var(--cp-tile-ink);
+  color: var(--cp-tile-deep);
   opacity: 0;
   transition: opacity var(--t-quick) var(--ease-out);
 }
 .cp-cover:is(:hover, :focus-within) .cp-cover-play {
   opacity: 1;
+}
+/* Alone in its disc the play mark is solid, and sits a hair right of centre to look centred. */
+.cp-cover-play[data-action='launch'] svg {
+  fill: currentColor;
+  translate: 0.5px 0;
 }
 .cp-cover-name {
   max-width: 100%;
@@ -139,7 +172,9 @@
   place-items: center;
   background: var(--fill);
   color: var(--accent);
-  transition: background var(--t-quick) var(--ease-out);
+  transition:
+    background var(--t-quick) var(--ease-out),
+    scale var(--t-pop) var(--ease-out);
 }
 .cp-cover--new:hover .cp-cover-art {
   background: var(--fill-2);

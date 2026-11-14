@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { InstanceFacts, SessionChip } from './InstanceFacts';
-import { InstanceTile } from './InstanceVisual';
+import { InstanceTile, useTileHue } from './InstanceVisual';
 import { Chip } from './Atoms';
 import { Icon } from './Icons';
 import { SelectionCheckbox } from './SelectionActionTray';
@@ -34,6 +34,7 @@ export function InstanceCard({
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const action = inst.launch_action.primary_action;
   const open = (): void => navigate({ name: 'instance', id: inst.id });
+  const hue = useTileHue(inst);
   return (
     <div
       class="cp-cover"
@@ -46,7 +47,7 @@ export function InstanceCard({
       onKeyDown={(e) => openOnKey(e, open)}
       onContextMenu={onContextMenu}
     >
-      <div class="cp-cover-art">
+      <div class="cp-cover-art cp-tile-ground" style={{ '--cp-tile-h': hue }}>
         <InstanceTile inst={inst} />
         {onToggleSelect && (
           <SelectionCheckbox
@@ -60,8 +61,8 @@ export function InstanceCard({
           />
         )}
         {!install.installing && !session && (
-          <span class="cp-cover-play" aria-hidden="true">
-            <Icon name={action === 'launch' ? 'play' : action === 'install' ? 'download' : 'alert'} size={14} />
+          <span class="cp-cover-play" data-action={action} aria-hidden="true">
+            <Icon name={action === 'launch' ? 'play' : action === 'install' ? 'download' : 'alert'} size={12} />
           </span>
         )}
       </div>
