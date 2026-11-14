@@ -22,9 +22,3 @@
   -webkit-mask: var(--cp-loader-src) center / contain no-repeat;
   mask: var(--cp-loader-src) center / contain no-repeat;
 }
-.cp-tile-glyph--mask[data-loader='quilt'] {
-  translate: 2.1cqmin 2.1cqmin;
-}
-.cp-tile-glyph--mask[data-loader='forge'] {
-  translate: 0 2.1cqmin;
-}

@@ -47,12 +47,7 @@ function loaderKeyForInstance(inst: VisualInstance, version: Version | undefined
 function GlyphMark({ loader, className }: { loader: LoaderKey; className: string }): JSX.Element {
   const src = loaderLogoSrc(loader);
   return (
-    <span
-      aria-hidden="true"
-      class={`${className} ${className}--mask`}
-      data-loader={loader}
-      style={{ '--cp-loader-src': `url("${src}")` }}
-    />
+    <span aria-hidden="true" class={`${className} ${className}--mask`} style={{ '--cp-loader-src': `url("${src}")` }} />
   );
 }
 

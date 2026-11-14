@@ -91,7 +91,6 @@ test('all LoaderKey values retain their assets in create and instance glyphs', (
   for (const loader of loaderKeys) {
     const createMark = LoaderLogo({ loader, size: 18 });
     assert.equal(createMark.type, 'span');
-    assert.equal(createMark.props['data-loader'], loader);
     assert.equal(createMark.props.style['--cp-loader-src'], `url("${expected[loader]}")`);
     assert.equal(createMark.props.style.width, '18px');
 
@@ -104,7 +103,6 @@ test('all LoaderKey values retain their assets in create and instance glyphs', (
     };
     const glyph = functionalResult(InstanceGlyph({ inst: instance, className: 'fixture-glyph' }));
     assert.equal(glyph.type, 'span');
-    assert.equal((glyph.props as LooseProps)['data-loader'], loader);
     assert.equal((glyph.props as LooseProps).class, 'fixture-glyph fixture-glyph--mask');
     assert.equal((glyph.props as LooseProps).style['--cp-loader-src'], `url("${expected[loader]}")`);
   }

@@ -58,26 +58,39 @@ repository settings.
 
 ## Loader marks
 
-Loader identity retains `vanilla_icon.svg`, `fabric_icon.svg`, `forge_icon.svg`,
-`neoforge_icon.svg` and `quilt_icon.svg` under `frontend/static/`, byte-for-byte
-from [Axial's historical source](https://github.com/killedoxygen/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static).
-Keep their original view boxes, monochrome CSS masks and Forge/Quilt optical
-offsets in creation rows and instance tiles. Preserve these recognizable marks;
-do not replace them with neutral glyphs or new brand geometry. A visual change
-requires an explicitly approved, specific correction and focused verification.
+`vanilla_icon.svg`, `fabric_icon.svg`, `forge_icon.svg`, `neoforge_icon.svg`
+and `quilt_icon.svg` under `frontend/static/` are repository-authored redrawings
+of each loader's own logo: the creeper's face, Fabric's length of cloth,
+Forge's anvil, NeoForge's fox, and Quilt's nine patches with one turned. They
+are rendered as monochrome CSS masks in creation tiles, downloads and instance
+tiles, so the theme owns their colour.
 
-The provenance entry identifies the exact historical input, not Axial ownership
-of third-party marks or a complete upstream rights chain. These SVGs contain
-historical adaptations and are not all byte-exact official downloads. Quilt's
-eight path geometries match its [official monochrome artwork](https://github.com/QuiltMC/art/blob/849d6dfd9ba639895e15c7b200e06b3bb50e9c2e/brand/svg/quilt_logo_mono_white_transparent.svg),
-whose [brand directory carries CC0](https://github.com/QuiltMC/art/blob/849d6dfd9ba639895e15c7b200e06b3bb50e9c2e/brand/LICENSE);
-the retained SVG changes the framing. Original derivation and rights evidence
-for the other four retained SVG adaptations remain incomplete. In particular,
-[NeoForged's official art](https://github.com/neoforged/.github/blob/382381b116e4a107c09fcd1fe7afaf48626d1ef3/art/README.md)
-credits Ridanisaurus under CC-BY-4.0, but does not establish the exact source of
-this historical monochrome SVG. The historical hashes prove restoration only,
-not a new license or trademark permission. Loader marks are retained inputs;
-the Axial icon generator does not regenerate them.
+The five are one set and are redrawn together:
+
+- A 24 by 24 view box that the art fills edge to edge on its longer axis, with
+  no per-loader offsets in CSS. Each mark is centred on its mass, not its
+  bounds: Quilt on its three by three grid with only the turned patch reaching
+  past it, the anvil on its centre of area so the long horn does not pull the
+  body off centre.
+- Solid `evenodd` paths with no colour or stroke. A mark is one path at full
+  strength, or two: a first path at `opacity="0.6"` and a full one over it.
+- Geometry comes from the logo. The creeper sits on a six by six module of 4.
+  Fabric and the fox keep their logos' cell maps (13 by 14 and 12 by 13 cells)
+  with every step rounded. The anvil follows Forge's outline: long horn, one
+  slit, heel carried past the body, spread feet.
+- Two strengths are only for a logo whose own artwork plainly contrasts light
+  and dark regions. Today that is the fox alone: its ears, eye whites and
+  muzzle are full and its face is 0.6, with no seam between them, and its
+  black pupils and nose stay open. Do not add a second strength to a logo that
+  does not show the difference itself.
+- The other four are one strength. Where their parts need telling apart they
+  are separate pieces set apart by a seam: Fabric's turned end and Quilt's
+  patches.
+
+Keep each loader recognisable as its logo; do not replace a mark with a neutral
+glyph or a generic drawing of the subject. They are Axial's drawings, not the
+projects' official artwork, and are used only to name the loader an instance
+runs. The loaders' names and logos remain their owners'.
 
 ## Interface icons
 
@@ -103,8 +116,8 @@ separate base/accent geometry so theme colors remain CSS-owned.
 
 `assets/provenance.json` is the strict source, rights, revision, mode, refresh,
 generator, and exact-hash inventory for retained delivery assets. It covers the
-tracked desktop icons, frontend font files and notices, SND kit files, historical
-loader marks, Worlds empty-state masks, interface icon notice, favicon, and
+tracked desktop icons, frontend font files and notices, SND kit files, loader
+marks, Worlds empty-state masks, interface icon notice, favicon, and
 Microsoft authentication symbol.
 
 The Microsoft symbol is the byte-exact asset published with Microsoft identity

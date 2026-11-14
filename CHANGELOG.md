@@ -17,6 +17,7 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ### Look
 - New logo: an axolotl, in the app, the icons and the download page; it takes the accent color you pick
+- Vanilla, Fabric, Forge, NeoForge and Quilt marks redrawn as one set
 
 ## [0.4.0-rc.5] - 2026-11-02
 

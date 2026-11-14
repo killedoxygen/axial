@@ -144,60 +144,60 @@
     {
       "id": "loader-marks",
       "source": {
-        "kind": "upstream",
-        "locator": "https://github.com/killedoxygen/axial/tree/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static",
-        "revision": "4897a626eb0d01b7c6a2c237e6babcc091538e90"
+        "kind": "repository-owned",
+        "locator": "repository://frontend/static/*_icon.svg",
+        "revision": "loader-marks-v1"
       },
       "rights": {
-        "basis": "historical-source-only",
+        "basis": "repository-owned",
         "evidence": {
           "locator": "docs/ICON-ASSETS.md",
           "sha256": null
         },
         "current_policy": null,
-        "reviewed_at": "2026-10-02"
+        "reviewed_at": "2026-11-14"
       },
-      "refresh": "Preserve the historical loader marks, view boxes, CSS masks and alignment. Change only for an explicitly approved visual correction; record its source and rights limitations without substituting new brand geometry.",
+      "refresh": "Redraw the five marks together under the shared rules in docs/ICON-ASSETS.md; keep each recognisable as its loader's logo and keep the monochrome CSS mask rendering.",
       "files": [
         {
           "path": "frontend/static/fabric_icon.svg",
           "mode": "100644",
-          "sha256": "724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e",
+          "sha256": "5d885dd11be32ba219876bac71ffa5465121c045296085605e4c12f272fa8c4f",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/fabric_icon.svg",
-          "upstream_sha256": "724a6ace8aab39ffeca373e847782c5ff56abc0bc898f962519bd9aa0b696f8e"
+          "locator": null,
+          "upstream_sha256": null
         },
         {
           "path": "frontend/static/forge_icon.svg",
           "mode": "100644",
-          "sha256": "48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908",
+          "sha256": "61e20ff57257e1701dd7abca69770a90679421054595ad57285cef096f87a732",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/forge_icon.svg",
-          "upstream_sha256": "48b1a0bd969b3f96dc9a154b1041c954aa6b76334873b6d332fffc47b4e7d908"
+          "locator": null,
+          "upstream_sha256": null
         },
         {
           "path": "frontend/static/neoforge_icon.svg",
           "mode": "100644",
-          "sha256": "cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac",
+          "sha256": "a55e9ff78826aba021958e92009a8fe4bc03d02b05c812e3778d033bf8fcb5c5",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/neoforge_icon.svg",
-          "upstream_sha256": "cdccab15e2e71a10ad21d1e4cd766c29fa10dbb48768266e713b0c4b694a5dac"
+          "locator": null,
+          "upstream_sha256": null
         },
         {
           "path": "frontend/static/quilt_icon.svg",
           "mode": "100644",
-          "sha256": "bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5",
+          "sha256": "38f8b931ea6b10593646f88f3beb160fa8d693fac10c9d6a89cc7e2ee0ce14d9",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/quilt_icon.svg",
-          "upstream_sha256": "bee418e2d25ef96bff9a5fd74851548098744580028042aaaf29baadfbef1fc5"
+          "locator": null,
+          "upstream_sha256": null
         },
         {
           "path": "frontend/static/vanilla_icon.svg",
           "mode": "100644",
-          "sha256": "34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28",
+          "sha256": "1eac4731bb6e92eb303972eed9438e7c626d2d416269a17c26cf1888a09294f4",
           "generator": null,
-          "locator": "https://raw.githubusercontent.com/killedoxygen/axial/4897a626eb0d01b7c6a2c237e6babcc091538e90/frontend/static/vanilla_icon.svg",
-          "upstream_sha256": "34abce831779c6bc43e91214e7e57c8ed8c4c3e0e63b58e38d6e7f9132585b28"
+          "locator": null,
+          "upstream_sha256": null
         }
       ]
     },

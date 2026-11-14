@@ -27,7 +27,6 @@ export function LoaderLogo({
     <span
       aria-hidden="true"
       class={className}
-      data-loader={loader}
       style={{
         ['--cp-loader-src' as any]: `url("${src}")`,
         width: `${size}px`,
