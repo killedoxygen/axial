@@ -60,6 +60,17 @@ function fmtElapsed(startedAt: string | undefined, now: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${r}` : `${m}:${r}`;
 }
 
+/** How long the game has run. It ticks by itself, so the page around it is not drawn again every second. */
+function PlayClock({ since }: { since?: string }): JSX.Element {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [since]);
+  return <span class="cp-instance-clock">{fmtElapsed(since, now)}</span>;
+}
+
 function defaultTabFor(inst: EnrichedInstance | undefined): Tab {
   return inst?.version_display.supports_mods ? 'mods' : 'worlds';
 }
@@ -77,7 +88,6 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
     data: lastListing(id, 'resources'),
   }));
   const resourceRequest = useRef(0);
-  const [now, setNow] = useState(() => Date.now());
   const session = inst ? launchSessions.value[inst.id] : undefined;
   const sessionActive = Boolean(session);
   const playing = launchSessionIsPlaying(session);
@@ -137,13 +147,6 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
     reloadResources();
   }, [revision]);
 
-  useEffect(() => {
-    if (!playing) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [playing]);
-
   if (!inst) {
     return (
       <div class="cp-view-page">
@@ -195,7 +198,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
   const status = session ? (
     playing ? (
       <Status eyes="open" tone="accent">
-        {sessionLabel} <span class="cp-instance-clock">{fmtElapsed(session.launchedAt, now)}</span>
+        {sessionLabel} <PlayClock since={session.launchedAt} />
       </Status>
     ) : (
       <Status busy>{sessionLabel}</Status>
@@ -337,7 +340,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
 
       {launchNotice && <LaunchOutcomeNotice inst={inst} notice={launchNotice} />}
 
-      {installLocked && (
+      {installLocked ? (
         <InstallBarrierPane
           installTarget={installTarget}
           installLabel={installLabel}
@@ -347,23 +350,19 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
           installFailure={matchingInstallFailure}
           onRetryInstall={() => matchingInstallFailure && retryFailedInstall(matchingInstallFailure)}
         />
-      )}
-      {!installLocked && activeTab === 'mods' && (
+      ) : activeTab === 'mods' ? (
         <ModsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-      )}
-      {!installLocked && (activeTab === 'resourcepacks' || activeTab === 'shaderpacks') && (
+      ) : activeTab === 'resourcepacks' || activeTab === 'shaderpacks' ? (
         <PacksPane key={activeTab} inst={inst} folder={activeTab} />
-      )}
-      {!installLocked && activeTab === 'worlds' && (
+      ) : activeTab === 'worlds' ? (
         <WorldsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-      )}
-      {!installLocked && activeTab === 'screenshots' && (
+      ) : activeTab === 'screenshots' ? (
         <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
-      )}
-      {!installLocked && activeTab === 'logs' && (
+      ) : activeTab === 'logs' ? (
         <LogsPane inst={inst} resources={resources} processLive={processLive} onRefresh={reloadResources} />
+      ) : (
+        <SettingsPane inst={inst} />
       )}
-      {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
     </div>
   );
 }
