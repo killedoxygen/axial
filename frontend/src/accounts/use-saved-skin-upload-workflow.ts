@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useState } from 'preact/hooks';
 import {
   captureWardrobeContext,
   isWardrobeContextCurrent,
@@ -8,27 +8,18 @@ import {
   wardrobeBusy,
   wardrobeOp,
 } from './wardrobe-state';
-import { pickNativeSkinFile } from '../platform/native';
-import {
-  boundedMessage,
-  isPngFile,
-  normalizeSkinUpload,
-  skinActionErrorMessage,
-  stagedSkinVariant,
-  uploadSkinName,
-} from './api';
+import { isPngFile, skinActionErrorMessage, stagedSkinVariant, uploadSkinName } from './api';
 import { usePngDrop } from './use-png-drop';
-import { NO_CAPE_VALUE, type StagedSkinUpload, type UploadSkinVariant } from './types';
+import { useStagedSkinPng } from './use-staged-skin-png';
+import { NO_CAPE_VALUE, type UploadSkinVariant } from './types';
 import { type SkinVariant } from '../generated/SkinVariant';
 
 export function useSavedSkinUploadWorkflow() {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const stagedUploadUrlRef = useRef<string | null>(null);
-  const stagedUploadTokenRef = useRef(0);
+  const png = useStagedSkinPng();
+  const stagedUpload = png.staged;
   const [skinName, setSkinName] = useState('');
   const [uploadVariant, setUploadVariant] = useState<UploadSkinVariant>('auto');
   const [stagedCapeId, setStagedCapeId] = useState<string>(NO_CAPE_VALUE);
-  const [stagedUpload, setStagedUpload] = useState<StagedSkinUpload | null>(null);
   const [uploadDragActive, setUploadDragActive] = useState(false);
 
   const busy = wardrobeOp.value?.kind === 'upload';
@@ -41,14 +32,8 @@ export function useSavedSkinUploadWorkflow() {
   const stagedCanSave = Boolean(stagedUpload && canUpload && stagedVariantReady && stagedValidated);
 
   const clearStagedUpload = (): void => {
-    stagedUploadTokenRef.current += 1;
-    if (stagedUploadUrlRef.current) {
-      URL.revokeObjectURL(stagedUploadUrlRef.current);
-      stagedUploadUrlRef.current = null;
-    }
-    setStagedUpload(null);
+    png.clear();
     setStagedCapeId(NO_CAPE_VALUE);
-    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const upload = async (
@@ -82,70 +67,22 @@ export function useSavedSkinUploadWorkflow() {
       } catch (err) {
         if (isWardrobeContextCurrent(capture)) setWardrobeNotice(skinActionErrorMessage(err, 'Could not save skin.'));
       } finally {
-        if (fileInputRef.current) fileInputRef.current.value = '';
+        png.resetInput();
       }
     });
   };
 
   const stageUploadFile = (file: File): void => {
     if (!isPngFile(file)) {
-      setWardrobeNotice('Upload a PNG skin file.');
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      png.refuse('Upload a PNG skin file.');
       return;
     }
     if (wardrobeBusy()) {
-      setWardrobeNotice('Wait for the current skin action to finish.');
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      png.refuse('Wait for the current skin action to finish.');
       return;
     }
-
-    const objectUrl = URL.createObjectURL(file);
-    stagedUploadTokenRef.current += 1;
-    const token = stagedUploadTokenRef.current;
-    if (stagedUploadUrlRef.current) URL.revokeObjectURL(stagedUploadUrlRef.current);
-    stagedUploadUrlRef.current = objectUrl;
-    setWardrobeNotice(null);
     setStagedCapeId(NO_CAPE_VALUE);
-    setStagedUpload({
-      file,
-      objectUrl,
-      detectedVariant: 'classic',
-      detectingVariant: true,
-      normalizeStatus: 'checking',
-    });
-
-    void normalizeSkinUpload(file)
-      .then((metadata) => {
-        if (token !== stagedUploadTokenRef.current) return;
-        setStagedUpload((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectedVariant: metadata.variant_suggestion,
-                detectingVariant: false,
-                normalizeStatus: 'ready',
-                normalizeError: undefined,
-                normalizedDataUrl: metadata.normalized_data_url,
-              }
-            : current,
-        );
-      })
-      .catch((err) => {
-        if (token !== stagedUploadTokenRef.current) return;
-        setStagedUpload((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectingVariant: false,
-                normalizeStatus: 'error',
-                normalizeError: boundedMessage(
-                  err instanceof Error ? err.message : undefined,
-                  'Skin validation failed.',
-                ),
-              }
-            : current,
-        );
-      });
+    png.stage(file);
   };
 
   const uploadDrop = usePngDrop({
@@ -166,34 +103,11 @@ export function useSavedSkinUploadWorkflow() {
   };
 
   const openUploadPicker = (): void => {
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    void (async () => {
-      try {
-        const nativeFile = await pickNativeSkinFile();
-        if (nativeFile) {
-          stageUploadFile(nativeFile);
-          return;
-        }
-        if (nativeFile === null) return;
-        fileInputRef.current?.click();
-      } catch (err) {
-        setWardrobeNotice(boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'));
-      }
-    })();
+    png.openPicker(stageUploadFile);
   };
 
-  useEffect(() => {
-    return () => {
-      stagedUploadTokenRef.current += 1;
-      if (stagedUploadUrlRef.current) {
-        URL.revokeObjectURL(stagedUploadUrlRef.current);
-        stagedUploadUrlRef.current = null;
-      }
-    };
-  }, []);
-
   return {
-    fileInputRef,
+    fileInputRef: png.inputRef,
     stagedUpload,
     stagedVariant,
     stagedName,
