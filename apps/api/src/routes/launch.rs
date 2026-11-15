@@ -254,8 +254,9 @@ async fn report(
 mod tests {
     use crate::fixture::Profile;
     use axial_app::launch::{
+        logs::Redactor,
         outcome::SessionOutcome,
-        reports::{LaunchReportStore, SessionReportInput},
+        reports::{LaunchProofRecord, LaunchReportStore, SessionReportInput},
     };
 
     #[tokio::test]
@@ -264,18 +265,21 @@ mod tests {
         let reports = LaunchReportStore::new(profile.services.settings.metadata().clone()).unwrap();
         let session_id = uuid::Uuid::new_v4().to_string();
         reports
-            .record_session(SessionReportInput {
-                session_id: session_id.clone(),
-                instance_id: uuid::Uuid::new_v4().to_string(),
-                version_id: "1.21.1".into(),
-                launched_at: "2026-09-26T10:00:00.000Z".into(),
-                ended_at: "2026-09-26T10:00:01.000Z".into(),
-                outcome: SessionOutcome::spawn_failed(),
-                entries: vec![],
-                exit_code: None,
-                boot_duration_ms: None,
-                logs_dropped: 0,
-            })
+            .record(
+                LaunchProofRecord::from_session(SessionReportInput {
+                    session_id: session_id.clone(),
+                    instance_id: uuid::Uuid::new_v4().to_string(),
+                    version_id: "1.21.1".into(),
+                    launched_at: "2026-09-26T10:00:00.000Z".into(),
+                    ended_at: "2026-09-26T10:00:01.000Z".into(),
+                    outcome: SessionOutcome::spawn_failed(),
+                    entries: vec![],
+                    exit_code: None,
+                    boot_duration_ms: None,
+                    logs_dropped: 0,
+                }),
+                &Redactor::new(Vec::new()),
+            )
             .unwrap();
         let list = profile.api.get("/api/v1/launch/reports").await;
         let single = profile

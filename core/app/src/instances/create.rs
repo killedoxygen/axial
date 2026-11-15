@@ -899,17 +899,6 @@ impl InstanceService {
 
     /// Playing sessions may lend their existing admission for next-launch
     /// metadata. File mutations and deletion still require a fresh exclusion.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn update_with_sessions(
-        &self,
-        id: &InstanceId,
-        patch: super::model::InstancePatch,
-        sessions: &crate::launch::session::SessionManager,
-    ) -> InstanceResult<Instance> {
-        self.update_record_with_sessions(id, patch, sessions)
-            .map(|record| public_instance(record.instance))
-    }
-
     /// Retain exact committed state for response projection before redaction.
     pub fn update_record_with_sessions(
         &self,
@@ -1414,16 +1403,19 @@ pub(crate) mod tests {
                 )
                 .unwrap();
             let initial_public = serde_json::to_value(&response).unwrap();
-            let response = service
-                .update_with_sessions(
-                    &instance.id,
-                    super::super::model::InstancePatch {
-                        expected_revision: Some(response.revision),
-                        ..Default::default()
-                    },
-                    &sessions,
-                )
-                .unwrap();
+            let response = public_instance(
+                service
+                    .update_record_with_sessions(
+                        &instance.id,
+                        super::super::model::InstancePatch {
+                            expected_revision: Some(response.revision),
+                            ..Default::default()
+                        },
+                        &sessions,
+                    )
+                    .unwrap()
+                    .instance,
+            );
             revision = response.revision;
             let public = serde_json::to_value(&response).unwrap();
             let repeated = serde_json::to_value(public_instance(response)).unwrap();
@@ -1670,7 +1662,7 @@ pub(crate) mod tests {
         ));
         let sessions = crate::launch::session::SessionManager::new(service.tasks.clone());
         assert!(matches!(
-            service.update_with_sessions(&instance.id, Default::default(), &sessions),
+            service.update_record_with_sessions(&instance.id, Default::default(), &sessions),
             Err(InstanceError::Busy)
         ));
         assert!(

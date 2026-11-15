@@ -523,7 +523,7 @@ impl SessionEntry {
                 first_attempt,
             )
         };
-        match reports.record(report, &super::logs::Redactor::new(Vec::new())) {
+        match reports.record(report, &crate::launch::logs::Redactor::new(Vec::new())) {
             Ok(()) => true,
             Err(error) => {
                 if first_attempt {
@@ -1566,18 +1566,21 @@ mod settlement_tests {
         ))
         .unwrap();
         reports
-            .record_session(SessionReportInput {
-                session_id: "5e78e914-6048-4497-b550-6854ab586420".into(),
-                instance_id: "3e6fa5da-7b17-47f8-b7fd-0a610923d951".into(),
-                version_id: old.version_id.clone(),
-                launched_at: old.launched_at.clone(),
-                ended_at: old.ended_at.clone(),
-                outcome: old.outcome(),
-                entries: collect(GRAPHICS_FAILURE).entries(),
-                exit_code: Some(0),
-                boot_duration_ms: Some(1),
-                logs_dropped: 0,
-            })
+            .record(
+                LaunchProofRecord::from_session(SessionReportInput {
+                    session_id: "5e78e914-6048-4497-b550-6854ab586420".into(),
+                    instance_id: "3e6fa5da-7b17-47f8-b7fd-0a610923d951".into(),
+                    version_id: old.version_id.clone(),
+                    launched_at: old.launched_at.clone(),
+                    ended_at: old.ended_at.clone(),
+                    outcome: old.outcome(),
+                    entries: collect(GRAPHICS_FAILURE).entries(),
+                    exit_code: Some(0),
+                    boot_duration_ms: Some(1),
+                    logs_dropped: 0,
+                }),
+                &crate::launch::logs::Redactor::new(Vec::new()),
+            )
             .unwrap();
         let saved = reports
             .get("5e78e914-6048-4497-b550-6854ab586420")
