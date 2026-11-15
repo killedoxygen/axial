@@ -195,6 +195,23 @@ export function applyConfigTheme(cfg: ConfigView): void {
   });
 }
 
+export type ThemeMode = 'dark' | 'light';
+
+/** Why a theme mode cannot be chosen yet, or null when it can. Every entrypoint asks here. */
+export function themeModeUnavailable(mode: ThemeMode): string | null {
+  return mode === 'light' ? 'In development' : null;
+}
+
+/** Switches the theme mode when it is available; returns whether it changed. */
+export function setThemeMode(mode: ThemeMode): boolean {
+  if (themeModeUnavailable(mode)) return false;
+  applyTheme(local.theme || 'custom', local.customHue, {
+    vibrancy: local.customVibrancy,
+    lightness: mode === 'light' ? 60 : 0,
+  });
+  return true;
+}
+
 export function resetThemeToDefault(): void {
   if (!canEditPreferences()) return;
   const nextTheme = defaults.theme;

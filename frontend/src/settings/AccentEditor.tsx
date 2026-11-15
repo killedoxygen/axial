@@ -3,28 +3,21 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Button } from '../ui/Atoms';
 import { Slider } from '../ui/Slider';
 import { ThemeTiles } from '../ui/SettingsSheet';
-import { applyTheme, resetThemeToDefault } from '../app/theme';
+import { applyTheme, resetThemeToDefault, setThemeMode, themeModeUnavailable, type ThemeMode } from '../app/theme';
 import { defaults, local, PRESET_HUES } from '../app/local-state';
 import { Sound } from '../app/sound';
 import { useTheme } from '../app/use-theme';
 
-type Mode = 'dark' | 'light';
-
 export function ThemeChoice(): JSX.Element {
-  const mode: Mode = useTheme().dark ? 'dark' : 'light';
+  const mode: ThemeMode = useTheme().dark ? 'dark' : 'light';
   return (
-    <ThemeTiles<Mode>
+    <ThemeTiles<ThemeMode>
       value={mode}
       ariaLabel="Theme mode"
-      onChange={(next) =>
-        applyTheme(local.theme || 'custom', local.customHue, {
-          vibrancy: local.customVibrancy,
-          lightness: next === 'light' ? 60 : 0,
-        })
-      }
+      onChange={(next) => void setThemeMode(next)}
       options={[
-        { value: 'dark', label: 'Dark' },
-        { value: 'light', label: 'Light', disabledReason: 'In development' },
+        { value: 'dark', label: 'Dark', disabledReason: themeModeUnavailable('dark') ?? undefined },
+        { value: 'light', label: 'Light', disabledReason: themeModeUnavailable('light') ?? undefined },
       ]}
     />
   );

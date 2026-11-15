@@ -9,7 +9,7 @@ import { Sound } from '../app/sound';
 import { canEditPreferences, local, saveLocalState } from '../app/local-state';
 import { instances } from '../instances/state';
 import { launchSessions } from '../launch/state';
-import { applyTheme } from '../app/theme';
+import { setThemeMode, themeModeUnavailable, type ThemeMode } from '../app/theme';
 import type { EnrichedInstance } from '../generated/EnrichedInstance';
 import type { LaunchSession } from '../launch/state';
 import { commandPaletteOpen, navigate, openAccountSwitcher, openCreate, quickCreate } from '../app/route';
@@ -70,7 +70,7 @@ function buildCommands(): Command[] {
     close();
   };
   const sessions = launchSessions.value;
-  const dark = local.lightness < 50;
+  const otherMode: ThemeMode = local.lightness < 50 ? 'light' : 'dark';
 
   return [
     ...instances.value.slice(0, INSTANCE_LIMIT).map((instance): Command => {
@@ -122,16 +122,20 @@ function buildCommands(): Command[] {
       keys: shortcutKeys('open-settings'),
       perform: go({ name: 'settings' }),
     },
-    {
-      id: 'action:mode',
-      group: 'action',
-      icon: 'palette',
-      label: dark ? 'Switch to light mode' : 'Switch to dark mode',
-      perform: () => {
-        applyTheme(local.theme || 'custom', null, { lightness: dark ? 60 : 0 });
-        close();
-      },
-    },
+    ...(themeModeUnavailable(otherMode)
+      ? []
+      : [
+          {
+            id: 'action:mode',
+            group: 'action',
+            icon: 'palette',
+            label: otherMode === 'light' ? 'Switch to light mode' : 'Switch to dark mode',
+            perform: () => {
+              setThemeMode(otherMode);
+              close();
+            },
+          } satisfies Command,
+        ]),
     {
       id: 'action:music',
       group: 'action',
