@@ -277,6 +277,7 @@ impl PhysicalWorkOwner {
         }
     }
 
+    #[cfg(feature = "test-support")]
     pub fn scratch_limit_bytes(&self) -> u64 {
         self.inner.scratch_limit_bytes
     }
