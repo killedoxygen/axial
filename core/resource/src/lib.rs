@@ -7,6 +7,11 @@ const BACKGROUND_WORKER_LIMIT: usize = 2;
 const HEAVY_IO_LIMIT: usize = 1;
 const SCRATCH_UNIT_BYTES: u64 = 1 << 20;
 const SCRATCH_LIMIT_BYTES: u64 = 512 << 20;
+/// Background workers admitted at once while any host activity (a running
+/// game) holds a lease. Foreground, recovery and shutdown work is unaffected.
+const BACKGROUND_DURING_ACTIVITY: usize = 1;
+/// Concurrent activities one process may record.
+const MAX_ACTIVITIES: usize = 64;
 const PROCESS_LIMITS: PhysicalWorkLimits = PhysicalWorkLimits {
     workers: PROCESS_WORKER_LIMIT,
     background: BACKGROUND_WORKER_LIMIT,
@@ -102,6 +107,52 @@ pub enum PhysicalWorkError {
     TaskStopped,
 }
 
+/// Owner-neutral record of what the host is running: how many activities
+/// and the memory they reserved. A revision orders every change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ActivitySnapshot {
+    pub count: usize,
+    pub reserved_mib: u64,
+    pub revision: u64,
+}
+
+/// One recorded activity; dropping it releases its count and reservation.
+pub struct ActivityLease {
+    owner: Arc<PhysicalWorkOwnerInner>,
+    reserved_mib: u64,
+}
+
+impl ActivityLease {
+    pub fn reserved_mib(&self) -> u64 {
+        self.reserved_mib
+    }
+}
+
+impl std::fmt::Debug for ActivityLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ActivityLease")
+            .field("reserved_mib", &self.reserved_mib)
+            .finish()
+    }
+}
+
+impl Drop for ActivityLease {
+    fn drop(&mut self) {
+        let mut ledger = self
+            .owner
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.count = ledger.count.saturating_sub(1);
+        ledger.reserved_mib = ledger.reserved_mib.saturating_sub(self.reserved_mib);
+        ledger.revision = ledger.revision.wrapping_add(1);
+        let revision = ledger.revision;
+        drop(ledger);
+        self.owner.activity_changed.send_replace(revision);
+    }
+}
+
 #[derive(Clone)]
 pub struct PhysicalWorkOwner {
     inner: Arc<PhysicalWorkOwnerInner>,
@@ -111,6 +162,7 @@ pub struct PhysicalWorkAdmission {
     owner: Arc<PhysicalWorkOwnerInner>,
     class: PhysicalWorkClass,
     _background: Option<OwnedSemaphorePermit>,
+    _quieted: Option<OwnedSemaphorePermit>,
     _scratch: Option<OwnedSemaphorePermit>,
     _heavy: Option<OwnedSemaphorePermit>,
     _worker: OwnedSemaphorePermit,
@@ -142,6 +194,9 @@ struct PhysicalWorkOwnerInner {
     workers: Arc<Semaphore>,
     worker_limit: usize,
     background: Arc<Semaphore>,
+    background_during_activity: Arc<Semaphore>,
+    activity: std::sync::Mutex<ActivitySnapshot>,
+    activity_changed: watch::Sender<u64>,
     heavy: Arc<Semaphore>,
     scratch: Arc<Semaphore>,
     scratch_limit_bytes: u64,
@@ -197,6 +252,9 @@ impl PhysicalWorkOwner {
                 workers: Arc::new(Semaphore::new(limits.workers)),
                 worker_limit: limits.workers,
                 background: Arc::new(Semaphore::new(limits.background)),
+                background_during_activity: Arc::new(Semaphore::new(BACKGROUND_DURING_ACTIVITY)),
+                activity: std::sync::Mutex::new(ActivitySnapshot::default()),
+                activity_changed: watch::channel(0).0,
                 heavy: Arc::new(Semaphore::new(limits.heavy)),
                 scratch: Arc::new(Semaphore::new(scratch_units)),
                 scratch_limit_bytes: limits.scratch_bytes,
@@ -204,6 +262,49 @@ impl PhysicalWorkOwner {
                 running: std::array::from_fn(|_| AtomicUsize::new(0)),
             }),
         }
+    }
+
+    /// The host activities currently recorded.
+    pub fn activity(&self) -> ActivitySnapshot {
+        *self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Notified with the ledger revision after every change.
+    pub fn subscribe_activity(&self) -> watch::Receiver<u64> {
+        self.inner.activity_changed.subscribe()
+    }
+
+    /// Records one host activity, sized from the ledger it joins: `size` sees
+    /// every other activity's reservation and returns this one's, so two
+    /// concurrent starts can never both size against the same free memory.
+    pub fn begin_activity<E>(
+        &self,
+        size: impl FnOnce(&ActivitySnapshot) -> Result<u64, E>,
+        at_capacity: E,
+    ) -> Result<ActivityLease, E> {
+        let mut ledger = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ledger.count >= MAX_ACTIVITIES {
+            return Err(at_capacity);
+        }
+        let reserved_mib = size(&ledger)?;
+        ledger.count += 1;
+        ledger.reserved_mib = ledger.reserved_mib.saturating_add(reserved_mib);
+        ledger.revision = ledger.revision.wrapping_add(1);
+        let revision = ledger.revision;
+        drop(ledger);
+        self.inner.activity_changed.send_replace(revision);
+        Ok(ActivityLease {
+            owner: Arc::clone(&self.inner),
+            reserved_mib,
+        })
     }
 
     pub fn group(&self) -> PhysicalWorkGroup {
@@ -229,6 +330,14 @@ impl PhysicalWorkOwner {
         } else {
             None
         };
+        // While a game runs, background work is narrowed, never stopped.
+        let quieted = if request.class == PhysicalWorkClass::Background
+            && self.activity().count > 0
+        {
+            Some(acquire_one(&self.inner.background_during_activity).await?)
+        } else {
+            None
+        };
         let heavy = if request.io == PhysicalIoClass::Heavy {
             Some(acquire_one(&self.inner.heavy).await?)
         } else {
@@ -240,6 +349,7 @@ impl PhysicalWorkOwner {
             owner: Arc::clone(&self.inner),
             class: request.class,
             _background: background,
+            _quieted: quieted,
             _scratch: scratch,
             _heavy: heavy,
             _worker: worker,
@@ -357,6 +467,13 @@ impl PhysicalWorkOwner {
         } else {
             None
         };
+        let quieted = if request.class == PhysicalWorkClass::Background
+            && self.activity().count > 0
+        {
+            Some(try_acquire_one(&self.inner.background_during_activity)?)
+        } else {
+            None
+        };
         let heavy = if request.io == PhysicalIoClass::Heavy {
             Some(try_acquire_one(&self.inner.heavy)?)
         } else {
@@ -368,6 +485,7 @@ impl PhysicalWorkOwner {
             owner: Arc::clone(&self.inner),
             class: request.class,
             _background: background,
+            _quieted: quieted,
             _scratch: scratch,
             _heavy: heavy,
             _worker: worker,
@@ -734,6 +852,52 @@ struct PhysicalWorkLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_leases_size_against_each_other_and_release_exactly() {
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let first = owner
+            .begin_activity(|ledger| Ok::<_, ()>(4096 - ledger.reserved_mib.min(4096)), ())
+            .unwrap();
+        let second = owner
+            .begin_activity(
+                |ledger| Ok::<_, ()>(4096u64.saturating_sub(ledger.reserved_mib).max(512)),
+                (),
+            )
+            .unwrap();
+        assert_eq!((first.reserved_mib(), second.reserved_mib()), (4096, 512));
+        let snapshot = owner.activity();
+        assert_eq!((snapshot.count, snapshot.reserved_mib), (2, 4608));
+        drop(first);
+        let after = owner.activity();
+        assert_eq!((after.count, after.reserved_mib), (1, 512));
+        assert!(after.revision > snapshot.revision);
+        assert_eq!(owner.begin_activity(|_| Err("refused"), "full").unwrap_err(), "refused");
+        drop(second);
+        assert_eq!(owner.activity().count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_running_activity_narrows_background_work_but_never_foreground() {
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let lease = owner.begin_activity(|_| Ok::<_, ()>(1024), ()).unwrap();
+        let first = owner
+            .admit(PhysicalWorkRequest::background(PhysicalIoClass::Read, 0))
+            .await
+            .unwrap();
+        assert!(matches!(
+            owner.try_admit(PhysicalWorkRequest::background(PhysicalIoClass::Read, 0)),
+            Err(PhysicalWorkError::Unavailable)
+        ));
+        let foreground = owner
+            .try_admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0))
+            .unwrap();
+        drop(lease);
+        let second = owner
+            .try_admit(PhysicalWorkRequest::background(PhysicalIoClass::Read, 0))
+            .unwrap();
+        drop((first, second, foreground));
+    }
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 

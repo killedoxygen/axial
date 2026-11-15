@@ -322,12 +322,31 @@ pub enum OverrideOrigin {
     Instance,
 }
 
+/// The maximum heap a launch was configured with. Automatic is resolved by
+/// the launch resources owner from the observed host and running games.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeapChoice {
+    Automatic,
+    Explicit(i32),
+}
+
+impl HeapChoice {
+    /// The persisted global maximum: zero is Automatic.
+    pub fn from_global(max_memory_mb: i32) -> Self {
+        if max_memory_mb == AUTOMATIC_HEAP_MB {
+            Self::Automatic
+        } else {
+            Self::Explicit(max_memory_mb)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectiveLaunchSettings {
     pub global_config_revision: u64,
-    pub max_memory_mb: i32,
+    pub heap: HeapChoice,
+    /// The configured initial heap; the launch bounds it by the decided maximum.
     pub min_memory_mb: i32,
-    pub min_memory_clamped: bool,
     pub java_path: String,
     pub java_override_origin: Option<OverrideOrigin>,
     pub window_width: i32,
@@ -341,16 +360,13 @@ pub struct EffectiveLaunchSettings {
 }
 
 impl EffectiveLaunchSettings {
-    /// Replaces an Automatic maximum with the heap resolved for this launch
-    /// and bounds the initial heap by the effective maximum.
-    pub fn resolve_heap(&mut self, automatic_max_mb: i32) {
-        if self.max_memory_mb == AUTOMATIC_HEAP_MB {
-            self.max_memory_mb = automatic_max_mb;
-            if self.min_memory_mb > self.max_memory_mb {
-                self.min_memory_mb = self.max_memory_mb;
-                self.min_memory_clamped = true;
-            }
-        }
+    /// (maximum, initial, initial clamped) for a decided maximum heap.
+    pub fn heap_bounds(&self, max_memory_mb: i32) -> (i32, i32, bool) {
+        (
+            max_memory_mb,
+            self.min_memory_mb.min(max_memory_mb),
+            self.min_memory_mb > max_memory_mb,
+        )
     }
 }
 
@@ -388,7 +404,11 @@ impl InstanceSettings {
         self.validate()?;
         global.validate()?;
         let inherit = |local, fallback| if local > 0 { local } else { fallback };
-        let max_memory_mb = inherit(self.max_memory_mb, global.max_memory_mb);
+        let heap = if self.max_memory_mb > 0 {
+            HeapChoice::Explicit(self.max_memory_mb)
+        } else {
+            HeapChoice::from_global(global.max_memory_mb)
+        };
         let min_memory_mb = inherit(self.min_memory_mb, global.min_memory_mb);
         let origin = |local: bool, global: bool| {
             if local {
@@ -397,16 +417,10 @@ impl InstanceSettings {
                 global.then_some(OverrideOrigin::Global)
             }
         };
-        let automatic = max_memory_mb == AUTOMATIC_HEAP_MB;
         Ok(EffectiveLaunchSettings {
             global_config_revision: global.revision,
-            max_memory_mb,
-            min_memory_mb: if automatic {
-                min_memory_mb
-            } else {
-                min_memory_mb.min(max_memory_mb)
-            },
-            min_memory_clamped: !automatic && min_memory_mb > max_memory_mb,
+            heap,
+            min_memory_mb,
             java_path: if self.java_path.trim().is_empty() {
                 global.java_path_override.trim()
             } else {

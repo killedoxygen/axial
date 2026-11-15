@@ -30,6 +30,9 @@ pub(super) struct PreparedSession {
     credential_expires_at: Option<u64>,
     telemetry: Arc<super::session::LaunchAttemptTelemetry>,
     stages: Vec<super::reports::LaunchProofStage>,
+    /// This session's host activity and heap reservation, held until the
+    /// session actor settles.
+    _activity: axial_resource::ActivityLease,
 }
 
 impl PreparedSession {
@@ -53,6 +56,7 @@ impl PreparedSession {
         credential_expires_at: Option<u64>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
         stages: Vec<super::reports::LaunchProofStage>,
+        activity: axial_resource::ActivityLease,
     ) -> Result<Self, PrepareError> {
         let prepared = Self {
             instance_id,
@@ -71,6 +75,7 @@ impl PreparedSession {
             credential_expires_at,
             telemetry,
             stages,
+            _activity: activity,
         };
         // Command construction just validated its retained file evidence.
         // The process actor repeats that proof at the actual spawn boundary.
@@ -111,6 +116,12 @@ impl PreparedSession {
 
     pub(super) fn natives(&self) -> Option<Arc<crate::install::vanilla::PreparedNatives>> {
         self.command.prepared_natives.clone()
+    }
+
+    /// The heap this session reserved in the host activity ledger.
+    #[cfg(test)]
+    pub(super) fn reserved_heap_mib(&self) -> u64 {
+        self._activity.reserved_mib()
     }
 
     pub(super) fn stages(&self) -> &[super::reports::LaunchProofStage] {
@@ -422,6 +433,9 @@ pub(super) mod tests {
             credential_expires_at: None,
             telemetry: super::super::session::LaunchAttemptTelemetry::started(None, "vanilla"),
             stages: Vec::new(),
+            _activity: axial_resource::process_physical_work()
+                .begin_activity(|_| Ok::<_, ()>(0), ())
+                .unwrap(),
         };
         (root, prepared, library.admit_application_root().unwrap())
     }
@@ -444,6 +458,7 @@ pub(super) mod tests {
             prepared.credential_expires_at,
             prepared.telemetry,
             prepared.stages,
+            prepared._activity,
         )
     }
 

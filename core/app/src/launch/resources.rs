@@ -6,22 +6,112 @@ const MEMORY_HEADROOM_MB: u64 = 2048;
 const DISK_HEADROOM_MB: u64 = 2048;
 const MIB: u64 = 1024 * 1024;
 
+/// One successful memory sample. A host with no total memory reported was
+/// not sampled; every value of a successful sample, including zero, is real.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HostMemory {
+    pub total_mb: u64,
+    pub available_mb: u64,
+    pub used_mb: u64,
+}
+
 pub(super) struct HostResources {
-    pub total_memory_mb: u64,
-    pub available_memory_mb: u64,
-    pub used_memory_mb: u64,
+    pub memory: Option<HostMemory>,
     pub cpu_threads: Option<usize>,
 }
 
 pub(super) fn capture_host() -> HostResources {
     let mut host = System::new();
     host.refresh_memory();
+    let total_mb = host.total_memory() / MIB;
     HostResources {
-        total_memory_mb: host.total_memory() / MIB,
-        available_memory_mb: host.available_memory() / MIB,
-        used_memory_mb: host.used_memory() / MIB,
+        memory: (total_mb > 0).then(|| HostMemory {
+            total_mb,
+            available_mb: host.available_memory() / MIB,
+            used_mb: host.used_memory() / MIB,
+        }),
         cpu_threads: std::thread::available_parallelism().ok().map(usize::from),
     }
+}
+
+/// How a launch's maximum heap was decided.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HeapSource {
+    Explicit,
+    Automatic,
+    /// Host memory could not be sampled; the conventional default was used.
+    AutomaticHostUnknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct HeapDecision {
+    pub max_mb: i32,
+    pub source: HeapSource,
+}
+
+/// The heap an Automatic choice aims for when the host has room.
+const AUTOMATIC_HEAP_TARGET_MB: u64 = 4096;
+/// Automatic when host memory could not be sampled.
+const AUTOMATIC_HEAP_UNKNOWN_HOST_MB: i32 = 2048;
+/// Memory the operating system, the launcher and each game's off-heap use
+/// (metaspace, code cache, direct buffers, natives) keep from automatic heaps.
+const AUTOMATIC_HEADROOM_MB: u64 = 1536;
+const HEAP_GRANULE_MB: u64 = 256;
+
+/// Decides the maximum heap. Automatic sizes from the sampled total memory
+/// less headroom and the heaps other running games reserved, never more than
+/// half the host or the target. It does not read available memory, which
+/// already excludes those games' resident pages, so nothing is counted twice.
+pub(super) fn decide_heap(
+    choice: crate::settings::HeapChoice,
+    memory: Option<&HostMemory>,
+    reserved_by_others_mb: u64,
+) -> HeapDecision {
+    let floor = crate::settings::HEAP_MIN_MB as u64;
+    match (choice, memory) {
+        (crate::settings::HeapChoice::Explicit(max_mb), _) => HeapDecision {
+            max_mb,
+            source: HeapSource::Explicit,
+        },
+        (crate::settings::HeapChoice::Automatic, None) => HeapDecision {
+            max_mb: AUTOMATIC_HEAP_UNKNOWN_HOST_MB,
+            source: HeapSource::AutomaticHostUnknown,
+        },
+        (crate::settings::HeapChoice::Automatic, Some(memory)) => {
+            let room = memory
+                .total_mb
+                .saturating_sub(AUTOMATIC_HEADROOM_MB)
+                .saturating_sub(reserved_by_others_mb);
+            let heap = AUTOMATIC_HEAP_TARGET_MB.min(memory.total_mb / 2).min(room);
+            let heap = (heap / HEAP_GRANULE_MB * HEAP_GRANULE_MB).max(floor);
+            HeapDecision {
+                max_mb: i32::try_from(heap).unwrap_or(crate::settings::HEAP_MIN_MB),
+                source: HeapSource::Automatic,
+            }
+        }
+    }
+}
+
+/// Decides this launch's heap against every other running game's reservation
+/// and records it in the process activity ledger in one step. The lease is
+/// held for the session's life; concurrent starts never size against the
+/// same unreserved memory.
+pub(super) fn reserve_heap(
+    work: &axial_resource::PhysicalWorkOwner,
+    choice: crate::settings::HeapChoice,
+    host: &HostResources,
+) -> Result<(axial_resource::ActivityLease, HeapDecision), super::coordinator::LaunchError> {
+    let mut decision = None;
+    let lease = work.begin_activity(
+        |ledger| {
+            let decided = decide_heap(choice, host.memory.as_ref(), ledger.reserved_mib);
+            decision = Some(decided);
+            Ok(decided.max_mb.max(0) as u64)
+        },
+        super::coordinator::LaunchError::AtCapacity,
+    )?;
+    Ok((lease, decision.expect("decided under the ledger lock")))
 }
 
 pub(super) fn capture(
@@ -32,7 +122,7 @@ pub(super) fn capture(
     paths: [&Path; 2],
 ) -> LaunchProofResourceBudget {
     let positive = |value| (value > 0).then_some(value);
-    let total = positive(host.total_memory_mb);
+    let total = host.memory.map(|memory| memory.total_mb);
     let requested_memory_mb = (requested_memory_mb > 0).then_some(requested_memory_mb);
     let remaining = total.zip(requested_memory_mb).map(|(total, requested)| {
         (i128::from(total) - i128::from(active_memory_allocation_mb) - i128::from(requested))
@@ -86,8 +176,8 @@ pub(super) fn capture(
         .min();
     LaunchProofResourceBudget {
         host_total_memory_mb: total,
-        host_available_memory_mb: positive(host.available_memory_mb),
-        host_used_memory_mb: positive(host.used_memory_mb),
+        host_available_memory_mb: host.memory.map(|memory| memory.available_mb),
+        host_used_memory_mb: host.memory.map(|memory| memory.used_mb),
         host_cpu_threads: host.cpu_threads,
         host_cpu_load_1m_x100: loads[0],
         host_cpu_load_5m_x100: loads[1],
@@ -447,12 +537,91 @@ mod tests {
     }
 
     #[test]
+    fn a_sampled_zero_is_real_and_only_a_failed_sample_is_unknown() {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let host = HostResources {
+            memory: Some(HostMemory {
+                total_mb: 8192,
+                available_mb: 0,
+                used_mb: 8192,
+            }),
+            cpu_threads: None,
+        };
+        let budget = capture(&host, (0, 0), 0, 2048, [root.path(), root.path()]);
+        assert_eq!(budget.host_available_memory_mb, Some(0));
+        let payload = serde_json::to_value(&budget).unwrap();
+        assert_eq!(payload["host_available_memory_mb"], 0);
+    }
+
+    #[test]
+    fn automatic_heaps_size_from_total_less_headroom_and_other_reservations() {
+        use crate::settings::HeapChoice::{Automatic, Explicit};
+        let memory = |total_mb| HostMemory {
+            total_mb,
+            available_mb: 0,
+            used_mb: 0,
+        };
+        for (total, reserved, expected) in [
+            (24_576, 0, 4096),
+            (24_576, 18_432, 4096),
+            (24_576, 20_480, 2560),
+            (24_576, 24_000, 512),
+            (6_144, 0, 3072),
+            (6_144, 2_048, 2560),
+            (1_536, 0, 512),
+            (1_024, 0, 512),
+        ] {
+            let decided = decide_heap(Automatic, Some(&memory(total)), reserved);
+            assert_eq!(decided.source, HeapSource::Automatic);
+            assert_eq!(decided.max_mb, expected, "{total} {reserved}");
+        }
+        assert_eq!(
+            decide_heap(Automatic, None, 0),
+            HeapDecision {
+                max_mb: 2048,
+                source: HeapSource::AutomaticHostUnknown
+            }
+        );
+        assert_eq!(
+            decide_heap(Explicit(16_384), Some(&memory(4096)), 8192),
+            HeapDecision {
+                max_mb: 16_384,
+                source: HeapSource::Explicit
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_automatic_reservations_never_size_against_the_same_memory() {
+        let host = HostResources {
+            memory: Some(HostMemory {
+                total_mb: 9_728,
+                available_mb: 0,
+                used_mb: 0,
+            }),
+            cpu_threads: None,
+        };
+        let work = axial_resource::PhysicalWorkOwner::isolated_for_test();
+        let automatic = crate::settings::HeapChoice::Automatic;
+        let (first, a) = reserve_heap(&work, automatic, &host).unwrap();
+        let (second, b) = reserve_heap(&work, automatic, &host).unwrap();
+        assert_eq!((a.max_mb, b.max_mb), (4096, 4096));
+        let (third, c) = reserve_heap(&work, automatic, &host).unwrap();
+        assert_eq!(c.max_mb, 512, "the third start sees both earlier reservations");
+        assert_eq!(work.activity().reserved_mib, 4096 + 4096 + 512);
+        drop(third);
+        drop((first, second));
+    }
+
+    #[test]
     fn resource_snapshot_preserves_overcommit_and_unknown_observations() {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let host = HostResources {
-            total_memory_mb: 4096,
-            available_memory_mb: 1024,
-            used_memory_mb: 3072,
+            memory: Some(HostMemory {
+                total_mb: 4096,
+                available_mb: 1024,
+                used_mb: 3072,
+            }),
             cpu_threads: None,
         };
         let budget = capture(&host, (2, 2048), 1, 4096, [root.path(), root.path()]);
@@ -471,9 +640,7 @@ mod tests {
         assert!(budget.memory_pressure && budget.install_pressure && !budget.cpu_pressure);
         let missing = root.path().join("missing");
         let host = HostResources {
-            total_memory_mb: 0,
-            available_memory_mb: 0,
-            used_memory_mb: 0,
+            memory: None,
             cpu_threads: None,
         };
         let mut budget = capture(&host, (0, 0), 0, 0, [&missing, &missing]);

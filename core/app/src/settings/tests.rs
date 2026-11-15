@@ -415,34 +415,24 @@ fn instance_settings_inherit_and_reset_with_retained_memory_clamping() {
         ..ConfigView::default()
     };
     let mut instance = InstanceSettings::default();
-    let mut inherited = instance.effective(&global).unwrap();
-    assert_eq!(
-        (inherited.max_memory_mb, inherited.min_memory_mb),
-        (AUTOMATIC_HEAP_MB, 512)
-    );
-    inherited.resolve_heap(3072);
-    assert_eq!(
-        (
-            inherited.max_memory_mb,
-            inherited.min_memory_mb,
-            inherited.min_memory_clamped
-        ),
-        (3072, 512, false)
-    );
-    let mut small = InstanceSettings {
+    let inherited = instance.effective(&global).unwrap();
+    assert_eq!(inherited.heap, HeapChoice::Automatic);
+    assert_eq!(inherited.min_memory_mb, 512);
+    assert_eq!(inherited.heap_bounds(3072), (3072, 512, false));
+    let small = InstanceSettings {
         min_memory_mb: 2048,
         ..InstanceSettings::default()
     }
     .effective(&global)
     .unwrap();
-    small.resolve_heap(1024);
+    assert_eq!(small.heap_bounds(1024), (1024, 1024, true));
+    let explicit_global = ConfigView {
+        max_memory_mb: 6144,
+        ..global.clone()
+    };
     assert_eq!(
-        (
-            small.max_memory_mb,
-            small.min_memory_mb,
-            small.min_memory_clamped
-        ),
-        (1024, 1024, true)
+        instance.effective(&explicit_global).unwrap().heap,
+        HeapChoice::Explicit(6144)
     );
     assert_eq!(inherited.java_path, "/custom/java");
     assert_eq!(inherited.jvm_preset, ConfigJvmPreset::Smooth);
@@ -453,17 +443,13 @@ fn instance_settings_inherit_and_reset_with_retained_memory_clamping() {
     instance.performance_mode = "vanilla".into();
     instance.window_width = 1920;
     let overridden = instance.effective(&global).unwrap();
-    assert_eq!(
-        (overridden.max_memory_mb, overridden.min_memory_mb),
-        (1024, 1024)
-    );
+    assert_eq!(overridden.heap, HeapChoice::Explicit(1024));
+    assert_eq!(overridden.heap_bounds(1024), (1024, 1024, true));
     assert_eq!(overridden.java_path, "/instance/java");
     assert_eq!(overridden.performance_mode, ConfigPerformanceMode::Vanilla);
     assert_eq!(
         (overridden.window_width, overridden.window_height),
         (1920, 720)
     );
-    let mut reset = InstanceSettings::default().effective(&global).unwrap();
-    reset.resolve_heap(3072);
-    assert_eq!(reset, inherited);
+    assert_eq!(InstanceSettings::default().effective(&global).unwrap(), inherited);
 }

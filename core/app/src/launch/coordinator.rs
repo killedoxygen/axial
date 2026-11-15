@@ -280,13 +280,11 @@ impl LaunchCoordinator {
         }
     }
 
-    /// Captures the account selection and effective settings, resolving an
-    /// Automatic heap from this host observation.
+    /// Captures the account selection and effective settings.
     fn capture(
         &self,
         instance: &crate::instances::model::Instance,
         username: Option<&str>,
-        host: &super::resources::HostResources,
     ) -> Result<(CapturedSelection, EffectiveLaunchSettings, String), LaunchError> {
         let selection = CapturedSelection::capture(&self.accounts)
             .map_err(|_| LaunchError::AccountUnavailable)?;
@@ -306,14 +304,10 @@ impl LaunchCoordinator {
             .settings
             .current()
             .map_err(|_| LaunchError::SettingsChanged)?;
-        let mut settings = instance
+        let settings = instance
             .settings
             .effective(&global)
             .map_err(|_| LaunchError::PlanRejected)?;
-        settings.resolve_heap(super::jvm::automatic_max_heap_mb(
-            host.total_memory_mb,
-            host.available_memory_mb,
-        ));
         super::plan::split_extra_args(&settings.extra_jvm_args)
             .map_err(|_| LaunchError::PlanRejected)?;
         let player_name = selection
@@ -379,13 +373,10 @@ impl LaunchCoordinator {
     ) -> Result<PreparedSession, LaunchError> {
         let stages = super::reports::StageTimings::default();
         let host = super::resources::capture_host();
-        let (selection, mut effective, player_name) = self.capture(
-            &admitted.record().instance,
-            request.username.as_deref(),
-            &host,
-        )?;
+        let (selection, mut effective, player_name) =
+            self.capture(&admitted.record().instance, request.username.as_deref())?;
         if let Some(value) = request.max_memory_mb.filter(|value| *value > 0) {
-            effective.max_memory_mb = value;
+            effective.heap = crate::settings::HeapChoice::Explicit(value);
         }
         if let Some(value) = request.min_memory_mb.filter(|value| *value > 0) {
             effective.min_memory_mb = value;
@@ -398,7 +389,15 @@ impl LaunchCoordinator {
         {
             return Err(LaunchError::InstanceChanged);
         }
-        let options = launch_options(&effective)?;
+        // The heap is decided against every other running game's reservation
+        // and reserved for this session's life in the same step.
+        let (activity, heap) = super::resources::reserve_heap(
+            &axial_resource::process_physical_work(),
+            effective.heap,
+            &host,
+        )?;
+        let (max_memory_mb, min_memory_mb, _) = effective.heap_bounds(heap.max_mb);
+        let options = launch_options(&effective, max_memory_mb, min_memory_mb)?;
         let composition = self
             .performance
             .settled_for_launch(&admitted)
@@ -540,7 +539,7 @@ impl LaunchCoordinator {
             &host,
             self.sessions.resource_use(),
             self.installs.active_count(),
-            effective.max_memory_mb,
+            max_memory_mb,
             [&library_dir, &game_dir],
         );
         let mut command = stages
@@ -572,7 +571,7 @@ impl LaunchCoordinator {
         let mut scenario = super::reports::LaunchProofScenario::default();
         scenario.performance_mode = effective.performance_mode.as_str().into();
         scenario.version_id = Some(instance.version_id.clone());
-        scenario.requested_memory_mb = Some(effective.max_memory_mb);
+        scenario.requested_memory_mb = Some(max_memory_mb);
         PreparedSession::new(
             instance.id,
             instance.version_id,
@@ -590,6 +589,7 @@ impl LaunchCoordinator {
             credential_expires_at,
             telemetry,
             stages.take(),
+            activity,
         )
     }
 
@@ -677,15 +677,19 @@ fn capture_after_profile(
     Ok(current)
 }
 
-fn launch_options(effective: &EffectiveLaunchSettings) -> Result<LaunchOptions, LaunchError> {
+fn launch_options(
+    effective: &EffectiveLaunchSettings,
+    max_memory_mb: i32,
+    min_memory_mb: i32,
+) -> Result<LaunchOptions, LaunchError> {
     let resolution = match (effective.window_width, effective.window_height) {
         (0, 0) => None,
         (width, height) if width > 0 && height > 0 => Some((width as u32, height as u32)),
         _ => return Err(LaunchError::PlanRejected),
     };
     Ok(LaunchOptions {
-        min_memory_mb: Some(effective.min_memory_mb),
-        max_memory_mb: Some(effective.max_memory_mb),
+        min_memory_mb: Some(min_memory_mb),
+        max_memory_mb: Some(max_memory_mb),
         resolution,
         extra_jvm_args: super::plan::split_extra_args(&effective.extra_jvm_args)
             .map_err(|_| LaunchError::PlanRejected)?,

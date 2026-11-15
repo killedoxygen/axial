@@ -11,7 +11,7 @@ pub use flags::{
 };
 pub use model::{
     AUTOMATIC_HEAP_MB, ConfigJvmPreset, ConfigLaunchAuthMode, ConfigPatch, ConfigPerformanceMode,
-    ConfigTheme, ConfigView, EffectiveLaunchSettings, GLOBAL_HEAP_MAX_MB, HEAP_MAX_MB, HEAP_MIN_MB,
+    ConfigTheme, ConfigView, EffectiveLaunchSettings, GLOBAL_HEAP_MAX_MB, HeapChoice, HEAP_MAX_MB, HEAP_MIN_MB,
     INITIAL_HEAP_MIN_MB, InstanceSettings, NullablePatch, OverrideOrigin, validate_username,
 };
 pub use preferences::{

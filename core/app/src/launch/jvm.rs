@@ -21,14 +21,6 @@ pub const PRESET_LEGACY: &str = "legacy";
 pub const PRESET_LEGACY_PVP: &str = "legacy_pvp";
 pub const PRESET_LEGACY_HEAVY: &str = "legacy_heavy";
 
-/// The heap an Automatic choice aims for when the host has room.
-const AUTOMATIC_HEAP_TARGET_MB: u64 = 4096;
-/// The smallest Automatic heap; a host with less still gets half its memory.
-const AUTOMATIC_HEAP_FLOOR_MB: u64 = 1024;
-/// Memory the operating system, the launcher and the game's off-heap use
-/// (metaspace, code cache, direct buffers, native libraries) keep from a heap.
-const AUTOMATIC_HEADROOM_MB: u64 = 1536;
-const HEAP_GRANULE_MB: u64 = 256;
 
 /// The launcher flags for `mode` and an already admitted explicit `preset`
 /// (empty for Automatic).
@@ -131,26 +123,6 @@ fn is_legacy_family(version_id: &str) -> bool {
     matches!((parts.next(), parts.next()), (Some(Ok(1)), Some(Ok(minor))) if minor <= 12)
 }
 
-/// The Automatic maximum heap from a completed host observation: the target
-/// when the host has room, never more than half of its memory or its free
-/// memory after headroom, and never below the floor a host can afford.
-/// Available memory already excludes running games' resident memory, so their
-/// committed heaps are not subtracted again. A missing sample (zero) is
-/// unknown, not empty: it does not constrain the choice.
-pub(crate) fn automatic_max_heap_mb(total_mb: u64, available_mb: u64) -> i32 {
-    let mut heap = AUTOMATIC_HEAP_TARGET_MB;
-    if total_mb > 0 {
-        let half = total_mb / 2;
-        heap = heap.min(half);
-        if available_mb > 0 {
-            heap = heap.min(available_mb.saturating_sub(AUTOMATIC_HEADROOM_MB));
-        }
-        heap = heap.max(AUTOMATIC_HEAP_FLOOR_MB.min(half));
-    }
-    let heap = (heap / HEAP_GRANULE_MB * HEAP_GRANULE_MB).max(crate::settings::HEAP_MIN_MB as u64);
-    i32::try_from(heap).unwrap_or(crate::settings::HEAP_MIN_MB)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,23 +206,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn automatic_heap_fits_the_observed_host() {
-        for (total, available, expected) in [
-            (24_576, 11_000, 4096),
-            (24_576, 4_000, 2304),
-            (24_576, 1_000, 1024),
-            (6_144, 3_800, 2048),
-            (4_096, 3_000, 1280),
-            (1_536, 1_200, 768),
-            (0, 0, 4096),
-            (16_384, 0, 4096),
-        ] {
-            assert_eq!(
-                automatic_max_heap_mb(total, available),
-                expected,
-                "{total} {available}"
-            );
-        }
-    }
 }

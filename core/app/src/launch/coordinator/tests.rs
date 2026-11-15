@@ -1196,6 +1196,16 @@ async fn prepared_launch_does_not_refresh_a_changed_library_scan() {
             )
             .await
             .unwrap();
+        // The Automatic heap in the actual command is the one recorded and
+        // reserved for this session.
+        let xmx = prepared
+            .validated_command()
+            .args()
+            .iter()
+            .find_map(|arg| arg.strip_prefix("-Xmx")?.strip_suffix('M')?.parse::<i32>().ok())
+            .unwrap();
+        assert_eq!(prepared.scenario().requested_memory_mb, Some(xmx));
+        assert_eq!(prepared.reserved_heap_mib(), xmx as u64);
         let initial = prepared.validate_before_spawn();
         let revision_before = versions.revision().unwrap();
         let observe_changed_revision = || async {

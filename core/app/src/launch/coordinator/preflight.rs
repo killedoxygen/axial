@@ -96,6 +96,7 @@ pub enum PreflightStatus {
 pub struct PreflightMemory {
     pub max_memory_mb: i32,
     pub min_memory_mb: i32,
+    pub source: crate::launch::resources::HeapSource,
     pub min_clamped: bool,
 }
 
@@ -175,15 +176,20 @@ pub struct PreflightResourceBudget {
 impl PreflightDiagnostics {
     pub(super) fn from_capture(
         settings: &EffectiveLaunchSettings,
+        heap: crate::launch::resources::HeapDecision,
         budget: crate::launch::reports::LaunchProofResourceBudget,
         readiness: PreflightReadiness,
     ) -> Self {
         Self {
             status: PreflightStatus::Ready,
-            memory: PreflightMemory {
-                max_memory_mb: settings.max_memory_mb,
-                min_memory_mb: settings.min_memory_mb,
-                min_clamped: settings.min_memory_clamped,
+            memory: {
+                let (max_memory_mb, min_memory_mb, min_clamped) = settings.heap_bounds(heap.max_mb);
+                PreflightMemory {
+                    max_memory_mb,
+                    min_memory_mb,
+                    source: heap.source,
+                    min_clamped,
+                }
             },
             overrides: PreflightOverrides {
                 java: settings.java_override_origin.into(),
@@ -590,7 +596,7 @@ impl LaunchCoordinator {
                     };
                     let version = &proof.version;
                     let (selection, settings, _) =
-                        coordinator.capture(&admitted.record().instance, None, &host)?;
+                        coordinator.capture(&admitted.record().instance, None)?;
                     captured_context = Some((selection.clone(), settings.global_config_revision));
                     let result = async {
                         if let Some(account) = selection.account()
@@ -659,7 +665,13 @@ impl LaunchCoordinator {
                             }
                             Err(error) => return Err(LaunchError::RuntimeFailure(error)),
                         };
-                        let options = launch_options(&settings)?;
+                        let heap = crate::launch::resources::decide_heap(
+                            settings.heap,
+                            host.memory.as_ref(),
+                            axial_resource::process_physical_work().activity().reserved_mib,
+                        );
+                        let (max_memory_mb, min_memory_mb, _) = settings.heap_bounds(heap.max_mb);
+                        let options = launch_options(&settings, max_memory_mb, min_memory_mb)?;
                         match runtime {
                             Some(runtime) => crate::launch::plan::validate_options(
                                 &options,
@@ -843,7 +855,7 @@ impl LaunchCoordinator {
                 if diagnostics && let Some(reasons) = refused_reasons {
                     let target = &admitted.record().instance;
                     if let Ok(ref mut refused) = result
-                        && let Ok((selection, settings, _)) = coordinator.capture(target, None, &host)
+                        && let Ok((selection, settings, _)) = coordinator.capture(target, None)
                         && let Ok(facts) = coordinator.preflight_diagnostics(
                             &admitted,
                             &settings,
@@ -911,15 +923,20 @@ impl LaunchCoordinator {
         let game_dir = game
             .read_projection()
             .map_err(|_| LaunchError::InstanceChanged)?;
+        let heap = crate::launch::resources::decide_heap(
+            settings.heap,
+            host.memory.as_ref(),
+            axial_resource::process_physical_work().activity().reserved_mib,
+        );
         let budget = crate::launch::resources::capture(
             host,
             self.sessions.resource_use(),
             self.installs.active_count(),
-            settings.max_memory_mb,
+            heap.max_mb,
             [&library_dir, &game_dir],
         );
         Ok(PreflightDiagnostics::from_capture(
-            settings, budget, readiness,
+            settings, heap, budget, readiness,
         ))
     }
 }

@@ -1349,7 +1349,6 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     )
     .await
     .unwrap();
-    let api = Api::new(&services);
     assert_eq!(performance_operation(&services, &command), completed);
     assert_eq!(
         composition_health(&services, &instance).await,
