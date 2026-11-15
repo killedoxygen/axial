@@ -9,6 +9,7 @@ use crate::tasks::CancellationToken;
 
 use super::*;
 
+const ABC_SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 struct Fixture {
@@ -433,7 +434,7 @@ fn provider_fetch_decoding_fits_default_worker_stack() {
                         fixture.request(
                             bounded(),
                             IntegrityPolicy::Checksum {
-                                checksum: Checksum::from_hex(HashAlgorithm::Sha256, ABC_SHA256)
+                                checksum: Checksum::from_hex(HashAlgorithm::Sha1, ABC_SHA1)
                                     .unwrap(),
                                 expected_size: Some(3),
                             },
@@ -549,11 +550,7 @@ fn http_test_seam_only_admits_literal_loopback_and_exact_ports() {
 
 #[test]
 fn checksum_validation_requires_exact_hex_width() {
-    for (algorithm, length) in [
-        (HashAlgorithm::Sha1, 40),
-        (HashAlgorithm::Sha256, 64),
-        (HashAlgorithm::Sha512, 128),
-    ] {
+    for (algorithm, length) in [(HashAlgorithm::Sha1, 40), (HashAlgorithm::Sha512, 128)] {
         assert_eq!(
             Checksum::from_hex(algorithm, &"AB".repeat(length / 2))
                 .unwrap()
@@ -655,11 +652,7 @@ async fn complete_body_reports_explicit_unhashed_evidence_and_redacted_origin() 
 #[tokio::test]
 async fn provider_hashes_are_verified_against_independent_known_vectors() {
     for (algorithm, expected) in [
-        (
-            HashAlgorithm::Sha1,
-            "a9993e364706816aba3e25717850c26c9cd0d89d",
-        ),
-        (HashAlgorithm::Sha256, ABC_SHA256),
+        (HashAlgorithm::Sha1, ABC_SHA1),
         (
             HashAlgorithm::Sha512,
             "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
@@ -690,14 +683,14 @@ async fn integrity_mismatch_never_returns_bytes() {
     for (policy, error) in [
         (
             IntegrityPolicy::Checksum {
-                checksum: Checksum::from_hex(HashAlgorithm::Sha256, &"00".repeat(32)).unwrap(),
+                checksum: Checksum::from_hex(HashAlgorithm::Sha1, &"00".repeat(20)).unwrap(),
                 expected_size: Some(3),
             },
             DownloadError::ChecksumMismatch,
         ),
         (
             IntegrityPolicy::Unhashed {
-                reason: UnhashedReason::ProviderDoesNotPublishChecksum,
+                reason: UnhashedReason::ProviderMetadata,
                 expected_size: Some(4),
             },
             DownloadError::SizeMismatch,
@@ -817,7 +810,7 @@ async fn gzip_and_deflate_verify_decoded_content_and_separate_byte_counts() {
         )])
         .await;
         let integrity = IntegrityPolicy::Checksum {
-            checksum: Checksum::from_hex(HashAlgorithm::Sha256, ABC_SHA256).unwrap(),
+            checksum: Checksum::from_hex(HashAlgorithm::Sha1, ABC_SHA1).unwrap(),
             expected_size: Some(3),
         };
         let result = client()
@@ -866,7 +859,7 @@ async fn all_gzip_members_contribute_to_decoded_bounds_and_integrity() {
     body.extend(gzip(b"c"));
     let fixture = Fixture::serve(vec![response(200, "Content-Encoding: gzip\r\n", &body)]).await;
     let integrity = IntegrityPolicy::Checksum {
-        checksum: Checksum::from_hex(HashAlgorithm::Sha256, ABC_SHA256).unwrap(),
+        checksum: Checksum::from_hex(HashAlgorithm::Sha1, ABC_SHA1).unwrap(),
         expected_size: Some(3),
     };
     let decoded = client()

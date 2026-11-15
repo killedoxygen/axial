@@ -434,7 +434,7 @@ impl SavedSkinLibrary {
             .mark_applied(account_id, &texture_key, Some(revision))
     }
 
-    /// For saving an already-current profile after the account owner verifies it.
+    #[cfg(test)]
     pub fn mark_applied(
         &self,
         account_id: &str,
@@ -584,7 +584,12 @@ mod tests {
         };
         let metadata = Arc::new(MetadataStore::in_memory().unwrap());
         let accounts = AccountDirectory::new(metadata.clone()).unwrap();
-        accounts.create_offline_account("Export").unwrap();
+        accounts
+            .create_offline_with_preconditions(
+                "Export",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let account = accounts.capture_selected().unwrap();
         metadata.migrate(&[MIGRATION]).unwrap();
         let library = SavedSkinLibrary::new(
@@ -689,9 +694,19 @@ mod tests {
         };
         let metadata = Arc::new(MetadataStore::in_memory().unwrap());
         let accounts = AccountDirectory::new(metadata.clone()).unwrap();
-        accounts.create_offline_account("Alice").unwrap();
+        accounts
+            .create_offline_with_preconditions(
+                "Alice",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let alice = accounts.capture_selected().unwrap();
-        accounts.create_offline_account("Bob").unwrap();
+        accounts
+            .create_offline_with_preconditions(
+                "Bob",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let bob = accounts.capture_selected().unwrap();
         metadata.migrate(&[MIGRATION]).unwrap();
         let library = SavedSkinLibrary::new(

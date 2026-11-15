@@ -109,10 +109,6 @@ impl AccountDirectory {
         capture.validate_account(&self.snapshot()?)
     }
 
-    pub fn create_offline_account(&self, username: &str) -> Result<AccountSnapshot, AccountError> {
-        self.create_offline_with_preconditions(username, AccountPreconditions::default())
-    }
-
     pub fn create_offline_with_preconditions(
         &self,
         username: &str,
@@ -146,18 +142,6 @@ impl AccountDirectory {
             select_identity(snapshot, Some(id));
             Ok(())
         })
-    }
-
-    pub fn rename_offline_account(
-        &self,
-        account_id: &str,
-        username: &str,
-    ) -> Result<AccountSnapshot, AccountError> {
-        self.rename_offline_with_preconditions(
-            account_id,
-            username,
-            AccountPreconditions::default(),
-        )
     }
 
     pub fn rename_offline_with_preconditions(
@@ -706,12 +690,29 @@ mod tests {
         let expected = {
             let directory =
                 AccountDirectory::new(Arc::new(MetadataStore::open(&path).unwrap())).unwrap();
-            let created = directory.create_offline_account("Steve").unwrap();
+            let created = directory
+                .create_offline_with_preconditions(
+                    "Steve",
+                    crate::accounts::model::AccountPreconditions::default(),
+                )
+                .unwrap();
             let capture = directory.capture_selected().unwrap();
             assert_eq!(capture.minecraft_uuid(), "5627dd98e6be3c21b8a8e92344183641");
-            assert_eq!(directory.create_offline_account("Steve").unwrap(), created);
+            assert_eq!(
+                directory
+                    .create_offline_with_preconditions(
+                        "Steve",
+                        crate::accounts::model::AccountPreconditions::default()
+                    )
+                    .unwrap(),
+                created
+            );
             let renamed = directory
-                .rename_offline_account(capture.account_id(), "Notch")
+                .rename_offline_with_preconditions(
+                    capture.account_id(),
+                    "Notch",
+                    crate::accounts::model::AccountPreconditions::default(),
+                )
                 .unwrap();
             assert!(matches!(
                 directory.validate_capture(&capture),
@@ -741,9 +742,19 @@ mod tests {
     #[test]
     fn stale_mutations_and_colliding_names_preserve_the_committed_snapshot() {
         let directory = directory();
-        let first = directory.create_offline_account("Steve").unwrap();
+        let first = directory
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let steve = first.active_account_id.as_ref().unwrap().as_str();
-        let current = directory.create_offline_account("Notch").unwrap();
+        let current = directory
+            .create_offline_with_preconditions(
+                "Notch",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         assert!(matches!(
             directory.select_with_preconditions(
                 steve,
@@ -755,7 +766,11 @@ mod tests {
             Err(AccountError::StaleCapture)
         ));
         assert!(matches!(
-            directory.rename_offline_account(steve, "Notch"),
+            directory.rename_offline_with_preconditions(
+                steve,
+                "Notch",
+                crate::accounts::model::AccountPreconditions::default()
+            ),
             Err(AccountError::AlreadyExists)
         ));
         assert_eq!(directory.snapshot().unwrap(), current);
@@ -771,7 +786,12 @@ mod tests {
     #[test]
     fn malformed_persisted_identity_is_rejected_without_repair() {
         let directory = directory();
-        let created = directory.create_offline_account("Steve").unwrap();
+        let created = directory
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         directory
             .store
             .transaction(|tx| -> Result<(), AccountError> {

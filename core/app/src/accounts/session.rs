@@ -3,10 +3,7 @@
 
 use std::{
     future::Future,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -49,7 +46,6 @@ pub enum AuthError {
 pub struct PendingLogin {
     service: Uuid,
     selection_revision: u64,
-    login_generation: u64,
     expires: Instant,
     flow: MicrosoftLoginFlow,
 }
@@ -69,7 +65,6 @@ pub struct AuthService {
     // Provider network calls happen outside it; logout can fence a refresh.
     mutation: Arc<Mutex<()>>,
     service: Uuid,
-    login_generation: Arc<AtomicU64>,
     account_removed: Arc<RwLock<Option<Arc<AccountRemovedObserver>>>>,
     profile_client: microsoft::ProfileClient,
 }
@@ -88,7 +83,6 @@ impl AuthService {
             tasks,
             mutation: Arc::default(),
             service: Uuid::new_v4(),
-            login_generation: Arc::default(),
             account_removed: Arc::default(),
             profile_client: microsoft::ProfileClient::default(),
         }
@@ -132,13 +126,11 @@ impl AuthService {
         let service = self.clone();
         self.retain(async move {
             let revision = service.directory.selection_revision()?;
-            let login_generation = service.login_generation.load(Ordering::SeqCst);
             let flow = microsoft::begin_login().await?;
-            service.validate_login(revision, login_generation)?;
+            service.validate_login(revision)?;
             Ok(PendingLogin {
                 service: service.service,
                 selection_revision: revision,
-                login_generation,
                 expires: Instant::now() + Duration::from_secs(600),
                 flow,
             })
@@ -156,24 +148,17 @@ impl AuthService {
         }
         let service = self.clone();
         self.retain(async move {
-            service.validate_login(pending.selection_revision, pending.login_generation)?;
+            service.validate_login(pending.selection_revision)?;
             let result = microsoft::finish_login(pending.flow, &callback).await?;
             service
-                .commit_login(pending.selection_revision, pending.login_generation, result)
+                .commit_login(pending.selection_revision, result)
                 .await
         })
         .await
     }
 
-    /// Invalidate pending and in-flight login captures. No credentials are touched here.
-    pub fn cancel_login(&self) {
-        self.login_generation.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn validate_login(&self, revision: u64, generation: u64) -> Result<(), AuthError> {
-        if self.directory.selection_revision()? != revision
-            || self.login_generation.load(Ordering::SeqCst) != generation
-        {
+    fn validate_login(&self, revision: u64) -> Result<(), AuthError> {
+        if self.directory.selection_revision()? != revision {
             return Err(AccountError::StaleCapture.into());
         }
         Ok(())
@@ -182,11 +167,10 @@ impl AuthService {
     async fn commit_login(
         &self,
         revision: u64,
-        generation: u64,
         result: MicrosoftMinecraftSession,
     ) -> Result<CapturedAccount, AuthError> {
         let _gate = self.mutation.lock().await;
-        self.validate_login(revision, generation)?;
+        self.validate_login(revision)?;
         microsoft::validate_profile(&result.profile)?;
         let account_id = microsoft_account_id(&result.profile.id)?;
         let mut status = self.credentials.status(&account_id).await?;
@@ -211,7 +195,7 @@ impl AuthService {
             receipt.revision(),
             true,
         );
-        let committed = self.validate_login(revision, generation).and_then(|()| {
+        let committed = self.validate_login(revision).and_then(|()| {
             self.directory
                 .commit_microsoft(revision, identity)
                 .map_err(Into::into)
@@ -600,7 +584,6 @@ mod tests {
         service
             .commit_login(
                 service.directory.selection_revision().unwrap(),
-                service.login_generation.load(Ordering::SeqCst),
                 provider_result(id, name, name),
             )
             .await
@@ -643,11 +626,7 @@ mod tests {
         let mut result = provider_result(FIRST, "PlayerOne", "ready");
         result.microsoft_refresh_token = None;
         let original = service
-            .commit_login(
-                service.directory.selection_revision().unwrap(),
-                service.login_generation.load(Ordering::SeqCst),
-                result,
-            )
+            .commit_login(service.directory.selection_revision().unwrap(), result)
             .await
             .unwrap();
         let snapshot = service.directory.snapshot().unwrap();
@@ -702,11 +681,7 @@ mod tests {
             result.microsoft_refresh_token = None;
             result.minecraft_expires_at = now_seconds() + remaining_seconds;
             let capture = service
-                .commit_login(
-                    service.directory.selection_revision().unwrap(),
-                    service.login_generation.load(Ordering::SeqCst),
-                    result,
-                )
+                .commit_login(service.directory.selection_revision().unwrap(), result)
                 .await
                 .unwrap();
             let snapshot = service.directory.snapshot().unwrap();
@@ -732,14 +707,16 @@ mod tests {
         let mut result = provider_result(FIRST, "PlayerOne", "ready");
         result.microsoft_refresh_token = None;
         let capture = service
-            .commit_login(
-                service.directory.selection_revision().unwrap(),
-                service.login_generation.load(Ordering::SeqCst),
-                result,
-            )
+            .commit_login(service.directory.selection_revision().unwrap(), result)
             .await
             .unwrap();
-        service.directory.create_offline_account("Steve").unwrap();
+        service
+            .directory
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         assert!(matches!(
             service.refresh(capture.clone()).await,
             Err(AuthError::Account(AccountError::StaleCapture))
@@ -764,13 +741,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_switch_and_cancel_reject_late_login_without_keyring_publication() {
+    async fn account_switch_rejects_late_login_without_keyring_publication() {
         let service = service();
         let revision = service.directory.selection_revision().unwrap();
-        service.directory.create_offline_account("Steve").unwrap();
+        service
+            .directory
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         assert!(matches!(
             service
-                .commit_login(revision, 0, provider_result(FIRST, "PlayerOne", "late"))
+                .commit_login(revision, provider_result(FIRST, "PlayerOne", "late"))
                 .await,
             Err(AuthError::Account(AccountError::StaleCapture))
         ));
@@ -778,14 +761,6 @@ mod tests {
             service.credentials.status(FIRST).await.unwrap().state,
             CredentialState::Absent
         );
-        let revision = service.directory.selection_revision().unwrap();
-        service.cancel_login();
-        assert!(matches!(
-            service
-                .commit_login(revision, 0, provider_result(FIRST, "PlayerOne", "late"))
-                .await,
-            Err(AuthError::Account(AccountError::StaleCapture))
-        ));
     }
 
     #[tokio::test]
@@ -854,7 +829,13 @@ mod tests {
     async fn profile_completion_is_bound_to_identity_and_revisions() {
         let service = service();
         let capture = login(&service, FIRST, "PlayerOne").await;
-        service.directory.create_offline_account("Steve").unwrap();
+        service
+            .directory
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let mut profile = capture.profile().unwrap().clone();
         profile.name = "NewName".into();
         let next = service

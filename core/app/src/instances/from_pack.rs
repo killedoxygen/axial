@@ -630,7 +630,6 @@ mod tests {
     fn creation_includes_client_overrides_and_pins_the_archive_for_retry() {
         let prepared = prepared(b"client defaults");
         assert_eq!(prepared.target().version_id, "provider-v1");
-        assert_eq!(prepared.plan().override_count(), 1);
         assert_eq!(prepared.plan().destinations(), vec!["config/fixture.txt"]);
         let stored = StoredPackSetup::new(
             &prepared,

@@ -86,7 +86,6 @@ pub enum StateError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatePublicationPhase {
-    Reconcile,
     Stage,
     Backup,
     Publish,
@@ -96,7 +95,6 @@ pub enum StatePublicationPhase {
 impl std::fmt::Display for StatePublicationPhase {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Reconcile => "reconciliation",
             Self::Stage => "staging",
             Self::Backup => "backup",
             Self::Publish => "publication",

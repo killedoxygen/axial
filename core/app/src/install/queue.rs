@@ -1307,18 +1307,6 @@ impl InstallQueue {
         Ok(id)
     }
 
-    pub async fn start_vanilla(
-        &self,
-        version_id: &str,
-    ) -> Result<InstallStartResponse, InstallError> {
-        self.enqueue(InstallQueueRequest::Vanilla {
-            version_id: version_id.into(),
-        })
-        .await?
-        .started_install
-        .ok_or(InstallError::Failed)
-    }
-
     pub async fn remove(&self, id: &str) -> Result<InstallQueueStateResponse, InstallError> {
         let setup = {
             let state = self.inner.state.lock().expect("install queue lock");

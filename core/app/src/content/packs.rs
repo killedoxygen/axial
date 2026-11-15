@@ -828,9 +828,6 @@ impl PackPlan {
     pub fn files(&self) -> &[PackFile] {
         &self.files
     }
-    pub fn override_count(&self) -> usize {
-        self.overrides.len()
-    }
     pub fn destinations(&self) -> Vec<&str> {
         self.files
             .iter()

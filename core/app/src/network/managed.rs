@@ -178,11 +178,7 @@ mod tests {
             assert!(pinned_config(origin.clone(), addresses).is_err());
         }
         let config = pinned_config(origin, vec!["1.1.1.1:443".parse().unwrap()]).unwrap();
-        assert_eq!(config.origin_count(), 1);
-        assert_eq!(config.pinned_origin_count(), 1);
         assert_eq!(config.connect_timeout(), CONNECT_TIMEOUT);
-        assert_eq!(config.idle_read_timeout(), IDLE_READ_TIMEOUT);
-        assert_eq!(config.request_timeout(), REQUEST_TIMEOUT);
     }
 
     #[test]

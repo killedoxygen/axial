@@ -56,7 +56,12 @@ async fn preflight_fixture_with_credentials(
         )
         .unwrap();
     let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());
-    accounts.create_offline_account("Preflight").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "Preflight",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     let auth = Arc::new(AuthService::new(
         accounts.clone(),
         credentials,
@@ -129,9 +134,9 @@ async fn assert_runtime_failure_keeps_safe_cause(missing: bool, launch: bool) {
     let (root, coordinator, id) = preflight_fixture().await;
     let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
     let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
-    let coordinator = coordinator
-        .with_storage(storage.clone(), reports.clone())
-        .unwrap();
+    let intents =
+        LaunchIntents::restore(storage.clone(), reports.clone(), &coordinator.instances).unwrap();
+    let coordinator = coordinator.with_intents(intents);
     let before = coordinator.instances.registry().get_live(&id).unwrap();
     let game = coordinator
         .instances
@@ -516,7 +521,8 @@ async fn historical_fml_client_requires_install_before_launch() {
     let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
     let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
     coordinator.sessions = SessionManager::with_reports(coordinator.tasks.clone(), reports.clone());
-    let coordinator = coordinator.with_storage(storage, reports.clone()).unwrap();
+    let intents = LaunchIntents::restore(storage, reports.clone(), &coordinator.instances).unwrap();
+    let coordinator = coordinator.with_intents(intents);
     let target = CreateTarget::loader_for_tests(
         axial_minecraft::LoaderComponentId::Forge,
         "1.4.7",
@@ -842,8 +848,12 @@ async fn preflight_projection_release_resumes_a_queued_install() {
     // Its retained projection is now the only blocker, with no running task.
     let queued = coordinator
         .installs
-        .start_vanilla("queued-after-preflight")
+        .enqueue(crate::install::model::InstallQueueRequest::Vanilla {
+            version_id: "queued-after-preflight".into(),
+        })
         .await
+        .unwrap()
+        .started_install
         .unwrap();
     assert_eq!(
         coordinator
@@ -1389,7 +1399,10 @@ fn account_change_during_install_readiness_rejects_the_captured_launch() {
         let first =
             std::future::poll_fn(|context| Poll::Ready(preparation.as_mut().poll(context))).await;
         let was_pending = first.is_pending();
-        let changed = coordinator.accounts.create_offline_account("Elsewhere");
+        let changed = coordinator.accounts.create_offline_with_preconditions(
+            "Elsewhere",
+            crate::accounts::model::AccountPreconditions::default(),
+        );
         let released = release.send(());
         let blocker = blocker.await;
         let result = match first {
@@ -1601,7 +1614,10 @@ async fn preflight_rechecks_captured_inputs_even_when_the_probe_fails() {
                 "account" | "absent_account" => {
                     let changed = coordinator
                         .accounts
-                        .create_offline_account("Elsewhere")
+                        .create_offline_with_preconditions(
+                            "Elsewhere",
+                            crate::accounts::model::AccountPreconditions::default(),
+                        )
                         .map_err(|_| LaunchError::AccountChanged)?;
                     if change == "absent_account" {
                         coordinator
@@ -1771,7 +1787,12 @@ fn profile_commit_can_advance_revision_but_cannot_replace_the_selected_login() {
     let after = capture_after_profile(&accounts, &before).unwrap();
     assert!(after.selection_revision() > before.selection_revision());
     assert_eq!(after.display_name(), "PlayerTwo");
-    accounts.create_offline_account("Elsewhere").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "Elsewhere",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     assert!(matches!(
         capture_after_profile(&accounts, &after),
         Err(LaunchError::AccountChanged)

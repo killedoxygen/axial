@@ -231,6 +231,7 @@ impl LaunchReportStore {
     }
 
     /// Already-redacted collector entries are rechecked at the durable boundary.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn record_session(&self, input: SessionReportInput) -> Result<(), ReportError> {
         self.record(
             LaunchProofRecord::from_session(input),

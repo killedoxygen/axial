@@ -140,10 +140,12 @@ impl MetadataStore {
         Self::initialize(connection, limits, false)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn in_memory() -> StorageResult<Self> {
         Self::in_memory_with_limits(StorageLimits::default())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn in_memory_with_limits(limits: StorageLimits) -> StorageResult<Self> {
         Self::validate_limits(limits)?;
         Self::initialize(Connection::open_in_memory()?, limits, true)

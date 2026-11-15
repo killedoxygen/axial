@@ -5,8 +5,8 @@ mod native;
 
 pub use image::{
     CAPE_PNG_MAX_BYTES, NormalizedSkinPng, SKIN_PNG_MAX_BYTES, SkinPngValidationError,
-    is_valid_cape_texture_png, is_valid_normalized_skin_cache_png, normalize_cape_png,
-    normalize_skin_png, texture_key, validate_skin_png,
+    is_valid_normalized_skin_cache_png, normalize_cape_png, normalize_skin_png, texture_key,
+    validate_skin_png,
 };
 pub use native::{
     AdmittedSkinFile, NativeSelection, NativeSkinAdmission, NativeSkinHandle, NativeSkinScope,

@@ -288,9 +288,6 @@ impl ContentPlanState {
     pub fn instance_id(&self) -> &crate::instances::model::InstanceId {
         &self.instance_id
     }
-    pub fn instance_revision(&self) -> u64 {
-        self.instance_revision
-    }
 }
 
 /// An untracked file observed at a planned destination while planning. It is
@@ -1592,10 +1589,6 @@ fn incompatible_conflict(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
-    fn sha512(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha512};
-        format!("{:x}", Sha512::digest(bytes))
-    }
 
     fn installed_entry(
         project: &str,
@@ -3285,8 +3278,7 @@ mod tests {
     #[test]
     fn only_live_installed_entries_create_reverse_conflicts() {
         let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
-        let mut entry = installed_entry("installed", "v1", vec![incompatible("candidate", None)]);
-        entry.record_authenticated_file(1, sha512(b"o")).unwrap();
+        let entry = installed_entry("installed", "v1", vec![incompatible("candidate", None)]);
         let mut manifest = ContentManifest::default();
         manifest.try_upsert(entry).unwrap();
         let conflicts = |live: &LiveManagedContent| {
@@ -3431,12 +3423,11 @@ mod tests {
 
     #[test]
     fn manifest_metadata_alone_is_not_installed_content() {
-        let mut entry = installed_entry("project", "v1", Vec::new());
+        let entry = installed_entry("project", "v1", Vec::new());
         assert_eq!(
             resolved_install_state(Some(&entry), &LiveManagedContent::default(), "v1"),
             (false, false)
         );
-        entry.record_authenticated_file(1, sha512(b"j")).unwrap();
         assert_eq!(
             resolved_install_state(
                 Some(&entry),

@@ -120,15 +120,6 @@ impl LaunchCoordinator {
         self
     }
 
-    pub fn with_storage(
-        mut self,
-        storage: Arc<MetadataStore>,
-        reports: super::reports::LaunchReportStore,
-    ) -> Result<Self, LaunchError> {
-        self.intents = LaunchIntents::restore(storage, reports, &self.instances)?;
-        Ok(self)
-    }
-
     /// Composition restores this same owner before other feature recovery.
     pub fn with_intents(mut self, intents: LaunchIntents) -> Self {
         self.intents = intents;

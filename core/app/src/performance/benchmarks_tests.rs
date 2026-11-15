@@ -115,8 +115,14 @@ fn service_with_directories(
         sessions.clone(),
         tasks.clone(),
     )
-    .with_storage(storage.clone(), reports.clone())
-    .unwrap();
+    .with_intents(
+        crate::launch::coordinator::LaunchIntents::restore(
+            storage.clone(),
+            reports.clone(),
+            &directories,
+        )
+        .unwrap(),
+    );
     let service = BenchmarkService::new(
         storage,
         registry,

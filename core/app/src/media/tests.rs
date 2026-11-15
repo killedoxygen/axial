@@ -134,12 +134,11 @@ fn animation_is_rejected_for_skins_and_capes() {
 #[test]
 fn capes_require_a_complete_bounded_frame_not_just_valid_header() {
     let bytes = png(64, 32, &vec![22; 64 * 32 * 4]);
-    assert!(is_valid_cape_texture_png(&bytes));
     assert_eq!(
         rgba(&normalize_cape_png(&bytes).unwrap()),
         vec![22; 64 * 32 * 4]
     );
-    assert!(!is_valid_cape_texture_png(&bytes[..33]));
+    assert!(normalize_cape_png(&bytes[..33]).is_err());
     let huge = png(513, 1, &vec![22; 513 * 4]);
     assert_eq!(
         normalize_cape_png(&huge),

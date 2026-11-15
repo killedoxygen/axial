@@ -331,15 +331,6 @@ impl ContentService {
         }
         Ok(result)
     }
-
-    pub async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
-        Ok(self
-            .metadata(ids)
-            .await?
-            .into_iter()
-            .map(|(id, metadata)| (id, metadata.title))
-            .collect())
-    }
 }
 
 struct ProviderBatchBudget {

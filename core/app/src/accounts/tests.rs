@@ -318,7 +318,13 @@ async fn sync_stale_or_unpublished_completion_cannot_change_ownership() {
         async move { f.sync().await.map(|_| ()) }
     });
     entered_wait.await.unwrap();
-    let selected = f.directory.create_offline_account("Steve").unwrap();
+    let selected = f
+        .directory
+        .create_offline_with_preconditions(
+            "Steve",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     resume.send(()).unwrap();
     assert!(matches!(
         pending.await.unwrap(),
