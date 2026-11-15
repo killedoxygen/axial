@@ -620,10 +620,7 @@ fn admit_restart_context(
         return Ok(None);
     }
     let marker_lane = publication.open_child(lane_name).map_err(tx)?;
-    let marker_limit = MAX_COMPONENT_LANE_ENTRIES
-        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
-        .and_then(|entries| entries.checked_add(1))
-        .ok_or(ComponentTransactionError)?;
+    let marker_limit = MAX_COMPONENT_LANE_ENTRIES + 1;
     let marker_entries = marker_lane.entries_bounded(marker_limit).map_err(tx)?;
     if marker_entries.len() >= marker_limit {
         return Err(ComponentTransactionError);
@@ -648,12 +645,12 @@ fn admit_restart_context(
         if clean_marker_free_lane {
             admit_empty_marker_free_lane(lease, component)?;
         } else {
-            cleanup_recovery_marker_temps(lease, component)?;
+            validate_recovery_marker_lane(lease, component)?;
         }
         return Ok(None);
     }
     drop(marker_lane);
-    cleanup_recovery_marker_temps(lease, component)?;
+    validate_recovery_marker_lane(lease, component)?;
     let lane = publication.open_child(lane_name).map_err(tx)?;
     let table = lane.open_child(COMPONENT_TABLE_DIRECTORY).map_err(tx)?;
     let staging = lane.open_child(COMPONENT_STAGING_DIRECTORY).map_err(tx)?;
@@ -824,7 +821,7 @@ fn admit_empty_marker_free_lane(
     lease.revalidate().map_err(tx)
 }
 
-fn cleanup_recovery_marker_temps(
+fn validate_recovery_marker_lane(
     lease: &ManagedRootPublicationLease,
     component: ManagedComponentKind,
 ) -> Result<(), ComponentTransactionError> {
@@ -838,67 +835,19 @@ fn cleanup_recovery_marker_temps(
         return Err(ComponentTransactionError);
     }
     let lane = publication.open_child(lane_name).map_err(tx)?;
-    let limit = MAX_COMPONENT_LANE_ENTRIES
-        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
-        .and_then(|entries| entries.checked_add(1))
-        .ok_or(ComponentTransactionError)?;
-    let entries = lane.entries_bounded(limit).map_err(tx)?;
-    if entries.len() >= limit {
-        return Err(ComponentTransactionError);
-    }
-    let mut temporary = Vec::new();
-    temporary
-        .try_reserve_exact(entries.len().min(MAX_MANAGED_TEMP_ENTRIES))
-        .map_err(tx)?;
-    let mut known = BTreeSet::new();
-    for name in entries {
-        let name = name.into_string().map_err(tx)?;
-        if matches!(
-            name.as_str(),
-            COMPONENT_TABLE_DIRECTORY
-                | COMPONENT_STAGING_DIRECTORY
-                | COMPONENT_QUARANTINE_DIRECTORY
-                | COMPONENT_ANCESTORS_DIRECTORY
-                | COMPONENT_INTENT_FILE
-                | COMPONENT_OUTCOME_FILE
-                | COMPONENT_SETTLEMENT_FILE
-        ) {
-            known.insert(name);
-            continue;
-        }
-        if !validate_managed_temp_name(&name).map_err(tx)?
-            || temporary.len() >= MAX_MANAGED_TEMP_ENTRIES
-        {
-            return Err(ComponentTransactionError);
-        }
-        let guard = lane
-            .inspect_regular_file(&name)
-            .map_err(tx)?
-            .ok_or(ComponentTransactionError)?;
-        if guard.size() > MAX_COMPONENT_INTENT_BYTES as u64
-            || !lane.managed_temp_is_orphan(&name, &guard).map_err(tx)?
-        {
-            return Err(ComponentTransactionError);
-        }
-        temporary.push(ComponentPlannedFile {
-            name,
-            size: guard.size(),
-            identity: guard.identity(),
-        });
-    }
-    let mut expected_known = BTreeSet::from([
+    let names = exact_entry_names(&lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)?;
+    let mut expected = BTreeSet::from([
         COMPONENT_TABLE_DIRECTORY.to_string(),
         COMPONENT_STAGING_DIRECTORY.to_string(),
         COMPONENT_QUARANTINE_DIRECTORY.to_string(),
         COMPONENT_ANCESTORS_DIRECTORY.to_string(),
     ]);
-    if known.contains(COMPONENT_INTENT_FILE) {
-        expected_known.insert(COMPONENT_INTENT_FILE.to_string());
+    for marker in [COMPONENT_INTENT_FILE, COMPONENT_OUTCOME_FILE] {
+        if names.contains(marker) {
+            expected.insert(marker.to_string());
+        }
     }
-    if known.contains(COMPONENT_OUTCOME_FILE) {
-        expected_known.insert(COMPONENT_OUTCOME_FILE.to_string());
-    }
-    if known != expected_known {
+    if names != expected {
         return Err(ComponentTransactionError);
     }
     let _table = lane.open_child(COMPONENT_TABLE_DIRECTORY).map_err(tx)?;
@@ -922,7 +871,7 @@ fn cleanup_recovery_marker_temps(
         return Err(ComponentTransactionError);
     }
     ancestor_staging.revalidate().map_err(tx)?;
-    let records_plan = plan_directory_files(
+    plan_directory_files(
         &records,
         MAX_COMPONENT_ANCESTOR_SHARDS,
         MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES as u64,
@@ -934,25 +883,6 @@ fn cleanup_recovery_marker_temps(
         },
     )
     .map_err(tx)?;
-    for planned in &temporary {
-        let guard = inspect_planned_file(&lane, planned).map_err(tx)?;
-        if !lane
-            .managed_temp_is_orphan(&planned.name, &guard)
-            .map_err(tx)?
-        {
-            return Err(ComponentTransactionError);
-        }
-    }
-    validate_planned_file_entries(
-        &records,
-        &records_plan.owned,
-        &records_plan.temporary,
-        MAX_COMPONENT_ANCESTOR_SHARDS,
-        true,
-    )
-    .map_err(tx)?;
-    remove_planned_temps(&lane, &temporary).map_err(tx)?;
-    remove_planned_temps(&records, &records_plan.temporary).map_err(tx)?;
     lease.revalidate().map_err(tx)
 }
 

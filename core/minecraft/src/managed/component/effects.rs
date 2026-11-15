@@ -15,9 +15,8 @@ use crate::managed::component::table::{
 };
 use crate::managed::fault::{self, Fault};
 use crate::managed::fs::{
-    MAX_MANAGED_TEMP_ENTRIES, ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity,
-    ManagedEmptyChildRemoval, ManagedFileGuard, ManagedFileIdentity, ManagedPassiveFileRevision,
-    validate_managed_temp_name,
+    ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity, ManagedEmptyChildRemoval,
+    ManagedFileGuard, ManagedFileIdentity, ManagedPassiveFileRevision,
 };
 use crate::managed::publication::{ManagedPublicationError, ManagedRootPublicationLease};
 use crate::portable_path::PortableRelativePath;
@@ -168,7 +167,6 @@ pub(crate) struct ComponentPreintentRowAuthority {
 }
 
 struct ComponentPreintentCleanupPlan {
-    temporary: Vec<ComponentPlannedFile>,
     table: Option<ComponentTableCleanupPlan>,
     staging: Option<ComponentBucketCleanupPlan>,
     quarantine: Option<ComponentBucketCleanupPlan>,
@@ -182,16 +180,10 @@ struct ComponentAncestorsCleanupPlan {
     staging: Option<(ManagedDir, ManagedDirectoryIdentity)>,
 }
 
-struct ComponentLaneEntryPlan {
-    directories: BTreeSet<String>,
-    temporary: Vec<ComponentPlannedFile>,
-}
-
 struct ComponentTableCleanupPlan {
     directory: ManagedDir,
     component: ManagedComponentKind,
     files: Vec<ComponentPlannedFile>,
-    temporary: Vec<ComponentPlannedFile>,
 }
 
 struct ComponentBucketCleanupPlan {
@@ -204,7 +196,6 @@ struct ComponentGuardedBucket {
     name: String,
     identity: ManagedDirectoryIdentity,
     files: Vec<ComponentPlannedFile>,
-    temporary: Vec<ComponentPlannedFile>,
 }
 
 struct ComponentParkedBucket {
@@ -217,11 +208,6 @@ struct ComponentPlannedFile {
     name: String,
     size: u64,
     identity: ManagedFileIdentity,
-}
-
-struct ComponentDirectoryFilePlan {
-    owned: Vec<ComponentPlannedFile>,
-    temporary: Vec<ComponentPlannedFile>,
 }
 
 pub(crate) struct ComponentCanonicalPathPlan {
@@ -1150,8 +1136,7 @@ impl ComponentPreintentCleanupPlan {
         lane: &ManagedDir,
         component: ManagedComponentKind,
     ) -> Result<Self, ComponentEffectsError> {
-        let entries = plan_component_lane_entries(lane)?;
-        let names = &entries.directories;
+        let names = plan_component_lane_entries(lane)?;
         let table = names
             .contains(COMPONENT_TABLE_DIRECTORY)
             .then(|| lane.open_child(COMPONENT_TABLE_DIRECTORY))
@@ -1175,13 +1160,12 @@ impl ComponentPreintentCleanupPlan {
             .then(|| ComponentAncestorsCleanupPlan::admit(lane))
             .transpose()?;
         let plan = Self {
-            temporary: entries.temporary,
             table,
             staging,
             quarantine,
             ancestors,
         };
-        plan.revalidate_with_temps(lane)?;
+        plan.revalidate(lane)?;
         Ok(plan)
     }
 
@@ -1205,58 +1189,6 @@ impl ComponentPreintentCleanupPlan {
         Ok(())
     }
 
-    fn revalidate_lane_with_temps(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
-        let mut expected = BTreeSet::new();
-        if self.table.is_some() {
-            expected.insert(COMPONENT_TABLE_DIRECTORY.to_string());
-        }
-        if self.staging.is_some() {
-            expected.insert(COMPONENT_STAGING_DIRECTORY.to_string());
-        }
-        if self.quarantine.is_some() {
-            expected.insert(COMPONENT_QUARANTINE_DIRECTORY.to_string());
-        }
-        if self.ancestors.is_some() {
-            expected.insert(COMPONENT_ANCESTORS_DIRECTORY.to_string());
-        }
-        for file in &self.temporary {
-            expected.insert(file.name.clone());
-        }
-        if exact_entry_names(
-            lane,
-            MAX_COMPONENT_LANE_ENTRIES + MAX_MANAGED_TEMP_ENTRIES + 1,
-        )? != expected
-        {
-            return Err(ComponentEffectsError::Topology);
-        }
-        for file in &self.temporary {
-            let guard = inspect_planned_file(lane, file)?;
-            if !validate_managed_temp_name(&file.name)?
-                || !lane.managed_temp_is_orphan(&file.name, &guard)?
-            {
-                return Err(ComponentEffectsError::Topology);
-            }
-        }
-        Ok(())
-    }
-
-    fn revalidate_with_temps(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
-        self.revalidate_lane_with_temps(lane)?;
-        if let Some(table) = &self.table {
-            table.revalidate_with_temps()?;
-        }
-        if let Some(staging) = &self.staging {
-            staging.revalidate_with_temps()?;
-        }
-        if let Some(quarantine) = &self.quarantine {
-            quarantine.revalidate_with_temps()?;
-        }
-        if let Some(ancestors) = &self.ancestors {
-            ancestors.revalidate(lane)?;
-        }
-        Ok(())
-    }
-
     fn revalidate(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
         self.revalidate_lane(lane)?;
         if let Some(table) = &self.table {
@@ -1275,17 +1207,6 @@ impl ComponentPreintentCleanupPlan {
     }
 
     fn execute(self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
-        self.revalidate_with_temps(lane)?;
-        remove_planned_temps(lane, &self.temporary)?;
-        if let Some(table) = &self.table {
-            table.remove_temps()?;
-        }
-        if let Some(staging) = &self.staging {
-            staging.remove_temps()?;
-        }
-        if let Some(quarantine) = &self.quarantine {
-            quarantine.remove_temps()?;
-        }
         self.revalidate(lane)?;
         if let Some(table) = self.table {
             table.execute()?;
@@ -1377,45 +1298,23 @@ impl ComponentTableCleanupPlan {
         directory: ManagedDir,
         component: ManagedComponentKind,
     ) -> Result<Self, ComponentEffectsError> {
-        let planned = plan_directory_files(
+        let files = plan_directory_files(
             &directory,
             MAX_COMPONENT_TABLE_SHARDS,
             MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
             |name| parse_component_table_file_name(name).is_some(),
         )?;
-        validate_component_table_prefix(&directory, component, &planned.owned)?;
+        validate_component_table_prefix(&directory, component, &files)?;
         Ok(Self {
             directory,
             component,
-            files: planned.owned,
-            temporary: planned.temporary,
+            files,
         })
     }
 
-    fn revalidate_with_temps(&self) -> Result<(), ComponentEffectsError> {
-        validate_planned_file_entries(
-            &self.directory,
-            &self.files,
-            &self.temporary,
-            MAX_COMPONENT_TABLE_SHARDS,
-            true,
-        )?;
-        validate_component_table_prefix(&self.directory, self.component, &self.files)
-    }
-
     fn revalidate(&self) -> Result<(), ComponentEffectsError> {
-        validate_planned_file_entries(
-            &self.directory,
-            &self.files,
-            &[],
-            MAX_COMPONENT_TABLE_SHARDS,
-            false,
-        )?;
+        validate_planned_file_entries(&self.directory, &self.files, MAX_COMPONENT_TABLE_SHARDS)?;
         validate_component_table_prefix(&self.directory, self.component, &self.files)
-    }
-
-    fn remove_temps(&self) -> Result<(), ComponentEffectsError> {
-        remove_planned_temps(&self.directory, &self.temporary)
     }
 
     fn execute(self) -> Result<(), ComponentEffectsError> {
@@ -1510,10 +1409,10 @@ impl ComponentBucketCleanupPlan {
                 parse_component_bucket_name(&name).ok_or(ComponentEffectsError::Topology)?;
             let child = directory.open_child(&name)?;
             let identity = child.identity()?;
-            let planned = plan_directory_files(&child, 256, MAX_TIER2_ARTIFACT_BYTES, |slot| {
+            let files = plan_directory_files(&child, 256, MAX_TIER2_ARTIFACT_BYTES, |slot| {
                 parse_component_slot_name(slot).is_some()
             })?;
-            for file in &planned.owned {
+            for file in &files {
                 total_slots = total_slots
                     .checked_add(1)
                     .filter(|count| *count <= MAX_TIER2_ENTRIES)
@@ -1529,8 +1428,7 @@ impl ComponentBucketCleanupPlan {
             buckets.push(ComponentGuardedBucket {
                 name,
                 identity,
-                files: planned.owned,
-                temporary: planned.temporary,
+                files,
             });
         }
         Ok(Self {
@@ -1540,15 +1438,7 @@ impl ComponentBucketCleanupPlan {
         })
     }
 
-    fn remove_temps(&self) -> Result<(), ComponentEffectsError> {
-        for bucket in &self.buckets {
-            let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
-            remove_planned_temps(&directory, &bucket.temporary)?;
-        }
-        Ok(())
-    }
-
-    fn validate_exact(&self, include_temporary: bool) -> Result<(), ComponentEffectsError> {
+    fn revalidate(&self) -> Result<(), ComponentEffectsError> {
         let mut expected = self
             .buckets
             .iter()
@@ -1562,18 +1452,7 @@ impl ComponentBucketCleanupPlan {
         }
         for bucket in &self.buckets {
             let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
-            let temporary = if include_temporary {
-                bucket.temporary.as_slice()
-            } else {
-                &[]
-            };
-            validate_planned_file_entries(
-                &directory,
-                &bucket.files,
-                temporary,
-                256,
-                include_temporary,
-            )?;
+            validate_planned_file_entries(&directory, &bucket.files, 256)?;
         }
         if let Some(parked) = &self.parked {
             let directory = open_planned_child(&self.directory, parked.name, parked.identity)?;
@@ -1582,14 +1461,6 @@ impl ComponentBucketCleanupPlan {
             }
         }
         Ok(())
-    }
-
-    fn revalidate_with_temps(&self) -> Result<(), ComponentEffectsError> {
-        self.validate_exact(true)
-    }
-
-    fn revalidate(&self) -> Result<(), ComponentEffectsError> {
-        self.validate_exact(false)
     }
 
     fn execute(self) -> Result<(), ComponentEffectsError> {
@@ -1666,50 +1537,15 @@ fn exact_entry_names(
 
 fn plan_component_lane_entries(
     lane: &ManagedDir,
-) -> Result<ComponentLaneEntryPlan, ComponentEffectsError> {
-    let limit = MAX_COMPONENT_LANE_ENTRIES
-        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
-        .and_then(|entries| entries.checked_add(1))
-        .ok_or(ComponentEffectsError::Topology)?;
-    let entries = lane.entries_bounded(limit)?;
-    if entries.len() >= limit {
+) -> Result<BTreeSet<String>, ComponentEffectsError> {
+    let names = exact_entry_names(lane, MAX_COMPONENT_LANE_ENTRIES + 1)?;
+    if !names
+        .iter()
+        .all(|name| component_preintent_lane_entry_is_known(name))
+    {
         return Err(ComponentEffectsError::Topology);
     }
-    let mut directories = BTreeSet::new();
-    let mut temporary = Vec::new();
-    temporary
-        .try_reserve_exact(entries.len().min(MAX_MANAGED_TEMP_ENTRIES))
-        .map_err(|_| ComponentEffectsError::Topology)?;
-    for name in entries {
-        let name = name
-            .into_string()
-            .map_err(|_| ComponentEffectsError::Topology)?;
-        if component_preintent_lane_entry_is_known(&name) {
-            directories.insert(name);
-            continue;
-        }
-        if !validate_managed_temp_name(&name)? || temporary.len() >= MAX_MANAGED_TEMP_ENTRIES {
-            return Err(ComponentEffectsError::Topology);
-        }
-        let guard = lane
-            .inspect_regular_file(&name)?
-            .ok_or(ComponentEffectsError::Topology)?;
-        if guard.size() > MAX_COMPONENT_INTENT_BYTES as u64
-            || !lane.managed_temp_is_orphan(&name, &guard)?
-        {
-            return Err(ComponentEffectsError::Topology);
-        }
-        temporary.push(ComponentPlannedFile {
-            name,
-            size: guard.size(),
-            identity: guard.identity(),
-        });
-    }
-    temporary.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    Ok(ComponentLaneEntryPlan {
-        directories,
-        temporary,
-    })
+    Ok(names)
 }
 
 fn plan_directory_files(
@@ -1717,10 +1553,9 @@ fn plan_directory_files(
     maximum_owned: usize,
     maximum_file_bytes: u64,
     owned_name: impl Fn(&str) -> bool,
-) -> Result<ComponentDirectoryFilePlan, ComponentEffectsError> {
+) -> Result<Vec<ComponentPlannedFile>, ComponentEffectsError> {
     let limit = maximum_owned
-        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
-        .and_then(|entries| entries.checked_add(1))
+        .checked_add(1)
         .ok_or(ComponentEffectsError::Topology)?;
     let entries = directory.entries_bounded(limit)?;
     if entries.len() >= limit {
@@ -1728,11 +1563,7 @@ fn plan_directory_files(
     }
     let mut owned = Vec::new();
     owned
-        .try_reserve_exact(entries.len().min(maximum_owned))
-        .map_err(|_| ComponentEffectsError::Topology)?;
-    let mut temporary = Vec::new();
-    temporary
-        .try_reserve_exact(entries.len().min(MAX_MANAGED_TEMP_ENTRIES))
+        .try_reserve_exact(entries.len())
         .map_err(|_| ComponentEffectsError::Topology)?;
     for name in entries {
         let name = name
@@ -1741,91 +1572,39 @@ fn plan_directory_files(
         let guard = directory
             .inspect_regular_file(&name)?
             .ok_or(ComponentEffectsError::Topology)?;
-        if guard.size() > maximum_file_bytes || !directory.file_guard_matches(&name, &guard)? {
+        if guard.size() > maximum_file_bytes
+            || !directory.file_guard_matches(&name, &guard)?
+            || !owned_name(&name)
+        {
             return Err(ComponentEffectsError::Topology);
         }
-        let planned = ComponentPlannedFile {
+        owned.push(ComponentPlannedFile {
             name,
             size: guard.size(),
             identity: guard.identity(),
-        };
-        if validate_managed_temp_name(&planned.name)? {
-            if temporary.len() >= MAX_MANAGED_TEMP_ENTRIES
-                || !directory.managed_temp_is_orphan(&planned.name, &guard)?
-            {
-                return Err(ComponentEffectsError::Topology);
-            }
-            temporary.push(planned);
-        } else if owned_name(&planned.name) {
-            if owned.len() >= maximum_owned {
-                return Err(ComponentEffectsError::Topology);
-            }
-            owned.push(planned);
-        } else {
-            return Err(ComponentEffectsError::Topology);
-        }
+        });
     }
     owned.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    temporary.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    Ok(ComponentDirectoryFilePlan { owned, temporary })
+    Ok(owned)
 }
 
 fn validate_planned_file_entries(
     directory: &ManagedDir,
     owned: &[ComponentPlannedFile],
-    temporary: &[ComponentPlannedFile],
     maximum_owned: usize,
-    include_temporary: bool,
 ) -> Result<(), ComponentEffectsError> {
-    if owned.len() > maximum_owned
-        || temporary.len() > MAX_MANAGED_TEMP_ENTRIES
-        || (!include_temporary && !temporary.is_empty())
-    {
+    if owned.len() > maximum_owned {
         return Err(ComponentEffectsError::Topology);
     }
-    let expected_count = owned
-        .len()
-        .checked_add(temporary.len())
-        .ok_or(ComponentEffectsError::Topology)?;
     let limit = maximum_owned
-        .checked_add(if include_temporary {
-            MAX_MANAGED_TEMP_ENTRIES
-        } else {
-            0
-        })
-        .and_then(|entries| entries.checked_add(1))
+        .checked_add(1)
         .ok_or(ComponentEffectsError::Topology)?;
     let names = exact_entry_names(directory, limit)?;
-    if names.len() != expected_count
-        || owned.iter().any(|file| !names.contains(&file.name))
-        || temporary.iter().any(|file| !names.contains(&file.name))
-    {
+    if names.len() != owned.len() || owned.iter().any(|file| !names.contains(&file.name)) {
         return Err(ComponentEffectsError::Topology);
     }
     for file in owned {
         let _ = inspect_planned_file(directory, file)?;
-    }
-    for file in temporary {
-        let guard = inspect_planned_file(directory, file)?;
-        if !validate_managed_temp_name(&file.name)?
-            || !directory.managed_temp_is_orphan(&file.name, &guard)?
-        {
-            return Err(ComponentEffectsError::Topology);
-        }
-    }
-    Ok(())
-}
-
-fn remove_planned_temps(
-    directory: &ManagedDir,
-    temporary: &[ComponentPlannedFile],
-) -> Result<(), ComponentEffectsError> {
-    for file in temporary.iter().rev() {
-        let guard = inspect_planned_file(directory, file)?;
-        if !directory.managed_temp_is_orphan(&file.name, &guard)? {
-            return Err(ComponentEffectsError::Topology);
-        }
-        directory.remove_guarded_file(&file.name, &guard)?;
     }
     Ok(())
 }
@@ -2339,7 +2118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_residue_prevents_every_cleanup_including_temp_sweeping() {
+    async fn unknown_residue_prevents_every_cleanup() {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
@@ -2353,8 +2132,7 @@ mod tests {
             .quarantine()
             .write_new_exact("sentinel", b"unknown")
             .unwrap();
-        let temp_name = format!(".axial-loader-tmp-{}-1-0", std::process::id());
-        fs::write(lane.table.path().join(&temp_name), b"dead-temp").unwrap();
+        fs::write(lane.table.path().join("residue"), b"unknown-table").unwrap();
 
         assert!(ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).is_err());
         assert_eq!(
@@ -2366,8 +2144,8 @@ mod tests {
             b"unknown"
         );
         assert_eq!(
-            fs::read(lane.table.path().join(temp_name)).unwrap(),
-            b"dead-temp"
+            fs::read(lane.table.path().join("residue")).unwrap(),
+            b"unknown-table"
         );
     }
 
@@ -2406,8 +2184,6 @@ mod tests {
             .staging()
             .write_new_exact(&component_slot_name(5).unwrap(), b"stage-five")
             .unwrap();
-        let dead_temp = format!(".axial-loader-tmp-{}-2-0", std::process::id());
-        fs::write(first.staging().path().join(dead_temp), b"dead-temp").unwrap();
         let later = lane.create_shard_buckets(7).unwrap();
         later
             .quarantine()
@@ -2577,32 +2353,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_same_size_temp_replacement_is_not_deleted() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
-        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
-        let temp_name = format!(".axial-loader-tmp-{}-41-0", std::process::id());
-        let temp_file = lane.table.path().join(&temp_name);
-        let saved_temp = temporary.path().join("saved-admitted-temp");
-        fs::write(&temp_file, b"original").unwrap();
-        drop(lane);
-
-        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
-            &lease,
-            ManagedComponentKind::Libraries,
-            || {
-                fs::rename(&temp_file, &saved_temp).unwrap();
-                fs::write(&temp_file, b"replaced").unwrap();
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(fs::read(temp_file).unwrap(), b"replaced");
-        assert_eq!(fs::read(saved_temp).unwrap(), b"original");
-    }
-
-    #[tokio::test]
     async fn admitted_empty_bucket_replacement_is_not_deleted() {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
@@ -2628,82 +2378,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn temp_added_after_admission_is_not_swept() {
+    async fn entry_added_after_admission_is_not_swept() {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let root = ManagedDir::open_root(temporary.path()).unwrap();
         let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
         let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
         let buckets = lane.create_shard_buckets(0).unwrap();
-        let temp_file = buckets
-            .staging()
-            .path()
-            .join(format!(".axial-loader-tmp-{}-42-0", std::process::id()));
+        let late_file = buckets.staging().path().join("late-residue");
         drop((buckets, lane));
 
         let result = ComponentLane::prepare_fresh_with_cleanup_hook(
             &lease,
             ManagedComponentKind::Libraries,
-            || fs::write(&temp_file, b"new-temp").unwrap(),
+            || fs::write(&late_file, b"late").unwrap(),
         );
 
         assert!(result.is_err());
-        assert_eq!(fs::read(temp_file).unwrap(), b"new-temp");
-    }
-
-    #[tokio::test]
-    async fn orphaned_lane_marker_temp_is_exactly_recovered() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
-        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
-        let temp_file = lane
-            .lane()
-            .path()
-            .join(format!(".axial-loader-tmp-{}-61-0", std::process::id()));
-        fs::write(&temp_file, b"partial-intent").unwrap();
-        drop(lane);
-
-        let recovered =
-            ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
-
-        assert!(!temp_file.exists());
-        assert_eq!(
-            exact_entry_names(recovered.lane(), MAX_COMPONENT_LANE_ENTRIES + 1).unwrap(),
-            BTreeSet::from([
-                COMPONENT_ANCESTORS_DIRECTORY.to_string(),
-                COMPONENT_QUARANTINE_DIRECTORY.to_string(),
-                COMPONENT_STAGING_DIRECTORY.to_string(),
-                COMPONENT_TABLE_DIRECTORY.to_string(),
-            ])
-        );
-    }
-
-    #[tokio::test]
-    async fn replaced_lane_marker_temp_is_never_deleted() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
-        let root = ManagedDir::open_root(temporary.path()).unwrap();
-        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
-        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
-        let temp_file = lane
-            .lane()
-            .path()
-            .join(format!(".axial-loader-tmp-{}-62-0", std::process::id()));
-        let saved_temp = temporary.path().join("saved-lane-marker-temp");
-        fs::write(&temp_file, b"original").unwrap();
-        drop(lane);
-
-        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
-            &lease,
-            ManagedComponentKind::Libraries,
-            || {
-                fs::rename(&temp_file, &saved_temp).unwrap();
-                fs::write(&temp_file, b"replaced").unwrap();
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(fs::read(temp_file).unwrap(), b"replaced");
-        assert_eq!(fs::read(saved_temp).unwrap(), b"original");
+        assert_eq!(fs::read(late_file).unwrap(), b"late");
     }
 
     #[tokio::test]
@@ -3678,29 +3369,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_recovery_cleans_authenticated_orphan_marker_temps() {
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
-        let published = single_absent_row_candidate(&temporary)
-            .await
-            .publish_intent()
-            .unwrap_or_else(|_| panic!("publish component intent"));
-        let lane_temp = format!(".axial-loader-tmp-{}-900001-0", std::process::id());
-        let record_temp = format!(".axial-loader-tmp-{}-900002-0", std::process::id());
-        let lane_temp_path = published.lane.lane.path().join(&lane_temp);
-        let record_temp_path = published.lane.ancestor_records.path().join(&record_temp);
-        fs::write(&lane_temp_path, b"orphan-intent-temp").unwrap();
-        fs::write(&record_temp_path, b"orphan-record-temp").unwrap();
-        let ComponentIntentPublished { lease, .. } = published;
-
-        assert!(matches!(
-            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
-            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
-        ));
-        assert!(!lane_temp_path.exists());
-        assert!(!record_temp_path.exists());
-    }
-
-    #[tokio::test]
     async fn intent_publication_distinguishes_before_and_attempted_faults() {
         let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
@@ -3942,13 +3610,12 @@ mod tests {
         for index in 0..MAX_COMPONENT_TABLE_SHARDS {
             fs::create_dir(temporary.path().join(component_bucket_name(index).unwrap())).unwrap();
         }
-        let temp_name = format!(".axial-loader-tmp-{}-1-0", std::process::id());
         fs::write(
             temporary
                 .path()
                 .join(component_bucket_name(MAX_COMPONENT_TABLE_SHARDS - 1).unwrap())
-                .join(temp_name),
-            b"dead-temp",
+                .join(component_slot_name(0).unwrap()),
+            b"slot",
         )
         .unwrap();
         let before = open_fds_beneath(temporary.path());
