@@ -99,7 +99,8 @@ async fn preflight_fixture_with_credentials(
         accounts,
         settings,
         installs,
-        RuntimeDiscovery::new(cache, tasks.clone()),
+        RuntimeDiscovery::new(cache, tasks.clone())
+            .with_probe_timeout_for_test(std::time::Duration::from_secs(60)),
         performance,
         auth,
         skins,

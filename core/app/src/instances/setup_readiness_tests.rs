@@ -113,7 +113,8 @@ fn compose_fixture(
         accounts.clone(),
         settings.clone(),
         queue.as_ref().clone(),
-        RuntimeDiscovery::new(runtime, tasks.clone()),
+        RuntimeDiscovery::new(runtime, tasks.clone())
+            .with_probe_timeout_for_test(std::time::Duration::from_secs(60)),
         performance,
         auth,
         skins,

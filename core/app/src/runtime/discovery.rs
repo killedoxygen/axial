@@ -30,6 +30,8 @@ pub struct RuntimeDiscovery {
     test_endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
     #[cfg(test)]
     pub(crate) probes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    probe_timeout: Option<std::time::Duration>,
 }
 
 /// A successful probe of one exact verified managed build.
@@ -174,7 +176,31 @@ impl RuntimeDiscovery {
             test_endpoints: None,
             #[cfg(test)]
             probes: Arc::default(),
+            #[cfg(test)]
+            probe_timeout: None,
         }
+    }
+
+    /// Fixture probes are scripts gated on test files; their deadline must not
+    /// depend on how loaded the machine running the suite is.
+    #[cfg(test)]
+    pub(crate) fn with_probe_timeout_for_test(mut self, timeout: std::time::Duration) -> Self {
+        self.probe_timeout = Some(timeout);
+        self
+    }
+
+    async fn run_probe(
+        &self,
+        path: &Path,
+        id_hint: Option<&str>,
+        cancellation: impl std::future::Future<Output = ()>,
+    ) -> Result<JavaProbeReceipt, axial_minecraft::JavaProbeError> {
+        #[cfg(test)]
+        if let Some(timeout) = self.probe_timeout {
+            return axial_minecraft::runtime::probe_java_within(path, id_hint, cancellation, timeout)
+                .await;
+        }
+        probe_java(path, id_hint, cancellation).await
     }
 
     #[cfg(feature = "test-support")]
@@ -445,7 +471,7 @@ impl RuntimeDiscovery {
             self.probes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SelectedRuntime {
-                probe: probe_java(path, None, cancellation.cancelled()).await?,
+                probe: self.run_probe(path, None, cancellation.cancelled()).await?,
                 managed: None,
                 manifest: None,
             }
@@ -476,6 +502,7 @@ impl RuntimeDiscovery {
             .clone();
         #[cfg(test)]
         let probes = self.probes.clone();
+        let discovery = self.clone();
         let task = self
             .tasks
             .try_spawn(admitted.clone(), move |cancel| async move {
@@ -509,7 +536,9 @@ impl RuntimeDiscovery {
                         *proven = None;
                         #[cfg(test)]
                         probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let probe = probe_java(&path, Some(&component), cancel.cancelled()).await?;
+                        let probe = discovery
+                            .run_probe(&path, Some(&component), cancel.cancelled())
+                            .await?;
                         *proven = Some(ProvenProbe {
                             manifest,
                             probe: probe.clone(),

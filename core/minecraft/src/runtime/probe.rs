@@ -132,6 +132,18 @@ pub async fn probe_java(
     probe_with_timeout(path, id_hint, cancellation, PROBE_TIMEOUT).await
 }
 
+/// `probe_java` with an explicit deadline, for fixtures whose probe is a
+/// script gated on test files rather than a real Java executable.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn probe_java_within(
+    path: &Path,
+    id_hint: Option<&str>,
+    cancellation: impl Future<Output = ()>,
+    timeout: Duration,
+) -> Result<JavaProbeReceipt, JavaProbeError> {
+    probe_with_timeout(path, id_hint, cancellation, timeout).await
+}
+
 async fn probe_with_timeout(
     path: &Path,
     id_hint: Option<&str>,

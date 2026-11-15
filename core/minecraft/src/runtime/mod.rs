@@ -46,6 +46,8 @@ pub use model::{
     RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
 pub use probe::{JavaArchitecture, JavaProbeError, JavaProbeReceipt, probe_java};
+#[cfg(any(test, feature = "test-support"))]
+pub use probe::probe_java_within;
 
 #[cfg(test)]
 use file_download::{
