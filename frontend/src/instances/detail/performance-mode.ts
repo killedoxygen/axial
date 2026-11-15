@@ -15,3 +15,10 @@ export function performanceModeLabel(mode: ConfigPerformanceMode): string {
   if (mode === 'vanilla') return 'Vanilla';
   return 'Custom';
 }
+
+/** What each mode adds at launch; shared by the global and instance settings. */
+export const performanceModeNotes: Record<ConfigPerformanceMode, string> = {
+  managed: 'Axial chooses JVM settings for each Java version.',
+  vanilla: "Pure Minecraft. Only the game's own launch settings and your memory.",
+  custom: 'Only the JVM preset and arguments you choose.',
+};

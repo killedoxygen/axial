@@ -55,7 +55,7 @@ use crate::{
     library::{ApplicationRootPin, GenerationPin},
     performance::{PerformanceMutationError, PerformanceService},
     runtime::{
-        discovery::{RuntimeDiscovery, RuntimeObservation},
+        discovery::{RuntimeDiscovery, RuntimeObservation, RuntimeProjection},
         model::JavaDiscoveryError,
     },
     settings::{EffectiveLaunchSettings, OverrideOrigin, SettingsStore},
@@ -378,10 +378,13 @@ impl LaunchCoordinator {
         }
     }
 
+    /// Captures the account selection and effective settings, resolving an
+    /// Automatic heap from this host observation.
     fn capture(
         &self,
         instance: &crate::instances::model::Instance,
         username: Option<&str>,
+        host: &super::resources::HostResources,
     ) -> Result<(CapturedSelection, EffectiveLaunchSettings, String), LaunchError> {
         let selection = CapturedSelection::capture(&self.accounts)
             .map_err(|_| LaunchError::AccountUnavailable)?;
@@ -401,10 +404,14 @@ impl LaunchCoordinator {
             .settings
             .current()
             .map_err(|_| LaunchError::SettingsChanged)?;
-        let settings = instance
+        let mut settings = instance
             .settings
             .effective(&global)
             .map_err(|_| LaunchError::PlanRejected)?;
+        settings.resolve_heap(super::jvm::automatic_max_heap_mb(
+            host.total_memory_mb,
+            host.available_memory_mb,
+        ));
         super::plan::split_extra_args(&settings.extra_jvm_args)
             .map_err(|_| LaunchError::PlanRejected)?;
         let player_name = selection
@@ -422,6 +429,13 @@ impl LaunchCoordinator {
         Ok((selection, settings, player_name))
     }
 
+    /// Prepares one accepted launch. Account work runs beside the installation
+    /// chain; within it the runtime and natives run beside the ordered
+    /// game-library and asset effects once the version names its runtime.
+    /// Every branch is joined before any result is used, so a failure never
+    /// abandons accepted sibling work, and a published native directory is
+    /// settled on every refusal.
+    #[allow(clippy::too_many_arguments)]
     async fn prepare(
         &self,
         admitted: RegisteredInstance,
@@ -432,8 +446,45 @@ impl LaunchCoordinator {
         library_retention: Arc<super::libraries::Retention>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
     ) -> Result<PreparedSession, LaunchError> {
-        let (selection, mut effective, player_name) =
-            self.capture(&admitted.record().instance, request.username.as_deref())?;
+        let result = self
+            .prepare_admitted(
+                admitted,
+                request,
+                cancellation,
+                context,
+                native_retention,
+                library_retention,
+                telemetry,
+            )
+            .await;
+        if result.is_err() {
+            let natives = native_retention
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            super::prepare::settle_natives(natives).await;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_admitted(
+        &self,
+        admitted: RegisteredInstance,
+        request: &LaunchRequest,
+        cancellation: &CancellationToken,
+        context: Option<super::reports::LaunchProofScenario>,
+        native_retention: &Mutex<Option<Arc<crate::install::vanilla::PreparedNatives>>>,
+        library_retention: Arc<super::libraries::Retention>,
+        telemetry: Arc<super::session::LaunchAttemptTelemetry>,
+    ) -> Result<PreparedSession, LaunchError> {
+        let stages = super::reports::StageTimings::default();
+        let host = super::resources::capture_host();
+        let (selection, mut effective, player_name) = self.capture(
+            &admitted.record().instance,
+            request.username.as_deref(),
+            &host,
+        )?;
         if let Some(value) = request.max_memory_mb.filter(|value| *value > 0) {
             effective.max_memory_mb = value;
         }
@@ -448,6 +499,11 @@ impl LaunchCoordinator {
         {
             return Err(LaunchError::InstanceChanged);
         }
+        let options = launch_options(&effective)?;
+        let composition = self
+            .performance
+            .settled_for_launch(&admitted)
+            .map_err(composition_error)?;
         let library_operation = admitted
             .generation()
             .managed_library()
@@ -456,100 +512,131 @@ impl LaunchCoordinator {
             .generation()
             .read_projection()
             .map_err(|_| LaunchError::LibraryUnavailable)?;
-        let version_guard = axial_minecraft::VersionBundleReadGuard::acquire(&library_operation)
-            .map_err(|_| LaunchError::InstallUnavailable)?;
-        let installed = self
-            .installs
-            .ready_version(admitted.generation(), &instance.version_id)
-            .await
-            .map_err(install_read_error)?;
-        let installed_versions = crate::catalog::installed_snapshot(admitted.generation())
-            .await
-            .map_err(|_| LaunchError::LibraryUnavailable)?;
-        if installed_versions.is_degraded() {
-            return Err(LaunchError::InstalledVersionsDegraded);
-        }
-        let (installed, game_libraries) = installed
-            .prepare_game_libraries(None)
-            .await
-            .map_err(game_libraries_error)?;
-        let mode = crate::performance::plan::configured_mode(effective.performance_mode);
-        let version = installed.version();
-        let required = axial_minecraft::effective_java_version_for(
-            &instance.minecraft_version,
-            &version.kind,
-            &version.java_version,
-        );
-        let runtime = self
-            .runtimes
-            .prepare_for_launch(&required, &effective.java_path, cancellation)
-            .await
-            .map_err(LaunchError::RuntimeFailure)?;
-        if cancellation.is_cancelled() {
-            return Err(LaunchError::Cancelled);
-        }
-        let performance = self
-            .performance
-            .prepare_for_launch(
-                &admitted,
-                self.performance.resolution_request(
-                    instance.minecraft_version.clone(),
-                    instance.loader_key.clone(),
-                    mode,
-                ),
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    stage = "performance_prepare",
-                    cause = error.diagnostic_code(),
-                    "Launch preparation rejected."
-                );
-                match error {
-                    PerformanceMutationError::Unsettled => LaunchError::PerformanceUnsettled,
-                    PerformanceMutationError::Cancelled => LaunchError::Cancelled,
-                    PerformanceMutationError::InstanceUnavailable => LaunchError::InstanceBusy,
-                    _ => LaunchError::PerformanceUnavailable,
-                }
-            })?;
-        let contribution = performance.effective();
-        let mut environment = axial_minecraft::default_environment();
-        let resolution = match (effective.window_width, effective.window_height) {
-            (0, 0) => None,
-            (width, height) if width > 0 && height > 0 => Some((width as u32, height as u32)),
-            _ => return Err(LaunchError::PlanRejected),
-        };
-        environment
-            .features
-            .insert("has_custom_resolution".into(), resolution.is_some());
-        // Complete fallible account/settings work before publishing a fresh
-        // native directory. Once published, every rejection must settle it.
-        let (selection, auth, secrets, credential_expires_at) =
-            if let Some(account) = selection.account() {
-                let (account, auth, secrets, expires) = self.prepare_auth(account.clone()).await?;
-                (
-                    CapturedSelection::from_account(account),
-                    auth,
-                    secrets,
-                    expires,
-                )
-            } else {
-                selection
-                    .validate(&self.accounts)
-                    .map_err(|_| LaunchError::AccountChanged)?;
-                (
-                    selection,
-                    LaunchAuthContext::offline(player_name),
-                    Vec::new(),
-                    None,
-                )
-            };
         let game_dir = admitted
             .game_directory()
             .read_projection()
             .map_err(|_| LaunchError::InstanceChanged)?;
-        let host = super::resources::capture_host();
-        let options = launch_options(&effective, &instance, &contribution, &host)?;
+        let version_guard = axial_minecraft::VersionBundleReadGuard::acquire(&library_operation)
+            .map_err(|_| LaunchError::InstallUnavailable)?;
+
+        let account = stages.time("account", "Account", async {
+            match selection.account() {
+                Some(account) => {
+                    let (account, auth, secrets, expires) =
+                        self.prepare_auth(account.clone()).await?;
+                    Ok::<_, LaunchError>((
+                        CapturedSelection::from_account(account),
+                        auth,
+                        secrets,
+                        expires,
+                    ))
+                }
+                None => {
+                    selection
+                        .validate(&self.accounts)
+                        .map_err(|_| LaunchError::AccountChanged)?;
+                    Ok((
+                        selection.clone(),
+                        LaunchAuthContext::offline(player_name.clone()),
+                        Vec::new(),
+                        None,
+                    ))
+                }
+            }
+        });
+        let installation = async {
+            let (installed, installed_versions) = stages
+                .time("installation", "Installed game files", async {
+                    let (installed, installed_versions) = tokio::join!(
+                        self.installs
+                            .ready_version(admitted.generation(), &instance.version_id),
+                        crate::catalog::installed_snapshot(admitted.generation()),
+                    );
+                    let installed = installed.map_err(install_read_error)?;
+                    let installed_versions =
+                        installed_versions.map_err(|_| LaunchError::LibraryUnavailable)?;
+                    if installed_versions.is_degraded() {
+                        return Err(LaunchError::InstalledVersionsDegraded);
+                    }
+                    Ok((installed, installed_versions))
+                })
+                .await?;
+            let (installed, game_libraries) = installed
+                .prepare_game_libraries(None)
+                .await
+                .map_err(game_libraries_error)?;
+            let version = installed.version();
+            let required = axial_minecraft::effective_java_version_for(
+                &instance.minecraft_version,
+                &version.kind,
+                &version.java_version,
+            );
+            let mut environment = axial_minecraft::default_environment();
+            environment
+                .features
+                .insert("has_custom_resolution".into(), options.resolution.is_some());
+            let (runtime, files, natives) = tokio::join!(
+                stages.time(
+                    "runtime",
+                    "Java runtime",
+                    self.runtimes
+                        .prepare_for_launch(&required, &effective.java_path, cancellation),
+                ),
+                stages.time("game_files", "Game libraries and assets", async {
+                    let game_libraries = match game_libraries {
+                        Some(inputs) => Some(
+                            super::libraries::prepare(
+                                inputs,
+                                library_retention.clone(),
+                                cancellation,
+                            )
+                            .await?,
+                        ),
+                        None => None,
+                    };
+                    let game_assets = super::assets::prepare(
+                        &installed,
+                        &library_operation,
+                        &library_dir,
+                        &game_dir,
+                        library_retention.clone(),
+                        cancellation,
+                    )
+                    .await?;
+                    Ok::<_, LaunchError>((game_libraries, game_assets))
+                }),
+                stages.time("natives", "Native libraries", async {
+                    let natives = installed
+                        .prepare_natives(&library_operation, &library_dir, &environment)
+                        .await
+                        .map_err(|_| LaunchError::InstallUnavailable)?
+                        .map(Arc::new);
+                    // Retained before any sibling result is read: every
+                    // later refusal settles this exact directory.
+                    *native_retention
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = natives.clone();
+                    Ok::<_, LaunchError>(natives)
+                }),
+            );
+            let runtime = runtime.map_err(LaunchError::RuntimeFailure)?;
+            let (game_libraries, game_assets) = files?;
+            Ok::<_, LaunchError>((
+                installed,
+                installed_versions,
+                runtime,
+                game_libraries,
+                game_assets,
+                natives?,
+            ))
+        };
+        let (account, installation) = tokio::join!(account, installation);
+        let (installed, installed_versions, runtime, game_libraries, game_assets, prepared_natives) =
+            installation?;
+        let (selection, auth, secrets, credential_expires_at) = account?;
+        if cancellation.is_cancelled() {
+            return Err(LaunchError::Cancelled);
+        }
         let resource_budget = super::resources::capture(
             &host,
             self.sessions.resource_use(),
@@ -557,87 +644,54 @@ impl LaunchCoordinator {
             effective.max_memory_mb,
             [&library_dir, &game_dir],
         );
-        let game_libraries = match game_libraries {
-            Some(inputs) => Some(
-                super::libraries::prepare(inputs, library_retention.clone(), cancellation).await?,
-            ),
-            None => None,
-        };
-        let game_assets = super::assets::prepare(
-            &installed,
-            &library_operation,
-            &library_dir,
-            &game_dir,
-            library_retention,
-            cancellation,
-        )
-        .await?;
-        let prepared_natives = installed
-            .prepare_natives(&library_operation, &library_dir, &environment)
-            .await
-            .map_err(|_| LaunchError::InstallUnavailable)?
-            .map(Arc::new);
-        let retained_natives = prepared_natives.clone();
-        *native_retention
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = retained_natives.clone();
-        let result = (|| {
-            if cancellation.is_cancelled() {
-                return Err(LaunchError::Cancelled);
-            }
-            let mut command = super::plan::build(LaunchPlanRequest {
-                library_operation,
-                library_dir,
-                target_version_id: instance.minecraft_version.clone(),
-                game_dir,
-                auth,
-                runtime: runtime.probe,
-                managed_launch: runtime.managed,
-                installed,
-                version_guard,
-                prepared_natives,
-                game_assets,
-                settings: options,
+        let mut command = stages
+            .time("plan", "Launch command", async {
+                super::plan::build(LaunchPlanRequest {
+                    library_operation,
+                    library_dir,
+                    target_version_id: instance.minecraft_version.clone(),
+                    game_dir,
+                    auth,
+                    runtime: runtime.probe,
+                    managed_launch: runtime.managed,
+                    installed,
+                    version_guard,
+                    prepared_natives,
+                    game_assets,
+                    settings: options,
+                })
+                .map_err(|error| {
+                    tracing::warn!(?error, stage = "build", "Launch plan rejected.");
+                    LaunchError::PlanRejected
+                })
             })
-            .map_err(|error| {
-                tracing::warn!(?error, stage = "build", "Launch plan rejected.");
-                LaunchError::PlanRejected
-            })?;
-            command.game_libraries = game_libraries;
-            if cancellation.is_cancelled() {
-                return Err(LaunchError::Cancelled);
-            }
-            let mut scenario = context.unwrap_or_default();
-            scenario.performance_mode = match mode {
-                crate::performance::model::PerformanceMode::Managed => "managed",
-                crate::performance::model::PerformanceMode::Vanilla => "vanilla",
-                crate::performance::model::PerformanceMode::Custom => "custom",
-            }
-            .into();
-            scenario.version_id = Some(instance.version_id.clone());
-            scenario.requested_memory_mb = Some(effective.max_memory_mb);
-            PreparedSession::new(
-                instance.id,
-                instance.version_id,
-                command,
-                installed_versions,
-                self.accounts.clone(),
-                selection,
-                self.settings.clone(),
-                effective.global_config_revision,
-                secrets,
-                admitted,
-                performance,
-                scenario,
-                resource_budget,
-                credential_expires_at,
-                telemetry,
-            )
-        })();
-        if result.is_err() {
-            super::prepare::settle_natives(retained_natives).await;
+            .await?;
+        command.game_libraries = game_libraries;
+        if cancellation.is_cancelled() {
+            return Err(LaunchError::Cancelled);
         }
-        result
+        let mut scenario = context.unwrap_or_default();
+        scenario.performance_mode = effective.performance_mode.as_str().into();
+        scenario.version_id = Some(instance.version_id.clone());
+        scenario.requested_memory_mb = Some(effective.max_memory_mb);
+        PreparedSession::new(
+            instance.id,
+            instance.version_id,
+            command,
+            installed_versions,
+            self.accounts.clone(),
+            selection,
+            self.settings.clone(),
+            effective.global_config_revision,
+            secrets,
+            admitted,
+            composition,
+            scenario,
+            resource_budget,
+            credential_expires_at,
+            telemetry,
+            stages.take(),
+        )
     }
 
     async fn prepare_auth(
@@ -716,12 +770,7 @@ fn capture_after_profile(
     Ok(current)
 }
 
-fn launch_options(
-    effective: &EffectiveLaunchSettings,
-    instance: &crate::instances::model::Instance,
-    contribution: &crate::performance::effective::EffectivePerformancePlan,
-    host: &super::resources::HostResources,
-) -> Result<LaunchOptions, LaunchError> {
+fn launch_options(effective: &EffectiveLaunchSettings) -> Result<LaunchOptions, LaunchError> {
     let resolution = match (effective.window_width, effective.window_height) {
         (0, 0) => None,
         (width, height) if width > 0 && height > 0 => Some((width as u32, height as u32)),
@@ -733,21 +782,20 @@ fn launch_options(
         resolution,
         extra_jvm_args: super::plan::split_extra_args(&effective.extra_jvm_args)
             .map_err(|_| LaunchError::PlanRejected)?,
-        jvm_preset: if effective.jvm_preset.as_str().is_empty() {
-            contribution
-                .jvm_contribution
-                .preset
-                .clone()
-                .unwrap_or_default()
-        } else {
-            effective.jvm_preset.as_str().into()
-        },
-        low_impact_startup: contribution.launch_smoothing.policy
-            != crate::performance::effective::EffectiveLaunchSmoothingPolicy::UserControlled,
-        logical_cores: host.cpu_threads.unwrap_or(4),
-        total_memory_mb: Some(host.total_memory_mb),
-        loader: instance.loader_key.clone(),
-        is_modded: !matches!(instance.loader_key.as_str(), "" | "vanilla"),
+        jvm_preset: effective.jvm_preset.as_str().into(),
+        performance_mode: effective.performance_mode,
         ..Default::default()
     })
+}
+
+fn composition_error(error: PerformanceMutationError) -> LaunchError {
+    tracing::warn!(
+        stage = "composition",
+        cause = error.diagnostic_code(),
+        "Launch preparation rejected."
+    );
+    match error {
+        PerformanceMutationError::InstanceUnavailable => LaunchError::InstanceBusy,
+        _ => LaunchError::PerformanceUnsettled,
+    }
 }

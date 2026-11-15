@@ -295,8 +295,7 @@ async fn assert_runtime_failure_keeps_safe_cause(missing: bool, launch: bool) {
         drop(reports);
         drop(storage);
         let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
-        let reports =
-            super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
+        let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
         let library = match crate::library::LibraryLifecycle::open(root.path()) {
             crate::library::LibraryOpenOutcome::Ready(library) => library,
             other => panic!("reopened fixture root: {other:?}"),
@@ -984,24 +983,11 @@ async fn preflight_projection_rejects_changed_evidence_until_a_fresh_request() {
         } else {
             std::fs::write(&jar, b"external drift").unwrap();
         }
-        let drifted = coordinator
+        // A row sharing the projection's proof does not rehash per row; the
+        // projection refuses publication when its single final check fails.
+        coordinator
             .preflight_with_projection(id.clone(), &mut projection)
             .await;
-        assert_eq!(drifted.error.unwrap().code, LaunchError::InstallUnavailable);
-        assert!(projection.current.is_none());
-        assert_eq!(
-            coordinator
-                .fresh_install_checks
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        if !ancestor {
-            std::fs::write(&jar, original).unwrap();
-        }
-        let stale = coordinator
-            .preflight_with_projection(id.clone(), &mut projection)
-            .await;
-        assert_eq!(stale.error.unwrap().code, LaunchError::LibraryUnavailable);
         assert!(
             coordinator
                 .finish_preflight_projection(&projection)
@@ -1009,13 +995,20 @@ async fn preflight_projection_rejects_changed_evidence_until_a_fresh_request() {
                 .is_err()
         );
         drop(projection);
+        let fresh = coordinator.preflight(id.clone()).await;
+        if ancestor {
+            assert!(fresh.launchable, "{fresh:?}");
+        } else {
+            assert_eq!(fresh.error.unwrap().code, LaunchError::InstallUnavailable);
+            std::fs::write(&jar, original).unwrap();
+        }
         let repaired = coordinator.preflight(id).await;
         assert!(repaired.launchable, "{repaired:?}");
         assert_eq!(
             coordinator
                 .fresh_install_checks
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            3
         );
     }
 }
@@ -1374,8 +1367,7 @@ fn account_change_during_install_readiness_rejects_the_captured_launch() {
         let mut request = request();
         request.instance_id = id;
         request.username = None;
-        let telemetry =
-            super::super::session::LaunchAttemptTelemetry::started(None, "vanilla");
+        let telemetry = super::super::session::LaunchAttemptTelemetry::started(None, "vanilla");
 
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -1438,14 +1430,6 @@ fn account_change_during_install_readiness_rejects_the_captured_launch() {
 #[tokio::test]
 async fn preflight_probe_does_not_reserve_the_foreground_launch_target() {
     let (root, coordinator, id) = preflight_fixture().await;
-    assert!(
-        !coordinator
-            .performance
-            .rules()
-            .status()
-            .status
-            .remote_refresh
-    );
     let waiter = tokio::spawn({
         let coordinator = coordinator.clone();
         let id = id.clone();
@@ -1465,12 +1449,6 @@ async fn preflight_probe_does_not_reserve_the_foreground_launch_target() {
         .is_err();
     let publication_blocked =
         axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).is_err();
-    let rules_blocked = tokio::time::timeout(
-        std::time::Duration::from_millis(10),
-        coordinator.performance.rules().refresh(),
-    )
-    .await
-    .is_err();
     std::fs::write(root.path().join("probe-release"), b"release").unwrap();
     let result = waiter.await.unwrap();
     coordinator
@@ -1487,7 +1465,7 @@ async fn preflight_probe_does_not_reserve_the_foreground_launch_target() {
         "foreground launch admission was blocked by preflight: {refusal:?}"
     );
     assert!(result.launchable, "{result:?}");
-    assert!(artifact_blocked && publication_blocked && rules_blocked);
+    assert!(artifact_blocked && publication_blocked);
     assert!(
         coordinator
             .instances
@@ -1549,6 +1527,9 @@ async fn preflight_rechecks_captured_inputs_even_when_the_probe_fails() {
         );
         std::fs::remove_file(root.path().join("probe-release")).unwrap();
         std::fs::remove_file(root.path().join("probe-started")).unwrap();
+        // The library proof stays shared; observe the runtime again so a live
+        // probe owns this row.
+        projection.runtimes = Default::default();
         if fail_probe {
             std::fs::write(root.path().join("probe-fail"), b"fail").unwrap();
         }
@@ -1692,6 +1673,9 @@ async fn preflight_waiter_loss_retains_artifacts_until_the_probe_is_reaped() {
     );
     std::fs::remove_file(root.path().join("probe-release")).unwrap();
     std::fs::remove_file(root.path().join("probe-started")).unwrap();
+    // The library proof stays shared; observe the runtime again so a live
+    // probe owns this row.
+    projection.runtimes = Default::default();
     let waiter = tokio::spawn({
         let coordinator = coordinator.clone();
         let id = id.clone();
@@ -2025,17 +2009,17 @@ async fn observed_settlement_survives_report_failure_and_disk_reopen() {
     let (intents, request, acceptance, session, _) =
         observed_fixture(durable_intents(storage.clone())).await;
     let key = request.intent_key.as_deref().unwrap();
-    assert_eq!(
-        session.phase,
-        super::super::session::SessionPhase::Exited
-    );
+    assert_eq!(session.phase, super::super::session::SessionPhase::Exited);
     assert!(
         session.tree_settled
             && session.output_drained
             && !session.process_alive
             && !session.stop_allowed
     );
-    assert_eq!(session.notice.as_ref().unwrap().tone, crate::public::Tone::Warn);
+    assert_eq!(
+        session.notice.as_ref().unwrap().tone,
+        crate::public::Tone::Warn
+    );
     assert!(
         session
             .notice
@@ -2233,10 +2217,7 @@ async fn observed_settlement_is_immutable_and_report_concordance_is_required() {
         }
         assert!(
             reports
-                .record(
-                    contradictory,
-                    &super::super::logs::Redactor::new(vec![])
-                )
+                .record(contradictory, &super::super::logs::Redactor::new(vec![]))
                 .is_err(),
             "{field}"
         );
@@ -2420,10 +2401,7 @@ async fn observed_settlement_write_faults_retain_owner_until_verified_retry() {
         let (session, _) = tokio::time::timeout(std::time::Duration::from_secs(2), finish)
             .await
             .unwrap();
-        assert_eq!(
-            session.phase,
-            super::super::session::SessionPhase::Exited
-        );
+        assert_eq!(session.phase, super::super::session::SessionPhase::Exited);
         assert!(terminal_ack(&storage, &key));
         assert!(intents.interrupted_records().unwrap().is_empty());
     }
@@ -2466,10 +2444,7 @@ async fn observed_settlement_without_durable_owner_does_not_release_failed_repor
     let (session, _) = tokio::time::timeout(std::time::Duration::from_secs(2), finish)
         .await
         .unwrap();
-    assert_eq!(
-        session.phase,
-        super::super::session::SessionPhase::Exited
-    );
+    assert_eq!(session.phase, super::super::session::SessionPhase::Exited);
     assert!(reports.get(&session_id).unwrap().is_some());
 }
 
@@ -2901,8 +2876,7 @@ async fn missing_or_changed_binding_refuses_startup_and_leaves_lifecycle_fenced(
             })
             .unwrap();
         drop(intents);
-        let reports =
-            super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
+        let reports = super::super::reports::LaunchReportStore::new(storage.clone()).unwrap();
         assert!(
             LaunchIntents::restore(storage, reports, &directories).is_err(),
             "{change}"

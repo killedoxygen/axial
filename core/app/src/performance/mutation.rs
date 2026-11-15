@@ -416,6 +416,24 @@ pub struct PerformanceService {
     retained: Arc<Mutex<BTreeMap<String, RetainedOperation>>>,
 }
 
+/// Owner proof that an admitted instance has no pending composition operation,
+/// queued or running command, or retained unsettled effect. Launch holds the
+/// instance lease, which excludes new composition work; spawn rechecks this.
+pub struct CompositionSettled {
+    service: PerformanceService,
+    instance: RegisteredInstance,
+}
+
+impl CompositionSettled {
+    pub fn validate_current(&self) -> Result<(), PerformanceMutationError> {
+        self.instance
+            .validate_current()
+            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+        self.service
+            .check_settled(&self.instance.record().instance.id)
+    }
+}
+
 pub struct PreparedPerformance {
     planned: Arc<PlannedPerformance>,
     instance: RegisteredInstance,
@@ -895,6 +913,47 @@ impl PerformanceService {
     /// Settle existing obligations and pin the selected mode's launch plan under
     /// launch's admission. Applying or removing bundles requires an explicit
     /// Performance command; Play does not authorize new content mutations.
+    /// Authoritative settled-or-absent composition state for an ordinary launch.
+    /// Reads only owner state; it plans nothing and writes nothing.
+    pub fn settled_for_launch(
+        &self,
+        instance: &RegisteredInstance,
+    ) -> Result<CompositionSettled, PerformanceMutationError> {
+        instance
+            .validate_current()
+            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+        self.check_settled(&instance.record().instance.id)?;
+        Ok(CompositionSettled {
+            service: self.clone(),
+            instance: instance.clone(),
+        })
+    }
+
+    fn check_settled(&self, id: &InstanceId) -> Result<(), PerformanceMutationError> {
+        if self
+            .retained
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id.as_str())
+        {
+            return Err(PerformanceMutationError::Unsettled);
+        }
+        let busy = self.storage.read(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM performance_operations WHERE instance_id=?1)
+                     OR EXISTS(SELECT 1 FROM performance_commands WHERE instance_id=?1 AND state IN ('queued','running'))",
+                    [id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(StorageError::from)
+        })?;
+        if busy {
+            return Err(PerformanceMutationError::Unsettled);
+        }
+        Ok(())
+    }
+
     pub async fn prepare_for_launch(
         &self,
         instance: &RegisteredInstance,
@@ -2254,7 +2313,9 @@ mod tests {
         } else {
             let _ = match action.as_str() {
                 "apply" => run_command(&service, &instance.id, Some(request), "apply", None).await,
-                "reapply" => run_command(&service, &instance.id, Some(request), "reapply", None).await,
+                "reapply" => {
+                    run_command(&service, &instance.id, Some(request), "reapply", None).await
+                }
                 "rollback" => run_command(&service, &instance.id, None, "rollback", snapshot).await,
                 _ => run_command(&service, &instance.id, None, "remove", None).await,
             };
@@ -2774,7 +2835,11 @@ mod tests {
                         Ok::<_, StorageError>(())
                     })
                     .unwrap();
-                assert!(run_command(&service, &id, None, "remove", None).await.is_err());
+                assert!(
+                    run_command(&service, &id, None, "remove", None)
+                        .await
+                        .is_err()
+                );
                 wait_for_mutation_tasks(&service).await;
                 let command = latest_command(&service, &id);
                 assert_ne!(command.state, "complete");
@@ -2841,7 +2906,9 @@ mod tests {
                 })
                 .unwrap();
             assert!(
-                run_command(&service, &id, None, "remove", None).await.is_err(),
+                run_command(&service, &id, None, "remove", None)
+                    .await
+                    .is_err(),
                 "{corruption}"
             );
             wait_for_mutation_tasks(&service).await;

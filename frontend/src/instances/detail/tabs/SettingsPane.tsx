@@ -10,6 +10,7 @@ import { JavaPathField, JvmArgsInput } from '../../../launch/RuntimeFields';
 import { canAutoSave, useAutoSave } from '../../../settings/autosave';
 import { normalizeJvmPreset, useJvmPresets } from '../../../launch/jvm-presets';
 import { performanceHealth, updateInstance } from '../../api';
+import { explicitMaxMemoryMb, isAutomaticMemory } from '../../../settings/memory';
 import { refreshInstanceReadiness } from '../../readiness';
 import { config, systemInfo } from '../../../settings/state';
 import { instances, updateInstanceInList } from '../../state';
@@ -18,7 +19,12 @@ import type { ConfigPerformanceMode } from '../../../generated/ConfigPerformance
 import type { EnrichedInstance } from '../../../generated/EnrichedInstance';
 import type { JavaSelection } from '../../../generated/JavaSelection';
 import { performanceHealthNotice } from '../../../performance/presenters';
-import { globalPerformanceMode, performanceModeFrom, performanceModeLabel } from '../performance-mode';
+import {
+  globalPerformanceMode,
+  performanceModeFrom,
+  performanceModeLabel,
+  performanceModeNotes,
+} from '../performance-mode';
 
 type InstancePerformanceMode = ConfigPerformanceMode | '';
 const INHERITED_JAVA: JavaSelection = { kind: 'inherited' };
@@ -56,7 +62,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
   const [healthNotice, setHealthNotice] = useState<ReturnType<typeof performanceHealthNotice>>(null);
 
   const memoryOverridden = (inst.max_memory_mb ?? 0) > 0 || (inst.min_memory_mb ?? 0) > 0;
-  const savedMaxGb = memoryGb(inst.max_memory_mb, cfg?.max_memory_mb ?? 4096);
+  const savedMaxGb = memoryGb(inst.max_memory_mb, explicitMaxMemoryMb(cfg));
   const savedMinGb = memoryGb(inst.min_memory_mb, cfg?.min_memory_mb ?? 1024);
   const [maxGb, setMaxGb] = useState(savedMaxGb);
   const [minGb, setMinGb] = useState(savedMinGb);
@@ -157,13 +163,9 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
       label: 'Inherit',
       note: `Follows the global Performance setting, currently ${performanceModeLabel(globalMode)}.`,
     },
-    {
-      value: 'managed',
-      label: 'Managed',
-      note: 'Axial applies recommended tuning and optimizations for this instance.',
-    },
-    { value: 'vanilla', label: 'Vanilla', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
-    { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
+    { value: 'managed', label: 'Managed', note: performanceModeNotes.managed },
+    { value: 'vanilla', label: 'Vanilla', note: performanceModeNotes.vanilla },
+    { value: 'custom', label: 'Custom', note: performanceModeNotes.custom },
   ];
 
   const changeMode = (next: InstancePerformanceMode): void => {
@@ -196,7 +198,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
             memoryOverridden ? (
               <OverrideChip onReset={() => commit({ min_memory_mb: 0, max_memory_mb: 0 }, { label: 'memory' })} />
             ) : (
-              <Chip>Global</Chip>
+              <Chip>{isAutomaticMemory(cfg) ? 'Automatic' : 'Global'}</Chip>
             )
           }
         >
@@ -219,7 +221,7 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
                   revert: () => {
                     const current = instances.value.find((instance) => instance.id === inst.id);
                     setMinGb(memoryGb(current?.min_memory_mb, config.value?.min_memory_mb ?? 1024));
-                    setMaxGb(memoryGb(current?.max_memory_mb, config.value?.max_memory_mb ?? 4096));
+                    setMaxGb(memoryGb(current?.max_memory_mb, explicitMaxMemoryMb(config.value)));
                   },
                 },
               )

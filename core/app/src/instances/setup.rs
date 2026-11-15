@@ -20,8 +20,8 @@ use crate::{
     catalog::Catalog,
     install::{
         model::{
-            InstallQueueContentActionRequest, InstallItem,
-            InstallLoaderItem, InstallQueueRequest, InstallQueueStateResponse,
+            InstallItem, InstallLoaderItem, InstallQueueContentActionRequest, InstallQueueRequest,
+            InstallQueueStateResponse,
         },
         queue::{InstallError, InstallQueue},
     },
@@ -34,12 +34,12 @@ use axial_minecraft::{
     loaders::{self, LoaderBuildRecord, LoaderComponentId, LoaderSelectionReason},
 };
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
+use ts_rs::TS;
 
 pub struct SetupService {
     pub(super) instances: Arc<InstanceService>,
@@ -1833,7 +1833,7 @@ fn preset_options() -> Vec<PresetOption> {
         (
             "",
             "Automatic",
-            "Choose a preset for this Minecraft and Java version.",
+            "Axial's settings in Managed mode; none in Custom or Vanilla.",
         ),
         ("smooth", "Smooth", "Favor consistent frame pacing."),
         ("performance", "Performance", "Favor throughput."),

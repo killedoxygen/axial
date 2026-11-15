@@ -11,6 +11,7 @@ import { useJvmPresets, normalizeJvmPreset } from '../launch/jvm-presets';
 import { saveConfigPatch, useAutoSave } from './autosave';
 import { fmtMem } from '../ui/format';
 import type { ConfigView } from '../generated/ConfigView';
+import { AUTOMATIC_MEMORY_TARGET_MB, explicitMaxMemoryMb, isAutomaticMemory } from './memory';
 
 export function LaunchingSection(): JSX.Element {
   const cfg = config.value;
@@ -24,7 +25,8 @@ export function LaunchingSection(): JSX.Element {
     errorLabel: 'settings',
   });
 
-  const savedMaxGb = (cfg?.max_memory_mb ?? 4096) / 1024;
+  const automaticMemory = isAutomaticMemory(cfg);
+  const savedMaxGb = explicitMaxMemoryMb(cfg) / 1024;
   const savedMinGb = (cfg?.min_memory_mb ?? 1024) / 1024;
   const [minGb, setMinGb] = useState(savedMinGb);
   const [maxGb, setMaxGb] = useState(savedMaxGb);
@@ -59,35 +61,58 @@ export function LaunchingSection(): JSX.Element {
   return (
     <SettingsSection>
       <SettingRow
-        title="Memory"
-        description={`JVM heap for instances that don't set their own. Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)}.`}
-      >
-        <MemoryField
-          minGb={minGb}
-          maxGb={maxGb}
-          totalGb={totalGb}
-          facts={<Chip>{totalGb} GB installed</Chip>}
-          onChange={(low, high) => {
-            setMinGb(low);
-            setMaxGb(high);
-          }}
-          onCommit={(low, high) =>
-            commit(
-              {
-                min_memory_mb: Math.round(Math.min(low, high) * 1024),
-                max_memory_mb: Math.round(high * 1024),
-              },
-              {
-                label: 'memory defaults',
-                revert: () => {
-                  setMinGb(savedMinGb);
-                  setMaxGb(savedMaxGb);
+        title="Automatic memory"
+        description={`Axial sizes the JVM heap at each launch from the memory that is free, up to ${fmtMem(AUTOMATIC_MEMORY_TARGET_MB / 1024)}.`}
+        control={
+          <Toggle
+            on={automaticMemory}
+            ariaLabel="Automatic memory"
+            onChange={() =>
+              commit(
+                automaticMemory
+                  ? {
+                      max_memory_mb: AUTOMATIC_MEMORY_TARGET_MB,
+                      min_memory_mb: Math.min(cfg?.min_memory_mb ?? 512, AUTOMATIC_MEMORY_TARGET_MB),
+                    }
+                  : { max_memory_mb: 0 },
+                { label: 'memory defaults' },
+              )
+            }
+          />
+        }
+      />
+      {!automaticMemory && (
+        <SettingRow
+          title="Memory"
+          description={`JVM heap for instances that don't set their own. Recommended ${fmtMem(recMin)} to ${fmtMem(recMax)}.`}
+        >
+          <MemoryField
+            minGb={minGb}
+            maxGb={maxGb}
+            totalGb={totalGb}
+            facts={<Chip>{totalGb} GB installed</Chip>}
+            onChange={(low, high) => {
+              setMinGb(low);
+              setMaxGb(high);
+            }}
+            onCommit={(low, high) =>
+              commit(
+                {
+                  min_memory_mb: Math.round(Math.min(low, high) * 1024),
+                  max_memory_mb: Math.round(high * 1024),
                 },
-              },
-            )
-          }
-        />
-      </SettingRow>
+                {
+                  label: 'memory defaults',
+                  revert: () => {
+                    setMinGb(savedMinGb);
+                    setMaxGb(savedMaxGb);
+                  },
+                },
+              )
+            }
+          />
+        </SettingRow>
+      )}
       <SettingRow title="Game window" description="Game window size for instances that don't set their own.">
         <WindowField
           width={width}

@@ -77,6 +77,62 @@ pub struct LaunchProofStage {
     pub evidence: Vec<LaunchProofStageEvidence>,
 }
 
+/// Wall-clock timings of the launch owner's own preparation stages, carried
+/// into the existing report. Best-effort metadata: never an obligation.
+#[derive(Default)]
+pub(crate) struct StageTimings(std::sync::Mutex<Vec<LaunchProofStage>>);
+
+impl StageTimings {
+    pub(crate) async fn time<T, E>(
+        &self,
+        stage: &'static str,
+        label: &'static str,
+        work: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        let started_at_ms = epoch_ms();
+        let started = std::time::Instant::now();
+        let result = work.await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut stages = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stages.len() < 32 {
+            stages.push(LaunchProofStage {
+                stage: stage.to_owned(),
+                label: label.to_owned(),
+                started_at_ms,
+                ended_at_ms: Some(started_at_ms.saturating_add(duration_ms)),
+                duration_ms: Some(duration_ms),
+                result: Some(if result.is_ok() { "ok" } else { "failed" }.to_owned()),
+                warnings: Vec::new(),
+                fallback_reason: None,
+                evidence: Vec::new(),
+            });
+        }
+        result
+    }
+
+    pub(crate) fn take(&self) -> Vec<LaunchProofStage> {
+        let mut stages = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        stages.sort_by_key(|stage| stage.started_at_ms);
+        stages
+    }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// Schema 4 removes Guardian/healing fields and includes sanitized historical output.
 /// IDs identify metadata only and never grant authority to a filesystem location.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]

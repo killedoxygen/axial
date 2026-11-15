@@ -24,16 +24,17 @@ pub(super) struct PreparedSession {
     settings_revision: u64,
     secrets: Vec<String>,
     instance: RegisteredInstance,
-    performance: crate::performance::PreparedPerformance,
+    composition: crate::performance::CompositionSettled,
     scenario: super::reports::LaunchProofScenario,
     resource_budget: super::reports::LaunchProofResourceBudget,
     credential_expires_at: Option<u64>,
     telemetry: Arc<super::session::LaunchAttemptTelemetry>,
+    stages: Vec<super::reports::LaunchProofStage>,
 }
 
 impl PreparedSession {
     /// Called only after the coordinator has completed account/profile,
-    /// Performance, runtime and installation preparation under retained
+    /// composition, runtime and installation preparation under retained
     /// instance authority. No caller-authored command can reach this point.
     pub(super) fn new(
         instance_id: InstanceId,
@@ -46,11 +47,12 @@ impl PreparedSession {
         settings_revision: u64,
         secrets: Vec<String>,
         instance: RegisteredInstance,
-        performance: crate::performance::PreparedPerformance,
+        composition: crate::performance::CompositionSettled,
         scenario: super::reports::LaunchProofScenario,
         resource_budget: super::reports::LaunchProofResourceBudget,
         credential_expires_at: Option<u64>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
+        stages: Vec<super::reports::LaunchProofStage>,
     ) -> Result<Self, PrepareError> {
         let prepared = Self {
             instance_id,
@@ -63,11 +65,12 @@ impl PreparedSession {
             settings_revision,
             secrets,
             instance,
-            performance,
+            composition,
             scenario,
             resource_budget,
             credential_expires_at,
             telemetry,
+            stages,
         };
         // Command construction just validated its retained file evidence.
         // The process actor repeats that proof at the actual spawn boundary.
@@ -108,6 +111,10 @@ impl PreparedSession {
 
     pub(super) fn natives(&self) -> Option<Arc<crate::install::vanilla::PreparedNatives>> {
         self.command.prepared_natives.clone()
+    }
+
+    pub(super) fn stages(&self) -> &[super::reports::LaunchProofStage] {
+        &self.stages
     }
 
     pub(super) fn telemetry(&self) -> Arc<super::session::LaunchAttemptTelemetry> {
@@ -153,7 +160,7 @@ impl PreparedSession {
         self.instance
             .validate_current()
             .map_err(|_| LaunchError::InstanceChanged)?;
-        self.performance
+        self.composition
             .validate_current()
             .map_err(|_| LaunchError::PerformanceUnsettled)?;
         self.account
@@ -300,17 +307,7 @@ pub(super) mod tests {
             crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
-        let performance = performance
-            .prepare_for_launch(
-                &instance,
-                performance.resolution_request(
-                    version_id.into(),
-                    "vanilla".into(),
-                    crate::performance::model::PerformanceMode::Vanilla,
-                ),
-            )
-            .await
-            .unwrap();
+        let composition = performance.settled_for_launch(&instance).unwrap();
         let mut files = Vec::new();
         let object = hex::encode(Sha1::digest(b"step"));
         let index = format!(
@@ -410,7 +407,7 @@ pub(super) mod tests {
             settings,
             secrets: vec![],
             instance,
-            performance,
+            composition,
             scenario: super::super::reports::LaunchProofScenario {
                 version_id: Some(version_id.into()),
                 ..Default::default()
@@ -424,6 +421,7 @@ pub(super) mod tests {
             ),
             credential_expires_at: None,
             telemetry: super::super::session::LaunchAttemptTelemetry::started(None, "vanilla"),
+            stages: Vec::new(),
         };
         (root, prepared, library.admit_application_root().unwrap())
     }
@@ -440,11 +438,12 @@ pub(super) mod tests {
             prepared.settings_revision,
             prepared.secrets,
             prepared.instance,
-            prepared.performance,
+            prepared.composition,
             prepared.scenario,
             prepared.resource_budget,
             prepared.credential_expires_at,
             prepared.telemetry,
+            prepared.stages,
         )
     }
 
@@ -530,11 +529,15 @@ pub(super) mod tests {
                 );
                 LaunchError::AccountChanged
             } else {
-                prepared.settings.update(
-                    serde_json::from_value(serde_json::json!({
-                        "expected_revision": prepared.settings_revision, "theme": "nether",
-                    })).unwrap(),
-                ).unwrap();
+                prepared
+                    .settings
+                    .update(
+                        serde_json::from_value(serde_json::json!({
+                            "expected_revision": prepared.settings_revision, "theme": "nether",
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
                 LaunchError::SettingsChanged
             };
             assert_eq!(prepared.validate_before_spawn().unwrap_err(), expected);

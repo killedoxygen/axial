@@ -18,7 +18,7 @@ fn retained_defaults_and_public_shape_are_exact() {
     assert_eq!(
         serde_json::to_value(settings.current().unwrap()).unwrap(),
         json!({
-        "revision":0,"account_selection_revision":0,"username":"Player","launch_auth_mode":"offline","max_memory_mb":4096,
+        "revision":0,"account_selection_revision":0,"username":"Player","launch_auth_mode":"offline","max_memory_mb":0,
             "min_memory_mb":512,"java_path_override":"","window_width":0,"window_height":0,
             "onboarding_done":false,"jvm_preset":"","performance_mode":"managed","theme":"",
             "custom_hue":null,"custom_vibrancy":null,"lightness":null,"telemetry_enabled":false,
@@ -181,7 +181,9 @@ fn invalid_patches_cannot_change_settings_or_revision() {
     let (_, settings) = store();
     for invalid in [
         json!({"expected_revision":0,"max_memory_mb":32769}),
-        json!({"expected_revision":0,"min_memory_mb":8192}),
+        json!({"expected_revision":0,"max_memory_mb":1024,"min_memory_mb":2048}),
+        json!({"expected_revision":0,"max_memory_mb":256}),
+        json!({"expected_revision":0,"min_memory_mb":32769}),
         json!({"expected_revision":0,"window_width":1280}),
         json!({"expected_revision":0,"java_path_override":"/java\nsecret"}),
         json!({"expected_revision":0,"custom_hue":361}),
@@ -413,10 +415,34 @@ fn instance_settings_inherit_and_reset_with_retained_memory_clamping() {
         ..ConfigView::default()
     };
     let mut instance = InstanceSettings::default();
-    let inherited = instance.effective(&global).unwrap();
+    let mut inherited = instance.effective(&global).unwrap();
     assert_eq!(
         (inherited.max_memory_mb, inherited.min_memory_mb),
-        (4096, 512)
+        (AUTOMATIC_HEAP_MB, 512)
+    );
+    inherited.resolve_heap(3072);
+    assert_eq!(
+        (
+            inherited.max_memory_mb,
+            inherited.min_memory_mb,
+            inherited.min_memory_clamped
+        ),
+        (3072, 512, false)
+    );
+    let mut small = InstanceSettings {
+        min_memory_mb: 2048,
+        ..InstanceSettings::default()
+    }
+    .effective(&global)
+    .unwrap();
+    small.resolve_heap(1024);
+    assert_eq!(
+        (
+            small.max_memory_mb,
+            small.min_memory_mb,
+            small.min_memory_clamped
+        ),
+        (1024, 1024, true)
     );
     assert_eq!(inherited.java_path, "/custom/java");
     assert_eq!(inherited.jvm_preset, ConfigJvmPreset::Smooth);
@@ -437,8 +463,7 @@ fn instance_settings_inherit_and_reset_with_retained_memory_clamping() {
         (overridden.window_width, overridden.window_height),
         (1920, 720)
     );
-    assert_eq!(
-        InstanceSettings::default().effective(&global).unwrap(),
-        inherited
-    );
+    let mut reset = InstanceSettings::default().effective(&global).unwrap();
+    reset.resolve_heap(3072);
+    assert_eq!(reset, inherited);
 }

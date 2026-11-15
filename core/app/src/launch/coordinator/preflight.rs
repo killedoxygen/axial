@@ -11,6 +11,7 @@ pub(crate) struct PreflightProjection {
     pub(super) diagnostics: bool,
     pub(crate) inspection: Inspection,
     pub(super) installs: InstallQueue,
+    pub(super) runtimes: RuntimeProjection,
 }
 
 impl PreflightProjection {
@@ -237,6 +238,7 @@ impl LaunchCoordinator {
             diagnostics: false,
             inspection: Inspection::Reverified,
             installs: self.installs.clone(),
+            runtimes: RuntimeProjection::default(),
         }
     }
 
@@ -303,6 +305,11 @@ impl LaunchCoordinator {
             .join()
             .await
             .map_err(|_| LaunchError::PreparationFailed)??;
+        projection
+            .runtimes
+            .revalidate()
+            .await
+            .map_err(LaunchError::RuntimeFailure)?;
         let (selection, revision) = projection.context.as_ref().map_err(Clone::clone)?;
         selection
             .validate(&self.accounts)
@@ -460,11 +467,11 @@ impl LaunchCoordinator {
         let inspection = projection.inspection;
         let finalize_scan = projection.finalize_scan;
         let budget = projection.budget.clone();
+        let runtimes = projection.runtimes.clone();
         let task = self
             .tasks
             .try_spawn(retained, move |cancel| async move {
                 let mut bundle_guard = None;
-                let mut planned_performance = None;
                 let mut observed_damage = None;
                 let mut runtime_absence = None;
                 let mut refused_reasons = None;
@@ -474,19 +481,15 @@ impl LaunchCoordinator {
                     // Only the guarded install proof establishes that need;
                     // catalogue display flags and transient admission failures do not.
                     let previous = owned_proof.lock().unwrap().clone();
+                    // A proof shared from an earlier row rechecks its version
+                    // bundle (publication lane and generation) per row. Its
+                    // file evidence is revalidated once, with every retained
+                    // inventory, before the projection publishes.
                     let proof = if let Some(proof) = previous {
-                        budget.lock().unwrap()
-                            .reserve_checks(proof.inventory.evidence.entry_count())
-                            .map_err(install_read_error)?;
-                        let checked = proof.inventory.clone();
-                        let result = tokio::task::spawn_blocking(move || checked.revalidate())
-                        .await
-                        .map_err(|_| LaunchError::PreparationFailed)
-                        .and_then(|result| result);
-                        if result.is_err() {
+                        if let Err(error) = proof.inventory.bundle.revalidate() {
                             *owned_proof.lock().unwrap() = None;
+                            return Err(bundle_read_error(error));
                         }
-                        result?;
                         proof
                     } else {
                         let operation = pin
@@ -573,7 +576,7 @@ impl LaunchCoordinator {
                     };
                     let version = &proof.version;
                     let (selection, settings, _) =
-                        coordinator.capture(&admitted.record().instance, None)?;
+                        coordinator.capture(&admitted.record().instance, None, &host)?;
                     captured_context = Some((selection.clone(), settings.global_config_revision));
                     let result = async {
                         if let Some(account) = selection.account()
@@ -589,19 +592,6 @@ impl LaunchCoordinator {
                                 .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
                         }
                         let target = &admitted.record().instance;
-                        let performance_request = coordinator.performance.resolution_request(
-                            target.minecraft_version.clone(),
-                            target.loader_key.clone(),
-                            crate::performance::plan::configured_mode(settings.performance_mode),
-                        );
-                        let performance = planned_performance.insert(
-                            coordinator
-                                .performance
-                                .rules()
-                                .plan(performance_request)
-                                .await
-                                .map_err(|_| LaunchError::PerformanceUnavailable)?,
-                        );
                         let required = axial_minecraft::effective_java_version_for(
                             &admitted.record().instance.minecraft_version,
                             &version.kind,
@@ -609,7 +599,7 @@ impl LaunchCoordinator {
                         );
                         let runtime = match coordinator
                             .runtimes
-                            .observe_for_preflight(&required, &settings.java_path, &cancel)
+                            .observe_for_preflight(&runtimes, &required, &settings.java_path, &cancel)
                             .await
                         {
                             Ok(RuntimeObservation::Ready(runtime)) => Some(runtime),
@@ -644,9 +634,7 @@ impl LaunchCoordinator {
                             }
                             Err(error) => return Err(LaunchError::RuntimeFailure(error)),
                         };
-                        let contribution =
-                            crate::performance::effective::effective_performance_plan(performance.plan());
-                        let options = launch_options(&settings, target, &contribution, &host)?;
+                        let options = launch_options(&settings)?;
                         match runtime {
                             Some(runtime) => crate::launch::plan::validate_options(
                                 &options,
@@ -739,6 +727,9 @@ impl LaunchCoordinator {
                         Err(error) => result = Err(error),
                     }
                 }
+                if finalize_scan && let Err(error) = runtimes.revalidate().await {
+                    result = Err(LaunchError::RuntimeFailure(error));
+                }
                 let final_proof = owned_proof.lock().unwrap().clone();
                 if finalize_scan && let Some(proof) = &final_proof {
                     let reserved = budget.lock().unwrap()
@@ -827,7 +818,7 @@ impl LaunchCoordinator {
                 if diagnostics && let Some(reasons) = refused_reasons {
                     let target = &admitted.record().instance;
                     if let Ok(ref mut refused) = result
-                        && let Ok((selection, settings, _)) = coordinator.capture(target, None)
+                        && let Ok((selection, settings, _)) = coordinator.capture(target, None, &host)
                         && let Ok(facts) = coordinator.preflight_diagnostics(
                             &admitted,
                             &settings,
@@ -860,7 +851,7 @@ impl LaunchCoordinator {
                         });
                     }
                 }
-                drop((planned_performance, bundle_guard));
+                drop(bundle_guard);
                 result
             })
             .map_err(|_| LaunchError::AtCapacity)?;

@@ -11,3 +11,4 @@ pub(crate) mod prepare;
 pub mod reports;
 pub(crate) mod resources;
 pub mod session;
+mod supervise;

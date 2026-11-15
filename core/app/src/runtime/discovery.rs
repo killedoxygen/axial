@@ -1,28 +1,124 @@
 //! Runtime selection retains verified executable and managed-component evidence.
+//!
+//! A managed runtime's complete tree proof and its Java probe are established
+//! once per exact build: one owned, single-flight task per component verifies
+//! the tree (reusing this process's full digests of unchanged file revisions)
+//! and reprobes only when the verified manifest or executable fingerprint has
+//! changed. A projection shares each selection across its rows and rechecks
+//! it once before publication.
 
 use super::model::{JavaDiscoveryError, JavaRuntimesResponse, JavaSelectionRequirement};
 use crate::tasks::{CancellationToken, TaskOwner};
 use axial_minecraft::{
     JavaProbeReceipt, JavaVersion, ManagedRuntimeCache, ManagedRuntimeLaunchReceipt, probe_java,
 };
+use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// The verification read buffer; the walk itself retains only directory handles.
+const VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
 #[derive(Clone)]
 pub struct RuntimeDiscovery {
     cache: ManagedRuntimeCache,
     tasks: TaskOwner,
+    /// One slot per known managed component; bounded by that vocabulary.
+    proven: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<ProvenProbe>>>>>>,
     #[cfg(feature = "test-support")]
     test_endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
+    #[cfg(test)]
+    pub(crate) probes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// A successful probe of one exact verified managed build.
+#[derive(Clone)]
+struct ProvenProbe {
+    manifest: [u8; 32],
+    probe: JavaProbeReceipt,
+}
+
+#[derive(Clone)]
 pub(crate) struct SelectedRuntime {
     pub probe: JavaProbeReceipt,
     pub managed: Option<ManagedRuntimeLaunchReceipt>,
+    manifest: Option<[u8; 32]>,
 }
 
+#[derive(Clone)]
 pub(crate) enum RuntimeObservation {
     Ready(SelectedRuntime),
-    Missing(axial_minecraft::runtime::RuntimeAbsence),
+    Missing(Arc<axial_minecraft::runtime::RuntimeAbsence>),
+}
+
+/// Selections shared by every row of one admitted projection, keyed by the
+/// exact requirement and override text. Recheck with `revalidate` once before
+/// the projection is published.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeProjection {
+    observed:
+        Arc<Mutex<HashMap<(i32, String, String), Result<RuntimeObservation, JavaDiscoveryError>>>>,
+}
+
+impl SelectedRuntime {
+    /// Rechecks the complete managed tree against the same manifest, the
+    /// retained executable binding and the probed executable fingerprint.
+    /// This never starts a process.
+    pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
+        let selected = self.clone();
+        let admission = process_physical_work()
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Read,
+                VERIFY_SCRATCH_BYTES,
+            ))
+            .await
+            .map_err(|_| JavaDiscoveryError::Failed)?;
+        admission
+            .run(move |_| {
+                if let Some(receipt) = &selected.managed {
+                    if receipt.component().verified_manifest() != selected.manifest {
+                        return Err(JavaDiscoveryError::Replaced);
+                    }
+                    receipt
+                        .validate_program(selected.probe.executable())
+                        .map_err(|_| JavaDiscoveryError::Replaced)?;
+                }
+                selected
+                    .probe
+                    .revalidate()
+                    .map_err(|_| JavaDiscoveryError::Replaced)
+            })
+            .await
+            .map_err(|_| JavaDiscoveryError::Failed)?
+    }
+}
+
+impl RuntimeObservation {
+    async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
+        match self {
+            Self::Ready(selected) => selected.revalidate().await,
+            Self::Missing(absence) => absence
+                .revalidate()
+                .map_err(|_| JavaDiscoveryError::Replaced),
+        }
+    }
+}
+
+impl RuntimeProjection {
+    pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
+        let observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(|observed| observed.as_ref().ok().cloned())
+            .collect::<Vec<_>>();
+        for observation in observed {
+            observation.revalidate().await?;
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeDiscovery {
@@ -30,8 +126,11 @@ impl RuntimeDiscovery {
         Self {
             cache,
             tasks,
+            proven: Arc::default(),
             #[cfg(feature = "test-support")]
             test_endpoints: None,
+            #[cfg(test)]
+            probes: Arc::default(),
         }
     }
 
@@ -134,8 +233,11 @@ impl RuntimeDiscovery {
         Ok(selected)
     }
 
+    /// Observes readiness once per projection key. Later rows reuse the same
+    /// observation; the projection rechecks it once before publication.
     pub(crate) async fn observe_for_preflight(
         &self,
+        projection: &RuntimeProjection,
         java: &JavaVersion,
         override_value: &str,
         cancellation: &CancellationToken,
@@ -143,6 +245,36 @@ impl RuntimeDiscovery {
         if cancellation.is_cancelled() {
             return Err(JavaDiscoveryError::Cancelled);
         }
+        let key = (
+            java.major_version,
+            java.component.clone(),
+            override_value.trim().to_owned(),
+        );
+        if let Some(observed) = projection
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
+            return observed.clone();
+        }
+        let observed = self.observe(java, override_value, cancellation).await;
+        if !matches!(observed, Err(JavaDiscoveryError::Cancelled)) {
+            projection
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, observed.clone());
+        }
+        observed
+    }
+
+    async fn observe(
+        &self,
+        java: &JavaVersion,
+        override_value: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<RuntimeObservation, JavaDiscoveryError> {
         if override_value.trim().is_empty() {
             let component = axial_minecraft::runtime::preferred_runtime_component(java);
             if !axial_minecraft::runtime::is_known_runtime_component(&component) {
@@ -153,7 +285,7 @@ impl RuntimeDiscovery {
                 .observe_missing_component(&component)
                 .map_err(|_| JavaDiscoveryError::Replaced)?
             {
-                return Ok(RuntimeObservation::Missing(absence));
+                return Ok(RuntimeObservation::Missing(Arc::new(absence)));
             }
         }
         self.select(java, override_value, cancellation)
@@ -178,39 +310,105 @@ impl RuntimeDiscovery {
         } else {
             None
         };
-        let (path, managed) = if let Some(component) = component.as_deref() {
-            let admitted = self
-                .cache
-                .admit_component(component)
-                .map_err(|_| JavaDiscoveryError::Replaced)?
-                .ok_or(JavaDiscoveryError::Missing)?;
-            // A marker alone is insufficient: verify the manifest's complete tree.
-            let verification = admitted.clone();
-            if !tokio::task::spawn_blocking(move || verification.contents_verified())
-                .await
-                .map_err(|_| JavaDiscoveryError::Failed)?
-            {
-                return Err(JavaDiscoveryError::Replaced);
-            }
-            let receipt = admitted
-                .launch_receipt()
-                .map_err(|_| JavaDiscoveryError::Replaced)?;
-            (admitted.java_executable_path(), Some(receipt))
+        let selected = if let Some(component) = component {
+            self.select_managed(component, cancellation).await?
         } else {
             let path = Path::new(requested);
             if !path.is_absolute() {
                 return Err(JavaDiscoveryError::InvalidPath);
             }
-            (path.to_owned(), None)
+            // A custom executable's libraries are outside any verified tree, so
+            // its probe is shared only within the projection that observed it.
+            #[cfg(test)]
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SelectedRuntime {
+                probe: probe_java(path, None, cancellation.cancelled()).await?,
+                managed: None,
+                manifest: None,
+            }
         };
-        let probe = probe_java(&path, component.as_deref(), cancellation.cancelled()).await?;
-        requirement.validate(probe.info(), probe.architecture())?;
-        if let Some(receipt) = &managed {
-            receipt
-                .validate_program(probe.executable())
-                .map_err(|_| JavaDiscoveryError::Replaced)?;
+        requirement.validate(selected.probe.info(), selected.probe.architecture())?;
+        Ok(selected)
+    }
+
+    /// Verifies the component's complete tree and reuses the probe of the same
+    /// verified build. The work is owned by the task owner, so a waiter that
+    /// stops waiting never abandons a shared verification or probe.
+    async fn select_managed(
+        &self,
+        component: String,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedRuntime, JavaDiscoveryError> {
+        let admitted = self
+            .cache
+            .admit_component(&component)
+            .map_err(|_| JavaDiscoveryError::Replaced)?
+            .ok_or(JavaDiscoveryError::Missing)?;
+        let slot = self
+            .proven
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(component.clone())
+            .or_default()
+            .clone();
+        #[cfg(test)]
+        let probes = self.probes.clone();
+        let task = self
+            .tasks
+            .try_spawn(admitted.clone(), move |cancel| async move {
+                let mut proven = slot.lock().await;
+                let checked = admitted.clone();
+                let manifest = process_physical_work()
+                    .admit(PhysicalWorkRequest::foreground(
+                        PhysicalIoClass::Read,
+                        VERIFY_SCRATCH_BYTES,
+                    ))
+                    .await
+                    .map_err(|_| JavaDiscoveryError::Failed)?
+                    .run(move |_| checked.verified_manifest())
+                    .await
+                    .map_err(|_| JavaDiscoveryError::Failed)?
+                    // A marker alone is insufficient: the manifest's complete tree must match.
+                    .ok_or(JavaDiscoveryError::Replaced)?;
+                let receipt = admitted
+                    .launch_receipt()
+                    .map_err(|_| JavaDiscoveryError::Replaced)?;
+                let path = admitted.java_executable_path();
+                let reusable = proven.as_ref().filter(|proven| {
+                    proven.manifest == manifest
+                        && proven.probe.executable() == path
+                        && proven.probe.revalidate().is_ok()
+                });
+                let probe = match reusable {
+                    Some(proven) => proven.probe.clone(),
+                    None => {
+                        *proven = None;
+                        #[cfg(test)]
+                        probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let probe = probe_java(&path, Some(&component), cancel.cancelled()).await?;
+                        *proven = Some(ProvenProbe {
+                            manifest,
+                            probe: probe.clone(),
+                        });
+                        probe
+                    }
+                };
+                receipt
+                    .validate_program(probe.executable())
+                    .map_err(|_| JavaDiscoveryError::Replaced)?;
+                Ok(SelectedRuntime {
+                    probe,
+                    managed: Some(receipt),
+                    manifest: Some(manifest),
+                })
+            })
+            .map_err(|_| JavaDiscoveryError::Failed)?;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(JavaDiscoveryError::Cancelled),
+            result = task.join() => result.map_err(|_| JavaDiscoveryError::Failed)?,
         }
-        Ok(SelectedRuntime { probe, managed })
     }
 }
 
@@ -287,8 +485,9 @@ mod tests {
                 };
                 let windowed = root.join("bin/javaw.exe");
                 let console = root.join("bin/java.exe");
+                let projection = RuntimeProjection::default();
                 let observed = match discovery
-                    .observe_for_preflight(&required, "", &cancel)
+                    .observe_for_preflight(&projection, &required, "", &cancel)
                     .await?
                 {
                     RuntimeObservation::Ready(selected) => selected,
@@ -321,7 +520,7 @@ mod tests {
                     .revalidate()
                     .map_err(JavaDiscoveryError::from);
                 let console_refusal = discovery
-                    .observe_for_preflight(&required, "", &cancel)
+                    .observe_for_preflight(&RuntimeProjection::default(), &required, "", &cancel)
                     .await
                     .err();
                 fs::write(&console, console_bytes).map_err(|_| JavaDiscoveryError::Failed)?;
@@ -342,7 +541,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|receipt| receipt.validate_program(&windowed).is_err());
                 let windowed_refusal = discovery
-                    .observe_for_preflight(&required, "", &cancel)
+                    .observe_for_preflight(&RuntimeProjection::default(), &required, "", &cancel)
                     .await
                     .err();
                 fs::write(&windowed, windowed_bytes).map_err(|_| JavaDiscoveryError::Failed)?;
@@ -378,5 +577,146 @@ mod tests {
         assert_eq!(windowed, Err(JavaDiscoveryError::Replaced));
         assert!(receipt_refuses);
         assert_eq!(windowed_refusal, Some(JavaDiscoveryError::Replaced));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod proof_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const COMPONENT: &str = "java-runtime-delta";
+
+    fn java(root: &Path, update: u32, gate: bool) -> Vec<u8> {
+        let wait = if gate {
+            format!(
+                "printf started > '{0}/probe-started'\nwhile [ ! -f '{0}/probe-release' ]; do sleep 0.01; done\n",
+                root.display()
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "#!/bin/sh\n{wait}printf 'java.version = 17.0.{update}\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
+            std::env::consts::ARCH
+        )
+        .into_bytes()
+    }
+
+    fn required() -> JavaVersion {
+        JavaVersion {
+            component: COMPONENT.into(),
+            major_version: 17,
+        }
+    }
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        ManagedRuntimeCache,
+        TaskOwner,
+        RuntimeDiscovery,
+    ) {
+        let scratch =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let cache = ManagedRuntimeCache::isolated_for_test().unwrap();
+        let tasks = TaskOwner::new(8).unwrap();
+        let discovery = RuntimeDiscovery::new(cache.clone(), tasks.clone());
+        (scratch, cache, tasks, discovery)
+    }
+
+    #[tokio::test]
+    async fn one_verified_build_is_probed_once_and_a_new_build_is_probed_again() {
+        let (scratch, cache, tasks, discovery) = fixture().await;
+        cache
+            .write_ready_component_for_test(COMPONENT, &java(scratch.path(), 3, false))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let first = discovery.select(&required(), "", &cancel).await.unwrap();
+        let second = discovery.select(&required(), "", &cancel).await.unwrap();
+        let reused = discovery.probes.load(Ordering::Relaxed);
+
+        // Bytes changed under the same manifest are refused, never reprobed.
+        let executable = first.probe.executable().to_owned();
+        let original = std::fs::read(&executable).unwrap();
+        std::fs::write(&executable, java(scratch.path(), 9, false)).unwrap();
+        let tampered = discovery.select(&required(), "", &cancel).await.err();
+        std::fs::write(&executable, &original).unwrap();
+
+        // A republished build with its own manifest is a new proof.
+        cache
+            .write_ready_component_for_test(COMPONENT, &java(scratch.path(), 4, false))
+            .unwrap();
+        let rebuilt = discovery.select(&required(), "", &cancel).await.unwrap();
+        tasks.shutdown(Duration::from_secs(5)).await.unwrap();
+
+        assert_eq!(reused, 1);
+        assert_eq!(first.probe.info().update, 3);
+        assert_eq!(second.probe.executable(), first.probe.executable());
+        assert_eq!(tampered, Some(JavaDiscoveryError::Replaced));
+        assert_eq!(rebuilt.probe.info().update, 4);
+        assert_eq!(discovery.probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_waiter_leaves_the_shared_probe_owned_to_completion() {
+        let (scratch, cache, tasks, discovery) = fixture().await;
+        cache
+            .write_ready_component_for_test(COMPONENT, &java(scratch.path(), 3, true))
+            .unwrap();
+        let waiter = tokio::spawn({
+            let discovery = discovery.clone();
+            async move {
+                discovery
+                    .select(&required(), "", &CancellationToken::new())
+                    .await
+            }
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            while !scratch.path().join("probe-started").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        waiter.abort();
+        let aborted = waiter.await.is_err_and(|error| error.is_cancelled());
+        let owned = !tasks.status().is_idle();
+        std::fs::write(scratch.path().join("probe-release"), b"release").unwrap();
+        let later = discovery
+            .select(&required(), "", &CancellationToken::new())
+            .await;
+        tasks.shutdown(Duration::from_secs(5)).await.unwrap();
+
+        assert!(started.is_ok() && aborted && owned);
+        assert_eq!(later.unwrap().probe.info().update, 3);
+        assert_eq!(discovery.probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_projection_shares_one_observation_and_rechecks_it_before_publication() {
+        let (scratch, cache, tasks, discovery) = fixture().await;
+        let executable = cache
+            .write_ready_component_for_test(COMPONENT, &java(scratch.path(), 3, false))
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let projection = RuntimeProjection::default();
+        for _ in 0..20 {
+            assert!(matches!(
+                discovery
+                    .observe_for_preflight(&projection, &required(), "", &cancel)
+                    .await,
+                Ok(RuntimeObservation::Ready(_))
+            ));
+        }
+        let unchanged = projection.revalidate().await;
+        let original = std::fs::read(&executable).unwrap();
+        std::fs::write(&executable, java(scratch.path(), 9, false)).unwrap();
+        let changed = projection.revalidate().await;
+        std::fs::write(&executable, original).unwrap();
+        tasks.shutdown(Duration::from_secs(5)).await.unwrap();
+
+        assert_eq!(discovery.probes.load(Ordering::Relaxed), 1);
+        assert_eq!(unchanged, Ok(()));
+        assert_eq!(changed, Err(JavaDiscoveryError::Replaced));
     }
 }

@@ -56,12 +56,9 @@ pub(crate) struct LaunchOptions {
     pub max_memory_mb: Option<i32>,
     pub resolution: Option<(u32, u32)>,
     pub extra_jvm_args: Vec<String>,
+    /// An explicit preset, or empty for Automatic.
     pub jvm_preset: String,
-    pub low_impact_startup: bool,
-    pub logical_cores: usize,
-    pub total_memory_mb: Option<u64>,
-    pub loader: String,
-    pub is_modded: bool,
+    pub performance_mode: crate::settings::ConfigPerformanceMode,
     pub launcher_name: String,
     pub launcher_version: String,
 }
@@ -74,11 +71,7 @@ impl Default for LaunchOptions {
             resolution: None,
             extra_jvm_args: Vec::new(),
             jvm_preset: String::new(),
-            low_impact_startup: false,
-            logical_cores: 4,
-            total_memory_mb: None,
-            loader: String::new(),
-            is_modded: false,
+            performance_mode: crate::settings::ConfigPerformanceMode::Managed,
             launcher_name: "Axial".into(),
             launcher_version: env!("CARGO_PKG_VERSION").into(),
         }

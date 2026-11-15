@@ -19,6 +19,18 @@ macro_rules! setting_enum {
     };
 }
 
+/// A global maximum heap of zero is Automatic: launch resolves it from the
+/// observed host. Instance zero inherits the global choice.
+pub const AUTOMATIC_HEAP_MB: i32 = 0;
+/// The smallest maximum heap the launcher starts a game with.
+pub const HEAP_MIN_MB: i32 = 512;
+/// The smallest initial heap.
+pub const INITIAL_HEAP_MIN_MB: i32 = 256;
+/// The largest global maximum heap a user may choose.
+pub const GLOBAL_HEAP_MAX_MB: i32 = 32768;
+/// The largest heap any instance override or launch request may carry.
+pub const HEAP_MAX_MB: i32 = 1024 * 1024;
+
 setting_enum!(ConfigLaunchAuthMode { Offline => "offline", Online => "online" });
 setting_enum!(ConfigPerformanceMode { Managed => "managed", Vanilla => "vanilla", Custom => "custom" });
 setting_enum!(ConfigTheme {
@@ -69,7 +81,7 @@ impl Default for ConfigView {
             account_selection_revision: 0,
             username: "Player".into(),
             launch_auth_mode: ConfigLaunchAuthMode::Offline,
-            max_memory_mb: 4096,
+            max_memory_mb: AUTOMATIC_HEAP_MB,
             min_memory_mb: 512,
             java_path_override: String::new(),
             window_width: 0,
@@ -215,11 +227,14 @@ impl ConfigView {
 
     fn validate_preferences(&self) -> Result<(), SettingsError> {
         ensure(
-            (512..=32768).contains(&self.max_memory_mb),
-            "Maximum memory must be between 512 and 32768 MiB.",
+            self.max_memory_mb == AUTOMATIC_HEAP_MB
+                || (HEAP_MIN_MB..=GLOBAL_HEAP_MAX_MB).contains(&self.max_memory_mb),
+            "Maximum memory must be Automatic or between 512 and 32768 MiB.",
         )?;
         ensure(
-            (256..=self.max_memory_mb).contains(&self.min_memory_mb),
+            (INITIAL_HEAP_MIN_MB..=GLOBAL_HEAP_MAX_MB).contains(&self.min_memory_mb)
+                && (self.max_memory_mb == AUTOMATIC_HEAP_MB
+                    || self.min_memory_mb <= self.max_memory_mb),
             "Minimum memory must be between 256 MiB and maximum memory.",
         )?;
         ensure(
@@ -325,11 +340,25 @@ pub struct EffectiveLaunchSettings {
     pub auto_optimize: bool,
 }
 
+impl EffectiveLaunchSettings {
+    /// Replaces an Automatic maximum with the heap resolved for this launch
+    /// and bounds the initial heap by the effective maximum.
+    pub fn resolve_heap(&mut self, automatic_max_mb: i32) {
+        if self.max_memory_mb == AUTOMATIC_HEAP_MB {
+            self.max_memory_mb = automatic_max_mb;
+            if self.min_memory_mb > self.max_memory_mb {
+                self.min_memory_mb = self.max_memory_mb;
+                self.min_memory_clamped = true;
+            }
+        }
+    }
+}
+
 impl InstanceSettings {
     pub fn validate(&self) -> Result<(), SettingsError> {
         ensure(
-            (0..=1024 * 1024).contains(&self.max_memory_mb)
-                && (0..=1024 * 1024).contains(&self.min_memory_mb),
+            (0..=HEAP_MAX_MB).contains(&self.max_memory_mb)
+                && (0..=HEAP_MAX_MB).contains(&self.min_memory_mb),
             "Instance memory bounds are invalid.",
         )?;
         ensure(
@@ -368,11 +397,16 @@ impl InstanceSettings {
                 global.then_some(OverrideOrigin::Global)
             }
         };
+        let automatic = max_memory_mb == AUTOMATIC_HEAP_MB;
         Ok(EffectiveLaunchSettings {
             global_config_revision: global.revision,
             max_memory_mb,
-            min_memory_mb: min_memory_mb.min(max_memory_mb),
-            min_memory_clamped: min_memory_mb > max_memory_mb,
+            min_memory_mb: if automatic {
+                min_memory_mb
+            } else {
+                min_memory_mb.min(max_memory_mb)
+            },
+            min_memory_clamped: !automatic && min_memory_mb > max_memory_mb,
             java_path: if self.java_path.trim().is_empty() {
                 global.java_path_override.trim()
             } else {

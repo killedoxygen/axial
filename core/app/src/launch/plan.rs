@@ -37,9 +37,8 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         return Err(LaunchPlanError::InvalidAccount);
     }
     let settings = &request.settings;
-    let preset = validate_options(settings, &request.target_version_id, request.runtime.info())?;
-    let maximum = settings.max_memory_mb.unwrap_or(4096);
-    let minimum = settings.min_memory_mb.unwrap_or(512);
+    validate_options(settings, &request.target_version_id, request.runtime.info())?;
+    let (maximum, minimum) = heap(settings);
     let mut environment = default_environment();
     environment.features.insert(
         "has_custom_resolution".into(),
@@ -95,14 +94,10 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
             .unwrap_or_default(),
     };
     let (mut args, game_args) = resolve_arguments(version, &environment, &vars);
-    args.extend(jvm::boot_throttle_args(
-        request.runtime.info().major,
-        settings.logical_cores,
-    ));
-    args.extend(jvm::gc_preset_args(
-        &preset,
+    args.extend(jvm::launcher_args(
+        settings.performance_mode,
+        &settings.jvm_preset,
         request.runtime.info(),
-        settings.low_impact_startup,
     ));
     args.extend([format!("-Xmx{maximum}M"), format!("-Xms{minimum}M")]);
     configure_native_paths(&mut args, &natives);
@@ -202,34 +197,27 @@ fn valid_player_name(auth: &super::model::LaunchAuthContext) -> bool {
     }
 }
 
+/// Refuses an explicit preset the target or runtime cannot run. Vanilla adds
+/// no launcher flags, so it never applies or refuses a preset.
 pub(crate) fn validate_options(
     settings: &LaunchOptions,
     target: &str,
     info: &axial_minecraft::JavaRuntimeInfo,
-) -> Result<String, LaunchPlanError> {
+) -> Result<(), LaunchPlanError> {
     validate_settings(settings, Some(info))?;
-    if settings.jvm_preset.is_empty() {
-        Ok(jvm::auto_select_preset_with_host(
-            target,
-            &settings.loader,
-            settings.is_modded,
-            info,
-            Some(settings.logical_cores),
-            settings.total_memory_mb,
-        ))
-    } else {
-        let selected = jvm::sanitize_preset(
-            &settings.jvm_preset,
-            target,
-            &settings.loader,
-            settings.is_modded,
-            info,
-        );
-        if selected != settings.jvm_preset {
-            return Err(LaunchPlanError::IncompatiblePreset);
-        }
-        Ok(selected)
+    if settings.performance_mode != crate::settings::ConfigPerformanceMode::Vanilla
+        && !jvm::preset_supported(&settings.jvm_preset, target, info)
+    {
+        return Err(LaunchPlanError::IncompatiblePreset);
     }
+    Ok(())
+}
+
+fn heap(settings: &LaunchOptions) -> (i32, i32) {
+    (
+        settings.max_memory_mb.unwrap_or(4096),
+        settings.min_memory_mb.unwrap_or(512),
+    )
 }
 
 pub(crate) fn validate_settings(
@@ -241,9 +229,10 @@ pub(crate) fn validate_settings(
             return Err(LaunchPlanError::InvalidResolution);
         }
     }
-    let maximum = settings.max_memory_mb.unwrap_or(4096);
-    let minimum = settings.min_memory_mb.unwrap_or(512);
-    if !(512..=1024 * 1024).contains(&maximum) || !(256..=maximum).contains(&minimum) {
+    let (maximum, minimum) = heap(settings);
+    if !(crate::settings::HEAP_MIN_MB..=crate::settings::HEAP_MAX_MB).contains(&maximum)
+        || !(crate::settings::INITIAL_HEAP_MIN_MB..=maximum).contains(&minimum)
+    {
         return Err(LaunchPlanError::InvalidMemory);
     }
     validate_extra_args(&settings.extra_jvm_args, info)

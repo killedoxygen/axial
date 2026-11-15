@@ -3,7 +3,7 @@
 //! can supply a `PreparedSession`; this module has no public command constructor.
 
 use super::{
-    logs::{LogCollector, LogEntry, LogStream, MAX_OUTPUT_CHUNK_BYTES},
+    logs::{LogCollector, LogEntry, LogStream},
     outcome::{SessionExitFacts, SessionOutcome, classify_session_outcome},
     prepare::PreparedSession,
     reports::{LaunchProofRecord, LaunchProofScenario, LaunchReportStore, SessionReportInput},
@@ -11,14 +11,12 @@ use super::{
 use crate::{
     instances::{directory::RegisteredInstance, model::InstanceId},
     public::Tone,
-    tasks::{CancellationToken, TaskOwner},
+    tasks::TaskOwner,
     telemetry::{
         Telemetry, TelemetryErrorKind, TelemetryEvent, TelemetryLaunchOutcome, TelemetryLoader,
     },
 };
-use axial_minecraft::process::{OwnedProcess, ProcessOutput, SpawnError};
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -27,17 +25,12 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    io::AsyncReadExt,
-    process::Command,
-    sync::{broadcast, watch},
-};
+use tokio::sync::{broadcast, watch};
+use ts_rs::TS;
 
-const PROCESS_POLL: Duration = Duration::from_millis(100);
-const SETTLEMENT_DEADLINE: Duration = Duration::from_secs(5);
 const RETAINED_TERMINAL_SESSIONS: usize = 64;
 const MAX_SESSION_IDENTITIES: usize = 4096;
-const STARTUP_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const STARTUP_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One accepted attempt spans preparation and its eventual process. Completion
 /// measures startup, not game exit; later stops/crashes cannot duplicate it.
@@ -75,7 +68,7 @@ impl LaunchAttemptTelemetry {
         self.complete(TelemetryLaunchOutcome::Failure, error);
     }
 
-    fn observe_startup(&self, boot: bool, has_output: bool, elapsed: Duration) -> bool {
+    pub(super) fn observe_startup(&self, boot: bool, has_output: bool, elapsed: Duration) -> bool {
         // The retained runner accepts a boot marker immediately, or a live
         // process with ordinary output after its observation window.
         if boot || has_output && elapsed >= STARTUP_OBSERVATION_TIMEOUT {
@@ -267,28 +260,29 @@ pub struct SessionLogSubscription {
     pub events: broadcast::Receiver<LogEntry>,
 }
 
-struct EntryState {
+pub(super) struct EntryState {
     snapshot: SessionSnapshot,
-    logs: LogCollector,
+    pub(super) logs: LogCollector,
     report: Option<LaunchProofRecord>,
-    process_started: Option<tokio::time::Instant>,
+    pub(super) process_started: Option<tokio::time::Instant>,
     boot_duration_ms: Option<u64>,
     observation: Option<ObservedSettlement>,
     report_unavailable: bool,
 }
 
-struct SessionEntry {
-    state: Mutex<EntryState>,
+pub(super) struct SessionEntry {
+    pub(super) state: Mutex<EntryState>,
     snapshot: watch::Sender<SessionSnapshot>,
     log_events: broadcast::Sender<LogEntry>,
-    stop: watch::Sender<bool>,
+    pub(super) stop: watch::Sender<bool>,
     changes: watch::Sender<u64>,
     command_inspection: SessionCommandInspection,
     reports: Option<LaunchReportStore>,
     version_id: String,
     scenario: LaunchProofScenario,
     resource_budget: Option<super::reports::LaunchProofResourceBudget>,
-    telemetry: Arc<LaunchAttemptTelemetry>,
+    stages: Vec<super::reports::LaunchProofStage>,
+    pub(super) telemetry: Arc<LaunchAttemptTelemetry>,
     acceptance: Option<super::coordinator::AcceptedIntent>,
     preparation: Weak<PreparedSession>,
 }
@@ -308,7 +302,7 @@ pub(super) struct ObservedSettlement {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum SettledProcess {
+pub(super) enum SettledProcess {
     NoChild {
         stopped: bool,
     },
@@ -432,7 +426,7 @@ impl ObservedSettlement {
 impl SessionEntry {
     /// Capture once, before any fallible report projection. Failed observation
     /// publication retains this owner; a later report failure does not.
-    fn persist_settlement(
+    pub(super) fn persist_settlement(
         &self,
         process: SettledProcess,
         startup_stalled: bool,
@@ -513,6 +507,7 @@ impl SessionEntry {
                 });
                 report.scenario = self.scenario.clone();
                 report.resource_budget = self.resource_budget.clone();
+                report.stages = self.stages.clone();
                 if let Some(budget) = &report.resource_budget {
                     report.device = super::reports::LaunchProofDevice::from_budget(budget);
                 }
@@ -540,7 +535,7 @@ impl SessionEntry {
         }
     }
 
-    fn publish(&self, update: impl FnOnce(&mut SessionSnapshot)) {
+    pub(super) fn publish(&self, update: impl FnOnce(&mut SessionSnapshot)) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let before = state.snapshot.clone();
         update(&mut state.snapshot);
@@ -560,7 +555,7 @@ impl SessionEntry {
         }
     }
 
-    fn output(&self, stream: LogStream, bytes: Option<&[u8]>) {
+    pub(super) fn output(&self, stream: LogStream, bytes: Option<&[u8]>) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let entries = match bytes {
             Some(bytes) => state.logs.push(stream, bytes),
@@ -583,7 +578,20 @@ impl SessionEntry {
         });
     }
 
-    fn current(&self) -> SessionSnapshot {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, EntryState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// (boot marker observed, any output entry) for startup observation.
+    pub(super) fn startup_evidence(&self) -> (bool, bool) {
+        let state = self.lock();
+        (
+            state.logs.evidence().boot_observed,
+            state.logs.has_entries(),
+        )
+    }
+
+    pub(super) fn current(&self) -> SessionSnapshot {
         self.snapshot.borrow().clone()
     }
 
@@ -679,6 +687,7 @@ impl SessionManager {
             version_id: prepared.version_id().to_owned(),
             scenario: prepared.scenario().clone(),
             resource_budget: Some(prepared.resource_budget().clone()),
+            stages: prepared.stages().to_vec(),
             telemetry: prepared.telemetry(),
             acceptance: Some(acceptance),
             preparation: Arc::downgrade(&prepared),
@@ -721,7 +730,7 @@ impl SessionManager {
         // Dropping this returned handle only drops a waiter, not accepted work.
         self.tasks
             .try_spawn(prepared, move |cancellation| async move {
-                run_session(worker_prepared, worker_entry, cancellation).await;
+                super::supervise::run(worker_prepared, worker_entry, cancellation).await;
             })
             .map_err(|_| SessionError::AtCapacity)?;
         registry
@@ -989,361 +998,7 @@ fn evict_terminal_history(registry: &mut Registry) {
     });
 }
 
-/// On a panic the task owner retains preparation and this sentinel marks the
-/// session nonterminal. It never claims a child/tree was reaped by Drop.
-struct SettlementSentinel {
-    entry: Arc<SessionEntry>,
-    settled: bool,
-}
-impl Drop for SettlementSentinel {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.entry.telemetry.failure(None);
-            self.entry.publish(|snapshot| {
-                snapshot.phase = SessionPhase::Unresolved;
-                snapshot.outcome = None;
-            });
-        }
-    }
-}
-
-async fn run_session(
-    prepared: Arc<PreparedSession>,
-    entry: Arc<SessionEntry>,
-    cancellation: CancellationToken,
-) {
-    let mut sentinel = SettlementSentinel {
-        entry: Arc::clone(&entry),
-        settled: false,
-    };
-    let stop = entry.stop.subscribe();
-    if *stop.borrow() || cancellation.is_cancelled() {
-        finish_without_process(&entry, true, prepared.natives()).await;
-        sentinel.settled = true;
-        return;
-    }
-    if let Err(error) = prepared.validate_before_spawn() {
-        tracing::warn!(
-            stage = "input_revalidation",
-            cause = ?error,
-            "Accepted launch could not start."
-        );
-        finish_without_process(&entry, false, prepared.natives()).await;
-        sentinel.settled = true;
-        return;
-    }
-    let validated = prepared.validated_command();
-    let mut command = Command::new(validated.program());
-    command
-        .args(validated.args())
-        .envs(validated.env())
-        .current_dir(validated.cwd());
-    for key in [
-        "JAVA_TOOL_OPTIONS",
-        "_JAVA_OPTIONS",
-        "JDK_JAVA_OPTIONS",
-        "CLASSPATH",
-    ] {
-        command.env_remove(key);
-    }
-    let (process, output, spawn_failed) = match OwnedProcess::spawn(command) {
-        Ok((process, output)) => (process, output, false),
-        Err(SpawnError::BeforeSpawn(error)) => {
-            tracing::warn!(
-                stage = "process_spawn",
-                error_kind = ?error.kind(),
-                os_error_code = error.raw_os_error(),
-                "Accepted launch could not start."
-            );
-            entry
-                .telemetry
-                .failure(Some(TelemetryErrorKind::LaunchSpawnFailed));
-            finish_without_process(&entry, false, prepared.natives()).await;
-            sentinel.settled = true;
-            return;
-        }
-        Err(SpawnError::Unsettled(process, output, error)) => {
-            tracing::warn!(
-                stage = "process_containment",
-                error_kind = ?error.kind(),
-                os_error_code = error.raw_os_error(),
-                "Accepted launch process could not be contained."
-            );
-            (process, output, true)
-        }
-    };
-    supervise_process(
-        process,
-        output,
-        spawn_failed,
-        entry,
-        cancellation,
-        stop,
-        prepared.natives(),
-        Some(prepared.instance().clone()),
-    )
-    .await;
-    sentinel.settled = true;
-}
-
-async fn supervise_process(
-    mut process: OwnedProcess,
-    mut output: ProcessOutput,
-    spawn_failed: bool,
-    entry: Arc<SessionEntry>,
-    cancellation: CancellationToken,
-    mut stop: watch::Receiver<bool>,
-    natives: Option<Arc<crate::install::vanilla::PreparedNatives>>,
-    instance: Option<RegisteredInstance>,
-) {
-    if spawn_failed {
-        entry
-            .telemetry
-            .failure(Some(TelemetryErrorKind::LaunchSpawnFailed));
-    }
-    let pid = process.pid();
-    entry
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .process_started = Some(tokio::time::Instant::now());
-    entry.publish(|snapshot| {
-        snapshot.pid = pid;
-        snapshot.process_alive = true;
-        snapshot.started_at_ms = Some(now_ms());
-        snapshot.phase = if spawn_failed {
-            SessionPhase::Settling
-        } else {
-            SessionPhase::Starting
-        };
-    });
-    let mut stdout_buffer = [0_u8; MAX_OUTPUT_CHUNK_BYTES];
-    let mut stderr_buffer = [0_u8; MAX_OUTPUT_CHUNK_BYTES];
-    let mut stdout_finished = false;
-    let mut stderr_finished = false;
-    let mut output_failed = false;
-    let mut stop_requested = false;
-    let mut settlement_failed = false;
-    let mut startup_observed = false;
-    let mut startup_stalled = false;
-    let launched_at = entry.current().launched_at;
-    let mut settling_since = spawn_failed.then(tokio::time::Instant::now);
-    let mut ticker = tokio::time::interval(PROCESS_POLL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        if output_failed {
-            settling_since.get_or_insert_with(tokio::time::Instant::now);
-        }
-        if !startup_stalled && (*stop.borrow() || cancellation.is_cancelled()) {
-            stop_requested = true;
-            settling_since.get_or_insert_with(tokio::time::Instant::now);
-        }
-        let exited = process.try_wait();
-        let status = match exited {
-            Ok(status) => status,
-            Err(_) => {
-                settling_since.get_or_insert_with(tokio::time::Instant::now);
-                None
-            }
-        };
-        if status.is_some() {
-            settling_since.get_or_insert_with(tokio::time::Instant::now);
-        }
-        if !startup_observed && settling_since.is_none() {
-            let state = entry
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            // The retained runner stalls only a silent attempt at 30 seconds.
-            // An observed boot or ordinary output completes startup below.
-            if !state.logs.evidence().boot_observed
-                && !state.logs.has_entries()
-                && state
-                    .process_started
-                    .is_some_and(|started| started.elapsed() >= STARTUP_OBSERVATION_TIMEOUT)
-                && !*stop.borrow()
-                && !cancellation.is_cancelled()
-            {
-                startup_stalled = true;
-                settling_since = Some(tokio::time::Instant::now());
-            }
-        }
-        let mut tree_settled = false;
-        if settling_since.is_some() {
-            let _ = process.terminate();
-            tree_settled = process.tree_settled().unwrap_or(false);
-        }
-        let drained = stdout_finished && stderr_finished && !output_failed;
-        let observed_now =
-            if !startup_observed && !spawn_failed && !stop_requested && !startup_stalled {
-                let state = entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                (state.logs.evidence().boot_observed || status.is_none())
-                    && entry.telemetry.observe_startup(
-                        state.logs.evidence().boot_observed,
-                        state.logs.has_entries(),
-                        state
-                            .process_started
-                            .map_or(Duration::ZERO, |started| started.elapsed()),
-                    )
-            } else {
-                false
-            };
-        if observed_now {
-            startup_observed = true;
-            if let Some(instance) = &instance {
-                let instance = instance.clone();
-                let launched_at = launched_at.clone();
-                if !matches!(
-                    tokio::task::spawn_blocking(move || {
-                        instance.record_successful_launch(&launched_at)
-                    })
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    // Recency is best effort, as in the retained launcher. Its
-                    // atomic failure leaves no file effect to keep unsettled.
-                    tracing::warn!("Successful launch recency could not be saved.");
-                }
-            }
-        }
-        let unresolved = output_failed
-            || settlement_failed
-            || settling_since.is_some_and(|started| started.elapsed() >= SETTLEMENT_DEADLINE);
-        entry.publish(|snapshot| {
-            snapshot.exit_code = status.and_then(|status| status.code());
-            snapshot.tree_settled = tree_settled;
-            snapshot.process_alive = !tree_settled;
-            snapshot.output_drained = drained;
-            snapshot.phase = if unresolved {
-                SessionPhase::Unresolved
-            } else if stop_requested {
-                SessionPhase::Stopping
-            } else if settling_since.is_some() {
-                SessionPhase::Settling
-            } else if startup_observed {
-                SessionPhase::Running
-            } else {
-                SessionPhase::Starting
-            };
-        });
-        if status.is_some() && tree_settled && drained {
-            entry.telemetry.failure(
-                (!spawn_failed && !stop_requested)
-                    .then_some(TelemetryErrorKind::LaunchStartupFailed),
-            );
-            if !super::prepare::try_settle_natives(natives.clone()).await {
-                settlement_failed = true;
-                entry.publish(|snapshot| {
-                    snapshot.phase = SessionPhase::Unresolved;
-                    snapshot.outcome = None;
-                });
-                ticker.tick().await;
-                continue;
-            }
-            let outcome = entry.persist_settlement(
-                SettledProcess::ChildExited {
-                    exit_code: status.and_then(|status| status.code()),
-                    signal: status.and_then(exit_signal),
-                    stop_requested,
-                    was_running: startup_observed,
-                    spawn_failed,
-                },
-                startup_stalled,
-            );
-            if outcome.is_none() {
-                settlement_failed = true;
-                entry.publish(|snapshot| {
-                    snapshot.phase = SessionPhase::Unresolved;
-                    snapshot.outcome = None;
-                });
-                ticker.tick().await;
-                continue;
-            }
-            entry
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .logs
-                .clear_secrets();
-            entry.publish(|snapshot| {
-                snapshot.phase = SessionPhase::Exited;
-                snapshot.stop_allowed = false;
-                snapshot.outcome = outcome;
-            });
-            return;
-        }
-        let ProcessOutput { stdout, stderr } = &mut output;
-        tokio::select! {
-            _ = ticker.tick() => {},
-            _ = stop.changed(), if !stop_requested && !startup_stalled => {},
-            _ = cancellation.cancelled(), if !stop_requested && !startup_stalled => {},
-            read = stdout.read(&mut stdout_buffer), if !stdout_finished => {
-                match read {
-                    Ok(0) => { stdout_finished = true; entry.output(LogStream::Stdout, None); },
-                    Ok(count) => entry.output(LogStream::Stdout, Some(&stdout_buffer[..count])),
-                    Err(_) => { stdout_finished = true; output_failed = true; },
-                }
-            },
-            read = stderr.read(&mut stderr_buffer), if !stderr_finished => {
-                match read {
-                    Ok(0) => { stderr_finished = true; entry.output(LogStream::Stderr, None); },
-                    Ok(count) => entry.output(LogStream::Stderr, Some(&stderr_buffer[..count])),
-                    Err(_) => { stderr_finished = true; output_failed = true; },
-                }
-            },
-        }
-    }
-}
-
-async fn finish_without_process(
-    entry: &SessionEntry,
-    stopped: bool,
-    natives: Option<Arc<crate::install::vanilla::PreparedNatives>>,
-) {
-    entry.telemetry.failure(None);
-    entry.output(LogStream::Stdout, None);
-    entry.output(LogStream::Stderr, None);
-    while !super::prepare::try_settle_natives(natives.clone()).await {
-        entry.publish(|snapshot| {
-            snapshot.phase = SessionPhase::Unresolved;
-            snapshot.tree_settled = true;
-            snapshot.process_alive = false;
-            snapshot.output_drained = true;
-            snapshot.outcome = None;
-        });
-        tokio::time::sleep(PROCESS_POLL).await;
-    }
-    let outcome = loop {
-        if let Some(outcome) = entry.persist_settlement(SettledProcess::NoChild { stopped }, false)
-        {
-            break Some(outcome);
-        }
-        entry.publish(|snapshot| {
-            snapshot.phase = SessionPhase::Unresolved;
-            snapshot.outcome = None;
-        });
-        tokio::time::sleep(PROCESS_POLL).await;
-    };
-    entry
-        .state
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .logs
-        .clear_secrets();
-    entry.publish(|snapshot| {
-        snapshot.phase = SessionPhase::Exited;
-        snapshot.stop_allowed = false;
-        snapshot.process_alive = false;
-        snapshot.tree_settled = true;
-        snapshot.output_drained = true;
-        snapshot.outcome = outcome;
-    });
-}
-
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1384,6 +1039,7 @@ fn entry_for_instance(
             ..Default::default()
         },
         resource_budget: None,
+        stages: Vec::new(),
         telemetry: LaunchAttemptTelemetry::started(telemetry, "vanilla"),
         acceptance: None,
         preparation: Weak::new(),
@@ -1412,22 +1068,11 @@ pub(super) async fn finish_unstarted_for_test(
     if !save_report {
         entry.reports = None;
     }
-    finish_without_process(entry, false, None).await;
+    super::supervise::finish_without_process(entry, false, None).await;
     (
         entry.current(),
         entry.state.get_mut().unwrap().report.clone(),
     )
-}
-
-#[cfg(unix)]
-fn exit_signal(status: std::process::ExitStatus) -> Option<i32> {
-    use std::os::unix::process::ExitStatusExt;
-    status.signal()
-}
-
-#[cfg(not(unix))]
-fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
-    None
 }
 
 #[cfg(test)]
@@ -1598,6 +1243,10 @@ mod settlement_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::launch::supervise::{finish_without_process, supervise as supervise_process};
+    use crate::tasks::CancellationToken;
+    use axial_minecraft::process::OwnedProcess;
+    use tokio::process::Command;
 
     #[test]
     fn resource_use_counts_nonterminal_sessions_and_their_known_allocations() {

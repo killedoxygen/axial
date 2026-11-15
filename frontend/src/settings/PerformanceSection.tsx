@@ -5,11 +5,12 @@ import { OptionTiles, SettingRow, SettingsSection, type OptionTile } from '../ui
 import { saveConfigPatch, useAutoSave } from './autosave';
 import type { ConfigView } from '../generated/ConfigView';
 import type { ConfigPerformanceMode } from '../generated/ConfigPerformanceMode';
+import { performanceModeNotes } from '../instances/detail/performance-mode';
 
 const PERFORMANCE_OPTIONS: Array<OptionTile<ConfigPerformanceMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Axial applies recommended tuning and optimizations for you.' },
-  { value: 'vanilla', label: 'Vanilla', note: 'Pure Minecraft. No tweaks or add-ons applied at launch.' },
-  { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
+  { value: 'managed', label: 'Managed', note: performanceModeNotes.managed },
+  { value: 'vanilla', label: 'Vanilla', note: performanceModeNotes.vanilla },
+  { value: 'custom', label: 'Custom', note: performanceModeNotes.custom },
 ];
 
 function performanceModeFrom(value: string | undefined): ConfigPerformanceMode {

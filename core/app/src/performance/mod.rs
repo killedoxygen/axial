@@ -16,7 +16,9 @@ pub mod rules;
 #[cfg(test)]
 mod tests;
 
-pub use mutation::{PerformanceMutationError, PerformanceService, PreparedPerformance};
+pub use mutation::{
+    CompositionSettled, PerformanceMutationError, PerformanceService, PreparedPerformance,
+};
 
 pub fn public_transfer_resolver() -> composition::ManagedArtifactTransferResolver {
     composition::ManagedArtifactTransferResolver::new(
