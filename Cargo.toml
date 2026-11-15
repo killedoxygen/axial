@@ -72,7 +72,7 @@ axial-resource = { path = "core/resource" }
 axial-minecraft = { path = "core/minecraft" }
 axial-app = { path = "core/app" }
 rusqlite = { version = "0.42", features = ["bundled", "hooks", "fallible_uint"] }
-ts-rs = { version = "12.0.1", features = ["serde-compat", "uuid-impl"] }
+ts-rs = { version = "12.0.1", features = ["serde-compat", "uuid-impl", "no-serde-warnings"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 
 # Managed publication repeats cryptographic admission proofs; keep dev SHA-1 throughput usable.
