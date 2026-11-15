@@ -41,9 +41,7 @@ pub use content_transaction::{
     ManagedContentTransferSettlement, ManagedContentTransferStep, ManagedContentTransferTask,
 };
 
-pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
 pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
-const RETIRED_MANAGED_TEMP_PREFIX: &str = ".axial-loader-tmp-";
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;
 const MAX_MANAGED_GUARDED_REMOVAL_BYTES: u64 = 1 << 30;
 const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
@@ -2424,28 +2422,6 @@ impl ManagedDir {
             self.revalidate()?;
             self.file_guard_matches_after_revalidation(name, guard)
         })
-    }
-
-    pub(crate) fn managed_temp_is_orphan(
-        &self,
-        name: &str,
-        guard: &ManagedFileGuard,
-    ) -> Result<bool, LoaderError> {
-        if !validate_managed_temp_name(name)? {
-            return Err(LoaderError::Verify(
-                "managed temp admission was requested for an ordinary file".to_string(),
-            ));
-        }
-        if !self.file_guard_matches(name, guard)? {
-            return Err(LoaderError::Verify(
-                "managed temp identity changed during admission".to_string(),
-            ));
-        }
-
-        // The retained filesystem uses .axial-stage-* capabilities. Nothing in the
-        // current process creates the retired loader-temp namespace, so an exact
-        // guarded entry under this exclusive root session is abandoned residue.
-        Ok(true)
     }
 
     fn file_guard_matches_locked(
@@ -6498,31 +6474,6 @@ fn portable_key(name: &str) -> Result<PortablePathKey, LoaderError> {
         .map_err(|_| LoaderError::Verify("managed leaf name is not portable".to_string()))
 }
 
-pub(crate) fn validate_managed_temp_name(name: &str) -> Result<bool, LoaderError> {
-    let Some(suffix) = name.strip_prefix(RETIRED_MANAGED_TEMP_PREFIX) else {
-        return Ok(false);
-    };
-    let mut parts = suffix.split('-');
-    let pid_text = parts.next().unwrap_or_default();
-    let nonce_text = parts.next().unwrap_or_default();
-    let sequence_text = parts.next().unwrap_or_default();
-    let exact = parts.next().is_none()
-        && pid_text
-            .parse::<u32>()
-            .is_ok_and(|pid| pid.to_string() == pid_text)
-        && u128::from_str_radix(nonce_text, 16)
-            .is_ok_and(|nonce| format!("{nonce:x}") == nonce_text)
-        && u64::from_str_radix(sequence_text, 16)
-            .is_ok_and(|sequence| format!("{sequence:x}") == sequence_text);
-    if exact {
-        Ok(true)
-    } else {
-        Err(LoaderError::Verify(
-            "managed temp name is malformed".to_string(),
-        ))
-    }
-}
-
 #[cfg(test)]
 mod library_lifecycle_tests {
     use super::*;
@@ -8098,26 +8049,6 @@ mod effect_transition_tests {
             root.entries_bounded(MAX_MANAGED_TREE_OPERATION_ENTRIES + 1)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn retired_managed_temp_names_require_exact_canonical_fields() {
-        assert!(!validate_managed_temp_name("ordinary.bin").expect("ordinary name"));
-        assert!(
-            validate_managed_temp_name(".axial-loader-tmp-42-a-0").expect("canonical managed temp")
-        );
-        for malformed in [
-            ".axial-loader-tmp-",
-            ".axial-loader-tmp-042-a-0",
-            ".axial-loader-tmp-42-A-0",
-            ".axial-loader-tmp-42-a-00",
-            ".axial-loader-tmp-42-a-0-extra",
-        ] {
-            assert!(
-                validate_managed_temp_name(malformed).is_err(),
-                "{malformed} was accepted"
-            );
-        }
     }
 
     #[test]
