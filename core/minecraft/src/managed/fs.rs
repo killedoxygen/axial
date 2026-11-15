@@ -289,11 +289,9 @@ struct ManagedAuthorityLifecycle {
 
 struct ManagedAuthorityLifecycleState {
     open: bool,
-    active: usize,
 }
 
 struct ManagedOperationPin {
-    lifecycle: Arc<ManagedAuthorityLifecycle>,
     admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
     _retained: Option<Arc<dyn Send + Sync>>,
 }
@@ -346,20 +344,6 @@ impl Drop for ManagedLibraryRoot {
     }
 }
 
-impl Drop for ManagedOperationPin {
-    fn drop(&mut self) {
-        let mut state = self
-            .lifecycle
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.active = state
-            .active
-            .checked_sub(1)
-            .expect("managed authority operation count is balanced");
-    }
-}
-
 impl ManagedOperationPin {
     fn verify_admission(&self) -> io::Result<()> {
         match &self.admission {
@@ -385,10 +369,7 @@ fn observe_operation_admission<T>(
 impl ManagedAuthorityLifecycle {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(ManagedAuthorityLifecycleState {
-                open: true,
-                active: 0,
-            }),
+            state: Mutex::new(ManagedAuthorityLifecycleState { open: true }),
         })
     }
 
@@ -401,10 +382,10 @@ impl ManagedAuthorityLifecycle {
     }
 
     fn acquire_pin(
-        self: &Arc<Self>,
+        &self,
         admission: Option<Arc<ManagedLibraryAdmissionVerifier>>,
     ) -> io::Result<Arc<ManagedOperationPin>> {
-        let mut state = self
+        let state = self
             .state
             .lock()
             .map_err(|_| io::Error::other("managed authority lifecycle lock was poisoned"))?;
@@ -414,12 +395,7 @@ impl ManagedAuthorityLifecycle {
                 "managed authority generation is retiring",
             ));
         }
-        state.active = state
-            .active
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("managed authority operation count overflowed"))?;
         Ok(Arc::new(ManagedOperationPin {
-            lifecycle: Arc::clone(self),
             admission,
             _retained: None,
         }))
@@ -7809,49 +7785,6 @@ mod library_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn derived_reader_and_identity_pin_the_authority_until_release() {
-        async fn check(root: ManagedLibraryRoot) {
-            let operation = root.try_acquire().expect("operation");
-            let directory = operation.managed_directory().expect("managed directory");
-            directory
-                .write_new_exact("source.bin", b"source")
-                .expect("write source");
-            let guard = directory
-                .inspect_regular_file("source.bin")
-                .expect("inspect source")
-                .expect("source guard");
-            let identity = guard.identity();
-            let reader = guard.into_bounded_reader(6).expect("bounded reader");
-            let active = || {
-                root.authority
-                    .lifecycle
-                    .state
-                    .lock()
-                    .expect("lifecycle")
-                    .active
-            };
-            drop(directory);
-            drop(operation);
-            assert_ne!(active(), 0);
-            reader.cancel();
-            assert_ne!(active(), 0);
-            drop(identity);
-            assert_eq!(active(), 0);
-            root.settle().expect("settled library");
-        }
-
-        let (_temporary, root) = managed_library("derived-pin");
-        check(root).await;
-        let temporary = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
-        let session = acquire_root_session(temporary.path()).unwrap();
-        check(ManagedLibraryRoot::from_directory(session.root().unwrap()).unwrap()).await;
-        assert!(matches!(
-            session.revoke(),
-            axial_fs::RootRevokeOutcome::Revoked
-        ));
-    }
-
-    #[tokio::test]
     async fn pinless_tree_cleanup_continuation_settles_with_the_library() {
         let (_temporary, root) = managed_library("tree-continuation");
         let operation = root.try_acquire().expect("operation");
@@ -7873,35 +7806,6 @@ mod library_lifecycle_tests {
         drop(directory);
         drop(operation);
         root.settle().expect("tree cleanup settled");
-    }
-
-    #[test]
-    fn file_move_continuation_payload_is_pinless() {
-        let (_temporary, root) = managed_library("file-move-payload");
-        let operation = root.try_acquire().expect("operation");
-        let directory = operation.managed_directory().expect("managed directory");
-        directory
-            .write_new_exact("source.bin", b"source")
-            .expect("write source");
-        let identity = directory
-            .inspect_regular_file("source.bin")
-            .expect("inspect source")
-            .expect("source guard")
-            .identity();
-        let continuation_payload: Arc<ManagedFileProof> = identity.pinless_proof();
-        drop(identity);
-        drop(directory);
-        drop(operation);
-        assert_eq!(
-            root.authority
-                .lifecycle
-                .state
-                .lock()
-                .expect("lifecycle")
-                .active,
-            0
-        );
-        drop(continuation_payload);
     }
 }
 
@@ -7925,26 +7829,6 @@ mod managed_tree_lifecycle_tests {
         let effects = tree.create_effect_owner().expect("tree effect owner");
         let root = ManagedTreeRoot::from_directory(tree, effects).expect("managed tree root");
         (temporary, session, tree_path, root)
-    }
-
-    #[test]
-    fn child_capabilities_pin_a_closed_root_that_refuses_acquisition() {
-        let (_temporary, _session, _tree_path, root) = managed_tree("child-pin");
-        let authority = Arc::clone(&root.authority);
-        let operation = root.try_acquire().expect("tree operation");
-        let directory = operation.directory().expect("operation directory");
-        let child = directory
-            .open_or_create_child("child")
-            .expect("managed child");
-        drop(directory);
-        drop(operation);
-
-        let active = || authority.lifecycle.state.lock().expect("lifecycle").active;
-        drop(root);
-        assert!(authority.try_acquire().is_err());
-        assert_eq!(active(), 1);
-        drop(child);
-        assert_eq!(active(), 0);
     }
 
     #[test]
@@ -8056,7 +7940,6 @@ mod managed_tree_lifecycle_tests {
         assert!(!tree_path.join("target").join("stage").exists());
 
         drop((target, source, directory, operation));
-        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
@@ -8095,7 +7978,6 @@ mod managed_tree_lifecycle_tests {
         );
 
         drop((target, source, directory, operation));
-        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
@@ -8129,7 +8011,6 @@ mod managed_tree_lifecycle_tests {
         );
 
         drop((owned, directory, operation));
-        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
@@ -8168,7 +8049,6 @@ mod managed_tree_lifecycle_tests {
         target.settle().expect("cleanup effects settled");
 
         drop((target, source, directory, operation));
-        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]

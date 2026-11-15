@@ -44,7 +44,6 @@ pub struct ManagedInstallPublicationRecovery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedInstallRollbackEffect {
     Promotion,
-    Postcheck,
     Rollback,
 }
 
