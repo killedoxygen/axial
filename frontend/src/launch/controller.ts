@@ -358,25 +358,35 @@ function connectLaunchEvents(
   };
   launchConnections.set(sessionId, streamHandle);
   onPlaying();
-  pollSubscription = makeLaunchStatusPoller(
-    sessionId,
-    instanceId,
-    (data) => onStatus(data, streamHandle),
-    (update) => {
-      updateLaunchSessionState(instanceId, { viewModel: update.viewModel });
-      surfaceLaunchNotice(update.notice, instanceId, noticeTracker);
-      onSessionTerminal(update.outcome, instanceId, instanceName, sessionId, streamHandle);
-    },
-  );
+  // Status is polled only until a stream connection delivers its first
+  // authoritative snapshot, and again while that stream is disconnected.
+  const startPolling = (): void => {
+    if (closed || pollSubscription) return;
+    pollSubscription = makeLaunchStatusPoller(
+      sessionId,
+      instanceId,
+      (data) => onStatus(data, streamHandle),
+      (update) => {
+        updateLaunchSessionState(instanceId, { viewModel: update.viewModel });
+        surfaceLaunchNotice(update.notice, instanceId, noticeTracker);
+        onSessionTerminal(update.outcome, instanceId, instanceName, sessionId, streamHandle);
+      },
+    );
+  };
+  startPolling();
   unsubscribe = subscribeSession(sessionId, {
     status: (snapshot) => {
-      if (!closed) onStatus(snapshot, streamHandle);
+      if (closed) return;
+      pollSubscription?.close();
+      pollSubscription = null;
+      onStatus(snapshot, streamHandle);
     },
     log: (entry) => {
       if (!closed) appendSessionLog(entry, sessionId, instanceId, instanceName);
     },
     error: () => {
       if (closed || launchSessions.value[instanceId]?.sessionId !== sessionId) return;
+      startPolling();
       appendLog(
         'system',
         `Live logs are reconnecting for ${instanceName || instanceId}. Checking session status continues.`,
