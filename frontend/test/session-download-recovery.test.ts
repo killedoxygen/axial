@@ -487,6 +487,7 @@ for (const [label, payload] of [
   ['live process', { ...terminal, session: { ...terminal.session, process_alive: true } }],
   ['stop allowed', { ...terminal, session: { ...terminal.session, stop_allowed: true } }],
   ['missing outcome', { ...terminal, session: { ...terminal.session, outcome: null } }],
+  ['unsafe revision', { ...terminal, session: { ...terminal.session, revision: Number.MAX_SAFE_INTEGER + 1 } }],
   ...(['playing', 'process_live', 'can_stop'] as const).map(
     (flag) =>
       [
@@ -732,6 +733,8 @@ test('a mismatched, terminal or unclassified external session read cannot publis
   };
   for (const { label, read, session = 'session-1', visible = true } of [
     { label: 'mismatched identity', read: async () => ({ ...status(), session_id: 'different-session' }) },
+    { label: 'live status with an outcome', read: async () => ({ ...status(), outcome: status(1, true).outcome }) },
+    { label: 'unsafe revision', read: async () => ({ ...status(), revision: Number.MAX_SAFE_INTEGER + 1 }) },
     { label: 'already terminal', read: async () => status(2, true), visible: false },
     { label: 'unclassified 404', read: refused(404, { error: 'private provider detail' }), session: historical },
     {
@@ -844,6 +847,25 @@ test('an interrupted durable launch stops recovery polling and prevents a fresh 
   assert.equal(harness.errors[harness.errors.length - 1], 'Its process outcome is unknown.');
   await harness.launch.launchGame();
   assert.equal(harness.calls.filter((path) => path === '/launch').length, 1);
+});
+
+test('a terminal status without its outcome or with an unsafe revision cannot end the session', async () => {
+  for (const snapshot of [
+    { ...status(2, true), outcome: null },
+    { ...status(2, true), revision: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    const h = launchHarness();
+    await flush();
+    const sessions = h.store.launchSessions.value;
+    h.emit(snapshot, 'status');
+    await flush();
+    assert.equal(h.store.launchSessions.value, sessions);
+    assert.equal(
+      h.calls.some((path) => path.endsWith('/logs')),
+      false,
+    );
+    assert.equal(h.closed(), 0);
+  }
 });
 
 test('replayed launch history is appended once per session sequence', async () => {
@@ -1581,6 +1603,20 @@ test('disconnect during a rebase prevents late publication and cannot schedule a
   assert.equal(downloads.calls.filter((path) => path === '/instances').length, 2);
   assert.equal(downloads.clock.timeouts.size, 0);
   assert.equal(downloads.errors.length, 0);
+});
+
+test('queue revisions beyond exact JavaScript ordering are refused before publication', async () => {
+  const harness = downloadsHarness();
+  await harness.machine.applyInstallQueueResponse(queue('first', 1, 0));
+  harness.calls.length = 0;
+  for (const response of [
+    queue('first', Number.MAX_SAFE_INTEGER + 1, 0),
+    queue('first', 2, Number.MAX_SAFE_INTEGER + 1),
+  ]) {
+    await assert.rejects(harness.machine.applyInstallQueueResponse(response), /outside the range/);
+  }
+  assert.equal(harness.machine.downloadQueue.value.view_model.status_label, 'first');
+  assert.equal(harness.calls.length, 0);
 });
 
 test('queue restart accepts lower revisions and rejects delayed snapshots from its retired process', async () => {

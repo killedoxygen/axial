@@ -29,9 +29,14 @@ export interface LaunchStatusUpdate {
   outcome: SessionOutcome | null;
 }
 
-/** The status a snapshot carries, when it is this session's own. */
+/**
+ * The status a snapshot carries, when it is this session's own and consistent: a terminal status always has its
+ * outcome, and the revision orders exactly in JavaScript.
+ */
 export function launchStatusUpdate(snapshot: SessionSnapshot, sessionId: string): LaunchStatusUpdate | null {
   if (snapshot.session_id !== sessionId) return null;
+  if (snapshot.view_model.terminal !== (snapshot.outcome !== null)) return null;
+  if (!Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0) return null;
   return {
     revision: snapshot.revision,
     viewModel: snapshot.view_model,
@@ -44,7 +49,9 @@ export function launchStatusUpdate(snapshot: SessionSnapshot, sessionId: string)
 export function liveSessions(snapshots: SessionSnapshot[]): Record<string, LaunchSession> {
   const sessions: Record<string, LaunchSession> = {};
   for (const snapshot of snapshots) {
-    if (snapshot.view_model.terminal) continue;
+    const status = launchStatusUpdate(snapshot, snapshot.session_id);
+    if (!status) throw new Error('Launch session snapshot was invalid.');
+    if (status.viewModel.terminal) continue;
     if (Object.prototype.hasOwnProperty.call(sessions, snapshot.instance_id)) {
       throw new Error('Launch session snapshot repeated an active instance.');
     }
