@@ -1198,10 +1198,22 @@ pub(crate) mod tests {
         )
     }
 
+    const CHILD: &str = "AXIAL_INVENTORY_PREPARATION_CHILD";
+
+    /// A test running alone in its `preparation_child` process composes the
+    /// real process budget; tests sharing the harness process each get their
+    /// own, so unrelated tests cannot refuse their non-waiting admissions.
+    pub(crate) fn fixture_physical_work() -> axial_resource::PhysicalWorkOwner {
+        if std::env::var_os(CHILD).is_some() {
+            axial_resource::process_physical_work()
+        } else {
+            axial_resource::PhysicalWorkOwner::isolated_for_test()
+        }
+    }
+
     pub(crate) async fn preparation_child(selector: &str) -> bool {
         use std::time::{Duration, Instant};
 
-        const CHILD: &str = "AXIAL_INVENTORY_PREPARATION_CHILD";
         if std::env::var(CHILD).ok().as_deref() == Some(selector) {
             return true;
         }

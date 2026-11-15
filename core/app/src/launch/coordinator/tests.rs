@@ -28,7 +28,8 @@ async fn preflight_fixture_with_credentials(
         tasks.clone(),
         cache.clone(),
     )
-    .unwrap();
+    .unwrap()
+    .with_physical_work(crate::install::artifacts::tests::fixture_physical_work());
     crate::install::queue::tests::install_ready_fixture(&installs, "1.20.1").await;
     let pin = directories.library().admit().unwrap();
     let installed = installs.ready_version(&pin, "1.20.1").await.unwrap();

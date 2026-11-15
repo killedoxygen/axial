@@ -38,6 +38,7 @@ use axial_minecraft::{
     ManagedInstallAcknowledgementOutcome, ManagedInstallActivationContractId,
     ManagedInstallDurableOutcome, ManagedRuntimeCache,
 };
+use axial_resource::PhysicalWorkOwner;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -176,6 +177,7 @@ impl From<rusqlite::Error> for InstallError {
 #[derive(Clone)]
 pub struct InstallQueue {
     inner: Arc<Inner>,
+    work: PhysicalWorkOwner,
     telemetry: Option<Arc<Telemetry>>,
     content: Option<(Arc<ContentService>, Arc<ContentMutations>)>,
     #[cfg(feature = "test-support")]
@@ -537,6 +539,7 @@ impl InstallQueue {
                 }),
                 observer_join: tokio::sync::Mutex::new(()),
             }),
+            work: axial_resource::process_physical_work(),
             telemetry: None,
             content: None,
             #[cfg(feature = "test-support")]
@@ -567,6 +570,14 @@ impl InstallQueue {
     #[cfg(feature = "test-support")]
     pub fn with_test_endpoints(mut self, endpoints: InstallTestEndpoints) -> Self {
         self.test_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Compose a fixture-owned budget before sharing this queue, so unrelated
+    /// tests in the same process cannot refuse its non-waiting admissions.
+    #[cfg(test)]
+    pub(crate) fn with_physical_work(mut self, work: PhysicalWorkOwner) -> Self {
+        self.work = work;
         self
     }
 
@@ -1916,7 +1927,8 @@ impl InstallQueue {
                     let bytes: Option<u64> = row.get(0)?;
                     let bytes = bytes.ok_or(InstallError::SettlementRequired)?;
                     if bytes > 128 << 20 { return Err(InstallError::SettlementRequired); }
-                    let scratch = axial_resource::process_physical_work()
+                    let scratch = self
+                        .work
                         .try_reserve_scratch(bytes)
                         .map_err(|_| InstallError::AtCapacity)?;
                     let encoded: String = row.get(1)?;
@@ -2201,6 +2213,7 @@ impl InstallQueue {
         let version_id = version_id.to_owned();
         let storage = self.inner.storage.clone();
         let pin = pin.clone();
+        let work = self.work.clone();
         tokio::task::spawn_blocking(move || {
             let record = storage.read(|db| {
                 let mut statement = db.prepare("SELECT length(CAST(inventory_json AS BLOB)), inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'")?;
@@ -2211,7 +2224,7 @@ impl InstallQueue {
                 if let Some(budget) = &budget {
                     budget.lock().unwrap().reserve_record(bytes)?;
                 }
-                let scratch = axial_resource::process_physical_work()
+                let scratch = work
                     .try_reserve_scratch(bytes)
                     .map_err(|_| InstallError::AtCapacity)?;
                 let record: String = row.get(1)?;
@@ -2219,7 +2232,7 @@ impl InstallQueue {
             })?;
             let (record, scratch) = record.ok_or(InstallError::NotReady)?;
             if record.len() > 128 << 20 { return Err(InstallError::NotReady); }
-            axial_resource::process_physical_work().try_run_inline(
+            work.try_run_inline(
                 axial_resource::PhysicalWorkRequest::foreground(axial_resource::PhysicalIoClass::Read, 0),
                 move || {
                     let activated = artifacts::DecodedVersion::decode(&record)?;
@@ -3933,6 +3946,17 @@ pub(crate) mod tests {
         }
     }
 
+    fn open_queue(
+        storage: Arc<MetadataStore>,
+        library: LibraryLifecycle,
+        exclusions: Exclusions,
+        owner: TaskOwner,
+        runtime: ManagedRuntimeCache,
+    ) -> Result<InstallQueue, InstallError> {
+        InstallQueue::new(storage, library, exclusions, owner, runtime)
+            .map(|queue| queue.with_physical_work(artifacts::tests::fixture_physical_work()))
+    }
+
     pub(crate) fn fixture() -> (
         tempfile::TempDir,
         Arc<MetadataStore>,
@@ -3952,7 +3976,7 @@ pub(crate) mod tests {
         let exclusions = Exclusions::new();
         let owner = TaskOwner::new(4).unwrap();
         let runtime = ManagedRuntimeCache::isolated_for_test().unwrap();
-        let queue = InstallQueue::new(
+        let queue = open_queue(
             storage.clone(),
             library.clone(),
             exclusions.clone(),
@@ -4027,7 +4051,7 @@ pub(crate) mod tests {
         )
         .parse()
         .unwrap();
-        let queue = InstallQueue::new(
+        let queue = open_queue(
             storage.clone(),
             library.clone(),
             exclusions.clone(),
@@ -4207,7 +4231,7 @@ pub(crate) mod tests {
             let status = started
                 .as_ref()
                 .map(|started| queue.status(&started.install_id).unwrap());
-            let reopened = InstallQueue::new(
+            let reopened = open_queue(
                 storage,
                 library.clone(),
                 exclusions.clone(),
@@ -4366,7 +4390,7 @@ pub(crate) mod tests {
                 format!("{:x}", Sha1::digest(&refused_metadata)),
                 expected_sha1
             );
-            let queue = InstallQueue::new(
+            let queue = open_queue(
                 storage.clone(),
                 library.clone(),
                 exclusions.clone(),
@@ -4570,7 +4594,7 @@ pub(crate) mod tests {
             let status = started
                 .as_ref()
                 .map(|started| queue.status(&started.install_id).unwrap());
-            let reloaded = InstallQueue::new(
+            let reloaded = open_queue(
                 storage,
                 library.clone(),
                 exclusions.clone(),
@@ -4741,8 +4765,7 @@ pub(crate) mod tests {
         queue.shutdown_queued().unwrap();
         drop(queue);
         let restored =
-            InstallQueue::new(storage, library.clone(), exclusions, owner.clone(), runtime)
-                .unwrap();
+            open_queue(storage, library.clone(), exclusions, owner.clone(), runtime).unwrap();
         let snapshot = restored.snapshot();
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].queue_id, ids[1]);
@@ -4770,7 +4793,7 @@ pub(crate) mod tests {
             let (root, storage, library, exclusions, owner, isolated_queue) = fixture();
             drop(isolated_queue);
             let runtime = library.runtime_cache().unwrap();
-            let queue = InstallQueue::new(
+            let queue = open_queue(
                 storage,
                 library.clone(),
                 exclusions.clone(),
@@ -5097,7 +5120,7 @@ pub(crate) mod tests {
         };
         queue.close_admission();
         queue.shutdown_queued().unwrap();
-        let restored = InstallQueue::new(
+        let restored = open_queue(
             queue.inner.storage.clone(),
             queue.inner.library.clone(),
             queue.inner.exclusions.clone(),
@@ -5204,7 +5227,7 @@ pub(crate) mod tests {
             LibraryOpenOutcome::Ready(library) => library,
             other => panic!("isolated library fixture: {other:?}"),
         };
-        let other_queue = InstallQueue::new(
+        let other_queue = open_queue(
             storage,
             other_library.clone(),
             exclusions,
@@ -5570,7 +5593,7 @@ pub(crate) mod tests {
         );
         queue.close_admission();
         queue.shutdown_queued().unwrap();
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions,
@@ -5661,7 +5684,7 @@ pub(crate) mod tests {
             queue.remove(&runtime_id).await.unwrap();
             queue.close_admission();
             queue.shutdown_queued().unwrap();
-            let restarted = InstallQueue::new(
+            let restarted = open_queue(
                 storage.clone(),
                 library,
                 exclusions,
@@ -5789,7 +5812,7 @@ pub(crate) mod tests {
             client,
             owner.clone(),
         ));
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions,
@@ -5982,7 +6005,7 @@ pub(crate) mod tests {
             publish_before_crash(&queue, &pin, &id, version, CheckpointKind::Final, point).await;
             queue.shutdown_queued().unwrap();
             drop(writer);
-            let restarted = InstallQueue::new(
+            let restarted = open_queue(
                 storage,
                 library,
                 exclusions.clone(),
@@ -6086,7 +6109,7 @@ pub(crate) mod tests {
             .unwrap();
         queue.shutdown_queued().unwrap();
         drop(writer);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage.clone(),
             library.clone(),
             exclusions.clone(),
@@ -6288,7 +6311,7 @@ pub(crate) mod tests {
         let original_bytes = std::fs::read(&metadata).unwrap();
         queue.shutdown_queued().unwrap();
         drop(writer);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage.clone(),
             library,
             exclusions.clone(),
@@ -6429,7 +6452,7 @@ pub(crate) mod tests {
         .await;
         queue.shutdown_queued().unwrap();
         drop(writer);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions.clone(),
@@ -6521,7 +6544,7 @@ pub(crate) mod tests {
                 .unwrap();
             queue.shutdown_queued().unwrap();
             drop(writer);
-            let restarted = InstallQueue::new(
+            let restarted = open_queue(
                 storage.clone(),
                 library,
                 exclusions,
@@ -6665,7 +6688,7 @@ pub(crate) mod tests {
         drop(verified);
         queue.shutdown_queued().unwrap();
         drop(writer);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage.clone(),
             library,
             exclusions.clone(),
@@ -6747,7 +6770,7 @@ pub(crate) mod tests {
             .await;
             queue.shutdown_queued().unwrap();
             drop(writer);
-            let restarted = InstallQueue::new(
+            let restarted = open_queue(
                 storage,
                 library,
                 exclusions,
@@ -6873,7 +6896,7 @@ pub(crate) mod tests {
             publish_before_crash(&queue, &pin, &id, base, CheckpointKind::Base, point).await;
             queue.shutdown_queued().unwrap();
             drop(writer);
-            let restarted = InstallQueue::new(
+            let restarted = open_queue(
                 storage,
                 library,
                 exclusions,
@@ -7337,7 +7360,7 @@ pub(crate) mod tests {
             axial_minecraft::classify_managed_install_publication(operation, version_id).await,
             axial_minecraft::ManagedInstallDurableOutcome::NoEffect
         ));
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions,
@@ -7387,7 +7410,7 @@ pub(crate) mod tests {
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), before);
         drop(blocker);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions,
@@ -7429,7 +7452,7 @@ pub(crate) mod tests {
             .unwrap();
         queue.shutdown_queued().unwrap();
         drop(writer);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions,
@@ -7493,7 +7516,7 @@ pub(crate) mod tests {
             .unwrap();
         queue.shutdown_queued().unwrap();
         drop(writer);
-        let restarted = InstallQueue::new(
+        let restarted = open_queue(
             storage,
             library,
             exclusions,
