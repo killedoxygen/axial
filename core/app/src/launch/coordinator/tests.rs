@@ -1516,12 +1516,10 @@ async fn preflight_rechecks_captured_inputs_even_when_the_probe_fails() {
         let mut projection = coordinator.preflight_projection(None, InventoryBudget::projection());
         projection.finalize_scan = change == "capacity_foreground";
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-        assert!(
-            coordinator
-                .preflight_with_projection(id.clone(), &mut projection)
-                .await
-                .launchable
-        );
+        let first = coordinator
+            .preflight_with_projection(id.clone(), &mut projection)
+            .await;
+        assert!(first.launchable, "{change}: {first:?}");
         std::fs::remove_file(root.path().join("probe-release")).unwrap();
         std::fs::remove_file(root.path().join("probe-started")).unwrap();
         // The library proof stays shared; observe the runtime again so a live

@@ -12,6 +12,9 @@ pub(crate) struct PreflightProjection {
     pub(crate) inspection: Inspection,
     pub(super) installs: InstallQueue,
     pub(super) runtimes: RuntimeProjection,
+    /// Exact account credential revisions this projection already verified;
+    /// their secure heads are rechecked once before publication.
+    pub(super) credentials: Arc<Mutex<Vec<CapturedAccount>>>,
 }
 
 impl PreflightProjection {
@@ -239,6 +242,7 @@ impl LaunchCoordinator {
             inspection: Inspection::Reverified,
             installs: self.installs.clone(),
             runtimes: RuntimeProjection::default(),
+            credentials: Arc::default(),
         }
     }
 
@@ -310,6 +314,13 @@ impl LaunchCoordinator {
             .revalidate()
             .await
             .map_err(LaunchError::RuntimeFailure)?;
+        let verified = projection.credentials.lock().unwrap().clone();
+        for account in &verified {
+            self.auth
+                .credential_head_matches(account)
+                .await
+                .map_err(|_| LaunchError::AccountChanged)?;
+        }
         let (selection, revision) = projection.context.as_ref().map_err(Clone::clone)?;
         selection
             .validate(&self.accounts)
@@ -468,6 +479,7 @@ impl LaunchCoordinator {
         let finalize_scan = projection.finalize_scan;
         let budget = projection.budget.clone();
         let runtimes = projection.runtimes.clone();
+        let credentials = projection.credentials.clone();
         let task = self
             .tasks
             .try_spawn(retained, move |cancel| async move {
@@ -586,11 +598,18 @@ impl LaunchCoordinator {
                             if !account.owns_minecraft_java() {
                                 return Err(LaunchError::OnlineAccountUnavailable);
                             }
-                            coordinator
-                                .auth
-                                .credentials(account)
-                                .await
-                                .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
+                            let verified = credentials.lock().unwrap().iter().any(|checked| {
+                                checked.account_id() == account.account_id()
+                                    && checked.credential_revision() == account.credential_revision()
+                            });
+                            if !verified {
+                                coordinator
+                                    .auth
+                                    .credentials(account)
+                                    .await
+                                    .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
+                                credentials.lock().unwrap().push(account.clone());
+                            }
                         }
                         let target = &admitted.record().instance;
                         let required = axial_minecraft::effective_java_version_for(

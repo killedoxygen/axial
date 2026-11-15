@@ -610,22 +610,30 @@ impl LaunchCoordinator {
         if !capture.owns_minecraft_java() {
             return Err(LaunchError::OnlineAccountUnavailable);
         }
-        if self.auth.launch_credentials(&capture).await.is_err() {
-            capture = self
-                .auth
-                .refresh(capture)
-                .await
-                .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
-        }
+        // One blob read per attempt: a refresh writes and reads back its own
+        // credentials; after the profile flush only the secure head is rechecked.
+        let credentials = match self.auth.launch_credentials(&capture).await {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                capture = self
+                    .auth
+                    .refresh(capture)
+                    .await
+                    .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
+                self.auth
+                    .launch_credentials(&capture)
+                    .await
+                    .map_err(|_| LaunchError::OnlineAccountUnavailable)?
+            }
+        };
         let account_id = capture.account_id().to_owned();
         self.skins
             .flush_account(&account_id)
             .await
             .map_err(|_| LaunchError::ProfileUnsettled)?;
         let capture = capture_after_profile(&self.accounts, &capture)?;
-        let credentials = self
-            .auth
-            .launch_credentials(&capture)
+        self.auth
+            .revalidate_launch_credentials(&capture, &credentials)
             .await
             .map_err(|_| LaunchError::OnlineAccountUnavailable)?;
         let token = credentials.minecraft_access_token().to_owned();

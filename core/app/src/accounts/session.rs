@@ -257,6 +257,45 @@ impl AuthService {
         Ok(credentials)
     }
 
+    /// Whether the secure-store head still holds the exact live credential
+    /// revision `capture` names. Reads no credential blob.
+    pub async fn credential_head_matches(&self, capture: &CapturedAccount) -> Result<(), AuthError> {
+        self.directory.validate_account_capture(capture)?;
+        let head = self.credentials.status(capture.account_id()).await?;
+        if head.state != super::credential_store::CredentialState::Ready
+            || head.revision != capture.credential_revision()
+        {
+            return Err(AuthError::SignInRequired);
+        }
+        Ok(())
+    }
+
+    /// Rechecks, by its secure-store head alone, credentials this launch
+    /// attempt already read for `capture`. The blob is not read again; a
+    /// changed, pending or deleted head refuses the attempt.
+    pub async fn revalidate_launch_credentials(
+        &self,
+        capture: &CapturedAccount,
+        credentials: &Credentials,
+    ) -> Result<(), AuthError> {
+        let _gate = self.mutation.lock().await;
+        self.directory.validate_capture(capture)?;
+        let head = self.credentials.status(capture.account_id()).await?;
+        if head.state != super::credential_store::CredentialState::Ready
+            || head.revision != capture.credential_revision()
+        {
+            return Err(AuthError::SignInRequired);
+        }
+        if !capture.owns_minecraft_java() {
+            return Err(AuthError::OwnershipMissing);
+        }
+        if credentials.minecraft_expires_at() <= now_seconds().saturating_add(30) {
+            return Err(AuthError::SignInRequired);
+        }
+        self.directory.validate_capture(capture)
+            .map_err(AuthError::from)
+    }
+
     pub async fn refresh_selected(&self) -> Result<CapturedAccount, AuthError> {
         let capture = self.directory.capture_selected()?;
         self.refresh(capture).await
