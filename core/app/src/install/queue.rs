@@ -160,8 +160,52 @@ pub enum InstallError {
     Closed,
     #[error("Installation resolution was cancelled.")]
     Cancelled,
+    #[error("This version's Java needs Rosetta 2 on this Mac. Install Rosetta 2, then try again.")]
+    RosettaRequired,
+    #[error("No Java runtime for this version is published for this computer.")]
+    RuntimeUnavailable,
+    #[error(
+        "There is not enough disk space to install this version. Free some space and try again."
+    )]
+    StorageFull,
     #[error("The installation failed. Check your connection and try again.")]
     Failed,
+}
+
+/// The safe, actionable cause an installer failure carries to its settled
+/// outcome. Raw provider, path and OS details never cross this boundary.
+trait InstallFailureCause {
+    fn cause(&self) -> InstallError;
+}
+
+impl InstallFailureCause for DownloadError {
+    fn cause(&self) -> InstallError {
+        match self {
+            DownloadError::RuntimeRosettaRequired { .. } => InstallError::RosettaRequired,
+            DownloadError::RuntimeUnavailableForPlatform { .. } => InstallError::RuntimeUnavailable,
+            DownloadError::Cancelled => InstallError::Cancelled,
+            _ if self.file_failure_class()
+                == Some(axial_minecraft::DownloadFileFailureClass::StorageFull) =>
+            {
+                InstallError::StorageFull
+            }
+            _ => InstallError::Failed,
+        }
+    }
+}
+
+impl InstallFailureCause for LoaderInstallError {
+    fn cause(&self) -> InstallError {
+        match self {
+            LoaderInstallError::BaseInstallFailed(failure) => failure.error().cause(),
+            LoaderInstallError::Active(failure) => match failure.source() {
+                axial_minecraft::LoaderError::BaseInstallFailed { error, .. } => error.cause(),
+                axial_minecraft::LoaderError::Cancelled => InstallError::Cancelled,
+                _ => InstallError::Failed,
+            },
+            _ => InstallError::Failed,
+        }
+    }
 }
 impl From<StorageError> for InstallError {
     fn from(_: StorageError) -> Self {
@@ -2854,13 +2898,17 @@ impl InstallQueue {
         }
     }
 
-    async fn classify_failure<E: Send + 'static>(
+    /// Classifies a failed installer at its publication boundary. A settled
+    /// failure reports the installer's safe cause; an unsettled one is retained.
+    async fn classify_failure(
         &self,
         id: &str,
         operation: &axial_minecraft::managed_path::ManagedLibraryOperation,
         version_id: &str,
-        _error: E,
+        error: impl InstallFailureCause,
     ) -> Result<(), WorkFailure> {
+        let cause = error.cause();
+        drop(error);
         match axial_minecraft::classify_managed_install_publication(
             operation.clone(),
             version_id.to_owned(),
@@ -2868,7 +2916,7 @@ impl InstallQueue {
         .await
         {
             axial_minecraft::ManagedInstallDurableOutcome::NoEffect => {
-                Err(WorkFailure::Failed(InstallError::Failed))
+                Err(WorkFailure::Failed(cause))
             }
             ManagedInstallDurableOutcome::RolledBack { evidence, .. } => {
                 let checkpoint = PublicationCheckpoint {
@@ -2880,7 +2928,7 @@ impl InstallQueue {
                 self.persist_checkpoint(id, &checkpoint)?;
                 match evidence.acknowledge().await {
                     ManagedInstallAcknowledgementOutcome::Acknowledged => {
-                        Err(WorkFailure::Failed(InstallError::Failed))
+                        Err(WorkFailure::Failed(cause))
                     }
                     ManagedInstallAcknowledgementOutcome::Indeterminate(recovery) => {
                         Err(WorkFailure::Unsettled(RetainedInstall::Acknowledgement {
@@ -3669,6 +3717,11 @@ fn failure_view(error: InstallError, detail: Option<String>) -> InstallFailureVi
                     ..InstallActionViewModel::enabled("retry", "Retry")
                 }
             }
+            InstallError::RuntimeUnavailable => InstallActionViewModel {
+                enabled: false,
+                disabled_reason: Some("Choose a version supported on this computer.".into()),
+                ..InstallActionViewModel::enabled("retry", "Retry")
+            },
             _ => InstallActionViewModel::enabled("retry", "Retry"),
         },
         dismiss_action: InstallActionViewModel::enabled("dismiss", "Dismiss"),
@@ -3773,6 +3826,55 @@ fn project(state: &State) -> InstallQueueStateResponse {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn settled_failures_keep_the_safe_platform_cause_and_truthful_retry() {
+        for (error, expected, retry) in [
+            (
+                DownloadError::RuntimeRosettaRequired {
+                    component: "jre-legacy".into(),
+                },
+                InstallError::RosettaRequired,
+                true,
+            ),
+            (
+                DownloadError::RuntimeUnavailableForPlatform {
+                    component: "jre-legacy".into(),
+                    platform: "linux-i386".into(),
+                },
+                InstallError::RuntimeUnavailable,
+                false,
+            ),
+            (
+                DownloadError::FileOperation(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+                InstallError::StorageFull,
+                true,
+            ),
+            (
+                DownloadError::Integrity("sha1 mismatch at /private/path".into()),
+                InstallError::Failed,
+                true,
+            ),
+        ] {
+            let cause = error.cause();
+            assert_eq!(cause, expected);
+            let view = serde_json::to_value(failure_view(cause, None)).unwrap();
+            let summary = view["summary"].as_str().unwrap();
+            assert_eq!(summary, expected.to_string());
+            assert!(!summary.contains("/private"), "{summary}");
+            assert_eq!(view["retry_action"]["enabled"], retry, "{summary}");
+        }
+        assert!(
+            InstallError::RosettaRequired
+                .to_string()
+                .contains("Rosetta 2")
+        );
+        assert!(
+            !InstallError::RosettaRequired
+                .to_string()
+                .contains("connection")
+        );
+    }
     use crate::library::LibraryOpenOutcome;
 
     #[test]
@@ -5311,9 +5413,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn retained_request_fixture(
-        loader: bool,
-    ) -> (InstallQueueRequest, InstallItem) {
+    fn retained_request_fixture(loader: bool) -> (InstallQueueRequest, InstallItem) {
         if loader {
             let component = LoaderComponentId::Quilt;
             let build_id = axial_minecraft::loaders::build_id_for(component, "1.20.1", "0.30.1");
@@ -5698,7 +5798,11 @@ pub(crate) mod tests {
                     .iter()
                     .map(|item| item.kind)
                     .collect::<Vec<_>>(),
-                [InstallKind::Vanilla, InstallKind::Content, InstallKind::Vanilla]
+                [
+                    InstallKind::Vanilla,
+                    InstallKind::Content,
+                    InstallKind::Vanilla
+                ]
             );
             assert_eq!(resumed.items[0].install_item.version_id, "1.21.4");
             assert_eq!(resumed.items[2].install_item.version_id, "unrelated");
