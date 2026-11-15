@@ -485,6 +485,7 @@ impl StagedFile {
 
     /// Seals scratch bytes whose durability is deferred until promotion.
     /// Recoverable stages journal their sealed proof and stay durable at seal.
+    #[cfg(any(test, not(target_os = "linux")))]
     pub(crate) fn seal_scratch(self) -> Result<SealedStagedFile, StageSealFailure> {
         self.seal_inner(false)
     }
