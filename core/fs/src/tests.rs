@@ -2160,7 +2160,7 @@ fn admitted_root_session_clones_its_detached_root_capability() {
         }
     };
     admitted_session
-        .validate_retained_authority()
+        .validate_reset_preflight()
         .expect("retained admitted root authority");
     assert_eq!(
         admitted_session
@@ -4653,7 +4653,7 @@ fn recovery_control_refuses_a_displaced_root_and_replacement_lease() {
     std::fs::create_dir(&root).expect("replacement application root");
     let replacement = acquire_test_root(&root);
     assert!(platform::recovery_control_write_all_at(&first.authority.lease, 0, &[0x22]).is_err());
-    assert!(first.validate_retained_authority().is_err());
+    assert!(first.validate_reset_preflight().is_err());
 
     let mut displaced_control =
         File::open(displaced.join(ROOT_LEASE_NAME)).expect("open displaced recovery control");

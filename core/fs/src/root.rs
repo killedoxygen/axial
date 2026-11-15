@@ -684,12 +684,6 @@ impl RootSession {
         platform::validate_root(&self.authority.root)
     }
 
-    pub fn validate_retained_authority(&self) -> io::Result<()> {
-        platform::validate_lease(&self.authority.lease)?;
-        platform::validate_root_handle(&self.authority.root)?;
-        self.validate_admission()
-    }
-
     pub fn revoke(self) -> RootRevokeOutcome {
         let start = self.authority.begin_terminal_drain(false);
         match start {
