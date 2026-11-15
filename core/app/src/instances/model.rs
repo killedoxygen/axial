@@ -1,6 +1,6 @@
 //! Instance metadata. Names and serialized location hints never authorize files.
 
-use crate::settings::InstanceSettings;
+use crate::{public::Tone, settings::InstanceSettings};
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 use ts_rs::TS;
@@ -70,6 +70,7 @@ pub struct Instance {
     pub settings: InstanceSettings,
     /// Derived presentation only. The registry encoder excludes this field.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub java_selection: Option<JavaSelection>,
     pub icon: String,
     pub accent: String,
@@ -86,7 +87,7 @@ pub enum JavaSelection {
     Custom,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct EnrichedInstance {
     #[serde(flatten)]
     pub instance: Instance,
@@ -95,7 +96,7 @@ pub struct EnrichedInstance {
     pub launch_action: InstanceLaunchAction,
     pub status_detail: String,
     pub needs_install: String,
-    pub install_target: Option<crate::install::model::InstallQueueInstallItemViewModel>,
+    pub install_target: Option<crate::install::model::InstallItem>,
     pub java_major: i32,
     pub saves_count: usize,
     pub mods_count: usize,
@@ -104,7 +105,7 @@ pub struct EnrichedInstance {
     pub counts_available: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct InstanceVersionDisplay {
     pub loader_key: String,
     pub loader_label: String,
@@ -115,15 +116,24 @@ pub struct InstanceVersionDisplay {
     pub supports_mods: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct InstanceLaunchAction {
     pub state_id: String,
     pub label: String,
-    pub tone: String,
+    pub tone: Tone,
     pub launchable: bool,
-    pub primary_action: String,
+    pub primary_action: LaunchPrimaryAction,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPrimaryAction {
+    Launch,
+    Install,
+    Blocked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,8 +166,9 @@ pub struct InstanceRecord {
     pub directory_receipt: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
+#[ts(optional_fields)]
 pub struct InstancePatch {
     pub expected_revision: Option<u64>,
     pub name: Option<String>,

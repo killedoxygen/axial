@@ -1,7 +1,7 @@
 //! HTTP adaptation only. Mount under the authenticated local transport boundary.
 
+use axial_app::public::StatusResponse;
 use super::{
-    Status,
     error::{ApiError, ApiResult, Extracted},
     media,
 };
@@ -280,9 +280,9 @@ async fn save_username(State(service): State<SkinState>, body: Body) -> ApiResul
     Ok(Json(record))
 }
 
-async fn remove(State(service): State<SkinState>, Path(key): Path<String>) -> ApiResult<Status> {
+async fn remove(State(service): State<SkinState>, Path(key): Path<String>) -> ApiResult<StatusResponse> {
     match service.delete_saved(&key).await? {
-        SavedSkinDeleteResult::Deleted(_) => Ok(Json(Status::new("deleted"))),
+        SavedSkinDeleteResult::Deleted(_) => Ok(Json(StatusResponse::new("deleted"))),
         SavedSkinDeleteResult::Missing => Err(ProfileMediaError::SavedSkinMissing.into()),
         SavedSkinDeleteResult::Applied => Err(ApiError::new(
             StatusCode::CONFLICT,

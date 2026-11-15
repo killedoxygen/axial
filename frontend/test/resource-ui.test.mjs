@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, relative, resolve, sep } from 'node:path';
 import { before, test } from 'node:test';
+import { enrichedInstance } from './wire';
 
-/** @typedef {typeof import('../src/views/instance/resources') & typeof import('../src/views/instance/bulk-actions') & typeof import('../src/views/instance/world-actions') & typeof import('../src/views/instance/screenshot-actions') & typeof import('../src/views/instance/mod-actions') & typeof import('../src/views/instance/mod-provenance-cache')} ResourceActions */
-/** @typedef {Parameters<typeof import('../src/api').api>} ApiCall */
-/** @typedef {import('../src/types-content').ContentSelection} ContentSelection */
-/** @typedef {import('../src/views/instance/mod-provenance-cache').ModProvenance} ModProvenance */
+/** @typedef {typeof import('../src/instances/detail/resources') & typeof import('../src/instances/detail/bulk-actions') & typeof import('../src/instances/detail/world-actions') & typeof import('../src/instances/detail/screenshot-actions') & typeof import('../src/instances/detail/mod-actions') & typeof import('../src/instances/detail/mod-provenance-cache')} ResourceActions */
+/** @typedef {[method: string, path: string, body?: unknown]} ApiCall */
+/** @typedef {import('../src/generated/ResolutionSelection').ResolutionSelection} ContentSelection */
+/** @typedef {import('../src/instances/detail/mod-provenance-cache').ModProvenance} ModProvenance */
 /**
  * @typedef {object} ResourceIo
- * @property {Parameters<typeof import('../src/toast').toast>[]} notices
+ * @property {Parameters<typeof import('../src/app/toast').toast>[]} notices
  * @property {ApiCall[]} calls
  * @property {unknown[][]} folders
  * @property {unknown[][]} navigation
@@ -19,8 +20,8 @@ import { before, test } from 'node:test';
  * @property {typeof import('../src/ui/Dialog').prompt} prompt
  * @property {() => Promise<unknown>} list
  * @property {() => Promise<unknown>} updates
- * @property {(...args: Parameters<typeof import('../src/content').installContent>) => Promise<unknown>} install
- * @property {(...args: Parameters<typeof import('../src/content').uninstallContents>) => Promise<unknown>} uninstall
+ * @property {(...args: Parameters<typeof import('../src/content/api').installContent>) => Promise<unknown>} install
+ * @property {(...args: Parameters<typeof import('../src/content/api').uninstallContents>) => Promise<unknown>} uninstall
  * @property {() => Promise<void>} queue
  */
 
@@ -31,15 +32,15 @@ const { build } = /** @type {typeof import('esbuild')} */ (require(esbuildPath))
 const dependencyRoot = resolve(dirname(esbuildPath), '../../');
 /** @type {Record<string, string>} */
 const boundaries = {
-  api: `export const api = (...args) => io.api(...args); export const apiResourceUrl = path => 'https://local.invalid/api/v1' + path;`,
-  toast: `export const toast = (...args) => io.notices.push(args);`,
-  Dialog: `export const prompt = (...args) => io.prompt(...args); export const showChoice = (...args) => io.choice(...args); export const showConfirm = (...args) => io.confirm(...args);`,
-  content: `export const listInstanceContent = (...args) => io.list(...args); export const checkContentUpdates = (...args) => io.updates(...args); export const installContent = (...args) => io.install(...args); export const uninstallContents = (...args) => io.uninstall(...args);`,
-  downloads: `export const applyInstallQueueResponse = (...args) => io.queue(...args);`,
-  'ui-state': `export const navigate = (...args) => io.navigation.push(args);`,
-  'instance-actions': `export const openInstanceFolder = (...args) => io.folders.push(args);`,
-  utils: `export const errMessage = error => error instanceof Error ? error.message : String(error); export const modBaseName = name => name.replace(/\\.disabled$/, '');`,
+  'platform/transport': `export const request = (...args) => io.api(...args); export const send = (...args) => io.api(...args); export const apiResourceUrl = path => 'https://local.invalid/api/v1' + path; export const isApiError = error => error instanceof Error && error.name === 'ApiError';`,
+  'app/toast': `export const toast = (...args) => io.notices.push(args); export const showError = message => io.notices.push([message, 'error']); export const errMessage = error => error instanceof Error ? error.message : String(error);`,
+  'ui/Dialog': `export const prompt = (...args) => io.prompt(...args); export const showChoice = (...args) => io.choice(...args); export const showConfirm = (...args) => io.confirm(...args);`,
+  'content/api': `export const listInstanceContent = (...args) => io.list(...args); export const checkContentUpdates = (...args) => io.updates(...args); export const installContent = (...args) => io.install(...args); export const uninstallContents = (...args) => io.uninstall(...args); export const requiredRefusal = error => error && error.status === 409 && error.payload && 'required_by' in error.payload ? error.payload : null;`,
+  'install/queue': `export const applyInstallQueueResponse = (...args) => io.queue(...args);`,
+  'app/route': `export const navigate = (...args) => io.navigation.push(args);`,
+  'instances/detail/instance-actions': `export const openInstanceFolder = (...args) => io.folders.push(args);`,
 };
+const sourceRoot = resolve(frontend, 'src');
 let bundleText = '';
 before(async () => {
   const bundle = await build({
@@ -52,7 +53,7 @@ before(async () => {
         'mod-actions',
         'mod-provenance-cache',
       ]
-        .map((name) => `export * from './src/views/instance/${name}';`)
+        .map((name) => `export * from './src/instances/detail/${name}';`)
         .join('\n'),
       resolveDir: frontend,
     },
@@ -66,10 +67,10 @@ before(async () => {
       {
         name: 'resource-io-boundaries',
         setup(builder) {
-          builder.onResolve({ filter: /./ }, (args) => {
-            const name = args.path.split('/').pop();
-            return name && Object.prototype.hasOwnProperty.call(boundaries, name)
-              ? { path: name, namespace: 'boundary' }
+          builder.onResolve({ filter: /^\./ }, (args) => {
+            const key = relative(sourceRoot, resolve(args.resolveDir, args.path)).split(sep).join('/');
+            return Object.prototype.hasOwnProperty.call(boundaries, key)
+              ? { path: key, namespace: 'boundary' }
               : undefined;
           });
           builder.onLoad({ filter: /./, namespace: 'boundary' }, (args) => ({ contents: boundaries[args.path] }));
@@ -126,14 +127,11 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-/** @type {import('../src/types-instance').EnrichedInstance} */
-const instance = {
+/** @type {import('../src/generated/EnrichedInstance').EnrichedInstance} */
+const instance = enrichedInstance({
   id: 'instance A',
   name: 'Resource fixture',
   version_id: 'fixture',
-  created_at: '2026-09-08T12:00:00Z',
-  java_selection: { kind: 'inherited' },
-  revision: 1,
   version_display: {
     loader_key: 'vanilla',
     loader_label: 'Vanilla',
@@ -143,16 +141,10 @@ const instance = {
     summary_label: 'Fixture',
     supports_mods: true,
   },
-  launchable: true,
-  launch_action: { state_id: 'ready', label: 'Launch', tone: 'ok', launchable: true, primary_action: 'launch' },
-  saves_count: 0,
-  mods_count: 0,
-  resource_count: 0,
-  shader_count: 0,
-};
+});
 const shot = { name: 'photo #1.png', size: 25, modified_at: '2026-09-08T12:00:00Z' };
 
-/** @param {string} name @param {boolean} [enabled] @returns {import('../src/types-instance').InstanceMod} */
+/** @param {string} name @param {boolean} [enabled] @returns {import('../src/generated/InstanceModInfo').InstanceModInfo} */
 function mod(name, enabled = true) {
   return { name, enabled, size: 25, modified_at: shot.modified_at };
 }
@@ -164,18 +156,6 @@ function mutationError(actions) {
   assert.ok(state.status === 'error');
   return state.error;
 }
-
-test('resource commands require an explicit acknowledgement and preserve backend errors', () => {
-  const { actions } = setup();
-  for (const value of [undefined, null, [], {}, { status: 'pending' }, { status: false }]) {
-    assert.throws(() => actions.requireResourceCommandSuccess(value, 'Delete'));
-  }
-  assert.throws(
-    () => actions.requireResourceCommandSuccess({ status: 'ok', error: 'Instance busy' }, 'Delete'),
-    /Instance busy/,
-  );
-  assert.deepEqual(actions.requireResourceCommandSuccess({ status: 'ok' }, 'Delete'), { status: 'ok' });
-});
 
 test('cancelled screenshot deletion never submits or clears selection', async () => {
   const { actions, io } = setup({ choice: async () => null });
@@ -202,7 +182,11 @@ test('pending confirmation refuses duplicate actions on the same instance only',
 });
 
 test('backend refusal preserves screenshot selection and lightbox success callbacks', async () => {
-  const { actions, io } = setup({ api: async () => ({ error: 'Instance is running' }) });
+  const { actions, io } = setup({
+    api: async () => {
+      throw Object.assign(new Error('Instance is running'), { name: 'ApiError', status: 409 });
+    },
+  });
   let done = 0;
   let refreshed = 0;
   await actions.deleteScreenshots(
@@ -323,24 +307,9 @@ test('screenshot rename uses the backend name and retains file-kind validation',
   assert.deepEqual(io.calls[0], ['PUT', '/instances/instance%20A/screenshots/old.jpg', { name: 'draft.jpeg' }]);
 });
 
-test('malformed rename response cannot advance lightbox or emit success', async () => {
-  const { actions, io } = setup({ prompt: async () => 'new.png' });
-  let done = 0;
-  await actions.renameScreenshot(instance, shot.name, () => done++);
-  assert.equal(done, 0);
-  assert.equal(actions.resourceMutationState(instance.id).status, 'error');
-  assert.equal(
-    io.notices.some(([message]) => message === 'Screenshot renamed'),
-    false,
-  );
-});
-
-test('world backup requires receipt fields before reporting its location', async () => {
+test('world backup reports where its receipt says the backup went', async () => {
   const { actions, io } = setup();
   let done = 0;
-  await actions.backupWorld(instance, 'My World', () => done++);
-  assert.equal(done, 0);
-  assert.equal(actions.resourceMutationState(instance.id).status, 'error');
   io.api = async () => ({ status: 'ok', backup: 'My World.zip', location: 'backups/My World.zip' });
   await actions.backupWorld(instance, 'My World', () => done++);
   assert.equal(done, 1);
@@ -440,7 +409,10 @@ test('disabling a mod others need offers to disable them together', async () => 
         throw Object.assign(new Error('Sodium Extra needs Sodium.'), {
           name: 'ApiError',
           status: 409,
-          payload: { error: 'Sodium Extra needs Sodium.', required_by: [{ canonical_id: 'modrinth:extra', title: 'Sodium Extra' }] },
+          payload: {
+            error: 'Sodium Extra needs Sodium.',
+            required_by: [{ canonical_id: 'modrinth:extra', title: 'Sodium Extra' }],
+          },
         });
       }
       return { status: 'ok' };

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { harmoniousTilePalette } from '../src/ui/look-guardian.ts';
-import { buildTheme } from '../src/tokens.ts';
+import { buildTheme } from '../src/app/tokens.ts';
 
 const theme = buildTheme({ hue: 140 });
 

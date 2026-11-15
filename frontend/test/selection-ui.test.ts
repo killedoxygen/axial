@@ -2,16 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { toChildArray, type VNode } from 'preact';
 
-import type { Version } from '../src/types-version';
+import type { VersionEntry } from '../src/generated/VersionEntry';
 import { Button } from '../src/ui/Atoms';
 import { SelectionActionTray } from '../src/ui/SelectionActionTray';
-import { minecraftVersionLabel } from '../src/version-display';
+import { minecraftVersionLabel } from '../src/instances/version-display';
 
-function version(overrides: Partial<Version> = {}): Version {
+function version(overrides: Partial<VersionEntry> = {}): VersionEntry {
   return {
     subject_kind: 'installed_version',
     id: 'version-id',
     raw_kind: 'release',
+    release_time: '',
+    inherits_from: '',
+    status_detail: '',
+    needs_install: '',
+    java_component: '',
+    java_major: 21,
     minecraft_meta: {
       family: 'release',
       base_id: 'base-id',

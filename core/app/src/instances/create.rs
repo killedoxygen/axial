@@ -20,6 +20,7 @@ use crate::{
     telemetry::{Telemetry, TelemetryEvent, TelemetryLoader},
 };
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -54,8 +55,9 @@ pub const MIGRATION: Migration = Migration {
     );",
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, TS)]
 #[serde(deny_unknown_fields)]
+#[ts(optional_fields)]
 pub struct CreateInstanceRequest {
     pub name: String,
     pub selection_id: String,
@@ -166,19 +168,14 @@ impl CreateTarget {
 }
 
 /// Interrupted creations and deletions awaiting recovery.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct PendingInstancesResponse {
     pub creations: Vec<PendingCreation>,
     pub deletions: Vec<super::delete::DeletionSnapshot>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct RecoveredCreationResponse {
-    pub instance: Option<Instance>,
-}
-
 /// These are status records, never permission to reopen serialized paths.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct PendingCreation {
     pub instance_id: InstanceId,
     pub phase: String,

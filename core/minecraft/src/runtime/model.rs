@@ -1,5 +1,6 @@
 use crate::launch::JavaVersion;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -14,7 +15,7 @@ pub struct JavaRuntimeInfo {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct JavaRuntimeResult {
     pub path: String,
     pub component: String,
@@ -42,7 +43,7 @@ impl From<&str> for RuntimeId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceFailureKind {
     Unavailable,

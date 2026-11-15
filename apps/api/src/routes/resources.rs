@@ -1,5 +1,6 @@
 //! Resource selectors are resolved only through registered instance authority.
 
+use axial_app::public::StatusResponse;
 use super::{
     error::{ApiError, ApiResult, Extracted},
     media,
@@ -261,10 +262,10 @@ async fn open_folder(
     State(state): State<Arc<FolderService>>,
     Path(raw): Path<String>,
     query: Result<Query<FolderQuery>, QueryRejection>,
-) -> ApiResult<super::Status> {
+) -> ApiResult<StatusResponse> {
     let query = query.or_refuse(|| FolderError::InvalidFolder)?;
     state.open(&id(&raw)?, query.sub.as_deref())?.wait().await?;
-    Ok(Json(super::Status::OK))
+    Ok(Json(StatusResponse::OK))
 }
 
 #[cfg(test)]

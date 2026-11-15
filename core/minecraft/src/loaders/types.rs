@@ -10,11 +10,12 @@ use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use thiserror::Error;
 
 pub type LoaderBuildId = String;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 pub enum LoaderComponentId {
     #[serde(rename = "net.fabricmc.fabric-loader")]
     Fabric,
@@ -71,7 +72,7 @@ pub struct LoaderComponentRecord {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LoaderTerm {
     Recommended,
@@ -85,7 +86,7 @@ pub enum LoaderTerm {
     Dev,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LoaderTermSource {
     ExplicitVersionLabel,
@@ -95,14 +96,14 @@ pub enum LoaderTermSource {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
 pub struct LoaderTermEvidence {
     pub term: LoaderTerm,
     #[serde(default)]
     pub source: LoaderTermSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LoaderSelectionReason {
     Recommended,
@@ -116,7 +117,7 @@ pub enum LoaderSelectionReason {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LoaderSelectionSource {
     ExplicitVersionLabel,
@@ -127,7 +128,7 @@ pub enum LoaderSelectionSource {
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub struct LoaderSelectionMeta {
     #[serde(default)]
     pub default_rank: i32,
@@ -137,7 +138,7 @@ pub struct LoaderSelectionMeta {
     pub source: LoaderSelectionSource,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub struct LoaderBuildMetadata {
     #[serde(default)]
     pub terms: Vec<LoaderTerm>,

@@ -1,7 +1,7 @@
 //! Settings, onboarding, interface preferences and feature flags.
 
+use axial_app::public::StatusResponse;
 use super::{
-    Status,
     error::{ApiResult, json_rejection},
 };
 use axial_app::settings::{
@@ -61,12 +61,12 @@ struct OnboardingCompletion {
 async fn complete_onboarding(
     State(settings): State<SettingsService>,
     request: Result<Json<OnboardingCompletion>, JsonRejection>,
-) -> ApiResult<Status> {
+) -> ApiResult<StatusResponse> {
     let Json(request) = request.map_err(json_rejection)?;
     settings
         .complete_onboarding(request.expected_revision)
         .await?;
-    Ok(Json(Status::OK))
+    Ok(Json(StatusResponse::OK))
 }
 
 async fn interface_preferences(
@@ -244,7 +244,8 @@ mod tests {
                 "selectedSkinsByAccount":{"account-one":"skin-two"},
                 "shortcuts":{"settings":{"key":",","ctrl":true}},
                 "overlayPositions":{"status":{"x":12.0,"y":34.0,"scaleX":0.5}},
-                "lastUpdateCheckAt":"2026-09-27T12:00:00Z","dismissedUpdateVersion":"1.2.3"
+                "lastUpdateCheckAt":"2026-09-27T12:00:00Z","dismissedUpdateVersion":"1.2.3",
+                "habits":{},"quietCautions":[]
             },
             "route":{"name":"instance","id":"12345678-1234-4234-8234-123456789abc"}
         });

@@ -1,54 +1,15 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import type { UpdateFlowState, UpdateInfo } from '../src/types-update';
+import { loadSource, requireDependency } from './source';
+import type { UpdateInfo } from '../src/generated/UpdateInfo';
 import type { UpdateFlow } from '../src/generated/UpdateFlow';
 import type { UpdateSnapshot } from '../src/generated/UpdateSnapshot';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
 const jsx: typeof import('preact/jsx-runtime') = requireDependency('preact/jsx-runtime');
 const signal = <T>(value: T): { value: T } => ({ value });
 const settle = (): Promise<void> => new Promise((done) => setImmediate(done));
 
-function source<T>(path: string, imports: Record<string, unknown> = {}, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    outputText,
-    {
-      exports,
-      Error,
-      require(id: string): unknown {
-        if (id === '@preact/signals') return { signal, batch: (action: () => unknown) => action() };
-        if (id === 'preact/jsx-runtime') return jsx;
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed updater test dependency: ${id}`);
-      },
-      ...globals,
-    },
-    { filename },
-  );
-  return exports as T;
-}
-
-const dto = source<typeof import('../src/dto-contract')>('dto-contract.ts');
-const updateTypes = source<typeof import('../src/types-update')>('types-update.ts');
-
-function flow(phase: UpdateFlowState['phase'], message = '', terminal = false): UpdateFlow {
+function flow(phase: UpdateFlow['phase'], message = '', terminal = false): UpdateFlow {
   return {
     revision: 10,
     phase,
@@ -72,8 +33,6 @@ function info(): UpdateInfo {
     available: true,
     platform: 'windows',
     arch: 'x86_64',
-    kind: 'release-asset',
-    install_mode: 'in-app',
     notes_url: '',
     action_url: '',
     checksum_url: null,
@@ -108,28 +67,36 @@ function harness() {
     activeDownload: signal<object | null>(null),
     downloadQueue: signal({ view_model: { queued_count: 0 } }),
   };
-  const updater = source<typeof import('../src/updater')>(
-    'updater.ts',
+  const call = async (method: string, path: string, body?: unknown): Promise<unknown> => {
+    calls.push({ method, path, body });
+    assert.ok(responses.has(path), `Unexpected update request ${path}`);
+    const response = responses.get(path);
+    if (response instanceof Error) throw response;
+    return typeof response === 'function' ? response() : response;
+  };
+  const updater = loadSource<typeof import('../src/update/updater')>(
+    'update/updater.ts',
     {
-      './state': {
+      '@preact/signals': { signal, batch: (action: () => unknown) => action() },
+      'app/local-state': {
         local,
         canEditPreferences: () => true,
         saveLocalState: () => {
           saved++;
         },
       },
-      './api': {
-        api: async (method: string, path: string, body?: unknown) => {
-          calls.push({ method, path, body });
-          assert.ok(responses.has(path), `Unexpected update request ${path}`);
-          const response = responses.get(path);
-          if (response instanceof Error) throw response;
-          return typeof response === 'function' ? response() : response;
-        },
+      'platform/transport': {
         isApiError: (error: unknown) => error instanceof Error && error.name === 'ApiError',
       },
-      './toast': { toast: (message: string) => notices.push(message) },
-      './native': {
+      'update/api': {
+        checkForUpdate: (force: boolean) => call('GET', force ? '/update?force=1' : '/update'),
+        updateFlow: () => call('GET', '/update/flow'),
+        updateSnapshot: () => call('GET', '/update/snapshot'),
+        downloadUpdate: (version: string) => call('POST', '/update/download', { version }),
+        applyUpdate: () => call('POST', '/update/apply'),
+      },
+      'app/toast': { toast: (message: string) => notices.push(message), errMessage: String },
+      'platform/native': {
         hasNativeDesktopRuntime: () => true,
         openExternalURL: async () => {},
         requestNativeAppRestart: async () => {
@@ -137,15 +104,12 @@ function harness() {
           return true;
         },
       },
-      './store': store,
-      './machines/downloads': downloads,
-      './sound': { Sound: { ui() {} } },
-      './types-update': updateTypes,
-      './utils': { errMessage: String },
-      './dto-contract': dto,
+      'app/store': store,
+      'launch/state': store,
+      'install/queue': downloads,
+      'app/sound': { Sound: { ui() {} } },
     },
     {
-      __AXIAL_MOCK_API__: false,
       window: {
         setTimeout(callback: () => void): number {
           const id = ++nextTimer;
@@ -158,6 +122,8 @@ function harness() {
       },
     },
   );
+  store.updateInfo = updater.updateInfo;
+  store.updateCheckState = updater.updateCheckState as typeof store.updateCheckState;
   return {
     updater,
     store,
@@ -364,21 +330,6 @@ test('recovery refuses stale and unrelated flow evidence and serializes pending 
   assert.equal(h.calls.filter((call) => call.method === 'POST').length, 1);
 });
 
-test('flow decoding preserves owner action flags and rejects invalid recovery evidence', () => {
-  const h = harness();
-  const terminal = h.updater.updateFlowFromResponse(flow('failed', 'Installation failed.', true));
-  assert.equal(terminal.can_restart, true);
-  assert.equal(terminal.can_download, false);
-  for (const invalid of [
-    { can_restart: 'true' },
-    { can_download: undefined },
-    { revision: -1 },
-    { revision: 1.5 },
-    { revision: Number.MAX_SAFE_INTEGER + 1 },
-  ])
-    assert.throws(() => h.updater.updateFlowFromResponse({ ...flow('failed'), ...invalid }));
-});
-
 interface Node {
   type: unknown;
   props: Record<string, unknown>;
@@ -393,30 +344,29 @@ function nodes(value: unknown): Node[] {
 }
 
 function renderControls(h: ReturnType<typeof harness>, surface: 'widget' | 'about'): Node[] {
-  const prefix = surface === 'widget' ? '../' : '../../';
-  const imports = {
+  const stubs = {
+    'preact/jsx-runtime': jsx,
     'preact/hooks': {
       useState: () => [true, () => {}],
       useRef: () => ({ current: null }),
       useEffect() {},
     },
-    [`${prefix}updater`]: h.updater,
-    [`${prefix}store`]: h.store,
-    [`${prefix}ui/Atoms`]: { Button: 'Button', Meter: 'Meter' },
-    [`${prefix}ui/Face`]: { Face: 'Face' },
-    [`${prefix}ui/Icons`]: { Icon: 'Icon' },
-    [`${prefix}ui/SettingsSheet`]: { SettingRow: 'SettingRow', SettingsSection: 'SettingsSection' },
-    [`${prefix}format`]: { formatBytes: String },
-    [`${prefix}native`]: { hasNativeDesktopRuntime: () => true },
-    [`${prefix}toast`]: { toast() {} },
-    [`${prefix}utils`]: { errMessage: String },
+    'update/updater': h.updater,
+    'app/store': h.store,
+    'ui/Atoms': { Button: 'Button', Meter: 'Meter', Ring: 'Ring', Chip: 'Chip' },
+    'ui/Face': { Face: 'Face' },
+    'ui/Icons': { Icon: 'Icon' },
+    'ui/SettingsSheet': { SettingRow: 'SettingRow', SettingsSection: 'SettingsSection' },
+    'ui/format': { formatBytes: String },
+    'platform/native': { hasNativeDesktopRuntime: () => true, openExternalURL: async () => {} },
+    'app/toast': { toast() {}, errMessage: String },
   };
   return nodes(
     surface === 'widget'
-      ? source<typeof import('../src/shell/UpdateWidget')>('shell/UpdateWidget.tsx', imports).UpdateWidget()
-      : source<typeof import('../src/views/settings/AboutSettingsSection')>(
-          'views/settings/AboutSettingsSection.tsx',
-          imports,
+      ? loadSource<typeof import('../src/update/UpdateWidget')>('update/UpdateWidget.tsx', stubs).UpdateWidget()
+      : loadSource<typeof import('../src/settings/AboutSettingsSection')>(
+          'settings/AboutSettingsSection.tsx',
+          stubs,
         ).AboutSettingsSection(),
   );
 }
@@ -426,7 +376,7 @@ for (const surface of ['widget', 'about'] as const) {
     for (const terminal of [true, false]) {
       const h = harness();
       h.store.updateInfo.value = info();
-      h.updater.updateFlow.value = h.updater.updateFlowFromResponse(flow('failed', 'Update failed.', terminal));
+      h.updater.updateFlow.value = flow('failed', 'Update failed.', terminal);
       const primary = renderControls(h, surface).find(
         (node) => node.type === 'Button' && node.props.variant === 'primary',
       );

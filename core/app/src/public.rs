@@ -24,6 +24,39 @@ pub struct CommandSummary {
     pub summary: &'static str,
 }
 
+/// How a view model reads at a glance. Every view model shares this vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum Tone {
+    Ok,
+    Info,
+    Warn,
+    Err,
+    Mute,
+}
+
+/// A command acknowledgement without further payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
+pub struct StatusResponse {
+    pub status: &'static str,
+}
+
+impl StatusResponse {
+    pub const OK: Self = Self::new("ok");
+
+    pub const fn new(status: &'static str) -> Self {
+        Self { status }
+    }
+}
+
+/// What the shell needs before its first view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+pub struct ApplicationStatus {
+    pub dev_mode: bool,
+    pub setup_required: bool,
+    pub warnings: Vec<&'static str>,
+}
+
 /// Names the default profile directory and binds each profile marker to this application.
 pub const APPLICATION_ID: &str = "com.killedoxygen.axial";
 

@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { ensureFlags, flagEnabled, refreshFlags, setFlagOverride } from '../src/flags';
-import { mockApi } from '../src/mock/api';
-import { featureFlags, featureFlagsLoadState } from '../src/store';
-import type { FeatureFlagViewModel } from '../src/types-flags';
+import { ensureFlags, flagEnabled, refreshFlags, setFlagOverride } from '../src/app/flags';
+import { mockApi } from '../src/platform/mock';
+import { featureFlags, featureFlagsLoadState } from '../src/app/flags';
+import type { FlagViewModel } from '../src/generated/FlagViewModel';
 
 const inspectorKey = 'dev.state-inspector';
 
-function inspectorFlag(): FeatureFlagViewModel {
+function inspectorFlag(): FlagViewModel {
   const flag = featureFlags.value?.find((candidate) => candidate.key === inspectorKey);
   assert.ok(flag, 'expected the inspector flag in the production flag store');
   return flag;

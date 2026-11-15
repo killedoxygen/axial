@@ -19,7 +19,7 @@ use crate::{
     content::catalog::ContentService,
     instances::{
         directory::{InstanceDirectories, RegisteredInstance},
-        model::{InstanceError, InstanceId, InstanceLifecycle},
+        model::InstanceId,
     },
     storage::{
         MetadataStore, Migration, StorageError,
@@ -603,23 +603,6 @@ impl PerformanceService {
             record
                 .map(|(instance, state, bytes)| command_status(id, &instance, &state, &bytes))
                 .transpose()
-        })
-    }
-    pub fn instance_operation(
-        &self,
-        id: &InstanceId,
-    ) -> Result<Option<PerformanceOperationStatus>, PerformanceMutationError> {
-        self.storage.read(|connection| {
-            let instance = crate::instances::directory::get_in(connection, id).map_err(|error| match error {
-                InstanceError::NotFound => PerformanceMutationError::InstanceNotFound,
-                InstanceError::Storage(error) => PerformanceMutationError::Storage(error),
-                _ => PerformanceMutationError::Storage(StorageError::Corrupt),
-            })?;
-            if instance.lifecycle != InstanceLifecycle::Live {
-                return Err(PerformanceMutationError::InstanceUnavailable);
-            }
-            let record: Option<(String, String, Vec<u8>)> = connection.query_row("SELECT id,state,payload FROM performance_commands WHERE instance_id=?1 ORDER BY rowid DESC LIMIT 1", [id.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
-            record.map(|(operation, state, bytes)| command_status(&operation, id.as_str(), &state, &bytes)).transpose()
         })
     }
 
@@ -1838,7 +1821,7 @@ mod tests {
                 Err(PerformanceMutationError::Unsettled)
             ));
             wait_for_mutation_tasks(&service).await;
-            let command = service.instance_operation(&id).unwrap().unwrap();
+            let command = latest_command(&service, &id);
             assert_eq!(command.state, "unsettled");
             let expected = PendingOperation {
                 operation_id: command.id,
@@ -2793,7 +2776,7 @@ mod tests {
                     .unwrap();
                 assert!(run_command(&service, &id, None, "remove", None).await.is_err());
                 wait_for_mutation_tasks(&service).await;
-                let command = service.instance_operation(&id).unwrap().unwrap();
+                let command = latest_command(&service, &id);
                 assert_ne!(command.state, "complete");
                 assert!(service.instances.admit(&id).is_err());
                 let pending = service.pending().unwrap().pop().unwrap();
@@ -2863,7 +2846,7 @@ mod tests {
             );
             wait_for_mutation_tasks(&service).await;
             assert_eq!(payload_files(&path), files);
-            let command = service.instance_operation(&id).unwrap().unwrap();
+            let command = latest_command(&service, &id);
             assert_eq!(command.action, "remove");
             assert_ne!(command.state, "complete");
             if corruption == "effect" {
@@ -3066,7 +3049,7 @@ mod tests {
         assert_eq!(count, 128);
         assert!(service.operation(&commands[0]).unwrap().is_none());
         assert!(service.operation(&commands[1]).unwrap().is_none());
-        let latest = service.instance_operation(id).unwrap().unwrap();
+        let latest = latest_command(&service, id);
         assert_eq!(&latest.id, commands.last().unwrap());
         let reopened = restore_budget_service(&service).unwrap();
         assert_eq!(reopened.operation(&latest.id).unwrap(), Some(latest));
@@ -3075,150 +3058,18 @@ mod tests {
         assert!(reopened.tasks.status().is_idle());
     }
 
-    #[tokio::test]
-    async fn latest_performance_operation_requires_live_registry_target() {
-        let (_root, service, admitted) = launch_fixture().await;
-        let live = service.instance_operation(&admitted.record().instance.id);
-        let unknown = service.instance_operation(&InstanceId::new());
-        let registry = service.instances.registry();
-        let mut pending = admitted.record().instance.clone();
-        pending.id = InstanceId::new();
-        pending.name = "Reserved Performance target".into();
-        let reserved = service
+    fn latest_command(service: &PerformanceService, id: &InstanceId) -> PerformanceOperationStatus {
+        let operation = service
             .storage
-            .transaction(|tx| registry.reserve(tx, pending, &admitted.record().library_id))
-            .unwrap();
-        let reserved_result = service.instance_operation(&reserved.instance.id);
-        let deleting = service
-            .storage
-            .transaction(|tx| {
-                registry.mark_deleting(
-                    tx,
-                    &admitted.record().instance.id,
-                    admitted.record().revision,
-                )
-            })
-            .unwrap();
-        let deleting_result = service.instance_operation(&deleting.instance.id);
-        assert!(matches!(live, Ok(None)));
-        assert!(
-            matches!(unknown, Err(PerformanceMutationError::InstanceNotFound)),
-            "an unknown UUID is not a live instance with empty history"
-        );
-        assert!(matches!(
-            reserved_result,
-            Err(PerformanceMutationError::InstanceUnavailable)
-        ));
-        assert!(matches!(
-            deleting_result,
-            Err(PerformanceMutationError::InstanceUnavailable)
-        ));
-        assert!(service.tasks.status().is_idle());
-    }
-
-    #[tokio::test]
-    async fn latest_performance_operation_deleted_target_keeps_global_history_on_reopen() {
-        use crate::instances::{
-            create::InstanceService,
-            delete::{DeleteIntent, DeletionStatus},
-            directory::Registry,
-        };
-        let (root, service, admitted) = launch_fixture_with_storage(true).await;
-        service
-            .storage
-            .migrate(&[crate::instances::delete::MIGRATION])
-            .unwrap();
-        let id = admitted.record().instance.id.clone();
-        drop(admitted);
-        run_command(&service, &id, None, "remove", None).await.unwrap();
-        let status = service.instance_operation(&id).unwrap().unwrap();
-        assert_eq!(status.state, "complete");
-        assert_eq!(status.action, "remove");
-        assert_eq!(service.operation(&status.id).unwrap(), Some(status.clone()));
-        let instances = InstanceService::new(service.instances.clone(), service.tasks.clone());
-        let deletion = instances
-            .delete(&id, DeleteIntent::KeepFiles, uuid::Uuid::new_v4())
-            .unwrap()
-            .join()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(deletion.status, DeletionStatus::Removed);
-        let removed_result = service.instance_operation(&id);
-        assert_eq!(service.operation(&status.id).unwrap(), Some(status.clone()));
-        service
-            .tasks
-            .shutdown(std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
-        let library = service.instances.library().clone();
-        let content = service.content.clone();
-        let transfers = service.transfers.clone();
-        drop(instances);
-        drop(service);
-        let storage = Arc::new(MetadataStore::open(root.path().join("metadata.sqlite")).unwrap());
-        let directories = InstanceDirectories::new(
-            Registry::new(storage.clone()),
-            library,
-            crate::tasks::Exclusions::new(),
-        );
-        let reopened = PerformanceService::new(
-            storage.clone(),
-            directories,
-            TaskOwner::new(8).unwrap(),
-            content,
-            transfers,
-            RulesSettings::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            reopened.operation(&status.id).unwrap(),
-            Some(status.clone())
-        );
-        let reopened_result = reopened.instance_operation(&id);
-        assert_eq!(reopened.pending_count().unwrap(), 0);
-        assert!(reopened.tasks.status().is_idle());
-        assert!(
-            matches!(
-                removed_result,
-                Err(PerformanceMutationError::InstanceNotFound)
-            ),
-            "removed instances must not have an instance-scoped latest view"
-        );
-        assert!(
-            matches!(
-                reopened_result,
-                Err(PerformanceMutationError::InstanceNotFound)
-            ),
-            "registry absence remains authoritative after reopening"
-        );
-    }
-
-    #[tokio::test]
-    async fn latest_performance_operation_refuses_corrupt_registry_without_hiding_global_history() {
-        let (_root, service, admitted) = launch_fixture().await;
-        let id = admitted.record().instance.id.clone();
-        drop(admitted);
-        run_command(&service, &id, None, "remove", None).await.unwrap();
-        let status = service.instance_operation(&id).unwrap().unwrap();
-        assert_eq!(status.state, "complete");
-        let global = service.operation(&status.id).unwrap();
-        service
-            .storage
-            .transaction(|tx| -> Result<_, StorageError> {
-                tx.execute(
-                    "UPDATE instances SET record_json='{' WHERE id=?1",
+            .read(|db| -> Result<String, StorageError> {
+                Ok(db.query_row(
+                    "SELECT id FROM performance_commands WHERE instance_id=?1 ORDER BY rowid DESC LIMIT 1",
                     [id.as_str()],
-                )?;
-                Ok(())
+                    |row| row.get(0),
+                )?)
             })
             .unwrap();
-        assert!(matches!(
-            service.instance_operation(&id),
-            Err(PerformanceMutationError::Storage(StorageError::Corrupt))
-        ));
-        assert_eq!(service.operation(&status.id).unwrap(), global);
-        assert!(service.tasks.status().is_idle());
+        service.operation(&operation).unwrap().unwrap()
     }
 
     async fn launch_fixture() -> (tempfile::TempDir, PerformanceService, RegisteredInstance) {

@@ -2,20 +2,21 @@
 //! Artifact bytes must be admitted by the instance resource owner; this module never reads paths.
 
 use serde::{Deserialize, Deserializer, Serialize, de};
+use ts_rs::TS;
 
 pub const MAX_CRASH_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_LINES: usize = 4_096;
 const MAX_LINE_BYTES: usize = 4_096;
 const MAX_SUSPECTED_MODS: usize = 8;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CrashArtifactKind {
     MinecraftCrashReport,
     JvmFatalError,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CrashFailurePhase {
     Startup,
@@ -28,8 +29,9 @@ pub enum CrashFailurePhase {
 
 macro_rules! evidence_value {
     ($name:ident, $validator:ident) => {
-        #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
         #[serde(transparent)]
+        #[ts(type = "string")]
         pub struct $name(String);
 
         impl $name {
@@ -61,42 +63,48 @@ evidence_value!(CrashExceptionClass, is_throwable_class);
 evidence_value!(CrashNativeModule, is_safe_native_module);
 evidence_value!(CrashNativeSymbol, is_safe_native_identifier);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CrashNativeFrameKind {
     Native,
     Vm,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct CrashProblematicFrame {
     pub kind: CrashNativeFrameKind,
     pub module: CrashNativeModule,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub symbol: Option<CrashNativeSymbol>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct CrashModEvidence {
     pub name: CrashModName,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub version: Option<CrashModVersion>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct CrashEvidence {
     pub source: CrashArtifactKind,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub failure_phase: Option<CrashFailurePhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub exception_class: Option<CrashExceptionClass>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional = nullable)]
     pub suspected_mods: Vec<CrashModEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub problematic_frame: Option<CrashProblematicFrame>,
     pub names_out_of_memory: bool,
 }

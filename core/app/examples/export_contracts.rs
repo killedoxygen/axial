@@ -1,24 +1,52 @@
-//! Export only reviewed public DTOs, never runtime commands or credentials.
+//! Export the public wire contract the frontend consumes, never runtime commands or credentials.
 
 use axial_app::{
     accounts::view::{
         AccountCommandResponse, AccountListResponse, AccountRemovedResponse, ProfileRefreshResponse,
     },
-    content::provenance::RequiredRefusal,
-    instances::{
-        delete::{DeletionResponse, DeletionSnapshot},
-        model::JavaSelection,
-        setup::{CreateLoaderBuildsView, CreateNotice},
+    catalog::VersionsResponse,
+    content::{
+        model::{ContentDetail, Page},
+        packs::ModpackFilesPlan,
+        provenance::RequiredRefusal,
+        view::{
+            CompatibilityResponse, InstalledContent, ResolutionPlan, SearchItem, TargetRef,
+            UpdatesResponse,
+        },
     },
-    launch::coordinator::PreflightDiagnostics,
-    public::{ErrorResponse, OperationId},
+    install::model::{InstallQueueRequest, InstallQueueStateResponse},
+    instances::{
+        create::{CreateInstanceRequest, PendingInstancesResponse},
+        delete::{DeletionResponse, DeletionSnapshot},
+        from_pack::ModpackTarget,
+        model::{EnrichedInstance, InstancePatch, JavaSelection},
+        setup::{
+            CreateInstanceResponse, CreateLoaderBuildsView, CreateView, InstanceSetupPlanResponse,
+            ListResponse, SetupStatusResponse,
+        },
+    },
+    launch::{
+        coordinator::{LaunchErrorResponse, LaunchIntentView, LaunchRequest, PreflightDiagnostics},
+        session::{SessionLogsResponse, SessionSnapshot, SessionsResponse},
+    },
+    music::MusicStatusResponse,
+    performance::{
+        benchmarks::{
+            BenchmarkDriverView, BenchmarkDriversResponse, BenchmarkLaunchRequest, BenchmarkMatrix,
+        },
+        health::PerformanceHealthResponse,
+        proofs::{LaunchProofView, LaunchReportsResponse},
+        qualification::QualificationResponse,
+    },
+    public::{ApplicationStatus, ErrorResponse, OperationId, StatusResponse, Tone},
     resources::{
-        InstanceLogTailResponse, InstanceResourcesResponse,
+        InstanceLogTailResponse, InstanceResourcesResponse, ResourceCommand,
         mods::{InstanceModMetadata, ModImportResponse},
         packs::InstancePackInfo,
     },
+    runtime::model::JavaRuntimesResponse,
     settings::{
-        ConfigView, FlagsResponse, InterfacePreferencesReceipt, InterfacePreferencesSnapshot,
+        ConfigPatch, ConfigView, FlagsResponse, InterfacePreferencesReceipt, InterfacePreferencesSnapshot,
         InterfacePreferencesUpdate,
     },
     skins::{
@@ -28,7 +56,7 @@ use axial_app::{
         view::{ProfileResetResponse, SkinApplyResponse, SkinCancelResponse, SkinFlushResponse},
     },
     system::SystemResourceResponse,
-    update::UpdateSnapshot,
+    update::{UpdateFlow, UpdateInfo, UpdateSnapshot},
 };
 use std::{collections::BTreeMap, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -65,42 +93,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+macro_rules! export {
+    ($config:expr; $($ty:ty),+ $(,)?) => {
+        $(<$ty>::export_all($config)?;)+
+    };
+}
+
 fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::default()
         .with_large_int("number")
         .with_out_dir(destination);
-    ErrorResponse::export_all(&config)?;
-    OperationId::export_all(&config)?;
-    UpdateSnapshot::export_all(&config)?;
-    ConfigView::export_all(&config)?;
-    InterfacePreferencesSnapshot::export_all(&config)?;
-    InterfacePreferencesUpdate::export_all(&config)?;
-    InterfacePreferencesReceipt::export_all(&config)?;
-    FlagsResponse::export_all(&config)?;
-    SystemResourceResponse::export_all(&config)?;
-    InstanceResourcesResponse::export_all(&config)?;
-    InstanceLogTailResponse::export_all(&config)?;
-    InstanceModMetadata::export_all(&config)?;
-    InstancePackInfo::export_all(&config)?;
-    ModImportResponse::export_all(&config)?;
-    AccountListResponse::export_all(&config)?;
-    AccountCommandResponse::export_all(&config)?;
-    AccountRemovedResponse::export_all(&config)?;
-    ProfileRefreshResponse::export_all(&config)?;
-    SavedSkinsResponse::export_all(&config)?;
-    SkinNormalizeResponse::export_all(&config)?;
-    SkinApplyResponse::export_all(&config)?;
-    SkinFlushResponse::export_all(&config)?;
-    SkinCancelResponse::export_all(&config)?;
-    ProfileResetResponse::export_all(&config)?;
-    UsernameProfile::export_all(&config)?;
-    DeletionSnapshot::export_all(&config)?;
-    DeletionResponse::export_all(&config)?;
-    JavaSelection::export_all(&config)?;
-    CreateLoaderBuildsView::export_all(&config)?;
-    CreateNotice::export_all(&config)?;
-    PreflightDiagnostics::export_all(&config)?;
-    RequiredRefusal::export_all(&config)?;
+    export!(&config;
+        // Shared
+        ErrorResponse, OperationId, StatusResponse, ApplicationStatus, Tone,
+        // Settings and system
+        ConfigView, ConfigPatch, InterfacePreferencesSnapshot, InterfacePreferencesUpdate,
+        InterfacePreferencesReceipt, FlagsResponse, SystemResourceResponse, MusicStatusResponse,
+        JavaRuntimesResponse, UpdateInfo, UpdateFlow, UpdateSnapshot,
+        // Instances
+        ListResponse, EnrichedInstance, InstancePatch, CreateInstanceRequest, JavaSelection, CreateView, CreateLoaderBuildsView,
+        CreateInstanceResponse, InstanceSetupPlanResponse, SetupStatusResponse,
+        PendingInstancesResponse, DeletionSnapshot, DeletionResponse, VersionsResponse,
+        // Resources
+        InstanceResourcesResponse, InstanceLogTailResponse, InstanceModMetadata, InstancePackInfo,
+        ModImportResponse, ResourceCommand,
+        // Content
+        Page<SearchItem>, ContentDetail, ResolutionPlan, TargetRef, CompatibilityResponse,
+        InstalledContent, UpdatesResponse, ModpackTarget, ModpackFilesPlan, RequiredRefusal,
+        // Installation
+        InstallQueueStateResponse, InstallQueueRequest,
+        // Launch
+        LaunchRequest, LaunchErrorResponse, SessionSnapshot, SessionsResponse, SessionLogsResponse,
+        LaunchIntentView,
+        PreflightDiagnostics, LaunchReportsResponse, LaunchProofView,
+        // Performance
+        PerformanceHealthResponse, BenchmarkLaunchRequest, BenchmarkMatrix, BenchmarkDriverView, BenchmarkDriversResponse,
+        QualificationResponse,
+        // Accounts and skins
+        AccountListResponse, AccountCommandResponse, AccountRemovedResponse,
+        ProfileRefreshResponse, SavedSkinsResponse, SkinNormalizeResponse, SkinApplyResponse,
+        SkinFlushResponse, SkinCancelResponse, ProfileResetResponse, UsernameProfile,
+    );
     Ok(())
 }
 

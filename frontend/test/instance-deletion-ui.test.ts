@@ -1,70 +1,22 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
+import { apiModule as feature, isApiError, loadSource } from './source';
+import { enrichedInstance } from './wire';
 import type { DeletionSnapshot } from '../src/generated/DeletionSnapshot';
-import type { EnrichedInstance } from '../src/types-instance';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    outputText,
-    {
-      exports,
-      Error,
-      URLSearchParams,
-      require(id: string): unknown {
-        if (id === '@preact/signals') return { signal: <V>(value: V) => ({ value }) };
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed deletion test dependency: ${id}`);
-      },
-      ...globals,
-    },
-    { filename },
-  );
-  return exports as T;
+function source<T>(path: string, stubs: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
+  return loadSource<T>(path, { '@preact/signals': { signal: <V>(value: V) => ({ value }) }, ...stubs }, globals);
 }
 
-const contract = source<typeof import('../src/dto-contract')>('dto-contract.ts', {});
-const installDto = source<typeof import('../src/dto-install')>('dto-install.ts', { './dto-contract': contract });
-const coreDto = source<typeof import('../src/dto-core')>('dto-core.ts', {
-  './dto-contract': contract,
-  './dto-install': installDto,
-});
 const instanceId = '94d4ec3a-4a90-4d70-9e97-a5774f1c0a8a';
 const oldOperation = '1577a9ba-9f20-40f1-b70c-b6c80956317d';
 const freshOperation = 'dbd4a061-dae5-4bce-9f83-8e59f1d963d0';
 function instance(id = instanceId): EnrichedInstance {
-  return {
+  return enrichedInstance({
     id,
     name: 'Test world',
     version_id: '1.21.1',
-    created_at: '2026-09-08T12:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
-    version_display: {
-      loader_key: 'vanilla',
-      loader_label: 'Vanilla',
-      minecraft_label: '1.21.1',
-      loader_version_label: '',
-      loader_detail_label: '',
-      summary_label: 'Minecraft 1.21.1',
-      supports_mods: false,
-    },
     launchable: false,
     launch_action: {
       state_id: 'install_required',
@@ -74,10 +26,7 @@ function instance(id = instanceId): EnrichedInstance {
       primary_action: 'install',
     },
     saves_count: 1,
-    mods_count: 0,
-    resource_count: 0,
-    shader_count: 0,
-  };
+  });
 }
 function deletion(status: DeletionSnapshot['status'], overrides: Partial<DeletionSnapshot> = {}): DeletionSnapshot {
   return { operation_id: oldOperation, instance_id: instanceId, intent: 'delete_files', status, ...overrides };
@@ -118,9 +67,8 @@ function harness() {
   let deleteRequest: ((requested: DeletionSnapshot) => Promise<unknown>) | null = null;
   let sequence = 0;
   const statusById = new Map<string, DeletionSnapshot>();
-  const apiModule = {
-    isApiError: (error: unknown) => error instanceof Error && error.name === 'ApiError',
-    async api(method: string, path: string) {
+  const transport = {
+    async request(method: string, path: string) {
       calls.push({ method, path });
       if (method === 'GET' && path === '/instances/pending')
         return pendingRead ? pendingRead() : { creations: [], deletions: pending };
@@ -160,52 +108,50 @@ function harness() {
     },
   };
   const shared = {
-    '../../api': apiModule,
-    '../../actions': uiActions,
-    '../../dto-contract': contract,
-    '../../dto-core': coreDto,
-    '../../store': store,
-    '../../utils': { errMessage: (error: unknown) => (error instanceof Error ? error.message : String(error)) },
-    '../../toast': { toast: (message: string) => notices.push(message) },
-    '../../ui/Dialog': {
+    'platform/transport': { isApiError },
+    'instances/api': feature('instances/api.ts', transport.request),
+    'instances/state': { ...uiActions, ...store },
+    'app/toast': {
+      errMessage: (error: unknown) => (error instanceof Error ? error.message : String(error)),
+      toast: (message: string) => notices.push(message),
+    },
+    'ui/Dialog': {
       showChoice: async (message: string, options: Array<{ value: string; label: string }>) => {
         choices.push({ message, options });
         return choice;
       },
     },
-    './mod-provenance-cache': { clearModProvenance: (id: string) => cleared.push(id) },
-    './listing-cache': { forgetListings: () => undefined },
+    'instances/detail/mod-provenance-cache': { clearModProvenance: (id: string) => cleared.push(id) },
+    'instances/detail/listing-cache': { forgetListings: () => undefined },
   };
-  const helper = source<typeof import('../src/views/instance/deletions')>(
-    'views/instance/deletions.ts',
-    shared,
-    {
-      crypto: {
-        randomUUID: () => {
-          sequence += 1;
-          return sequence === 1 ? freshOperation : `dbd4a061-dae5-4bce-9f83-${String(sequence).padStart(12, '0')}`;
-        },
+  const helper = source<typeof import('../src/instances/detail/deletions')>('instances/detail/deletions.ts', shared, {
+    crypto: {
+      randomUUID: () => {
+        sequence += 1;
+        return sequence === 1 ? freshOperation : `dbd4a061-dae5-4bce-9f83-${String(sequence).padStart(12, '0')}`;
       },
     },
+  });
+  const bulk = source<typeof import('../src/instances/detail/bulk-actions')>(
+    'instances/detail/bulk-actions.ts',
+    shared,
   );
-  const bulk = source<typeof import('../src/views/instance/bulk-actions')>('views/instance/bulk-actions.ts', shared);
-  const actions = source<typeof import('../src/views/instance/instance-actions')>(
-    'views/instance/instance-actions.ts',
-    { ...shared, './deletions': helper, './bulk-actions': bulk },
+  const actions = source<typeof import('../src/instances/detail/instance-actions')>(
+    'instances/detail/instance-actions.ts',
+    { ...shared, 'instances/detail/deletions': helper, 'instances/detail/bulk-actions': bulk },
   );
-  const notice = source<typeof import('../src/views/instances/PendingRemovalsNotice')>(
-    'views/instances/PendingRemovalsNotice.tsx',
+  const notice = source<typeof import('../src/instances/PendingRemovalsNotice')>(
+    'instances/PendingRemovalsNotice.tsx',
     {
       'preact/jsx-runtime': {
         jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
         jsxs: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
       },
       'preact/hooks': { useEffect: () => undefined },
-      '../../ui/Atoms': { Button: 'Button' },
-      '../../ui/Icons': { Icon: 'Icon' },
-      '../../store': store,
-      '../instance/instance-actions': actions,
-      '../instance/deletions': helper,
+      'ui/Atoms': { Button: 'Button', Notice: 'Notice' },
+      'instances/state': store,
+      'instances/detail/instance-actions': actions,
+      'instances/detail/deletions': helper,
     },
   );
   return {
@@ -327,12 +273,11 @@ test('a later status check confirming Removed finishes the original detail navig
   assert.equal(h.calls.filter((call) => call.method === 'DELETE').length, 1);
 });
 
-test('mismatched identities, intents, and unknown statuses cannot clear the instance', async () => {
+test('mismatched identities and intents cannot clear the instance', async () => {
   for (const change of [
     { instance_id: 'another-instance' },
     { intent: 'keep_files' },
     { operation_id: oldOperation },
-    { status: 'successful' },
   ]) {
     const h = harness();
     h.setDelete(async (row) => ({ status: 'removed', deletion: { ...row, ...change } }));

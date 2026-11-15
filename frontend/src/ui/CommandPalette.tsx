@@ -1,21 +1,23 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { useLeave } from '../hooks/use-leave';
-import { useDraggableOverlay } from '../hooks/use-draggable-overlay';
-import { Music } from '../music';
-import { reloadApplication } from '../preferences/persistence';
-import { comboParts, effectiveCombos, shortcutById, type ShortcutId } from '../shortcuts';
-import { Sound } from '../sound';
-import { canEditPreferences, local, saveLocalState } from '../state';
-import { instances, launchSessions } from '../store';
-import { applyTheme } from '../theme';
-import type { EnrichedInstance } from '../types-instance';
-import type { LaunchSession } from '../types-launch';
-import { commandPaletteOpen, navigate, openAccountSwitcher, openCreate, quickCreate, type Route } from '../ui-state';
+import { useLeave } from './use-leave';
+import { useDraggableOverlay } from './use-draggable-overlay';
+import { Music } from '../music/music';
+import { reloadApplication } from '../app/preferences/persistence';
+import { comboParts, effectiveCombos, shortcutById, type ShortcutId } from '../app/shortcuts';
+import { Sound } from '../app/sound';
+import { canEditPreferences, local, saveLocalState } from '../app/local-state';
+import { instances } from '../instances/state';
+import { launchSessions } from '../launch/state';
+import { applyTheme } from '../app/theme';
+import type { EnrichedInstance } from '../generated/EnrichedInstance';
+import type { LaunchSession } from '../launch/state';
+import { commandPaletteOpen, navigate, openAccountSwitcher, openCreate, quickCreate } from '../app/route';
+import { type InterfaceRoute } from '../generated/InterfaceRoute';
 import { LOADER_LABELS, type LoaderKey } from '../create/defaults';
 import { useVersionSearch } from '../create/find';
 import { loaderKeyFromSourceId, type VersionRowModel } from '../create/versions';
-import { LoaderLogo } from '../views/create/loader-logos';
+import { LoaderLogo } from '../create/loader-logos';
 import { Kbd, KeyLegend, Keys } from './Atoms';
 import { Face } from './Face';
 import { Icon, type IconName } from './Icons';
@@ -63,7 +65,7 @@ function close(): void {
 }
 
 function buildCommands(): Command[] {
-  const go = (route: Route) => (): void => {
+  const go = (route: InterfaceRoute) => (): void => {
     navigate(route);
     close();
   };

@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { computed, signal } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { useLeave } from '../hooks/use-leave';
+import { useLeave } from './use-leave';
 import { Button, Input } from './Atoms';
 import { Face } from './Face';
 

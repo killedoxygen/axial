@@ -5,10 +5,10 @@ import { Chip } from './Atoms';
 import { Icon } from './Icons';
 import { SelectionCheckbox } from './SelectionActionTray';
 import { selectionToggleLabel } from './selection';
-import { navigate } from '../ui-state';
-import { launchSessions, versionById } from '../store';
-import { instanceInstallStatus } from '../instance-install-status';
-import type { EnrichedInstance } from '../types-instance';
+import { navigate } from '../app/route';
+import { launchSessions } from '../launch/state';
+import { instanceInstallStatus } from '../install/status';
+import type { EnrichedInstance } from '../generated/EnrichedInstance';
 
 /** Opens the instance on Enter or Space when the row or cover itself has focus, not a control inside it. */
 export function openOnKey(e: KeyboardEvent, open: () => void): void {
@@ -30,7 +30,7 @@ export function InstanceCard({
   onToggleSelect?: (e: MouseEvent) => void;
 }): JSX.Element {
   const session = launchSessions.value[inst.id];
-  const install = instanceInstallStatus(inst, versionById(inst.version_id));
+  const install = instanceInstallStatus(inst);
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
   const action = inst.launch_action.primary_action;
   const open = (): void => navigate({ name: 'instance', id: inst.id });

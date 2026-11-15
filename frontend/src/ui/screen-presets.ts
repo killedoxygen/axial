@@ -37,4 +37,3 @@ export function buildWindowPresets(max: ScreenSize): WindowPresetSpec[] {
   const fits = CANDIDATES.filter((p) => p.w <= max.w && p.h <= max.h);
   return [...fits, DEFAULT_PRESET];
 }
-

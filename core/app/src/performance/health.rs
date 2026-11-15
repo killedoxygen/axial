@@ -3,11 +3,12 @@
 use super::composition::{
     ManagedCompositionInspection, ManagedResolvedInspection, storage::ManagedStorageDirectory,
 };
-use super::{model::*, mutation::PerformanceOperationStatus};
+use super::model::*;
 use serde::Serialize;
+use ts_rs::TS;
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct PerformanceHealthResponse {
     pub state: Option<CompositionState>,
     pub health: BundleHealth,
@@ -29,7 +30,7 @@ pub fn disabled_health_response() -> PerformanceHealthResponse {
             state_id: "performance_summary_disabled".into(),
             title: "No managed bundle".into(),
             detail: "Memory allocation and Java detection are shown below.".into(),
-            tone: ViewModelTone::Mute,
+            tone: Tone::Mute,
             health: Some("disabled".into()),
             composition_id: None,
             managed_artifact_count: 0,
@@ -59,19 +60,19 @@ pub fn health_response(inspection: ManagedCompositionInspection) -> PerformanceH
             "healthy",
             "Performance is ready",
             "Managed files match their recorded composition.",
-            ViewModelTone::Ok,
+            Tone::Ok,
         ),
         BundleHealth::Disabled => (
             "disabled",
             "Managed files are not installed",
             "Apply a managed plan to install its performance files.",
-            ViewModelTone::Mute,
+            Tone::Mute,
         ),
         BundleHealth::Invalid => (
             "invalid",
             "Performance needs attention",
             "The managed bundle could not be validated.",
-            ViewModelTone::Warn,
+            Tone::Warn,
         ),
     };
     let managed_artifacts = inspection
@@ -129,71 +130,6 @@ pub fn health_response(inspection: ManagedCompositionInspection) -> PerformanceH
         health: inspection.health,
         warnings: inspection.warnings,
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PerformanceOperationView {
-    #[serde(flatten)]
-    pub operation: PerformanceOperationStatus,
-    pub view_model: PerformanceOperationViewModel,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PerformanceOperationViewModel {
-    pub state_label: String,
-    pub tone: &'static str,
-    pub title: &'static str,
-    pub detail: String,
-    pub progress: PerformanceOperationProgress,
-    pub is_terminal: bool,
-    pub is_complete: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PerformanceOperationProgress {
-    pub phase: String,
-    pub current: u8,
-    pub total: u8,
-    pub done: bool,
-}
-
-impl From<PerformanceOperationStatus> for PerformanceOperationView {
-    fn from(operation: PerformanceOperationStatus) -> Self {
-        let complete = operation.state == "complete";
-        let terminal = matches!(
-            operation.state.as_str(),
-            "complete" | "failed" | "interrupted"
-        );
-        let view_model = PerformanceOperationViewModel {
-            state_label: operation.state.clone(),
-            tone: if complete {
-                "ok"
-            } else if terminal {
-                "warn"
-            } else {
-                "mute"
-            },
-            title: "Performance operation",
-            detail: operation.error.clone().unwrap_or_default(),
-            progress: PerformanceOperationProgress {
-                phase: operation.state.clone(),
-                current: terminal.into(),
-                total: 1,
-                done: terminal,
-            },
-            is_terminal: terminal,
-            is_complete: complete,
-        };
-        Self {
-            operation,
-            view_model,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct PerformanceInstanceOperationResponse {
-    pub operation: Option<PerformanceOperationView>,
 }
 
 pub(crate) fn derive_health(

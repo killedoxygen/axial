@@ -70,7 +70,7 @@ pub(super) fn session_error(error: SessionError) -> LaunchError {
 }
 
 /// Only bounded domain text can cross the transport boundary.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchError {
     #[error("The launch request is invalid.")]
@@ -137,6 +137,7 @@ pub enum LaunchError {
     PreparationFailed,
     #[error("{0}")]
     #[serde(untagged, skip_deserializing)]
+    #[ts(skip)]
     RuntimeFailure(#[serde(serialize_with = "serialize_runtime_failure")] JavaDiscoveryError),
 }
 
@@ -148,7 +149,7 @@ pub(super) fn serialize_runtime_failure<S: serde::Serializer>(
     LaunchError::RuntimeUnavailable.serialize(serializer)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct LaunchErrorResponse {
     pub error: String,
     pub code: LaunchError,

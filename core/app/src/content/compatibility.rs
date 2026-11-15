@@ -11,6 +11,7 @@ use super::resolve::{
 };
 use axial_minecraft::LoaderComponentId;
 use serde::Serialize;
+use ts_rs::TS;
 
 /// Preference between candidates that are otherwise tied. Fabric first because
 /// it is where most of Modrinth lives.
@@ -128,13 +129,13 @@ impl CompatVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 pub struct CompatDrop {
     pub canonical_id: CanonicalId,
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 pub struct CompatCandidate {
     /// Empty for vanilla.
     pub loader: String,

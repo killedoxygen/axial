@@ -6,8 +6,8 @@ import {
   entryMatches,
   fileDisplayName,
   type EntryView,
-} from '../src/views/instance/components/entries';
-import { packMembership } from '../src/views/instance/components/pack-origin';
+} from '../src/instances/detail/components/entries';
+import { packMembership } from '../src/instances/detail/components/pack-origin';
 
 function row(title: string, fileName: string, overrides: Partial<EntryView> = {}): EntryView {
   return { key: fileName, title, fileName, icon: 'puzzle', ...overrides };

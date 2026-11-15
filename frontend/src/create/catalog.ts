@@ -1,28 +1,27 @@
 import { signal } from '@preact/signals';
-import { api } from '../api';
-import { createBackendViewResponse, type CreateBackendViewResponse, type CreateSourceId } from './contract';
+import { createView } from './api';
+import type { CreateView } from '../generated/CreateView';
+import type { CreateSourceId } from './versions';
 
 /* The last good create view per loader, kept for the session: lists drawn from it appear at once while a fresh
    copy loads, and a search can read every loader it names. */
-const views = new Map<CreateSourceId, CreateBackendViewResponse>();
+const views = new Map<CreateSourceId, CreateView>();
 const listing = new Set<CreateSourceId>();
 
 /** Moves whenever a view arrives or a listing settles; read it to be redrawn with the catalog. */
 export const catalogRevision = signal(0);
 
-export function cachedView(source: CreateSourceId): CreateBackendViewResponse | null {
+export function cachedView(source: CreateSourceId): CreateView | null {
   return views.get(source) ?? null;
 }
 
-export function storeView(source: CreateSourceId, view: CreateBackendViewResponse): void {
+export function storeView(source: CreateSourceId, view: CreateView): void {
   views.set(source, view);
   catalogRevision.value += 1;
 }
 
-export async function fetchView(source: CreateSourceId): Promise<CreateBackendViewResponse> {
-  const view = createBackendViewResponse(
-    await api('GET', `/instances/create-view?source=${encodeURIComponent(source)}`),
-  );
+export async function fetchView(source: CreateSourceId): Promise<CreateView> {
+  const view = await createView(source);
   storeView(source, view);
   return view;
 }

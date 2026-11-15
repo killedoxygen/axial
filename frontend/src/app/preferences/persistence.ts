@@ -1,0 +1,294 @@
+import { isApiError } from '../../platform/transport';
+import { getInterfacePreferences, updateInterfacePreferences } from '../../settings/api';
+import { prepareAutoSaves } from '../../settings/autosave';
+import {
+  completeNativePreferences,
+  hasNativeDesktopRuntime,
+  nativePreferencesEventName,
+  nativePreferencesRequest,
+  onNativeEvent,
+  pendingNativePreferences,
+  type NativePreferencesRequest,
+} from '../../platform/native';
+import { toast } from '../toast';
+import type { InterfacePreferences } from '../../generated/InterfacePreferences';
+import type { InterfacePreferencesSnapshot } from '../../generated/InterfacePreferencesSnapshot';
+import type { InterfacePreferencesUpdate } from '../../generated/InterfacePreferencesUpdate';
+import type { ConfigView } from '../../generated/ConfigView';
+import type { LocalPreferences } from '../../generated/LocalPreferences';
+import type { InterfaceRoute } from '../../generated/InterfaceRoute';
+import { defaultLocalPreferences, parseLocalPreferences, parseRoutePreference } from './local';
+
+const saveError =
+  'Interface preferences could not be saved. Your changes remain in this window; closing or reloading is paused.';
+let accepted: InterfacePreferencesSnapshot | null = null;
+let initialPreferences = defaultLocalPreferences();
+let initialization: Promise<InterfacePreferences> | null = null;
+let listenerReady = false;
+let eventRevision = 0;
+let localDraft: LocalPreferences | undefined;
+let routeDraft: InterfaceRoute | null | undefined;
+let running: Promise<void> | null = null;
+const seals = new Set<symbol>();
+let nativeRequest: { request: NativePreferencesRequest; release: () => void } | null = null;
+let reloadPending: Promise<boolean> | null = null;
+let lastNativeRequest = '0';
+let lastNativePhase: NativePreferencesRequest['phase'] = 'release';
+let writeFailed = false;
+
+interface PendingWrite {
+  update: InterfacePreferencesUpdate;
+  value: InterfacePreferences;
+  local: LocalPreferences | undefined;
+  route: InterfaceRoute | null | undefined;
+}
+let uncertain: PendingWrite | null = null;
+
+function seal(): () => void {
+  const token = Symbol();
+  seals.add(token);
+  return () => {
+    seals.delete(token);
+  };
+}
+
+export function canEditPreferences(): boolean {
+  return seals.size === 0 && (!hasNativeDesktopRuntime() || accepted !== null);
+}
+
+export function nativePreferencesHydrated(): boolean {
+  return accepted !== null;
+}
+
+function acknowledge(write: PendingWrite, nextRevision: number): void {
+  writeFailed = false;
+  accepted = { revision: nextRevision, value: write.value };
+  if (localDraft === write.local) localDraft = undefined;
+  if (routeDraft === write.route) routeDraft = undefined;
+  if (uncertain === write) uncertain = null;
+}
+
+async function reconcile(write: PendingWrite): Promise<void> {
+  const current = await getInterfacePreferences();
+  if (
+    current.revision !== write.update.expected_revision + 1 ||
+    JSON.stringify(current.value) !== JSON.stringify(write.value)
+  ) {
+    throw new Error(saveError);
+  }
+  acknowledge(write, current.revision);
+}
+
+async function commit(write: PendingWrite): Promise<void> {
+  uncertain = write;
+  try {
+    const nextRevision = (await updateInterfacePreferences(write.update)).revision;
+    if (nextRevision !== write.update.expected_revision + 1) throw new Error(saveError);
+    acknowledge(write, nextRevision);
+  } catch (error) {
+    if (isApiError(error) && error.status >= 400 && error.status < 500) {
+      // A definite refusal can be rebased by a later explicit edit or flush.
+      uncertain = null;
+      accepted = await getInterfacePreferences();
+      throw new Error(saveError);
+    }
+    // An older read does not prove the accepted write was cancelled. Retain it
+    // and only read again on the next flush; never replay an unknown mutation.
+    await reconcile(write);
+  }
+}
+
+function draftWrite(): PendingWrite {
+  if (!accepted) throw new Error('Interface preferences have not loaded.');
+  const value: InterfacePreferences = {
+    version: 1,
+    preferences: localDraft ?? accepted.value?.preferences ?? initialPreferences,
+    route: routeDraft === undefined ? (accepted.value?.route ?? null) : routeDraft,
+  };
+  const change: InterfacePreferencesUpdate['change'] =
+    !accepted.value || (localDraft && routeDraft !== undefined)
+      ? { kind: 'replace', value }
+      : localDraft
+        ? { kind: 'local', preferences: localDraft }
+        : { kind: 'route', route: value.route };
+  return { update: { expected_revision: accepted.revision, change }, value, local: localDraft, route: routeDraft };
+}
+
+export function flushNativePreferences(): Promise<void> {
+  if (!hasNativeDesktopRuntime()) return Promise.resolve();
+  if (running) return running;
+  const work = (async () => {
+    if (initialization) await initialization;
+    if (!accepted) throw new Error('Interface preferences have not loaded.');
+    if (uncertain) await reconcile(uncertain);
+    while ((localDraft !== undefined || routeDraft !== undefined) && nativeRequest?.request.phase !== 'discard') {
+      await commit(draftWrite());
+    }
+  })();
+  running = work
+    .catch((error: unknown) => {
+      writeFailed = true;
+      throw error;
+    })
+    .finally(() => {
+      running = null;
+      if (
+        !writeFailed &&
+        !uncertain &&
+        nativeRequest?.request.phase !== 'discard' &&
+        (localDraft !== undefined || routeDraft !== undefined)
+      )
+        scheduleSave();
+    });
+  return running;
+}
+
+function scheduleSave(): void {
+  if (running) return;
+  void flushNativePreferences().catch(() => toast(saveError, 'error'));
+}
+
+export function saveNativeLocalPreferences(preferences: LocalPreferences): void {
+  if (!canEditPreferences()) return;
+  localDraft = parseLocalPreferences(preferences);
+  scheduleSave();
+}
+
+export function saveNativeRoute(next: InterfaceRoute): void {
+  if (!canEditPreferences()) return;
+  routeDraft = parseRoutePreference(next);
+  scheduleSave();
+}
+
+function handleNativeRequest(request: NativePreferencesRequest): void {
+  const number = /^preferences-([1-9][0-9]*)$/.exec(request.request_id)?.[1];
+  if (!number) throw new Error('Invalid desktop preference request identity.');
+  const newer =
+    number.length > lastNativeRequest.length ||
+    (number.length === lastNativeRequest.length && number > lastNativeRequest);
+  if (!newer && number !== lastNativeRequest) return;
+  if (!newer && lastNativePhase === 'release') return;
+  if (newer) {
+    lastNativeRequest = number;
+    lastNativePhase = request.phase;
+  }
+  if (request.phase === 'release') {
+    lastNativePhase = 'release';
+    nativeRequest?.release();
+    nativeRequest = null;
+    if (accepted && (localDraft !== undefined || routeDraft !== undefined) && !uncertain && !writeFailed)
+      scheduleSave();
+    return;
+  }
+  if (nativeRequest?.request.request_id === request.request_id) return;
+  const releasePreferences = seal();
+  const autosaves = prepareAutoSaves(request.phase);
+  const active = {
+    request,
+    release: () => {
+      releasePreferences();
+      autosaves.release();
+    },
+  };
+  nativeRequest?.release();
+  nativeRequest = active;
+  void (async () => {
+    let saved = true;
+    try {
+      const results = await Promise.allSettled([
+        autosaves.done,
+        request.phase === 'flush' ? flushNativePreferences() : running?.catch(() => undefined),
+      ]);
+      saved = results.every((result) => result.status === 'fulfilled' && result.value !== false);
+      if (!saved) toast(saveError, 'error');
+    } catch {
+      saved = false;
+      toast(saveError, 'error');
+    }
+    if (nativeRequest !== active) return;
+    try {
+      await completeNativePreferences(request.request_id, saved);
+    } catch {
+      toast('Could not confirm interface preference preparation. Keep this window open and try again.', 'error');
+    }
+  })();
+}
+
+export function initializeNativePreferences(cfg: ConfigView): Promise<InterfacePreferences> {
+  if (initialization) return initialization;
+  initialization = (async () => {
+    if (!listenerReady) {
+      const listener = await onNativeEvent(nativePreferencesEventName, (value) => {
+        eventRevision++;
+        try {
+          handleNativeRequest(nativePreferencesRequest(value));
+        } catch {
+          toast('Could not read the desktop preference request.', 'error');
+        }
+      });
+      if (!listener) throw new Error('Desktop preference coordination is unavailable.');
+      listenerReady = true;
+    }
+    const before = eventRevision;
+    const pending = await pendingNativePreferences();
+    if (pending && before === eventRevision) handleNativeRequest(pending);
+    const loaded = await getInterfacePreferences();
+    initialPreferences = defaultLocalPreferences();
+    if (loaded.value === null && cfg.theme) {
+      initialPreferences = parseLocalPreferences({
+        ...initialPreferences,
+        theme: cfg.theme,
+        customHue: cfg.custom_hue ?? initialPreferences.customHue,
+        customVibrancy: cfg.custom_vibrancy ?? initialPreferences.customVibrancy,
+        lightness: cfg.lightness ?? initialPreferences.lightness,
+      });
+    }
+    accepted = loaded;
+    return loaded.value ?? { version: 1, preferences: initialPreferences, route: null };
+  })().catch((error: unknown) => {
+    initialization = null;
+    throw error;
+  });
+  return initialization;
+}
+
+function reloadSealed(): void {
+  location.reload();
+}
+
+export function reloadApplication(): boolean | Promise<boolean> {
+  if (!hasNativeDesktopRuntime()) {
+    reloadSealed();
+    return true;
+  }
+  if (reloadPending) return reloadPending;
+  if (nativeRequest) {
+    toast('Reload is paused while the desktop operation finishes.', 'error');
+    return false;
+  }
+  const release = seal();
+  const before = eventRevision;
+  const autosaves = prepareAutoSaves('flush');
+  reloadPending = Promise.allSettled([autosaves.done, flushNativePreferences()])
+    .then((results) => {
+      if (
+        nativeRequest ||
+        before !== eventRevision ||
+        !results.every((result) => result.status === 'fulfilled' && result.value !== false)
+      ) {
+        throw new Error(saveError);
+      }
+      reloadSealed();
+      return true;
+    })
+    .catch(() => {
+      release();
+      autosaves.release();
+      toast(saveError, 'error');
+      return false;
+    })
+    .finally(() => {
+      reloadPending = null;
+    });
+  return reloadPending;
+}

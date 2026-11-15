@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createDetailCache } from '../src/views/discover/detail-cache';
+import { createDetailCache } from '../src/discover/detail-cache';
 
 interface Deferred<T> {
   promise: Promise<T>;

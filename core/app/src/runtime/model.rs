@@ -7,9 +7,10 @@ pub use axial_minecraft::{
     RuntimeSource,
 };
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use thiserror::Error;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
 pub struct JavaRuntimesResponse {
     pub runtimes: Vec<JavaRuntimeResult>,
 }
@@ -70,7 +71,7 @@ impl JavaSelectionRequirement {
 
 /// Bounded public failure vocabulary. Raw paths, process output and OS errors
 /// are deliberately excluded from user-facing error text.
-#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JavaDiscoveryError {
     #[error("The selected Java executable is missing.")]

@@ -19,6 +19,7 @@ pub mod versions;
 
 use axial_app::{
     library::{AdmissionState, LibraryLifecycle, LibraryMode},
+    public::ApplicationStatus,
     settings::SettingsStore,
 };
 use axum::{
@@ -29,22 +30,7 @@ use axum::{
     routing::get,
 };
 use error::{ApiError, ApiResult};
-use serde::Serialize;
 use std::sync::Arc;
-
-/// A command acknowledgement without further payload.
-#[derive(Serialize)]
-pub(crate) struct Status {
-    status: &'static str,
-}
-
-impl Status {
-    pub(crate) const OK: Self = Self::new("ok");
-
-    pub(crate) const fn new(status: &'static str) -> Self {
-        Self { status }
-    }
-}
 
 /// Media bodies are never sniffed; `cache` states their reuse policy.
 pub(crate) fn media(content_type: &'static str, cache: &'static str, bytes: Vec<u8>) -> Response {
@@ -63,13 +49,6 @@ pub(crate) fn status_router(settings: Arc<SettingsStore>, library: LibraryLifecy
     Router::new()
         .route("/api/v1/status", get(status))
         .with_state((settings, library))
-}
-
-#[derive(Serialize)]
-struct ApplicationStatus {
-    dev_mode: bool,
-    setup_required: bool,
-    warnings: Vec<&'static str>,
 }
 
 async fn status(

@@ -10,7 +10,9 @@ use super::proofs::{
     comparison_baseline_matches_report,
 };
 use axial_minecraft::loaders::{LoaderComponentId, api::decode_installed_version_id};
-use serde_json::{Value, json};
+use crate::public::Tone;
+use serde::Serialize;
+use ts_rs::TS;
 
 pub const FAMILY_C_QUALIFICATION_SCHEMA: &str =
     "axial.launch.benchmark.qualification.family_c_1_12_2";
@@ -26,12 +28,158 @@ const FAMILY_C_COMPARISON_STAGE_METRIC_NAME: &str = "total_completed_stage_durat
 const FAMILY_C_COMPARISON_BOOT_METRIC_NAME: &str = "boot_duration_ms";
 const FAMILY_C_MANAGED_EXPECTED_PROJECT_IDS: [&str; 3] = ["jupr7Bf5", "DSVgwcji", "Wnxd13zP"];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum QualificationStatus {
+    Ready,
+    Incomplete,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationResponse {
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub status: QualificationStatus,
+    pub view_model: QualificationViewModel,
+    pub suite: QualificationSuite,
+    pub target: QualificationTarget,
+    pub targets: Vec<QualificationTargetEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationViewModel {
+    pub status_label: &'static str,
+    pub status_tone: Tone,
+    pub target_label: String,
+    pub suite_label: String,
+    pub schema_label: String,
+    pub missing_summary: String,
+    pub suite_summary: String,
+    pub evidence_summary: String,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationSuite {
+    pub present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub suite_id: Option<String>,
+    pub mode: String,
+    pub run_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationTarget {
+    pub family: &'static str,
+    pub loader: &'static str,
+    pub version: &'static str,
+    pub mode: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationTargetEvidence {
+    pub role: &'static str,
+    pub target_id: &'static str,
+    pub family: &'static str,
+    pub loader: &'static str,
+    pub version: &'static str,
+    pub required: QualificationRequirement,
+    pub suite_run: Option<QualificationSuiteRun>,
+    pub proof: Option<QualificationProof>,
+    pub managed_install: Option<ManagedInstallReport>,
+    pub missing: Vec<&'static str>,
+    pub view_model: QualificationTargetViewModel,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationRequirement {
+    pub profile: &'static str,
+    pub run_type: &'static str,
+    pub mode: &'static str,
+    pub performance_mode: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationSuiteRun {
+    pub run_index: usize,
+    pub profile: String,
+    pub run_type: String,
+    pub target_id: String,
+    pub benchmark_id: String,
+    pub session_id: Option<String>,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationProof {
+    pub session_id: String,
+    pub benchmark_id: Option<String>,
+    pub profile: Option<String>,
+    pub run_type: Option<String>,
+    pub mode: Option<String>,
+    pub performance_mode: String,
+    pub version: Option<String>,
+    pub outcome: String,
+    pub comparison: Option<QualificationComparison>,
+    pub resource_budget: QualificationResourceEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationComparison {
+    pub baseline_session_id: String,
+    pub metric_name: String,
+    pub matched_sample_count: usize,
+    /// Present only where the target requires a comparison.
+    pub evidence: Option<ComparisonEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, TS)]
+pub struct ComparisonEvidence {
+    pub baseline_matches: bool,
+    pub metric_valid: bool,
+    pub samples_present: bool,
+    pub values_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, TS)]
+pub struct QualificationResourceEvidence {
+    pub present: bool,
+    pub memory: bool,
+    pub cpu: bool,
+    pub install: bool,
+    pub disk: bool,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct ManagedInstallReport {
+    pub present: bool,
+    pub composition_id: Option<String>,
+    pub installed_count: usize,
+    pub expected_artifacts_present: bool,
+    pub ownership: bool,
+    pub source: bool,
+    pub integrity: bool,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct QualificationTargetViewModel {
+    pub role_label: String,
+    pub target_label: String,
+    pub required_label: String,
+    pub suite_label: String,
+    pub suite_present: bool,
+    pub proof_label: String,
+    pub proof_present: bool,
+    pub missing_label: String,
+    pub missing_tone: Tone,
+}
+
 pub fn qualification_payload(
     manifest: &BenchmarkSuiteManifest,
     proofs: &[LaunchProofRecord],
     managed_install: Option<&ManagedInstallEvidence>,
     suite_present: bool,
-) -> Value {
+) -> QualificationResponse {
     let [baseline_target, managed_target] = family_c_qualification_targets();
     let extra_missing = if suite_present {
         vec![]
@@ -64,66 +212,47 @@ pub fn qualification_payload(
         managed_install.or(preview_install.as_ref()),
         &managed_extra_missing,
     );
-    let status = if family_c_qualification_target_ready(&baseline)
-        && family_c_qualification_target_ready(&managed)
-    {
-        "ready"
+    let status = if baseline.missing.is_empty() && managed.missing.is_empty() {
+        QualificationStatus::Ready
     } else {
-        "incomplete"
+        QualificationStatus::Incomplete
     };
-
-    json!({
-        "schema": FAMILY_C_QUALIFICATION_SCHEMA,
-        "schema_version": FAMILY_C_QUALIFICATION_SCHEMA_VERSION,
-        "status": status,
-        "view_model": family_c_qualification_view_model(status, suite_present, manifest, [&baseline, &managed]),
-        "suite": if suite_present { json!({
-            "suite_id": bounded_descriptor_token(&manifest.suite_id, "suite"),
-            "mode": bounded_descriptor_token(&manifest.mode, "mode"),
-            "run_count": manifest.runs.len(),
-        }) } else { json!({
-            "present": false,
-            "mode": bounded_descriptor_token(&manifest.mode, "mode"),
-            "run_count": manifest.runs.len(),
-        }) },
-        "target": {
-            "family": "C",
-            "loader": FAMILY_C_QUALIFICATION_LOADER,
-            "version": FAMILY_C_QUALIFICATION_VERSION,
-            "mode": FAMILY_C_QUALIFICATION_MODE,
+    let targets = [&baseline, &managed];
+    let suite_summary = family_c_qualification_suite_summary(suite_present, manifest);
+    QualificationResponse {
+        schema: FAMILY_C_QUALIFICATION_SCHEMA,
+        schema_version: FAMILY_C_QUALIFICATION_SCHEMA_VERSION,
+        status,
+        view_model: QualificationViewModel {
+            status_label: match status {
+                QualificationStatus::Ready => "Ready",
+                QualificationStatus::Incomplete => "Incomplete",
+            },
+            status_tone: match status {
+                QualificationStatus::Ready => Tone::Ok,
+                QualificationStatus::Incomplete => Tone::Warn,
+            },
+            target_label: family_c_qualification_target_label(),
+            suite_label: suite_summary.clone(),
+            schema_label: format!("v{FAMILY_C_QUALIFICATION_SCHEMA_VERSION}"),
+            missing_summary: family_c_qualification_missing_summary(targets),
+            suite_summary,
+            evidence_summary: family_c_qualification_evidence_summary(targets),
         },
-        "targets": [baseline, managed],
-    })
-}
-
-fn family_c_qualification_view_model(
-    status: &str,
-    suite_present: bool,
-    manifest: &BenchmarkSuiteManifest,
-    targets: [&Value; 2],
-) -> Value {
-    json!({
-        "status_label": family_c_qualification_status_label(status),
-        "status_tone": family_c_qualification_status_tone(status),
-        "target_label": family_c_qualification_target_label(),
-        "suite_label": family_c_qualification_suite_summary(suite_present, manifest),
-        "schema_label": format!("v{FAMILY_C_QUALIFICATION_SCHEMA_VERSION}"),
-        "missing_summary": family_c_qualification_missing_summary(targets),
-        "suite_summary": family_c_qualification_suite_summary(suite_present, manifest),
-        "evidence_summary": family_c_qualification_evidence_summary(targets),
-    })
-}
-
-fn family_c_qualification_status_label(status: &str) -> &'static str {
-    if status == "ready" {
-        "Ready"
-    } else {
-        "Incomplete"
+        suite: QualificationSuite {
+            present: suite_present,
+            suite_id: suite_present.then(|| bounded_descriptor_token(&manifest.suite_id, "suite")),
+            mode: bounded_descriptor_token(&manifest.mode, "mode"),
+            run_count: manifest.runs.len(),
+        },
+        target: QualificationTarget {
+            family: "C",
+            loader: FAMILY_C_QUALIFICATION_LOADER,
+            version: FAMILY_C_QUALIFICATION_VERSION,
+            mode: FAMILY_C_QUALIFICATION_MODE,
+        },
+        targets: vec![baseline, managed],
     }
-}
-
-fn family_c_qualification_status_tone(status: &str) -> &'static str {
-    if status == "ready" { "ok" } else { "warn" }
 }
 
 fn family_c_qualification_target_label() -> String {
@@ -147,17 +276,10 @@ fn family_c_qualification_suite_summary(
     format!("{}, {} runs", mode, manifest.runs.len())
 }
 
-fn family_c_qualification_missing_summary(targets: [&Value; 2]) -> String {
+fn family_c_qualification_missing_summary(targets: [&QualificationTargetEvidence; 2]) -> String {
     let missing = targets
         .iter()
-        .flat_map(|target| {
-            target
-                .get("missing")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-        })
+        .flat_map(|target| target.missing.iter().copied())
         .collect::<Vec<_>>();
     if missing.is_empty() {
         return "No missing evidence".to_string();
@@ -182,100 +304,48 @@ fn family_c_qualification_missing_summary(targets: [&Value; 2]) -> String {
     format!("{} missing: {}{}", missing.len(), labels.join(", "), suffix)
 }
 
-fn family_c_qualification_evidence_summary(targets: [&Value; 2]) -> String {
-    let mut selected = Vec::new();
-    for role in ["baseline", "managed"] {
-        if let Some(target) = targets
-            .iter()
-            .find(|target| target.get("role").and_then(Value::as_str) == Some(role))
-        {
-            selected.push(*target);
-        }
-    }
-    if selected.is_empty() {
-        selected.extend(targets);
-    }
-
-    selected
-        .into_iter()
-        .take(2)
+fn family_c_qualification_evidence_summary(targets: [&QualificationTargetEvidence; 2]) -> String {
+    targets
+        .iter()
         .map(|target| {
-            let view_model = target.get("view_model").unwrap_or(&Value::Null);
-            let role = view_model
-                .get("role_label")
-                .and_then(Value::as_str)
-                .unwrap_or("Target");
-            let suite = view_model
-                .get("suite_label")
-                .and_then(Value::as_str)
-                .unwrap_or("Suite unknown");
-            let proof = view_model
-                .get("proof_label")
-                .and_then(Value::as_str)
-                .unwrap_or("Proof unknown");
-            format!("{role}: {suite}, {proof}")
+            let view = &target.view_model;
+            format!("{}: {}, {}", view.role_label, view.suite_label, view.proof_label)
         })
         .collect::<Vec<_>>()
         .join(" | ")
 }
 
-fn family_c_qualification_required_label(required: &Value) -> String {
-    ["profile", "run_type", "mode", "performance_mode"]
-        .into_iter()
-        .filter_map(|key| required.get(key).and_then(Value::as_str))
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| qualification_token_label(value, value))
-        .collect::<Vec<_>>()
-        .join(" | ")
+fn family_c_qualification_required_label(required: &QualificationRequirement) -> String {
+    [
+        required.profile,
+        required.run_type,
+        required.mode,
+        required.performance_mode,
+    ]
+    .into_iter()
+    .filter(|value| !value.trim().is_empty())
+    .map(|value| qualification_token_label(value, value))
+    .collect::<Vec<_>>()
+    .join(" | ")
 }
 
-fn family_c_qualification_suite_run_label(suite_run: &Value) -> String {
-    if !suite_run
-        .get("present")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+fn family_c_qualification_suite_run_label(suite_run: Option<&QualificationSuiteRun>) -> String {
+    let Some(suite_run) = suite_run else {
         return "Suite missing".to_string();
-    }
-
-    let state = suite_run
-        .get("state")
-        .and_then(Value::as_str)
-        .map(|value| qualification_token_label(value, value))
-        .unwrap_or_else(|| "Suite present".to_string());
-    suite_run
-        .get("run_index")
-        .and_then(Value::as_u64)
-        .map(|run_index| format!("{state}, run #{}", run_index + 1))
-        .unwrap_or(state)
+    };
+    let state = qualification_token_label(&suite_run.state, &suite_run.state);
+    format!("{state}, run #{}", suite_run.run_index + 1)
 }
 
-fn family_c_qualification_proof_label(proof: &Value) -> String {
-    if !proof
-        .get("present")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+fn family_c_qualification_proof_label(proof: Option<&QualificationProof>) -> String {
+    let Some(proof) = proof else {
         return "Proof missing".to_string();
-    }
-
-    let outcome = proof
-        .get("outcome")
-        .and_then(Value::as_str)
-        .map(|value| qualification_token_label(value, value))
-        .unwrap_or_else(|| "Proof present".to_string());
+    };
+    let outcome = qualification_token_label(&proof.outcome, &proof.outcome);
     let matched = proof
-        .get("comparison")
-        .and_then(|comparison| {
-            comparison
-                .get("present")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                .then_some(comparison)
-        })
-        .and_then(|comparison| comparison.get("matched_sample_count"))
-        .and_then(Value::as_u64)
-        .map(|count| format!(", {count} matched"))
+        .comparison
+        .as_ref()
+        .map(|comparison| format!(", {} matched", comparison.matched_sample_count))
         .unwrap_or_default();
     format!("{outcome}{matched}")
 }
@@ -381,7 +451,7 @@ fn family_c_qualification_target_payload(
     baseline_proof: Option<&LaunchProofRecord>,
     managed_install: Option<&ManagedInstallEvidence>,
     extra_missing: &[&'static str],
-) -> Value {
+) -> QualificationTargetEvidence {
     let mut missing = Vec::new();
     missing.extend(extra_missing.iter().copied());
     let expected_benchmark_id = benchmark_suite_run_id(
@@ -512,61 +582,42 @@ fn family_c_qualification_target_payload(
     missing.sort_unstable();
     missing.dedup();
 
-    let required = json!({
-        "profile": target.profile,
-        "run_type": target.run_type,
-        "mode": FAMILY_C_QUALIFICATION_MODE,
-        "performance_mode": target.performance_mode,
-    });
+    let required = QualificationRequirement {
+        profile: target.profile,
+        run_type: target.run_type,
+        mode: FAMILY_C_QUALIFICATION_MODE,
+        performance_mode: target.performance_mode,
+    };
     let suite_run = family_c_qualification_suite_run_payload(run);
-    let proof_payload = family_c_qualification_proof_payload(proof, target, baseline_proof);
-    let view_model = family_c_qualification_target_view_model(
-        target,
-        &required,
-        &suite_run,
-        &proof_payload,
-        &missing,
-    );
-
-    json!({
-        "role": target.role,
-        "target_id": target.target_id,
-        "family": "C",
-        "loader": FAMILY_C_QUALIFICATION_LOADER,
-        "version": FAMILY_C_QUALIFICATION_VERSION,
-        "required": required,
-        "suite_run": suite_run,
-        "proof": proof_payload,
-        "managed_install": managed_install.payload,
-        "missing": missing,
-        "view_model": view_model,
-    })
-}
-
-fn family_c_qualification_target_view_model(
-    target: FamilyCQualificationTarget,
-    required: &Value,
-    suite_run: &Value,
-    proof: &Value,
-    missing: &[&str],
-) -> Value {
-    json!({
-        "role_label": qualification_token_label(target.role, "Target"),
-        "target_label": family_c_qualification_target_label(),
-        "required_label": family_c_qualification_required_label(required),
-        "suite_label": family_c_qualification_suite_run_label(suite_run),
-        "suite_present": suite_run
-            .get("present")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "proof_label": family_c_qualification_proof_label(proof),
-        "proof_present": proof
-            .get("present")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "missing_label": family_c_qualification_missing_label(missing),
-        "missing_tone": if missing.is_empty() { "ok" } else { "warn" },
-    })
+    let proof = family_c_qualification_proof_payload(proof, target, baseline_proof);
+    let view_model = QualificationTargetViewModel {
+        role_label: qualification_token_label(target.role, "Target"),
+        target_label: family_c_qualification_target_label(),
+        required_label: family_c_qualification_required_label(&required),
+        suite_label: family_c_qualification_suite_run_label(suite_run.as_ref()),
+        suite_present: suite_run.is_some(),
+        proof_label: family_c_qualification_proof_label(proof.as_ref()),
+        proof_present: proof.is_some(),
+        missing_label: family_c_qualification_missing_label(&missing),
+        missing_tone: if missing.is_empty() {
+            Tone::Ok
+        } else {
+            Tone::Warn
+        },
+    };
+    QualificationTargetEvidence {
+        role: target.role,
+        target_id: target.target_id,
+        family: "C",
+        loader: FAMILY_C_QUALIFICATION_LOADER,
+        version: FAMILY_C_QUALIFICATION_VERSION,
+        required,
+        suite_run,
+        proof,
+        managed_install: managed_install.report,
+        missing,
+        view_model,
+    }
 }
 
 pub fn managed_install_evidence(
@@ -575,7 +626,7 @@ pub fn managed_install_evidence(
 ) -> ManagedInstallEvidence {
     let mut evidence = ManagedInstallEvidence {
         missing: Vec::new(),
-        payload: Value::Null,
+        report: None,
     };
     let installed_count = composition_state.installed_mods.len();
     let has_installed = installed_count > 0;
@@ -621,15 +672,17 @@ pub fn managed_install_evidence(
         evidence.missing.push("managed_install_integrity_missing");
     }
 
-    evidence.payload = json!({
-        "required": true,
-        "present": true,
-        "composition_id": bounded_descriptor_token(&composition_state.composition_id, "composition"),
-        "installed_count": installed_count,
-        "expected_artifacts_present": expected_artifacts_present,
-        "ownership": ownership,
-        "source": source,
-        "integrity": integrity,
+    evidence.report = Some(ManagedInstallReport {
+        present: true,
+        composition_id: Some(bounded_descriptor_token(
+            &composition_state.composition_id,
+            "composition",
+        )),
+        installed_count,
+        expected_artifacts_present,
+        ownership,
+        source,
+        integrity,
     });
     evidence
 }
@@ -640,20 +693,19 @@ fn unobserved_managed_install_evidence(
     if target.target_id != FAMILY_C_MANAGED_TARGET_ID || target.performance_mode != "managed" {
         return ManagedInstallEvidence {
             missing: Vec::new(),
-            payload: json!({ "required": false }),
+            report: None,
         };
     }
     ManagedInstallEvidence {
         missing: vec!["managed_install_state_missing"],
-        payload: json!({
-            "required": true,
-            "present": false,
-            "composition_id": null,
-            "installed_count": 0,
-            "expected_artifacts_present": false,
-            "ownership": false,
-            "source": false,
-            "integrity": false,
+        report: Some(ManagedInstallReport {
+            present: false,
+            composition_id: None,
+            installed_count: 0,
+            expected_artifacts_present: false,
+            ownership: false,
+            source: false,
+            integrity: false,
         }),
     }
 }
@@ -695,8 +747,8 @@ fn family_c_qualification_matching_proof<'a>(
 fn family_c_qualification_managed_comparison_evidence(
     comparison: &LaunchProofComparison,
     baseline_proof: Option<&LaunchProofRecord>,
-) -> FamilyCManagedComparisonEvidence {
-    FamilyCManagedComparisonEvidence {
+) -> ComparisonEvidence {
+    ComparisonEvidence {
         baseline_matches: baseline_proof
             .is_some_and(|baseline| comparison_baseline_matches_report(comparison, baseline)),
         metric_valid: matches!(
@@ -708,20 +760,21 @@ fn family_c_qualification_managed_comparison_evidence(
     }
 }
 
-fn family_c_qualification_suite_run_payload(run: Option<&BenchmarkSuiteManifestRun>) -> Value {
-    let Some(run) = run else {
-        return json!({ "present": false });
-    };
-
-    json!({
-        "present": true,
-        "run_index": run.run_index,
-        "profile": bounded_descriptor_token(&run.profile, "profile"),
-        "run_type": bounded_descriptor_token(&run.run_type, "run-type"),
-        "target_id": bounded_descriptor_token(&run.target_id, "target"),
-        "benchmark_id": bounded_descriptor_token(&run.benchmark_id, "benchmark"),
-        "session_id": run.session_id.as_deref().map(|value| bounded_descriptor_token(value, "session")),
-        "state": bounded_descriptor_token(&run.state, "state"),
+fn family_c_qualification_suite_run_payload(
+    run: Option<&BenchmarkSuiteManifestRun>,
+) -> Option<QualificationSuiteRun> {
+    let run = run?;
+    Some(QualificationSuiteRun {
+        run_index: run.run_index,
+        profile: bounded_descriptor_token(&run.profile, "profile"),
+        run_type: bounded_descriptor_token(&run.run_type, "run-type"),
+        target_id: bounded_descriptor_token(&run.target_id, "target"),
+        benchmark_id: bounded_descriptor_token(&run.benchmark_id, "benchmark"),
+        session_id: run
+            .session_id
+            .as_deref()
+            .map(|value| bounded_descriptor_token(value, "session")),
+        state: bounded_descriptor_token(&run.state, "state"),
     })
 }
 
@@ -729,85 +782,49 @@ fn family_c_qualification_proof_payload(
     proof: Option<&LaunchProofRecord>,
     target: FamilyCQualificationTarget,
     baseline_proof: Option<&LaunchProofRecord>,
-) -> Value {
-    let Some(proof) = proof else {
-        return json!({ "present": false });
-    };
-    let comparison = proof.comparison.as_ref().map(|comparison| {
-        let mut payload = json!({
-            "present": true,
-            "baseline_session_id": bounded_descriptor_token(
-                &comparison.baseline_session_id,
-                "session"
-            ),
-            "metric_name": bounded_descriptor_token(&comparison.metric_name, "metric"),
-            "matched_sample_count": comparison.matched_sample_count,
-        });
-        if target.comparison_required {
-            let evidence =
-                family_c_qualification_managed_comparison_evidence(comparison, baseline_proof);
-            payload["baseline_matches"] = json!(evidence.baseline_matches);
-            payload["metric_valid"] = json!(evidence.metric_valid);
-            payload["samples_present"] = json!(evidence.samples_present);
-            payload["values_present"] = json!(evidence.values_present);
-        }
-        payload
-    });
-
-    json!({
-        "present": true,
-        "session_id": bounded_descriptor_token(&proof.session_id, "session"),
-        "benchmark_id": proof
-            .scenario
-            .benchmark_id
-            .as_deref()
-            .map(|value| bounded_descriptor_token(value, "benchmark")),
-        "profile": proof
-            .scenario
-            .benchmark_profile
-            .as_deref()
-            .map(|value| bounded_descriptor_token(value, "profile")),
-        "run_type": proof
-            .scenario
-            .benchmark_run_type
-            .as_deref()
-            .map(|value| bounded_descriptor_token(value, "run-type")),
-        "mode": proof
-            .scenario
-            .benchmark_mode
-            .as_deref()
-            .map(|value| bounded_descriptor_token(value, "mode")),
-        "performance_mode": bounded_descriptor_token(&proof.scenario.performance_mode, "mode"),
-        "version": family_c_proof_version(proof)
-            .as_deref()
-            .map(|value| bounded_descriptor_token(value, "version")),
-        "outcome": bounded_descriptor_token(&proof.outcome, "outcome"),
-        "comparison": comparison.unwrap_or_else(|| json!({ "present": false })),
-        "resource_budget": family_c_qualification_resource_budget_payload(
-            proof.resource_budget.as_ref()
-        ),
-    })
-}
-
-fn family_c_qualification_resource_budget_payload(
-    resource_budget: Option<&LaunchProofResourceBudget>,
-) -> Value {
-    let Some(resource_budget) = resource_budget else {
-        return json!({
-            "present": false,
-            "memory": false,
-            "cpu": false,
-            "install": false,
-            "disk": false,
-        });
-    };
-
-    json!({
-        "present": true,
-        "memory": family_c_qualification_resource_memory_evidence(resource_budget),
-        "cpu": family_c_qualification_resource_cpu_evidence(resource_budget),
-        "install": family_c_qualification_resource_install_evidence(resource_budget),
-        "disk": family_c_qualification_resource_disk_evidence(resource_budget),
+) -> Option<QualificationProof> {
+    let proof = proof?;
+    let token = |value: Option<&str>, kind| value.map(|value| bounded_descriptor_token(value, kind));
+    let scenario = &proof.scenario;
+    Some(QualificationProof {
+        session_id: bounded_descriptor_token(&proof.session_id, "session"),
+        benchmark_id: token(scenario.benchmark_id.as_deref(), "benchmark"),
+        profile: token(scenario.benchmark_profile.as_deref(), "profile"),
+        run_type: token(scenario.benchmark_run_type.as_deref(), "run-type"),
+        mode: token(scenario.benchmark_mode.as_deref(), "mode"),
+        performance_mode: bounded_descriptor_token(&scenario.performance_mode, "mode"),
+        version: token(family_c_proof_version(proof).as_deref(), "version"),
+        outcome: bounded_descriptor_token(&proof.outcome, "outcome"),
+        comparison: proof
+            .comparison
+            .as_ref()
+            .map(|comparison| QualificationComparison {
+                baseline_session_id: bounded_descriptor_token(
+                    &comparison.baseline_session_id,
+                    "session",
+                ),
+                metric_name: bounded_descriptor_token(&comparison.metric_name, "metric"),
+                matched_sample_count: comparison.matched_sample_count,
+                evidence: target.comparison_required.then(|| {
+                    family_c_qualification_managed_comparison_evidence(comparison, baseline_proof)
+                }),
+            }),
+        resource_budget: match proof.resource_budget.as_ref() {
+            Some(budget) => QualificationResourceEvidence {
+                present: true,
+                memory: family_c_qualification_resource_memory_evidence(budget),
+                cpu: family_c_qualification_resource_cpu_evidence(budget),
+                install: family_c_qualification_resource_install_evidence(budget),
+                disk: family_c_qualification_resource_disk_evidence(budget),
+            },
+            None => QualificationResourceEvidence {
+                present: false,
+                memory: false,
+                cpu: false,
+                install: false,
+                disk: false,
+            },
+        },
     })
 }
 
@@ -838,13 +855,6 @@ fn family_c_qualification_resource_disk_evidence(
     resource_budget: &LaunchProofResourceBudget,
 ) -> bool {
     resource_budget.launch_disk_available_mb.is_some()
-}
-
-fn family_c_qualification_target_ready(target: &Value) -> bool {
-    target
-        .get("missing")
-        .and_then(|missing| missing.as_array())
-        .is_some_and(Vec::is_empty)
 }
 
 fn family_c_proof_version(proof: &LaunchProofRecord) -> Option<String> {
@@ -889,15 +899,7 @@ struct FamilyCQualificationTarget {
 #[derive(Clone, Debug)]
 pub struct ManagedInstallEvidence {
     missing: Vec<&'static str>,
-    payload: Value,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FamilyCManagedComparisonEvidence {
-    baseline_matches: bool,
-    metric_valid: bool,
-    samples_present: bool,
-    values_present: bool,
+    report: Option<ManagedInstallReport>,
 }
 
 #[cfg(test)]
@@ -912,7 +914,7 @@ mod tests {
     };
     use axial_minecraft::loaders::{LoaderComponentId, installed_version_id_for};
 
-    fn baseline_payload(version: &str, scenario_version: Option<&str>) -> Value {
+    fn baseline_payload(version: &str, scenario_version: Option<&str>) -> serde_json::Value {
         let plan = benchmark_suite_plan(FAMILY_C_QUALIFICATION_MODE).unwrap();
         let mut runs = benchmark_suite_manifest_run_inputs(FAMILY_C_QUALIFICATION_MODE, &plan)
             .into_iter()
@@ -973,11 +975,12 @@ mod tests {
             updated_at: report.recorded_at.clone(),
             runs,
         };
-        let payload = qualification_payload(&manifest, &[report], None, true);
+        let payload =
+            serde_json::to_value(qualification_payload(&manifest, &[report], None, true)).unwrap();
         assert_eq!(payload["status"], "incomplete");
         let baseline = &payload["targets"][0];
         assert_eq!(baseline["role"], "baseline");
-        assert_eq!(baseline["proof"]["present"], true);
+        assert!(baseline["proof"].is_object());
         assert_eq!(baseline["proof"]["outcome"], "exited");
         let other_missing = baseline["missing"]
             .as_array()
@@ -999,7 +1002,7 @@ mod tests {
         baseline.clone()
     }
 
-    fn version_matches(baseline: &Value) -> bool {
+    fn version_matches(baseline: &serde_json::Value) -> bool {
         !baseline["missing"]
             .as_array()
             .unwrap()

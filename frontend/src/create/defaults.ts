@@ -1,5 +1,5 @@
-import type { Version } from '../types-version';
-import type { LoaderComponentId } from '../types-loader';
+import type { VersionEntry } from '../generated/VersionEntry';
+import type { LoaderComponentId } from '../generated/LoaderComponentId';
 
 export type LoaderKey = 'vanilla' | 'fabric' | 'quilt' | 'forge' | 'neoforge';
 export type Channel = 'release' | 'snapshot' | 'legacy' | 'unknown';
@@ -44,7 +44,7 @@ export function loaderKeyFromComponentId(componentId: LoaderComponentId | null |
   return 'vanilla';
 }
 
-export function loaderKeyFromVersion(version: Version | null | undefined): LoaderKey {
+export function loaderKeyFromVersion(version: VersionEntry | null | undefined): LoaderKey {
   if (!version?.loader) return 'vanilla';
   return loaderKeyFromComponentId(version.loader.component_id);
 }

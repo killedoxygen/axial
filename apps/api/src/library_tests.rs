@@ -1097,17 +1097,7 @@ async fn interrupted_content_exit(boundary: ContentExit) {
             )
         });
         let before_fence = content_fence(&services, &id).await;
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/api/v1/instances/{id}/content/settle",
-                bootstrap.base_url
-            ))
-            .header(transport::CAPABILITY_HEADER, &bootstrap.capability)
-            .send()
-            .await
-            .unwrap();
-        let settle_status = response.status().as_u16();
-        let settle_body: Value = response.json().await.unwrap();
+        let settlement = settle_content(&services, &id).await;
         let after_fence = content_fence(&services, &id).await;
         let after = (
             content_receipt(services.instances.registry().storage(), &id),
@@ -1153,7 +1143,7 @@ async fn interrupted_content_exit(boundary: ContentExit) {
             ),
             (before, after, preserved),
             (before_fence, after_fence),
-            (settle_status, settle_body),
+            settlement,
             (queue_before, queue_after, queue_status, queue_after_status),
         ));
     }
@@ -1165,17 +1155,16 @@ async fn interrupted_content_exit(boundary: ContentExit) {
         (shutdown, settled, joined, http_closed, idle, update_refused),
         (before, after, preserved),
         (before_fence, after_fence),
-        (settle_status, settle_body),
+        settlement,
         (queue_before, queue_after, queue_status, queue_after_status),
     ) in observations
     {
         assert_eq!(before, (receipt.clone(), tree.clone()));
         assert_eq!(after, before);
         assert_eq!(preserved, before);
-        assert_eq!(settle_status, 409);
         assert_eq!(
-            settle_body,
-            json!({"error":"content operation requires settlement before this instance can be used"})
+            settlement,
+            Err("content operation requires settlement before this instance can be used".into())
         );
         assert_eq!(before_fence.0, 503);
         assert_eq!(after_fence.0, 503);
@@ -1203,6 +1192,19 @@ async fn interrupted_content_exit(boundary: ContentExit) {
     }
 }
 
+/// Settles retained Content through its owner, as startup recovery does.
+async fn settle_content(services: &DesktopServices, id: &InstanceId) -> Result<(), String> {
+    let work = services
+        .content_mutations
+        .resume(id)
+        .map_err(|error| error.to_string())?;
+    work.join()
+        .await
+        .map_err(|_| "content settlement was interrupted".to_owned())?
+        .map(drop)
+        .map_err(|error| error.to_string())
+}
+
 async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, operation: &str) {
     let mut before = Vec::new();
     fs::File::open(root.parent().unwrap().join(CONTENT_BEFORE_TREE))
@@ -1215,17 +1217,7 @@ async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, o
     let services = start_in_profile(root.to_path_buf(), None).await.unwrap();
     let bootstrap = services.server.bootstrap();
     let before_fence = content_fence(&services, id).await;
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/api/v1/instances/{id}/content/settle",
-            bootstrap.base_url
-        ))
-        .header(transport::CAPABILITY_HEADER, &bootstrap.capability)
-        .send()
-        .await
-        .unwrap();
-    let status = response.status().as_u16();
-    let body: Value = response.json().await.unwrap();
+    let settlement = settle_content(&services, id).await;
     let receipt_absent =
         !axial_app::content::install::has_pending(services.instances.registry().storage(), id)
             .unwrap();
@@ -1274,10 +1266,9 @@ async fn recover_created_content(root: &Path, payload: &Path, id: &InstanceId, o
         drop(services);
     }
 
-    assert_eq!(status, 409);
     assert_eq!(
-        body,
-        json!({"error":"content operation was cancelled before publication"})
+        settlement,
+        Err("content operation was cancelled before publication".into())
     );
     assert_eq!(before_fence, (503, true, true));
     assert!(receipt_absent && readable && admitted && update_allowed);

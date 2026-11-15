@@ -12,6 +12,7 @@ use axial_minecraft::download::{
     transfer_cancellation_channel,
 };
 use serde::Serialize;
+use ts_rs::TS;
 use std::{
     num::NonZeroU64,
     sync::{Arc, Mutex},
@@ -26,13 +27,13 @@ const MUSIC_SOURCES: [&str; 2] = [
     "https://github.com/killedoxygen/axial/releases/download/music-v2/sublunar-hum.mp3",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
 pub struct MusicTrackStatus {
     pub cached: bool,
     pub file: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, TS)]
 pub struct MusicStatusResponse {
     pub tracks: Vec<MusicTrackStatus>,
     pub count: usize,

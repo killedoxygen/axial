@@ -1,11 +1,12 @@
+import type { Tone } from '../generated/Tone';
 import type { JSX, ComponentChildren } from 'preact';
-import type { SoundKind } from '../sound';
+import type { SoundKind } from '../app/sound';
 import { Face, type Eyes, type FaceTone } from './Face';
 import { glideThumb, settleWidth } from './motion';
 import { Icon, type IconName } from './Icons';
 
 /** `ok` and `info` arrive from wire view models; both read as the accent. */
-type ChipTone = 'neutral' | 'accent' | 'ok' | 'info' | 'warn' | 'err' | 'bare';
+type ChipTone = Tone | 'neutral' | 'accent' | 'bare';
 type BtnVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
 type BtnSize = 'sm' | 'md' | 'lg';
 
@@ -157,7 +158,7 @@ export function Chip({
   icon?: IconName;
   title?: string;
 }): JSX.Element {
-  const look = tone === 'ok' || tone === 'info' ? 'accent' : tone;
+  const look = tone === 'ok' || tone === 'info' ? 'accent' : tone === 'mute' ? 'neutral' : tone;
   const cls = `cp-chip${look !== 'neutral' ? ` cp-chip--${look}` : ''}`;
   return (
     <span class={cls} title={title}>
@@ -250,14 +251,12 @@ export function Status({
   );
 }
 
-export type NoticeTone = 'info' | 'warned' | 'intervened' | 'success' | 'error';
-
-const NOTICE_FACE: Record<NoticeTone, { eyes: Eyes; tone?: FaceTone }> = {
+const NOTICE_FACE: Record<Tone, { eyes: Eyes; tone?: FaceTone }> = {
+  ok: { eyes: 'happy' },
   info: { eyes: 'open' },
-  warned: { eyes: 'wide', tone: 'warn' },
-  intervened: { eyes: 'happy' },
-  success: { eyes: 'happy' },
-  error: { eyes: 'x', tone: 'err' },
+  warn: { eyes: 'wide', tone: 'warn' },
+  err: { eyes: 'x', tone: 'err' },
+  mute: { eyes: 'open', tone: 'mute' },
 };
 
 export function Notice({
@@ -268,7 +267,7 @@ export function Notice({
   role,
   class: cls,
 }: {
-  tone?: NoticeTone;
+  tone?: Tone;
   title?: ComponentChildren;
   children?: ComponentChildren;
   onDismiss?: () => void;

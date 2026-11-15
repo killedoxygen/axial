@@ -1,7 +1,7 @@
 use super::error::{ApiResult, Extracted};
 use axial_app::instances::{
     create::{
-        CreateInstanceRequest, InstanceService, PendingInstancesResponse, RecoveredCreationResponse,
+        CreateInstanceRequest, InstanceService, PendingInstancesResponse,
     },
     delete::{DeleteIntent, DeletionResponse, DeletionSnapshot},
     duplicate::DuplicateRequest,
@@ -49,10 +49,6 @@ pub fn router(
         .route("/api/v1/instances/setup/plan", post(plan_setup))
         .route("/api/v1/instances/setup", post(execute_setup))
         .route("/api/v1/instances/{id}/setup/resume", post(resume_setup))
-        .route(
-            "/api/v1/instances/pending/{id}/resume",
-            post(resume_creation),
-        )
         .route(
             "/api/v1/instances/deletions/{operation_id}",
             get(deletion_status),
@@ -214,18 +210,6 @@ async fn resume_setup(
     Path(id): Path<String>,
 ) -> ApiResult<CreateInstanceResponse> {
     Ok(Json(services.setup.resume_setup(&identity(&id)?).await?))
-}
-
-async fn resume_creation(
-    State(services): State<Services>,
-    Path(id): Path<String>,
-) -> ApiResult<RecoveredCreationResponse> {
-    let work = services.instances.recover_creation(&identity(&id)?)?;
-    let instance = work
-        .join()
-        .await
-        .map_err(|_| InstanceError::SettlementRequired)??;
-    Ok(Json(RecoveredCreationResponse { instance }))
 }
 
 #[derive(Default, Deserialize)]

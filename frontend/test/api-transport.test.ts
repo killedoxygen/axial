@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { api, apiEventSourceUrl } from '../src/api';
+import { apiEventSourceUrl, request } from '../src/platform/transport';
 
 const originalFetch = globalThis.fetch;
 
@@ -15,15 +15,14 @@ test.after(() => {
 test('JSON requests carry the process-local API capability', async () => {
   const observed: Request[] = [];
   globalThis.fetch = async (input, init) => {
-    const request = requestFrom(input, init);
-    observed.push(request);
+    observed.push(requestFrom(input, init));
     return new Response('{"ok":true}', {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     });
   };
 
-  assert.deepEqual(await api('POST', '/status', { value: 1 }), { ok: true });
+  assert.deepEqual(await request('POST', '/status', { value: 1 }), { ok: true });
   assert.equal(observed.length, 1);
   assert.equal(observed[0]!.headers.get('X-Axial-Capability'), 'frontend-test-capability');
   assert.equal(observed[0]!.headers.get('Content-Type'), 'application/json');

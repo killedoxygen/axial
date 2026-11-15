@@ -4,3 +4,4 @@ dist/
 dist.stage-*/
 dist.previous-*/
 static/sounds/**/*.json
+src/generated/

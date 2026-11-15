@@ -1,8 +1,7 @@
 import type { ComponentChildren, JSX } from 'preact';
 import { RangeSlider } from './Slider';
 import { Chip } from './Atoms';
-import { fmtMem } from '../format';
-import { getMemoryRecommendation } from '../utils';
+import { fmtMem } from './format';
 
 export function heapCeilingGb(totalGb: number): number {
   return Math.max(2, Math.min(32, totalGb));
@@ -86,4 +85,11 @@ export function MemoryField({
       </div>
     </div>
   );
+}
+
+export function getMemoryRecommendation(totalGB: number): { rec: number; text: string } {
+  if (totalGB <= 4) return { rec: 2, text: 'Low RAM: 2 GB recommended' };
+  if (totalGB <= 8) return { rec: 4, text: '4 GB recommended' };
+  if (totalGB <= 16) return { rec: 6, text: '6 GB recommended' };
+  return { rec: 8, text: '8 GB recommended' };
 }

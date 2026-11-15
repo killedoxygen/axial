@@ -1,0 +1,359 @@
+/** Native events and command replies cross a separate boundary; these check their shape before use. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function nativeRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${label} was invalid.`);
+  return value;
+}
+
+function nativeString(value: unknown, label: string): string {
+  if (typeof value !== 'string') throw new Error(`${label} was invalid.`);
+  return value;
+}
+
+interface TauriInvokeBinding {
+  invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
+}
+
+interface TauriEventBinding {
+  listen(eventName: string, callback: (event: { payload: unknown }) => void): Promise<() => void>;
+}
+
+interface TauriOpenerBinding {
+  openUrl(url: string): Promise<void>;
+}
+
+interface TauriBinding {
+  core?: TauriInvokeBinding;
+  event?: TauriEventBinding;
+  opener?: TauriOpenerBinding;
+}
+
+declare global {
+  interface Window {
+    __TAURI__?: TauriBinding;
+  }
+}
+
+function getTauriBinding(): TauriBinding | null {
+  if (typeof window === 'undefined') return null;
+  return window.__TAURI__ ?? null;
+}
+
+/** The desktop shell's commands; none in a browser. */
+export function nativeCommands(): TauriInvokeBinding | null {
+  return getTauriBinding()?.core ?? null;
+}
+
+export type NativeDragDropType = 'enter' | 'over' | 'drop' | 'leave';
+
+export interface NativeDragDropPayload {
+  type: NativeDragDropType;
+  eligible: boolean;
+  token: string | null;
+  position: { x: number; y: number } | null;
+  error: string | null;
+}
+
+export interface NativeMicrosoftSignInResult {
+  status: 'authenticated' | 'cancelled';
+  login_id?: string | null;
+  profile_name?: string | null;
+  owns_minecraft_java?: boolean | null;
+}
+
+export function hasNativeDesktopRuntime(): boolean {
+  return getTauriBinding() !== null;
+}
+
+export type DesktopPlatform = 'browser' | 'linux' | 'macos' | 'unknown' | 'windows';
+export type DesktopChromeMode = 'browser' | 'custom-frameless' | 'mac-overlay' | 'native-decorated';
+
+export interface NativeDesktopChrome {
+  platform: DesktopPlatform;
+  chrome_mode: DesktopChromeMode;
+}
+
+const browserDesktopChrome: NativeDesktopChrome = {
+  platform: 'browser',
+  chrome_mode: 'browser',
+};
+
+let desktopChrome = browserDesktopChrome;
+
+function desktopPlatformFromPayload(value: unknown): DesktopPlatform {
+  return value === 'linux' || value === 'macos' || value === 'windows' ? value : 'unknown';
+}
+
+function desktopChromeModeFromPayload(value: unknown): DesktopChromeMode {
+  return value === 'custom-frameless' || value === 'mac-overlay' || value === 'native-decorated' ? value : 'browser';
+}
+
+function desktopChromeFromPayload(payload: unknown): NativeDesktopChrome {
+  if (!isRecord(payload)) return browserDesktopChrome;
+  return {
+    platform: desktopPlatformFromPayload(payload.platform),
+    chrome_mode: desktopChromeModeFromPayload(payload.chrome_mode),
+  };
+}
+
+async function getNativeDesktopChrome(): Promise<NativeDesktopChrome> {
+  const core = nativeCommands();
+  if (!core) return browserDesktopChrome;
+  const payload = await core.invoke('desktop_chrome');
+  return desktopChromeFromPayload(payload);
+}
+
+export function desktopPlatform(): DesktopPlatform {
+  return desktopChrome.platform;
+}
+
+/** macOS desktop, or a browser running on a Mac when no native shell reports a platform. */
+export function isMacPlatform(): boolean {
+  if (desktopChrome.platform !== 'browser' && desktopChrome.platform !== 'unknown') {
+    return desktopChrome.platform === 'macos';
+  }
+  return typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || navigator.userAgent);
+}
+
+export function desktopChromeMode(): DesktopChromeMode {
+  return desktopChrome.chrome_mode;
+}
+
+/** Asks the desktop shell what it is running on. A browser, or a shell that will not say, stays `browser`. */
+export async function loadDesktopChrome(): Promise<void> {
+  desktopChrome = await getNativeDesktopChrome().catch(() => browserDesktopChrome);
+}
+
+export const nativeDesktopCloseBlockedEventName = 'axial:desktop:close-blocked';
+export const nativePreferencesEventName = 'axial:desktop:preferences';
+
+export interface NativePreferencesRequest {
+  request_id: string;
+  phase: 'flush' | 'discard' | 'release';
+}
+
+export function nativePreferencesRequest(value: unknown): NativePreferencesRequest {
+  const record = nativeRecord(value, 'Desktop preference request');
+  const request_id = nativeString(record.request_id, 'Desktop preference request id');
+  if (!request_id || !['flush', 'discard', 'release'].includes(String(record.phase))) {
+    throw new Error('Invalid desktop preference request.');
+  }
+  return { request_id, phase: record.phase as NativePreferencesRequest['phase'] };
+}
+
+export async function pendingNativePreferences(): Promise<NativePreferencesRequest | null> {
+  const core = nativeCommands();
+  if (!core) throw new Error('Desktop preference coordination is unavailable.');
+  const value = await core.invoke('pending_interface_preferences');
+  return value === null ? null : nativePreferencesRequest(value);
+}
+
+export async function completeNativePreferences(requestId: string, saved: boolean): Promise<void> {
+  const core = nativeCommands();
+  if (!core) throw new Error('Desktop preference coordination is unavailable.');
+  await core.invoke('complete_interface_preferences', { requestId, saved });
+}
+
+export async function onNativeEvent(
+  eventName: string,
+  callback: (data: unknown) => void,
+): Promise<{ close(): void } | null> {
+  const tauri = getTauriBinding();
+  if (!tauri?.event) return null;
+
+  const unsubscribe = await tauri.event.listen(eventName, (event) => {
+    callback(event.payload);
+  });
+
+  return {
+    close(): void {
+      unsubscribe();
+    },
+  };
+}
+
+function nativeDragDropPayload(payload: unknown): NativeDragDropPayload | null {
+  if (!isRecord(payload)) return null;
+  const record = payload;
+  const type = record.type;
+  if (type !== 'enter' && type !== 'over' && type !== 'drop' && type !== 'leave') return null;
+  const rawPosition = record.position;
+  const positionRecord = isRecord(rawPosition) ? rawPosition : null;
+  const x = positionRecord?.x;
+  const y = positionRecord?.y;
+  const position =
+    typeof x === 'number' && typeof y === 'number' && Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  return {
+    type,
+    eligible: record.eligible === true,
+    token: typeof record.token === 'string' && record.token ? record.token : null,
+    position,
+    error: typeof record.error === 'string' && record.error ? record.error : null,
+  };
+}
+
+export function onNativeDragDrop(
+  callback: (payload: NativeDragDropPayload) => void,
+): Promise<{ close(): void } | null> {
+  return onNativeEvent('axial:desktop:skin-drag', (data) => {
+    const payload = nativeDragDropPayload(data);
+    if (payload) callback(payload);
+  });
+}
+
+export async function getNativeAppVersion(): Promise<string | null> {
+  const core = nativeCommands();
+  if (!core) return null;
+  const value = await core.invoke('app_version');
+  if (typeof value !== 'string' || !value.trim()) throw new Error('Native app version response was invalid.');
+  return value;
+}
+
+export interface NativeApiTransportBootstrap {
+  base_url: string;
+  capability: string;
+}
+
+export async function getNativeApiTransportBootstrap(): Promise<NativeApiTransportBootstrap | null> {
+  const core = nativeCommands();
+  if (!core) return null;
+  const value = await core.invoke('api_transport_bootstrap');
+  const record = nativeRecord(value, 'Native API transport bootstrap');
+  const baseUrl = nativeString(record.base_url, 'Native API transport base URL');
+  const capability = nativeString(record.capability, 'Native API transport capability');
+  if (!baseUrl || !capability) {
+    throw new Error('Native API transport bootstrap was invalid.');
+  }
+  return { base_url: baseUrl, capability };
+}
+
+export async function signInWithMicrosoft(): Promise<NativeMicrosoftSignInResult | undefined> {
+  const core = nativeCommands();
+  if (!core) return undefined;
+  const value = await core
+    .invoke('microsoft_sign_in')
+    .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Microsoft sign-in could not be completed.'));
+  const record = nativeRecord(value, 'Native Microsoft sign-in');
+  if (record.status !== 'authenticated' && record.status !== 'cancelled') {
+    throw new Error('Native Microsoft sign-in response was invalid.');
+  }
+  for (const key of ['login_id', 'profile_name'] as const) {
+    if (record[key] !== undefined && record[key] !== null && typeof record[key] !== 'string') {
+      throw new Error('Native Microsoft sign-in response was invalid.');
+    }
+  }
+  if (
+    record.owns_minecraft_java !== undefined &&
+    record.owns_minecraft_java !== null &&
+    typeof record.owns_minecraft_java !== 'boolean'
+  ) {
+    throw new Error('Native Microsoft sign-in response was invalid.');
+  }
+  const loginId =
+    record.login_id == null ? (record.login_id === null ? null : undefined) : nativeString(record.login_id, 'Login id');
+  const profileName =
+    record.profile_name == null
+      ? record.profile_name === null
+        ? null
+        : undefined
+      : nativeString(record.profile_name, 'Profile name');
+  const ownsMinecraftJava =
+    record.owns_minecraft_java == null
+      ? record.owns_minecraft_java === null
+        ? null
+        : undefined
+      : record.owns_minecraft_java;
+  return {
+    status: record.status,
+    login_id: loginId,
+    profile_name: profileName,
+    owns_minecraft_java: ownsMinecraftJava,
+  };
+}
+
+export async function requestNativeAppRestart(): Promise<boolean> {
+  const core = nativeCommands();
+  if (!core) return false;
+  await core.invoke('app_restart');
+  return true;
+}
+
+export async function requestNativeAppReset(): Promise<boolean> {
+  const core = nativeCommands();
+  if (!core) return false;
+  await core.invoke('app_reset');
+  return true;
+}
+
+function nativeSkinFileFromPayload(payload: unknown): File {
+  const record = nativeRecord(payload, 'Native skin picker');
+  if (!Array.isArray(record.bytes)) {
+    throw new Error('Native skin picker returned an invalid file.');
+  }
+
+  const bytes = new Uint8Array(record.bytes.length);
+  record.bytes.forEach((value, index) => {
+    if (!Number.isInteger(value) || value < 0 || value > 255) {
+      throw new Error('Native skin picker returned an invalid file.');
+    }
+    bytes[index] = value;
+  });
+
+  const name = typeof record.name === 'string' && record.name.trim() ? record.name.trim() : 'skin.png';
+
+  return new File([bytes], name, { type: 'image/png' });
+}
+
+function rethrowNativeCommandError(reason: unknown, fallback: string): never {
+  throw new Error(typeof reason === 'string' && reason.trim() ? reason : fallback);
+}
+
+export async function pickNativeSkinFile(): Promise<File | null | undefined> {
+  const core = nativeCommands();
+  if (!core) return undefined;
+  const payload = await core
+    .invoke('pick_skin_file')
+    .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Could not read skin file.'));
+  return payload === null ? null : nativeSkinFileFromPayload(payload);
+}
+
+export async function consumeNativeSkinDrop(token: string): Promise<File | undefined> {
+  const core = nativeCommands();
+  if (!core) return undefined;
+
+  const payload = await core
+    .invoke('consume_skin_drop', { token })
+    .catch((reason: unknown) => rethrowNativeCommandError(reason, 'Could not read skin file.'));
+  return nativeSkinFileFromPayload(payload);
+}
+
+export async function openExternalURL(url: string): Promise<void> {
+  let externalUrl: URL;
+  try {
+    externalUrl = new URL(url);
+  } catch {
+    throw new Error('External URL must be an absolute HTTPS URL');
+  }
+
+  if (externalUrl.protocol !== 'https:') {
+    throw new Error('External URL must be an absolute HTTPS URL');
+  }
+
+  const tauri = getTauriBinding();
+  if (tauri?.opener) {
+    await tauri.opener.openUrl(externalUrl.href);
+    return;
+  }
+
+  window.open(externalUrl.href, '_blank', 'noopener,noreferrer');
+}
+
+export async function windowSetResizeBackground(dark: boolean): Promise<boolean> {
+  const core = nativeCommands();
+  if (!core) return false;
+  await core.invoke('window_set_resize_background', { dark });
+  return true;
+}

@@ -2,8 +2,9 @@
 //! No repair, retry, relaunch, or process ownership is granted by an outcome.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
     Unknown,
@@ -56,7 +57,7 @@ pub struct SessionExitFacts {
     pub outputs_drained: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionOutcomeKind {
     Clean,
@@ -65,7 +66,7 @@ pub enum SessionOutcomeKind {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionExitReason {
     SpawnFailed,
@@ -79,7 +80,7 @@ pub enum SessionExitReason {
     UnknownExit,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct SessionOutcome {
     pub kind: SessionOutcomeKind,
     pub reason: SessionExitReason,

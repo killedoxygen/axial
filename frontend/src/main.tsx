@@ -1,17 +1,21 @@
 import { render } from 'preact';
-import './styles';
-import { App } from './App';
-import { startApplicationBootstrap } from './bootstrap';
-import { local } from './state';
-import { initErrorReporting } from './error-reporting';
-import { applyTheme } from './theme';
-import { Sound, bindButtonSounds } from './sound';
-import { hasNativeDesktopRuntime, nativeDesktopCloseBlockedEventName, onNativeEvent } from './native';
-import { installWindowChrome } from './shell/window';
-import { toast } from './toast';
-import { restoreRoute } from './ui-state';
-import { dtoRecord } from './dto-contract';
-import { nativePreferencesHydrated, reloadApplication } from './preferences/persistence';
+import './app/styles';
+import { App } from './app/App';
+import { startApplicationBootstrap } from './app/bootstrap';
+import { local } from './app/local-state';
+import { initErrorReporting } from './app/error-reporting';
+import { applyTheme } from './app/theme';
+import { Sound, bindButtonSounds } from './app/sound';
+import {
+  hasNativeDesktopRuntime,
+  isRecord,
+  nativeDesktopCloseBlockedEventName,
+  onNativeEvent,
+} from './platform/native';
+import { installWindowChrome } from './app/shell/window';
+import { toast } from './app/toast';
+import { restoreRoute } from './app/route';
+import { nativePreferencesHydrated, reloadApplication } from './app/preferences/persistence';
 
 async function init(): Promise<void> {
   if (hasNativeDesktopRuntime()) Sound.enabled = false;
@@ -64,7 +68,7 @@ async function init(): Promise<void> {
 function registerNativeCloseBlockedToast(): void {
   if (!hasNativeDesktopRuntime()) return;
   void onNativeEvent(nativeDesktopCloseBlockedEventName, (data) => {
-    const record = dtoRecord(data, 'Desktop close event');
+    const record = isRecord(data) ? data : {};
     const message =
       typeof record.error === 'string' && record.error.trim()
         ? record.error.trim()

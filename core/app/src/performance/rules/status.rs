@@ -5,7 +5,7 @@ use crate::performance::model::{
     BundleHealth, CompositionTier, EmergencyDisableDiagnostic, FamilyCoverage, Manifest,
     OwnershipClass, PerformanceRulesStatus, PerformanceRulesStatusResponse,
     PerformanceRulesStatusViewModel, RuleChannel, RuleSource, RulesCacheState, RulesValidation,
-    VersionFamily, ViewModelTone,
+    VersionFamily, Tone,
 };
 use std::collections::BTreeSet;
 
@@ -30,9 +30,9 @@ pub(super) fn response(
         .into(),
         validation_label: if valid { "Valid" } else { "Needs attention" }.into(),
         validation_tone: if valid {
-            ViewModelTone::Ok
+            Tone::Ok
         } else {
-            ViewModelTone::Warn
+            Tone::Warn
         },
         validation_icon: if valid { "check" } else { "alert-triangle" }.into(),
         summary: format!("{} performance compositions", status.composition_count),

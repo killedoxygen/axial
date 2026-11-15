@@ -8,6 +8,7 @@ pub(crate) use comparison::comparison_baseline_matches_report;
 use comparison::*;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use super::crash::CrashEvidence;
 use super::logs::{LogEntry, MAX_LOG_ENTRIES, MAX_LOG_LINE_CHARS, Redactor};
@@ -50,7 +51,7 @@ impl From<rusqlite::Error> for ReportError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofStageEvidence {
     pub id: String,
@@ -60,7 +61,7 @@ pub struct LaunchProofStageEvidence {
     pub details: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofStage {
     pub stage: String,
@@ -78,7 +79,7 @@ pub struct LaunchProofStage {
 
 /// Schema 4 removes Guardian/healing fields and includes sanitized historical output.
 /// IDs identify metadata only and never grant authority to a filesystem location.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofRecord {
     pub schema: String,
@@ -150,12 +151,6 @@ fn outcome_name(outcome: &SessionOutcome) -> &'static str {
         SessionOutcomeKind::Failed => "failed",
         SessionOutcomeKind::Unknown => "unknown",
     }
-}
-
-/// Recent launch proofs with their history view models.
-#[derive(Clone, Debug, Serialize)]
-pub struct LaunchReportsResponse {
-    pub reports: Vec<serde_json::Value>,
 }
 
 /// Synchronous, bounded metadata methods. Async adapters run them on spawn_blocking.
@@ -553,22 +548,28 @@ fn sanitize_comparison(
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofScenario {
     pub scenario_id: String,
     pub performance_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub requested_memory_mb: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub version_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_run_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_id: Option<String>,
 }
 
@@ -587,13 +588,15 @@ impl Default for LaunchProofScenario {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofDevice {
     pub tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub total_memory_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub cpu_threads: Option<usize>,
 }
 
@@ -634,7 +637,7 @@ impl LaunchProofDevice {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofComparison {
     pub baseline_session_id: String,
@@ -648,53 +651,68 @@ pub struct LaunchProofComparison {
     pub delta_percent: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofComparisonBaseline {
     pub performance_mode: String,
     pub version_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub requested_memory_mb: Option<i32>,
     pub device_tier: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_run_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub benchmark_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchProofResourceBudget {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_total_memory_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_available_memory_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_used_memory_mb: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_cpu_threads: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_cpu_load_1m_x100: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_cpu_load_5m_x100: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub host_cpu_load_15m_x100: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub launcher_process_memory_mb: Option<u64>,
     pub active_session_count: usize,
     pub active_install_count: usize,
     pub active_memory_allocation_mb: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub requested_memory_mb: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub estimated_remaining_memory_mb: Option<i64>,
     pub memory_headroom_mb: u64,
     pub memory_pressure: bool,
     pub cpu_pressure: bool,
     pub install_pressure: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub launch_disk_available_mb: Option<u64>,
     pub launch_disk_headroom_mb: u64,
     pub disk_pressure: bool,

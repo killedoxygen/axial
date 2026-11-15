@@ -1,14 +1,9 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import type { EnrichedInstance } from '../src/types-instance';
+import { apiModule, loadSource, requireDependency } from './source';
+import { enrichedInstance } from './wire';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
 const signals: typeof import('@preact/signals') = requireDependency('@preact/signals');
 const jsx = requireDependency('preact/jsx-runtime');
 type Node = { type: unknown; props: Record<string, unknown>; ref?: { current: unknown } };
@@ -30,33 +25,8 @@ function nodes(value: unknown): Node[] {
   return [node, ...nodes(node.props.children)];
 }
 
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown>): T {
-  const filename = resolve(frontend, 'src', path);
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    outputText,
-    {
-      exports,
-      ...globals,
-      require(id: string): unknown {
-        if (id === '@preact/signals') return signals;
-        if (id === 'preact/jsx-runtime') return jsx;
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed modal dependency: ${id}`);
-      },
-    },
-    { filename },
-  );
-  return exports as T;
+function source<T>(path: string, stubs: Record<string, unknown>, globals: Record<string, unknown>): T {
+  return loadSource<T>(path, { '@preact/signals': signals, 'preact/jsx-runtime': jsx, ...stubs }, globals);
 }
 
 function hooks() {
@@ -163,29 +133,11 @@ class Element {
   }
 }
 
-const instance: EnrichedInstance = {
+const instance: EnrichedInstance = enrichedInstance({
   id: 'screenshot-instance',
   name: 'Screenshot fixture',
   version_id: 'fixture',
-  created_at: '2026-10-04T12:00:00Z',
-  java_selection: { kind: 'inherited' },
-  revision: 1,
-  version_display: {
-    loader_key: 'vanilla',
-    loader_label: 'Vanilla',
-    minecraft_label: 'Fixture',
-    loader_version_label: '',
-    loader_detail_label: '',
-    summary_label: 'Fixture',
-    supports_mods: false,
-  },
-  launchable: true,
-  launch_action: { state_id: 'ready', label: 'Launch', tone: 'ok', launchable: true, primary_action: 'launch' },
-  saves_count: 0,
-  mods_count: 0,
-  resource_count: 0,
-  shader_count: 0,
-};
+});
 
 function harness(
   apiResult: () => Promise<unknown> = async () => ({ status: 'ok', name: 'after.png' }),
@@ -254,9 +206,9 @@ function harness(
     'ui/Dialog.tsx',
     {
       'preact/hooks': dialogHooks,
-      '../hooks/use-leave': { useLeave: () => () => {} },
-      './Atoms': { Button: 'Button', Input: 'Input' },
-      './Face': { Face: 'Face' },
+      'ui/use-leave': { useLeave: () => () => {} },
+      'ui/Atoms': { Button: 'Button', Input: 'Input' },
+      'ui/Face': { Face: 'Face' },
     },
     globals,
   );
@@ -275,70 +227,66 @@ function harness(
           },
         }),
       },
-      './Icons': { Icon: 'Icon' },
-      './motion': { leaveBehind() {} },
-      '../utils': { cn: (...names: string[]) => names.filter(Boolean).join(' ') },
-      './Dialog': dialogs,
+      'ui/Icons': { Icon: 'Icon' },
+      'ui/motion': { leaveBehind() {} },
+      'ui/cn': { cn: (...names: string[]) => names.filter(Boolean).join(' ') },
+      'ui/Dialog': dialogs,
     },
     globals,
   );
-  const calls: Parameters<typeof import('../src/api').api>[] = [];
+  const calls: [method: string, path: string, body?: unknown][] = [];
   const requestEntered = heldResponse();
-  const api = {
-    api: (...args: Parameters<typeof import('../src/api').api>) => {
-      calls.push(args);
-      requestEntered.resolve(undefined);
-      return apiResult();
-    },
-    apiResourceUrl: (path: string) => path,
-  };
+  const api = apiModule('instances/api.ts', (...args: [string, string, unknown?]) => {
+    calls.push(args);
+    requestEntered.resolve(undefined);
+    return apiResult();
+  });
   const notices: string[] = [];
-  const toast = { toast: (message: string) => notices.push(message) };
-  const utils = source<typeof import('../src/utils')>('utils.ts', { './store': {}, './toast': toast }, globals);
-  const dto = source<typeof import('../src/dto-contract')>('dto-contract.ts', {}, globals);
-  const resources = source<typeof import('../src/views/instance/resources')>(
-    'views/instance/resources.ts',
-    { '../../api': api, '../../dto-core': {}, '../../dto-contract': dto },
+  const toast = {
+    toast: (message: string) => notices.push(message),
+    errMessage: (error: unknown) => (error instanceof Error && error.message ? error.message : 'Unknown error'),
+  };
+  const resources = source<typeof import('../src/instances/detail/resources')>(
+    'instances/detail/resources.ts',
+    { 'instances/api': api },
     globals,
   );
-  const mutations = source<typeof import('../src/views/instance/bulk-actions')>(
-    'views/instance/bulk-actions.ts',
-    { '../../ui/Dialog': dialogs, '../../toast': toast, '../../utils': utils },
+  const mutations = source<typeof import('../src/instances/detail/bulk-actions')>(
+    'instances/detail/bulk-actions.ts',
+    { 'ui/Dialog': dialogs, 'app/toast': toast },
     globals,
   );
-  const actions = source<typeof import('../src/views/instance/screenshot-actions')>(
-    'views/instance/screenshot-actions.ts',
+  const actions = source<typeof import('../src/instances/detail/screenshot-actions')>(
+    'instances/detail/screenshot-actions.ts',
     {
-      '../../api': api,
-      '../../toast': toast,
-      '../../ui/Dialog': dialogs,
-      './instance-actions': {},
-      './bulk-actions': mutations,
-      '../../dto-contract': dto,
-      './resources': resources,
+      'instances/api': api,
+      'app/toast': toast,
+      'ui/Dialog': dialogs,
+      'instances/detail/instance-actions': {},
+      'instances/detail/bulk-actions': mutations,
     },
     globals,
   );
   const atoms = source<typeof import('../src/ui/Atoms')>(
     'ui/Atoms.tsx',
-    { './Icons': { Icon: 'Icon' }, './Face': { Face: 'Face' }, './motion': { glideThumb() {}, settleWidth() {} } },
+    { 'ui/Icons': { Icon: 'Icon' }, 'ui/Face': { Face: 'Face' }, 'ui/motion': { glideThumb() {}, settleWidth() {} } },
     globals,
   );
   const lightboxHooks = hooks();
   let mutation: Promise<void> | undefined;
   let shot = { name: 'before.png', size: 512, modified_at: '2026-10-04T12:00:00Z' };
   const renamed: string[] = [];
-  const lightbox = source<typeof import('../src/views/instance/components/screenshot-lightbox')>(
-    'views/instance/components/screenshot-lightbox.tsx',
+  const lightbox = source<typeof import('../src/instances/detail/components/screenshot-lightbox')>(
+    'instances/detail/components/screenshot-lightbox.tsx',
     {
       'preact/hooks': lightboxHooks,
-      '../../../ui/Modal': modal,
-      '../../../ui/Atoms': atoms,
-      '../../../format': source('format.ts', {}, globals),
-      '../instance-actions': {},
-      '../bulk-actions': mutations,
-      './resource-bits': { ResourceMutationStatus: 'ResourceMutationStatus' },
-      '../screenshot-actions': {
+      'ui/Modal': modal,
+      'ui/Atoms': atoms,
+      'ui/format': source('ui/format.ts', {}, globals),
+      'instances/detail/instance-actions': {},
+      'instances/detail/bulk-actions': mutations,
+      'instances/detail/components/resource-bits': { ResourceMutationStatus: 'ResourceMutationStatus' },
+      'instances/detail/screenshot-actions': {
         ...actions,
         renameScreenshot(...args: Parameters<typeof actions.renameScreenshot>) {
           mutation = actions.renameScreenshot(...args);
@@ -349,33 +297,33 @@ function harness(
     globals,
   );
   const paneHooks = hooks();
-  const pane = source<typeof import('../src/views/instance/tabs/ScreenshotsPane')>(
-    'views/instance/tabs/ScreenshotsPane.tsx',
+  const pane = source<typeof import('../src/instances/detail/tabs/ScreenshotsPane')>(
+    'instances/detail/tabs/ScreenshotsPane.tsx',
     {
       'preact/hooks': paneHooks,
-      '../../../ui/Icons': { Icon: 'Icon' },
-      '../../../ui/Atoms': atoms,
-      '../../../ui/Rows': { RowId: 'RowId', RowMenu: 'RowMenu' },
-      '../../../ui/Segmented': { Segmented: 'Segmented' },
-      '../../../ui/ContextMenu': {},
-      '../../../ui/SelectionActionTray': {
+      'ui/Icons': { Icon: 'Icon' },
+      'ui/Atoms': atoms,
+      'ui/Rows': { RowId: 'RowId', RowMenu: 'RowMenu' },
+      'ui/Segmented': { Segmented: 'Segmented' },
+      'ui/ContextMenu': {},
+      'ui/SelectionActionTray': {
         SelectionActionTray: 'SelectionActionTray',
         SelectionCheckbox: 'SelectionCheckbox',
       },
-      '../../../ui/selection': source('ui/selection.ts', { 'preact/hooks': paneHooks }, globals),
-      '../../../format': source('format.ts', {}, globals),
-      '../instance-actions': {},
-      '../components/pane': { Pane: 'Pane', PaneBar: 'PaneBar' },
-      '../components/screenshot-lightbox': lightbox,
-      '../screenshot-actions': actions,
-      '../bulk-actions': mutations,
+      'ui/selection': source('ui/selection.ts', { 'preact/hooks': paneHooks }, globals),
+      'ui/format': source('ui/format.ts', {}, globals),
+      'instances/detail/instance-actions': {},
+      'instances/detail/components/pane': { Pane: 'Pane', PaneBar: 'PaneBar' },
+      'instances/detail/components/screenshot-lightbox': lightbox,
+      'instances/detail/screenshot-actions': actions,
+      'instances/detail/bulk-actions': mutations,
     },
     globals,
   );
   let refreshes = 0;
   let paneTree: Node[] = [];
   let lightboxTree: Node[] = [];
-  let resourceState: import('../src/views/instance/resources').ResourceLoadState = {
+  let resourceState: import('../src/instances/detail/resources').ResourceLoadState = {
     status: 'ready',
     data: { ...resources.emptyResources(), screenshots: [shot, { ...shot, name: 'neighbor.png' }] },
   };
@@ -704,10 +652,16 @@ test('closing a prompt before its focus frame cannot focus its detached input', 
 
 function heldResponse() {
   let resolve!: (value: unknown) => void;
-  const promise = new Promise<unknown>((yes) => {
+  let reject!: (error: Error) => void;
+  const promise = new Promise<unknown>((yes, no) => {
     resolve = yes;
+    reject = no;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
+}
+
+function refusal(message: string): Error {
+  return Object.assign(new Error(message), { name: 'ApiError', status: 409, payload: { error: message } });
 }
 
 function submitScreenshotRename(h: ReturnType<typeof harness>) {
@@ -771,9 +725,8 @@ for (const outcome of ['success', 'refusal'] as const) {
     assert.equal(h.pendingFrames(), 0);
     assert.equal(h.focusListeners(), 0);
 
-    response.resolve(
-      outcome === 'success' ? { status: 'ok', name: 'after.png' } : { error: 'Screenshot name already exists.' },
-    );
+    if (outcome === 'success') response.resolve({ status: 'ok', name: 'after.png' });
+    else response.reject(refusal('Screenshot name already exists.'));
     await h.settled();
     h.frames();
     assert.equal(h.opener.disabled, false);

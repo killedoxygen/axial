@@ -1,45 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
+import { apiModule, loadSource } from './source';
 import type { PendingSkinStatus } from '../src/generated/PendingSkinStatus';
-import type { WardrobeContext } from '../src/machines/skin-wardrobe';
+import type { WardrobeContext } from '../src/accounts/wardrobe-state';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
-
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const output = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    output.outputText,
-    {
-      exports,
-      Error,
-      URLSearchParams,
-      require(id: string): unknown {
-        if (id === '@preact/signals') return { signal: <V>(value: V) => ({ value }) };
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed skin test dependency: ${id}`);
-      },
-      ...globals,
-    },
-    { filename },
-  );
-  return exports as T;
-}
+const signals = { signal: <V>(value: V) => ({ value }) };
 
 function deferred<T>() {
   let resolveValue!: (value: T) => void;
@@ -126,7 +91,7 @@ function harness(
   let cancelRead: (() => Promise<unknown>) | null = null;
   let confirm: () => Promise<boolean> = async () => true;
   const transport = {
-    async api(method: string, path: string, body?: unknown) {
+    async request(method: string, path: string, body?: unknown) {
       calls.push([method, path]);
       const url = new URL(path, 'http://skin-fixture.invalid');
       if (method === 'GET' && url.pathname === '/skins')
@@ -164,24 +129,21 @@ function harness(
     apiResourceUrl: (path: string) => path,
   };
   const defaults = { DEFAULT_SKINS: [{ id: 'steve', name: 'Steve', variant: 'classic', src: 'fixture.png' }] };
-  const api = source<typeof import('../src/views/accounts/api')>('views/accounts/api.ts', {
-    '../../api': transport,
-    '../../default-skins': defaults,
-  });
-  const machine = source<typeof import('../src/machines/skin-wardrobe')>(
-    'machines/skin-wardrobe.ts',
+  const api = apiModule<typeof import('../src/accounts/api')>('accounts/api.ts', transport.request);
+  const machine = loadSource<typeof import('../src/accounts/wardrobe-state')>(
+    'accounts/wardrobe-state.ts',
     {
-      '../api': transport,
-      '../default-skins': defaults,
-      '../views/accounts/api': { ...api, exportNativeSavedSkinPng: native.exportNativeSavedSkinPng },
-      '../toast': { toast: (message: string) => notices.push(message) },
-      '../ui/Dialog': { showConfirm: () => confirm() },
-      './accounts': {
+      '@preact/signals': signals,
+      'accounts/default-skins': defaults,
+      'accounts/api': { ...api, exportNativeSavedSkinPng: native.exportNativeSavedSkinPng },
+      'app/toast': { toast: (message: string) => notices.push(message) },
+      'ui/Dialog': { showConfirm: () => confirm() },
+      'accounts/state': {
         refreshAccountsData: async () => {
           accountRefreshes += 1;
         },
       },
-      '../player-skin': {
+      'accounts/player-skin': {
         FALLBACK_SKIN_ACCOUNT_KEY: 'account:fallback',
         launcherSkinAccountKey: (id: string) => `account:${id.trim()}`,
         hasSelectedSkinForAccount: (key: string) => preferences.has(key),
@@ -207,26 +169,25 @@ function harness(
   );
   const primitives = Object.fromEntries(
     ['CapePicker', 'SkinEditDialog', 'SkinFinder', 'SkinSnapshotImg', 'SkinStage', 'SkinUploadDialog', 'WearTile'].map(
-      (name) => [`./${name}`, { [name]: name }],
+      (name) => [`accounts/${name}`, { [name]: name }],
     ),
   );
-  primitives['./WearTile'] = { WearTile: 'WearTile', WearGrid: 'WearGrid' };
-  const { Wardrobe } = source<typeof import('../src/views/accounts/Wardrobe')>('views/accounts/Wardrobe.tsx', {
+  primitives['accounts/WearTile'] = { WearTile: 'WearTile', WearGrid: 'WearGrid' };
+  const { Wardrobe } = loadSource<typeof import('../src/accounts/Wardrobe')>('accounts/Wardrobe.tsx', {
     ...primitives,
-    '../../api': transport,
-    '../../default-skins': defaults,
-    '../../machines/skin-wardrobe': machine,
-    '../../player-skin': { profileCape: () => null },
-    '../../ui/Atoms': { Notice: 'Notice', Status: 'Status' },
-    '../../ui/Icons': { Icon: 'Icon' },
-    './api': api,
-    './types': { NO_CAPE_VALUE: '__none' },
-    './skin-menu': { savedSkinMenuItems: () => [] },
-    './use-palette-fit': { usePaletteFit: () => [Infinity, Infinity] },
-    './use-saved-skin-edit-workflow': { useSavedSkinEditWorkflow: () => ({ editReplacementDrop: {} }) },
-    './use-saved-skin-lookup-workflow': { useSavedSkinLookupWorkflow: () => ({}) },
-    './use-saved-skin-upload-workflow': { useSavedSkinUploadWorkflow: () => ({ uploadDrop: {} }) },
-    './use-saved-skin-native-drag-drop': { useSavedSkinNativeDragDrop() {} },
+    'accounts/default-skins': defaults,
+    'accounts/wardrobe-state': machine,
+    'accounts/player-skin': { profileCape: () => null },
+    'ui/Atoms': { Notice: 'Notice', Status: 'Status' },
+    'ui/Icons': { Icon: 'Icon' },
+    'accounts/api': api,
+    'accounts/types': { NO_CAPE_VALUE: '__none' },
+    'accounts/skin-menu': { savedSkinMenuItems: () => [] },
+    'accounts/use-palette-fit': { usePaletteFit: () => [Infinity, Infinity] },
+    'accounts/use-saved-skin-edit-workflow': { useSavedSkinEditWorkflow: () => ({ editReplacementDrop: {} }) },
+    'accounts/use-saved-skin-lookup-workflow': { useSavedSkinLookupWorkflow: () => ({}) },
+    'accounts/use-saved-skin-upload-workflow': { useSavedSkinUploadWorkflow: () => ({ uploadDrop: {} }) },
+    'accounts/use-saved-skin-native-drag-drop': { useSavedSkinNativeDragDrop() {} },
     'preact/hooks': { useRef: <V>(value: V) => ({ current: value }), useMemo: <V>(read: () => V) => read() },
     'preact/jsx-runtime': {
       jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }),
@@ -275,20 +236,16 @@ function harness(
 function inlineErrors(h: ReturnType<typeof harness>): unknown[] {
   return h
     .view()
-    .filter((node) => node.type === 'Notice' && node.props.tone === 'error')
+    .filter((node) => node.type === 'Notice' && node.props.tone === 'err')
     .map((node) => (node.props.children as ViewNode).props.children);
 }
 
 function nativeSkinBoundary(invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>) {
   const globals = { window: { __TAURI__: { core: { invoke } } }, File };
-  const native = source<typeof import('../src/native')>(
-    'native.ts',
-    { './dto-contract': source<typeof import('../src/dto-contract')>('dto-contract.ts', {}) },
-    globals,
-  );
-  const api = source<typeof import('../src/views/accounts/api')>(
-    'views/accounts/api.ts',
-    { '../../api': {}, '../../default-skins': { DEFAULT_SKINS: [] } },
+  const native = loadSource<typeof import('../src/platform/native')>('platform/native.ts', {}, globals);
+  const api = loadSource<typeof import('../src/accounts/api')>(
+    'accounts/api.ts',
+    { 'platform/transport': {} },
     globals,
   );
   return { ...native, exportNativeSavedSkinPng: api.exportNativeSavedSkinPng };
@@ -302,20 +259,21 @@ test('native picker validation failures reach the upload hook and wardrobe notic
       commands.push(command);
       throw message;
     });
-    const { useSavedSkinUploadWorkflow } = source<
-      typeof import('../src/views/accounts/use-saved-skin-upload-workflow')
-    >('views/accounts/use-saved-skin-upload-workflow.ts', {
-      '../../native': native,
-      '../../machines/skin-wardrobe': h.machine,
-      './api': h.api,
-      './types': { NO_CAPE_VALUE: '__none' },
-      './use-png-drop': { usePngDrop: () => ({}) },
-      'preact/hooks': {
-        useEffect() {},
-        useRef: <V>(value: V) => ({ current: value }),
-        useState: <V>(value: V) => [value, () => {}],
+    const { useSavedSkinUploadWorkflow } = loadSource<typeof import('../src/accounts/use-saved-skin-upload-workflow')>(
+      'accounts/use-saved-skin-upload-workflow.ts',
+      {
+        'platform/native': native,
+        'accounts/wardrobe-state': h.machine,
+        'accounts/api': h.api,
+        'accounts/types': { NO_CAPE_VALUE: '__none' },
+        'accounts/use-png-drop': { usePngDrop: () => ({}) },
+        'preact/hooks': {
+          useEffect() {},
+          useRef: <V>(value: V) => ({ current: value }),
+          useState: <V>(value: V) => [value, () => {}],
+        },
       },
-    });
+    );
     let browserPickerOpened = false;
     const workflow = useSavedSkinUploadWorkflow();
     workflow.fileInputRef.current = {
@@ -499,15 +457,12 @@ test('late cancellation from the previous account cannot cancel the new account 
 
 test('an unreadable wardrobe remains visibly unavailable', async () => {
   const h = harness();
-  h.setSkinsRead(async () => ({ error: 'Saved skins are locked.' }));
-  h.machine.setWardrobeContext(context());
-  await settle();
-  assert.equal(h.machine.wardrobeData.value.state, 'unavailable');
-  assert.deepEqual(inlineErrors(h), ['Saved skins returned an invalid response.']);
   h.setSkinsRead(async () => {
     throw new Error('Skin status could not be read.');
   });
-  await h.machine.refreshWardrobe();
+  h.machine.setWardrobeContext(context());
+  await settle();
+  assert.equal(h.machine.wardrobeData.value.state, 'unavailable');
   assert.deepEqual(inlineErrors(h), ['Skin status could not be read.']);
   assert.equal(h.timers.size, 0);
 });
@@ -663,31 +618,28 @@ for (const missingTarget of [false, true]) {
       },
     };
     const config = { value: { revision: 7, onboarding_done: false } };
-    const { finishOnboarding } = source<typeof import('../src/views/onboarding/finish')>(
-      'views/onboarding/finish.ts',
+    const call = async (method: string, path: string, body?: unknown) => {
+      calls.push({ method, path, body: JSON.stringify(body) });
+      if (path.startsWith('/skins/from-profile')) throw new Error('Stale fixture selection');
+      if (method === 'POST' && path === '/onboarding/complete') {
+        config.value.onboarding_done = true;
+        return { status: 'ok' };
+      }
+      if (method === 'GET' && path === '/config') return config.value;
+      throw new Error(`Unexpected onboarding request: ${method} ${path}`);
+    };
+    const { finishOnboarding } = loadSource<typeof import('../src/onboarding/finish')>(
+      'onboarding/finish.ts',
       {
-        '../../api': {
-          api: async (method: string, path: string, body: unknown) => {
-            calls.push({ method, path, body: JSON.stringify(body) });
-            if (path.startsWith('/skins/from-profile')) throw new Error('Stale fixture selection');
-            if (method === 'POST' && path === '/onboarding/complete') {
-              config.value.onboarding_done = true;
-              return {};
-            }
-            if (method === 'GET' && path === '/config') return config.value;
-            throw new Error(`Unexpected onboarding request: ${method} ${path}`);
-          },
-        },
-        '../../default-skins': { DEFAULT_SKINS: [{ id: 'steve' }] },
-        '../../dto-contract': { dtoError: () => null },
-        '../../dto-core': { configResponse: (value: unknown) => value },
-        '../../hooks/use-autosave': { saveConfigPatch: () => savedConfig.promise },
-        '../../machines/accounts': { accountsSnapshot },
-        '../../music': { Music: { applyConfig() {} } },
-        '../../player-skin': { refreshAccountSkin() {} },
-        '../../store': { config, systemInfo: { value: null } },
-        '../../utils': { getMemoryRecommendation: () => ({ rec: 4 }) },
-        '../accounts/api': {},
+        'accounts/default-skins': { DEFAULT_SKINS: [{ id: 'steve' }] },
+        'settings/api': apiModule('settings/api.ts', call),
+        'settings/autosave': { saveConfigPatch: () => savedConfig.promise },
+        'accounts/state': { accountsSnapshot },
+        'music/music': { Music: { applyConfig() {} } },
+        'accounts/player-skin': { refreshAccountSkin() {} },
+        'settings/state': { config, systemInfo: { value: null } },
+        'ui/MemoryField': { getMemoryRecommendation: () => ({ rec: 4 }) },
+        'accounts/api': apiModule('accounts/api.ts', call),
       },
       { console: { warn() {} } },
     );

@@ -1,88 +1,32 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import vm from 'node:vm';
 import test from 'node:test';
+import { apiModule, isApiError, loadSource as load, requireDependency } from './source';
+import { enrichedInstance, queueSnapshot } from './wire';
 
 /**
- * @typedef {{
- *   'src/preferences/local.ts': typeof import('../src/preferences/local'),
- *   'src/dto-contract.ts': typeof import('../src/dto-contract'),
- *   'src/native.ts': typeof import('../src/native'),
- *   'src/launch-notice-tracker.ts': typeof import('../src/launch-notice-tracker'),
- *   'src/launch-response-adapters.ts': typeof import('../src/launch-response-adapters'),
- *   'src/dto-install.ts': typeof import('../src/dto-install'),
- *   'src/dto-core.ts': typeof import('../src/dto-core'),
- *   'src/actions.ts': typeof import('../src/actions'),
- *   'src/hooks/use-autosave.ts': typeof import('../src/hooks/use-autosave'),
- *   'src/views/accounts/api.ts': typeof import('../src/views/accounts/api'),
- *   'src/machines/accounts.ts': typeof import('../src/machines/accounts'),
- *   'src/machines/accounts-state.ts': typeof import('../src/machines/accounts-state'),
- *   'src/machines/downloads.ts': typeof import('../src/machines/downloads'),
- *   'src/machines/download-view-models.ts': typeof import('../src/machines/download-view-models'),
- *   'src/install-item.ts': typeof import('../src/install-item'),
- *   'src/instance-readiness.ts': typeof import('../src/instance-readiness'),
- *   'src/state.ts': typeof import('../src/state'),
- *   'src/ui-state.ts': typeof import('../src/ui-state'),
- *   'src/bootstrap.ts': typeof import('../src/bootstrap'),
- * }} SourceModules
- * @typedef {import('../src/types-settings').Config} Config
+ * @typedef {import('../src/generated/ConfigView').ConfigView} Config
  * @typedef {Partial<Config> & { expected_revision: number, expected_account_selection_revision?: number }} ConfigPatch
  * @typedef {(method: string, path: string, patch?: ConfigPatch) => Promise<unknown>} ConfigApi
  * @typedef {[string, string, number | undefined]} RevisionCall
  */
 
-const frontendPath = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const frontendRoot = pathToFileURL(`${frontendPath}/`);
-const dependencyRequire = createRequire(new URL('package.json', frontendRoot));
-const ts = /** @type {typeof import('typescript')} */ (dependencyRequire('typescript'));
-const jsxRuntime = /** @type {typeof import('preact/jsx-runtime')} */ (dependencyRequire('preact/jsx-runtime'));
-const signals = /** @type {typeof import('@preact/signals')} */ (dependencyRequire('@preact/signals'));
+const signals = /** @type {typeof import('@preact/signals')} */ (requireDependency('@preact/signals'));
+const jsxRuntime = /** @type {typeof import('preact/jsx-runtime')} */ (requireDependency('preact/jsx-runtime'));
 /** @template T @param {T} value */
 const signal = (value) => signals.signal(value);
 
 /**
- * @template {keyof SourceModules} T
- * @param {T} path
- * @param {Record<string, unknown>} [imports]
+ * @param {string} path
+ * @param {Record<string, unknown>} [stubs]
  * @param {Record<string, unknown>} [globals]
- * @returns {SourceModules[T]}
+ * @returns {any}
  */
-function loadSource(path, imports = {}, globals = {}) {
-  const filename = fileURLToPath(new URL(path, frontendRoot));
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    outputText,
-    {
-      exports,
-      /** @param {string} id */
-      require(id) {
-        if (id === 'preact/jsx-runtime') return jsxRuntime;
-        if (id === '@preact/signals') return signals;
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed UI composition dependency: ${id}`);
-      },
-      Date,
-      Error,
-      setTimeout,
-      clearTimeout,
-      console: { error() {} },
-      ...globals,
-    },
-    { filename },
+function loadSource(path, stubs = {}, globals = {}) {
+  return load(
+    path.replace(/^src\//, ''),
+    { '@preact/signals': signals, 'preact/jsx-runtime': jsxRuntime, ...stubs },
+    { Date, console: { error() {}, warn() {} }, ...globals },
   );
-  return /** @type {SourceModules[T]} */ (exports);
 }
 
 /** @param {Array<[string, string]>} [entries] */
@@ -108,20 +52,12 @@ function storedValue(localStorage, key) {
   return value;
 }
 
-const preferences = loadSource('src/preferences/local.ts');
+const preferences = loadSource('src/app/preferences/local.ts');
 const browserPreferenceImports = {
-  './preferences/local': preferences,
-  './native': { hasNativeDesktopRuntime: () => false },
-  './preferences/persistence': { canEditPreferences: () => true },
+  'app/preferences/local': preferences,
+  'platform/native': { hasNativeDesktopRuntime: () => false },
+  'app/preferences/persistence': { canEditPreferences: () => true },
 };
-const contract = loadSource('src/dto-contract.ts');
-const notices = loadSource('src/launch-notice-tracker.ts');
-const sessions = loadSource('src/launch-response-adapters.ts', {
-  './dto-contract': contract,
-  './launch-notice-tracker': notices,
-});
-const installs = loadSource('src/dto-install.ts', { './dto-contract': contract });
-const core = loadSource('src/dto-core.ts', { './dto-contract': contract, './dto-install': installs });
 
 /** @param {Partial<Config>} [patch] @returns {Config} */
 function configSnapshot(patch = {}) {
@@ -152,39 +88,17 @@ function configSnapshot(patch = {}) {
   };
 }
 
-test('config decoding accepts the settings projection and requires exact revisions', () => {
-  const parsed = core.configResponse(configSnapshot());
-  assert.equal(JSON.stringify(parsed), JSON.stringify(configSnapshot()));
-  for (const revision of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.throws(() => core.configResponse(configSnapshot({ revision })), /revision/);
-    assert.throws(
-      () => core.configResponse(configSnapshot({ account_selection_revision: revision })),
-      /selection revision/,
-    );
-  }
-  assert.throws(
-    () => core.configResponse(configSnapshot({ account_selection_revision: undefined })),
-    /selection revision/,
-  );
-});
-
 /** @param {ConfigApi} api @param {Config} [initial] */
 function configWriterHarness(api, initial = configSnapshot()) {
-  const config = signal(initial);
-  const actions = loadSource('src/actions.ts', {
-    './store': { config },
-    './launch-response-adapters': sessions,
-  });
-  const writer = loadSource('src/hooks/use-autosave.ts', {
+  const settings = /** @type {typeof import('../src/settings/state')} */ (loadSource('src/settings/state.ts'));
+  settings.config.value = initial;
+  const writer = loadSource('src/settings/autosave.ts', {
     'preact/hooks': {},
-    '../actions': actions,
-    '../api': { api },
-    '../dto-core': core,
-    '../store': { config },
-    '../toast': { toast() {} },
-    '../utils': { errMessage: /** @param {Error} error */ (error) => error.message },
+    'settings/state': settings,
+    'settings/api': apiModule('settings/api.ts', /** @type {any} */ (api)),
+    'app/toast': { toast() {}, errMessage: /** @param {Error} error */ (error) => error.message },
   });
-  return { ...writer, config, setConfig: actions.setConfig };
+  return { ...writer, config: settings.config, setConfig: settings.setConfig };
 }
 
 function gate() {
@@ -298,8 +212,8 @@ test('a delayed failed-save reconciliation cannot replace newer settings or sele
   }
 });
 
-/** @param {{ invalidReply?: boolean, lostReply?: boolean, nativeInvoke?: (command: string) => Promise<unknown> }} [options] */
-function accountRenameHarness({ invalidReply = false, lostReply = false, nativeInvoke } = {}) {
+/** @param {{ lostReply?: boolean, nativeInvoke?: (command: string) => Promise<unknown> }} [options] */
+function accountRenameHarness({ lostReply = false, nativeInvoke } = {}) {
   const disabled = { state_id: 'offline', label: 'Offline', enabled: false };
   let account = {
     account_id: 'offline-before',
@@ -322,7 +236,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
   let selectionRevision = 4;
   /** @type {Array<[string, string, unknown]>} */
   const calls = [];
-  /** @type {Array<Parameters<typeof import('../src/toast').toast>>} */
+  /** @type {Array<Parameters<typeof import('../src/app/toast').toast>>} */
   const toasts = [];
   /** @type {string[]} */
   const errors = [];
@@ -331,24 +245,12 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       errors.push(message);
     },
   };
-  /** @param {string} id @param {boolean} launchable @returns {import('../src/types-instance').EnrichedInstance} */
+  /** @param {string} id @param {boolean} launchable @returns {import('../src/generated/EnrichedInstance').EnrichedInstance} */
   function instance(id, launchable) {
-    return {
+    return enrichedInstance({
       id,
       name: id,
       version_id: '1.21',
-      created_at: '2026-09-08T08:00:00Z',
-      java_selection: { kind: 'inherited' },
-      revision: 1,
-      version_display: {
-        loader_key: 'vanilla',
-        loader_label: 'Vanilla',
-        minecraft_label: '1.21',
-        loader_version_label: '',
-        loader_detail_label: '',
-        summary_label: '1.21',
-        supports_mods: false,
-      },
       launchable,
       launch_action: {
         state_id: launchable ? 'ready' : 'blocked',
@@ -357,17 +259,13 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
         launchable,
         primary_action: launchable ? 'launch' : 'blocked',
       },
-      saves_count: 0,
-      mods_count: 0,
-      resource_count: 0,
-      shader_count: 0,
-    };
+    });
   }
-  const store = {
-    config: signal(configSnapshot()),
-    instances: signal([instance('first', false), instance('second', false)]),
-    launchSessions: signal({}),
-  };
+  const settings = /** @type {typeof import('../src/settings/state')} */ (loadSource('src/settings/state.ts'));
+  settings.config.value = configSnapshot();
+  const instanceState = /** @type {typeof import('../src/instances/state')} */ (loadSource('src/instances/state.ts'));
+  instanceState.instances.value = [instance('first', false), instance('second', false)];
+  const store = { ...settings, ...instanceState, launchSessions: signal({}) };
   /** @type {(path: string, response: unknown) => Promise<unknown>} */
   let read = async (_path, response) => response;
   /**
@@ -384,7 +282,12 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       account = { ...account, account_id: 'offline-after', display_name: patch.username, account_revision: 3 };
       selectionRevision++;
       if (lostReply) throw new Error('Account response lost');
-      return { status: 'account_updated', account: invalidReply ? undefined : account };
+      return {
+        status: 'account_updated',
+        selection_revision: selectionRevision,
+        account,
+        view_model: { summary: 'Offline identity updated.' },
+      };
     }
     if (path === '/config')
       return read(
@@ -405,47 +308,45 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
       });
     throw new Error(`Unexpected account request ${method} ${path}`);
   };
-  const accountsApi = loadSource('src/views/accounts/api.ts', {
-    '../../api': { api, isApiError: () => false },
-    '../../default-skins': { DEFAULT_SKINS: [] },
-  });
-  const accountState = loadSource('src/machines/accounts-state.ts');
+  const accountsApi = apiModule('accounts/api.ts', /** @type {any} */ (api));
+  const accountState = /** @type {typeof import('../src/accounts/snapshot')} */ (
+    loadSource('src/accounts/snapshot.ts')
+  );
   const readiness = loadSource(
-    'src/instance-readiness.ts',
+    'src/instances/readiness.ts',
     {
-      './api': { api },
-      './dto-core': core,
-      './store': store,
-      './utils': utils,
+      'instances/api': apiModule('instances/api.ts', /** @type {any} */ (api)),
+      'settings/state': settings,
+      'instances/state': instanceState,
+      'launch/state': store,
+      'app/toast': utils,
     },
     { window: { setTimeout } },
   );
-  const machine = loadSource(
-    'src/machines/accounts.ts',
-    {
-      './accounts-state': accountState,
-      '../store': store,
-      '../actions': loadSource('src/actions.ts', { './store': store, './launch-response-adapters': sessions }),
-      '../api': { api, isApiError: () => false },
-      '../native': nativeInvoke
-        ? loadSource(
-            'src/native.ts',
-            { './dto-contract': contract },
-            { window: { __TAURI__: { core: { invoke: nativeInvoke } } } },
-          )
-        : {},
-      '../player-name': { promptPlayerName: async () => 'Renamed' },
-      '../player-skin': { refreshAccountSkin() {}, moveAccountSkin() {}, forgetAccountSkin() {} },
-      '../toast': {
-        toast: /** @param {Parameters<typeof import('../src/toast').toast>} args */ (...args) => toasts.push(args),
+  const machine = /** @type {typeof import('../src/accounts/state')} */ (
+    loadSource(
+      'src/accounts/state.ts',
+      {
+        'accounts/snapshot': accountState,
+        'settings/state': settings,
+        'settings/api': apiModule('settings/api.ts', /** @type {any} */ (api)),
+        'platform/transport': { isApiError },
+        'platform/native': nativeInvoke
+          ? loadSource('src/platform/native.ts', {}, { window: { __TAURI__: { core: { invoke: nativeInvoke } } } })
+          : {},
+        'accounts/player-name': { promptPlayerName: async () => 'Renamed' },
+        'accounts/player-skin': { refreshAccountSkin() {}, moveAccountSkin() {}, forgetAccountSkin() {} },
+        'app/toast': {
+          ...utils,
+          toast: /** @param {Parameters<typeof import('../src/app/toast').toast>} args */ (...args) =>
+            toasts.push(args),
+        },
+        'ui/Dialog': {},
+        'accounts/api': accountsApi,
+        'instances/readiness': readiness,
       },
-      '../ui/Dialog': {},
-      '../views/accounts/api': accountsApi,
-      '../dto-core': core,
-      '../instance-readiness': readiness,
-      '../utils': utils,
-    },
-    { console: { warn() {} } },
+      { console: { warn() {} } },
+    )
   );
   return {
     machine,
@@ -462,7 +363,7 @@ function accountRenameHarness({ invalidReply = false, lostReply = false, nativeI
   };
 }
 
-/** @param {SourceModules['src/machines/accounts.ts']} machine */
+/** @param {typeof import('../src/accounts/state')} machine */
 function activeAccount(machine) {
   const account = machine.activeAccount();
   assert.ok(account);
@@ -551,17 +452,6 @@ test('an acknowledged account change stays successful when readiness is unavaila
   assert.equal(h.calls.filter(([method]) => method === 'PATCH').length, 1);
 });
 
-test('invalid rename confirmation reconciles accounts without publishing success or replaying mutation', async () => {
-  const { machine, calls, toasts } = accountRenameHarness({ invalidReply: true });
-  await machine.refreshAccountsData();
-  assert.equal(await machine.renameOfflineAccount(activeAccount(machine), 'Renamed'), false);
-  assert.equal(activeAccount(machine).account_id, 'offline-after');
-  assert.ok(machine.accountsNotice.value);
-  assert.match(machine.accountsNotice.value, /invalid account response/);
-  assert.equal(calls.filter(([method]) => method !== 'GET').length, 1);
-  assert.equal(toasts.length, 0);
-});
-
 test('a lost committed account reply still refreshes readiness without replay or success', async () => {
   const { machine, calls, toasts } = accountRenameHarness({ lostReply: true });
   await machine.refreshAccountsData();
@@ -597,7 +487,7 @@ for (const accountless of [false, true]) {
     h.read(async (path, response) => {
       if (path === '/instances') return { instances: retained, last_instance_id: null };
       if (accountless && path === '/accounts')
-        return { ...contract.dtoRecord(response, 'Accounts'), active_account_id: null, accounts: [] };
+        return { .../** @type {Record<string, unknown>} */ (response), active_account_id: null, accounts: [] };
       return response;
     });
     await h.machine.refreshAccountsData();
@@ -632,7 +522,7 @@ for (const change of [
     const actionChange = change === 'online-action';
     let changed = false;
     h.read(async (path, response) => {
-      const value = contract.dtoRecord(response, 'Account fixture');
+      const value = /** @type {Record<string, unknown>} */ (response);
       if (
         changed &&
         ((change === 'config-unavailable' && path === '/config') ||
@@ -818,7 +708,7 @@ test('native sign-in cancellation releases busy for retry without weakening DTO 
 
 test('browser preferences persist edits and return independent preference maps', () => {
   const localStorage = storage();
-  const state = loadSource('src/state.ts', browserPreferenceImports, { localStorage });
+  const state = loadSource('src/app/local-state.ts', browserPreferenceImports, { localStorage });
   assert.equal(state.local.theme, 'obsidian');
   state.local.theme = 'birch';
   state.saveLocalState();
@@ -830,7 +720,7 @@ test('browser preferences persist edits and return independent preference maps',
 
 test('stored browser preferences validate values and recover with fresh defaults', () => {
   const localStorage = storage([['axial_ui', JSON.stringify({ theme: 'end', sounds: false })]]);
-  const state = loadSource('src/state.ts', browserPreferenceImports, { localStorage });
+  const state = loadSource('src/app/local-state.ts', browserPreferenceImports, { localStorage });
   assert.equal(state.local.theme, 'end');
   assert.equal(state.local.sounds, false);
   localStorage.setItem(state.STORAGE_KEY, JSON.stringify({ theme: 'unknown', customHue: 'red' }));
@@ -842,7 +732,7 @@ test('stored browser preferences validate values and recover with fresh defaults
 
 test('route restoration reads saved routes and rejects incomplete route identities', () => {
   const localStorage = storage();
-  const ui = loadSource('src/ui-state.ts', browserPreferenceImports, { localStorage });
+  const ui = loadSource('src/app/route.ts', browserPreferenceImports, { localStorage });
   ui.restoreRoute();
   const initialRoute = ui.route.value;
   assert.equal(initialRoute.name, 'home');
@@ -856,87 +746,22 @@ test('route restoration reads saved routes and rejects incomplete route identiti
   assert.equal(ui.route.value.name, 'content');
 });
 
-const progress = { phase_id: 'starting', label: 'Preparing', progress_pct: 0, terminal: false, failed: false };
-const action = { action: 'retry', label: 'Retry install', enabled: false, disabled_reason: 'Busy' };
-const failure = {
-  state_id: 'failed',
-  title: 'Install failed',
-  tone: 'err',
-  summary: 'Provider rejected download',
-  details: ['Retry when available'],
-  retry_action: action,
-  dismiss_action: { ...action, action: 'dismiss' },
-};
-function queue() {
-  return {
-    queue_epoch: 'queue-1',
-    revision: 7,
-    registry_revision: 1,
-    items: [],
-    view_model: {
-      state_id: 'idle',
-      status_label: 'Idle',
-      title: 'Downloads',
-      summary: '',
-      queued_count: 0,
-      queued_count_label: '0',
-      queued_item_label: 'items',
-      section_title: 'Queue',
-      empty_title: 'No downloads',
-      empty_summary: '',
-    },
-    failures: [
-      {
-        failed_at_ms: 1788854400000,
-        queue_id: 'q1',
-        install_id: 'i1',
-        operation_id: 'o1',
-        label: 'Minecraft',
-        install_item: { version_id: '1.21.1' },
-        failure_view_model: failure,
-      },
-    ],
-  };
-}
-
-test('queue decoding preserves producer revision, failure identity, timestamp and action authority', () => {
-  const parsed = installs.installQueueStateResponse(queue());
-  assert.equal(parsed.revision, 7);
-  const [failed] = parsed.failures;
-  assert.equal(parsed.failures.length, 1);
-  assert.equal(failed.queue_id, 'q1');
-  assert.equal(failed.failed_at_ms, 1788854400000);
-  assert.equal(failed.failure_view_model.retry_action.enabled, false);
-  assert.equal(failed.failure_view_model.retry_action.disabled_reason, 'Busy');
-  assert.equal(installs.installQueueStateResponse({ ...queue(), failures: undefined }).failures.length, 0);
-  for (const revision of [undefined, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.throws(() => installs.installQueueStateResponse({ ...queue(), revision }));
-  }
-});
-
-test('status decoding requires explicit outcome and allowed actions without inventing terminal success', () => {
-  const status = {
-    revision: 2,
-    queue_id: 'q',
-    outcome: null,
-    allowed_actions: [],
-    install_id: 'i',
-    operation_id: 'o',
-    done: false,
-    view_model: progress,
-  };
-  assert.equal(installs.installStatusResponse(status).outcome, null);
-  assert.equal(installs.installStatusResponse({ ...status, outcome: 'cancelled' }).outcome, 'cancelled');
-  assert.throws(() => installs.installStatusResponse({ ...status, outcome: undefined }));
-  assert.throws(() => installs.installStatusResponse({ ...status, allowed_actions: undefined }));
-});
-
+/** @param {Partial<import('../src/generated/SessionSnapshot').SessionSnapshot>} [overrides] @returns {import('../src/generated/SessionSnapshot').SessionSnapshot} */
 function session(overrides = {}) {
   return {
     instance_id: 'instance-1',
     session_id: 'session-1',
     launched_at: '2026-09-08T08:00:00Z',
     revision: 4,
+    phase: 'running',
+    started_at_ms: null,
+    pid: null,
+    process_alive: true,
+    stop_allowed: true,
+    exit_code: null,
+    tree_settled: false,
+    output_drained: false,
+    boot_observed: true,
     view_model: {
       state_id: 'running',
       label: 'Playing',
@@ -953,43 +778,35 @@ function session(overrides = {}) {
 }
 
 test('session hydration restores backend process controls and excludes explicitly terminal sessions', () => {
+  const launch = /** @type {typeof import('../src/launch/state')} */ (loadSource('src/launch/state.ts'));
   const active = session();
   const terminal = session({
     instance_id: 'ended',
     session_id: 'ended-session',
     view_model: { ...active.view_model, terminal: true, playing: false, process_live: false, can_stop: false },
-    outcome: { kind: 'clean', reason: 'clean_exit', summary: 'Game closed' },
+    outcome: { kind: 'clean', reason: 'clean_exit', failure_class: null, summary: 'Game closed' },
   });
-  const parsed = sessions.launchSessionsResponse({ sessions: [active, terminal] });
+  const parsed = launch.liveSessions([active, terminal]);
   assert.equal(parsed['instance-1'].sessionId, 'session-1');
   assert.equal(parsed['instance-1'].statusRevision, 4);
   assert.equal(parsed['instance-1'].viewModel.can_stop, true);
   assert.equal(parsed.ended, undefined);
-  assert.throws(() => sessions.launchSessionsResponse({ sessions: [active, active] }));
-  assert.throws(() => sessions.launchSessionsResponse({ sessions: [session({ revision: -1 })] }));
-  assert.throws(() => sessions.launchSessionsResponse({ sessions: [session({ launched_at: 'invalid' })] }));
+  assert.throws(() => launch.liveSessions([active, active]));
 });
 
 /** @param {{queueFailure?: boolean, registryFailure?: boolean, sessionFailure?: boolean, activeSessions?: ReturnType<typeof session>[], optionalFailure?: boolean}} [options] */
-function bootstrapHarness({ queueFailure = false, registryFailure = false, sessionFailure = false, activeSessions = [], optionalFailure = false } = {}) {
-  /** @type {Record<string, {value: unknown}> & {launchSessions: {value: ReturnType<typeof sessions.launchSessionsResponse>}}} */
-  const store = {
-    ...Object.fromEntries(
-      [
-        'appVersion',
-        'bootstrapError',
-        'bootstrapState',
-        'config',
-        'devMode',
-        'instances',
-        'lastInstanceId',
-        'systemInfo',
-        'versions',
-      ].map((key) => [key, signal(/** @type {unknown} */ (null))]),
-    ),
-    launchSessions: signal(/** @type {ReturnType<typeof sessions.launchSessionsResponse>} */ ({})),
-    launchState: signal({ status: 'idle' }),
-  };
+function bootstrapHarness({
+  queueFailure = false,
+  registryFailure = false,
+  sessionFailure = false,
+  activeSessions = [],
+  optionalFailure = false,
+} = {}) {
+  const appStore = /** @type {typeof import('../src/app/store')} */ (loadSource('src/app/store.ts'));
+  const settings = /** @type {typeof import('../src/settings/state')} */ (loadSource('src/settings/state.ts'));
+  const instanceState = /** @type {typeof import('../src/instances/state')} */ (loadSource('src/instances/state.ts'));
+  const launch = /** @type {typeof import('../src/launch/state')} */ (loadSource('src/launch/state.ts'));
+  const store = { ...appStore, ...settings, ...instanceState, ...launch };
   /** @type {Array<[string, string]>} */
   const calls = [];
   /** @type {Array<[string, string]>} */
@@ -1001,21 +818,16 @@ function bootstrapHarness({ queueFailure = false, registryFailure = false, sessi
   /** @type {Record<string, unknown>} */
   const values = {
     '/config': { onboarding_done: true },
-    '/status': { dev_mode: true, setup_required: false },
+    '/status': { dev_mode: true, setup_required: false, warnings: [] },
     '/system': {},
     '/music/status': { count: 0 },
     '/versions': { versions: [] },
     '/instances': { instances: [{ id: 'instance-1', name: 'World' }], last_instance_id: 'instance-1' },
     '/launch/sessions': { sessions: activeSessions },
-    '/install/queue': {
-      queue_epoch: 'bootstrap', revision: 1, registry_revision: 0, active: null, items: [], failures: [],
-      view_model: { state_id: 'empty', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,
-        queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' },
-    },
+    '/install/queue': queueSnapshot({ queue_epoch: 'bootstrap', revision: 1, registry_revision: 0, failures: [] }),
   };
-  const api = {
-    initializeApiBase: async () => {},
-    api: /** @param {string} method @param {string} path */ async (method, path) => {
+  const transport = {
+    request: /** @param {string} method @param {string} path */ async (method, path) => {
       calls.push([method, path]);
       if (path === '/install/queue') {
         queueAttempts++;
@@ -1028,54 +840,50 @@ function bootstrapHarness({ queueFailure = false, registryFailure = false, sessi
       return values[path];
     },
   };
-  const downloads = loadSource('src/machines/downloads.ts', {
-    '../api': api, '../utils': { errMessage: String, showError() {} }, '../toast': { toast() {} },
-    '../loaders/api': { connectInstallQueueSSE: () => () => {} }, '../store': store,
-    '../content-activity': { markContentChanged() {} }, '../dto-install': installs,
-    '../dto-core': { versionsResponse: /** @param {unknown} value */ (value) => value,
-      instancesResponse: /** @param {unknown} value */ (value) => value },
-    '../install-item': loadSource('src/install-item.ts'),
-    './download-view-models': loadSource('src/machines/download-view-models.ts'),
+  const call = /** @type {any} */ (transport.request);
+  const toast = { toast() {}, showError() {}, errMessage: /** @param {Error} error */ (error) => error.message };
+  const downloads = loadSource('src/install/queue.ts', {
+    'app/toast': toast,
+    'install/api': apiModule('install/api.ts', call),
+    'instances/api': apiModule('instances/api.ts', call),
+    'settings/state': settings,
+    'instances/state': instanceState,
+    'launch/state': launch,
+    'content/activity': { markContentChanged() {} },
+    'install/item': loadSource('src/install/item.ts'),
+    'install/presenters': loadSource('src/install/presenters.ts'),
   });
   const bootstrap = loadSource(
-    'src/bootstrap.ts',
+    'src/app/bootstrap.ts',
     {
-      './api': api,
-      './App': { preloadDeferredViews() {} },
-      './dto-contract': contract,
-      './dto-core': Object.fromEntries(
-        [
-          'configResponse',
-          'instancesResponse',
-          'launcherStatusResponse',
-          'musicStatusResponse',
-          'systemInfoResponse',
-          'versionsResponse',
-        ].map((name) => [name, /** @param {unknown} value */ (value) => value]),
-      ),
-      './machines/downloads': downloads,
-      './launch': {
+      'platform/transport': { initializeApiBase: async () => {} },
+      'app/App': { preloadDeferredViews() {} },
+      'settings/api': apiModule('settings/api.ts', call),
+      'music/api': apiModule('music/api.ts', call),
+      'launch/api': apiModule('launch/api.ts', call),
+      'install/queue': downloads,
+      'launch/controller': {
         reconnectLaunchSession: /** @param {string} id @param {string} name */ (id, name) => {
           assert.ok(store.launchSessions.value);
           assert.equal(store.launchSessions.value[id].sessionId, 'session-1');
           reconnects.push([id, name]);
         },
       },
-      './launch-response-adapters': sessions,
-      './music': { Music: { setTrackCount() {}, applyConfig() {}, enabled: false } },
-      './native': { getNativeAppVersion: async () => null, hasNativeDesktopRuntime: () => false },
-      './preferences/persistence': {},
-      './sound': {},
-      './machines/accounts': { refreshAccountsData: async () => {} },
-      './state': { local: { theme: 'obsidian' } },
-      './store': store,
-      './startup-warnings': { startupWarningMessages: () => [] },
-      './theme': { applyConfigTheme() {} },
-      './toast': { toast() {} },
-      './ui-state': { route: signal({ name: 'home' }), showOnboardingOverlay: signal(false) },
-      './updater': { scheduleAutoUpdateCheck() {} },
-      './utils': { errMessage: /** @param {Error} error */ (error) => error.message },
-      './views/home/HomeView': { warmHome: async () => {} },
+      'music/music': { Music: { setTrackCount() {}, applyConfig() {}, enabled: false } },
+      'platform/native': { getNativeAppVersion: async () => null, hasNativeDesktopRuntime: () => false },
+      'app/preferences/persistence': {},
+      'app/sound': {},
+      'accounts/state': { refreshAccountsData: async () => {} },
+      'app/local-state': { local: { theme: 'obsidian' } },
+      'app/store': appStore,
+      'settings/state': settings,
+      'instances/state': instanceState,
+      'launch/state': launch,
+      'app/theme': { applyConfigTheme() {} },
+      'app/toast': toast,
+      'app/route': { route: signal({ name: 'home' }), showOnboardingOverlay: signal(false) },
+      'update/updater': { scheduleAutoUpdateCheck() {} },
+      'home/HomeView': { warmHome: async () => {} },
     },
     { window: { requestIdleCallback() {}, addEventListener() {} } },
   );
@@ -1094,7 +902,10 @@ function bootstrapHarness({ queueFailure = false, registryFailure = false, sessi
       failSessions = false;
     },
     changeReadiness() {
-      values['/instances'] = { instances: [{ id: 'instance-1', name: 'Updated world' }], last_instance_id: 'instance-1' };
+      values['/instances'] = {
+        instances: [{ id: 'instance-1', name: 'Updated world' }],
+        last_instance_id: 'instance-1',
+      };
     },
     queueAttempts: () => queueAttempts,
   };
@@ -1130,7 +941,7 @@ test('bootstrap uses the install owner initial projection and retries its failur
   await harness.bootstrap.startApplicationBootstrap();
   assert.equal(harness.store.bootstrapState.value, 'error');
   assert.equal(harness.store.bootstrapError.value, 'Registry state unavailable');
-  assert.equal(harness.store.instances.value, null);
+  assert.equal(harness.store.instances.value.length, 0);
   assert.deepEqual(harness.reconnects, []);
   assert.equal(harness.calls.filter(([, path]) => path === '/instances').length, 1);
   harness.recoverRegistry();

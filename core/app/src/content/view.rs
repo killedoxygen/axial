@@ -15,8 +15,9 @@ use super::{
 };
 use crate::instances::model::InstanceId;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TargetRef {
     Instance {
@@ -24,12 +25,13 @@ pub enum TargetRef {
     },
     Draft {
         #[serde(default)]
+        #[ts(optional = nullable)]
         loader: Option<String>,
         game_version: String,
     },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct PlanItem {
     pub canonical_id: CanonicalId,
     pub title: String,
@@ -39,22 +41,27 @@ pub struct PlanItem {
     pub version_number: String,
     pub filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub sha1: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub sha512: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub size: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional = nullable)]
     pub dependencies: Vec<ContentDependency>,
     pub reason: ResolutionReason,
     pub already_installed: bool,
     pub update: bool,
     /// An untracked file already at this destination.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub existing_file: Option<ExistingFileState>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ExistingFileState {
     /// Same bytes as the planned file; it is adopted without downloading.
@@ -63,23 +70,27 @@ pub enum ExistingFileState {
     Different,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct PlanConflict {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub canonical_id: Option<CanonicalId>,
     /// The project the conflict is about, when its metadata was resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub title: Option<String>,
     pub kind: ResolutionConflictKind,
     pub detail: String,
     /// Instance-relative file a replacement decision names.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub path: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct ResolutionPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub instance_id: Option<String>,
     pub loader: String,
     pub game_version: String,
@@ -218,17 +229,18 @@ pub async fn preview_draft(
     .await
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallState {
     Installed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct SearchItem {
     #[serde(flatten)]
     pub content: CanonicalContent,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub install_state: Option<InstallState>,
 }
 
@@ -264,13 +276,13 @@ pub async fn search(
     })
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct InstalledContent {
     pub entries: Vec<InstalledEntry>,
     pub packs: Vec<InstalledPack>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct InstalledEntry {
     pub canonical_id: CanonicalId,
     pub kind: ContentKind,
@@ -280,13 +292,15 @@ pub struct InstalledEntry {
     pub filename: String,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional = nullable)]
     pub required_by: Vec<CanonicalId>,
 }
 
 /// Pack provenance owns no file; its recorded paths only mark membership.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct InstalledPack {
     pub canonical_id: CanonicalId,
     pub provider: ProviderId,
@@ -294,8 +308,10 @@ pub struct InstalledPack {
     pub version_id: String,
     pub paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub version_number: Option<String>,
 }
 
@@ -340,12 +356,12 @@ pub fn installed(manifest: &ContentManifest, live: &LiveManagedContent) -> Insta
     InstalledContent { entries, packs }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct CompatibilityResponse {
     pub candidates: Vec<super::compatibility::CompatCandidate>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct UpdatesResponse {
     pub updates: Vec<resolve::AvailableUpdate>,
 }
