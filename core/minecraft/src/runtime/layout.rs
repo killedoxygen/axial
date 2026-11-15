@@ -327,6 +327,10 @@ impl ManagedRuntimeLaunchReceipt {
         }
     }
 
+    pub fn component(&self) -> &ManagedRuntimeComponent {
+        &self.inner.component
+    }
+
     pub fn validate_program(&self, program: &Path) -> std::io::Result<()> {
         if program != self.inner.program_path {
             return Err(std::io::Error::new(

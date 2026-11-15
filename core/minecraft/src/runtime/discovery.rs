@@ -13,6 +13,7 @@ use super::model::{
 use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
 use crate::portable_path::PortableRelativePath;
+use sha2::Digest as _;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +128,61 @@ impl ManagedRuntimeCache {
     pub fn component_root_for_test(&self, component: &str) -> Option<PathBuf> {
         self.component_root(component)
     }
+
+    /// Writes a ready component whose only file is `java` with these bytes,
+    /// its exact manifest proof and its ready marker. Returns the executable.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn write_ready_component_for_test(
+        &self,
+        component: &str,
+        java: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        use sha1::Digest as _;
+        let root = self
+            .component_root(component)
+            .ok_or_else(|| std::io::Error::other("unknown runtime component"))?;
+        let executable = super::layout::java_executable(&root);
+        std::fs::create_dir_all(executable.parent().expect("executable parent"))?;
+        std::fs::write(&executable, java)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let relative = runtime_java_relative_path();
+        let mut files = serde_json::Map::new();
+        files.insert(
+            relative.into(),
+            serde_json::json!({"type": "file", "executable": cfg!(unix), "downloads": {"raw": {
+                "url": "https://example.invalid/java",
+                "sha1": format!("{:x}", sha1::Sha1::digest(java)),
+                "size": java.len(),
+            }}}),
+        );
+        if cfg!(windows) {
+            let config = root.join("lib").join("jvm.cfg");
+            std::fs::create_dir_all(config.parent().expect("config parent"))?;
+            std::fs::write(&config, b"jvm")?;
+            files.insert(
+                "lib/jvm.cfg".into(),
+                serde_json::json!({"type": "file", "downloads": {"raw": {
+                    "url": "https://example.invalid/jvm.cfg",
+                    "sha1": format!("{:x}", sha1::Sha1::digest(b"jvm")),
+                    "size": 3,
+                }}}),
+            );
+        }
+        let manifest =
+            serde_json::from_value::<ComponentManifest>(serde_json::json!({ "files": files }))
+                .map_err(std::io::Error::other)?;
+        std::fs::write(
+            root.join(COMPONENT_MANIFEST_PROOF_FILE),
+            component_manifest_proof_bytes(&manifest)
+                .map_err(|_| std::io::Error::other("manifest"))?,
+        )?;
+        std::fs::write(root.join(".axial-ready"), b"ready")?;
+        Ok(executable)
+    }
 }
 
 impl ManagedRuntimeComponent {
@@ -197,7 +253,7 @@ impl ManagedRuntimeComponent {
             && self.validate_projection().is_ok()
     }
 
-    fn persisted_manifest(&self) -> Option<ComponentManifest> {
+    fn persisted_manifest(&self) -> Option<(ComponentManifest, [u8; 32])> {
         self.validate_projection().ok()?;
         let guard = self
             .root
@@ -226,23 +282,33 @@ impl ManagedRuntimeComponent {
             return None;
         }
         self.validate_projection().ok()?;
-        Some(manifest)
+        Some((manifest, sha2::Sha256::digest(&bytes).into()))
     }
 
+    /// Verifies exact tree membership, kinds, links, executable bits and every
+    /// file digest against the persisted manifest proof. A file this process
+    /// already hashed in full at its exact unchanged revision is not reread;
+    /// the first verification after a restart hashes every byte.
     pub fn contents_verified(&self) -> bool {
-        let Some(manifest) = self.persisted_manifest() else {
-            return false;
-        };
+        self.verified_manifest().is_some()
+    }
+
+    /// `contents_verified`, returning the SHA-256 of the verified manifest
+    /// proof: the identity of the exact runtime build these contents are.
+    pub fn verified_manifest(&self) -> Option<[u8; 32]> {
+        let (manifest, digest) = self.persisted_manifest()?;
         if !self.executable_ready() {
-            return false;
+            return None;
         }
         let (_sender, cancellation) = crate::cancellation::channel();
-        super::install::managed_runtime_tree_matches_manifest(
+        (super::install::managed_runtime_tree_matches_manifest(
             &RuntimeId::from(self.component.clone()),
             &self.root,
             &manifest,
+            crate::managed::fs::DigestProof::Reverified,
             &cancellation.thread(),
-        ) && self.validate_projection().is_ok()
+        ) && self.validate_projection().is_ok())
+        .then_some(digest)
     }
 }
 

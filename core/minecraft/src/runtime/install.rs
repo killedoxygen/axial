@@ -23,7 +23,9 @@ use super::model::{
     RuntimeSourceFailureKind,
 };
 use crate::cancellation::{Cancellation, ThreadCancellation};
-use crate::managed::fs::{ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents};
+use crate::managed::fs::{
+    DigestProof, ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents,
+};
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
 use futures_util::StreamExt;
@@ -1178,6 +1180,7 @@ async fn runtime_tree_matches_source_inner(
                 &component,
                 &root,
                 &source_manifest,
+                DigestProof::Full,
                 &worker_cancellation,
             )
         })
@@ -1196,6 +1199,7 @@ pub(super) fn managed_runtime_tree_matches_manifest(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
+    proof: DigestProof,
     cancellation: &ThreadCancellation,
 ) -> bool {
     // One validation window for the whole tree; a failed close refuses it.
@@ -1206,6 +1210,7 @@ pub(super) fn managed_runtime_tree_matches_manifest(
                     component,
                     root,
                     manifest,
+                    proof,
                     cancellation,
                 ))
             },
@@ -1219,6 +1224,7 @@ fn managed_runtime_tree_matches(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
+    proof: DigestProof,
     cancellation: &ThreadCancellation,
 ) -> bool {
     let Ok(expected_proof) = component_manifest_proof_bytes(manifest) else {
@@ -1341,15 +1347,22 @@ fn managed_runtime_tree_matches(
                     return false;
                 };
                 if root
-                    .verify_relative_file_sha1(&mut parents, &relative_path, size, &sha1, || {
-                        if cancellation.is_cancelled() {
-                            Err(crate::loaders::types::LoaderError::Verify(
-                                "runtime verification was cancelled".to_string(),
-                            ))
-                        } else {
-                            Ok(())
-                        }
-                    })
+                    .verify_relative_file_sha1(
+                        &mut parents,
+                        &relative_path,
+                        size,
+                        &sha1,
+                        proof,
+                        || {
+                            if cancellation.is_cancelled() {
+                                Err(crate::loaders::types::LoaderError::Verify(
+                                    "runtime verification was cancelled".to_string(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
                     .is_err()
                 {
                     return false;

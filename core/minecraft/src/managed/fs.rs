@@ -183,6 +183,15 @@ struct ManagedFileProof {
     capability: Mutex<Option<FileCapability>>,
 }
 
+/// How a manifest file digest is established.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DigestProof {
+    /// Rehash every byte: publication and mutation admission.
+    Full,
+    /// Reuse this process's full hash of the exact unchanged revision.
+    Reverified,
+}
+
 /// Bounds retained digests; clearing only forces later full hashes.
 const MAX_VERIFIED_SHA1_REVISIONS: usize = 1 << 16;
 
@@ -2034,14 +2043,17 @@ impl ManagedDir {
         ))
     }
 
-    /// Fully hashes `relative` beneath this directory. `parents` reuses the
-    /// directories opened for the previous path from this same directory.
+    /// Verifies `relative` beneath this directory against its manifest digest.
+    /// `Full` always rehashes; `Reverified` accepts this process's earlier full
+    /// hash only while the name still binds that exact file revision. `parents`
+    /// reuses the directories opened for the previous path from this directory.
     pub(crate) fn verify_relative_file_sha1(
         &self,
         parents: &mut ManagedRelativeParents,
         relative: &PortableRelativePath,
         expected_size: u64,
         expected_sha1: &[u8; 20],
+        proof: DigestProof,
         mut check: impl FnMut() -> Result<(), LoaderError>,
     ) -> Result<(), LoaderError> {
         let (parent_path, name) = relative
@@ -2052,14 +2064,21 @@ impl ManagedDir {
         let guard = directory
             .inspect_regular_file(name)?
             .ok_or_else(|| LoaderError::Verify("managed runtime file is absent".to_string()))?;
-        if guard.size != expected_size
-            || directory.sha1_guarded_file_bytes_with_check(
+        let digest = match proof {
+            DigestProof::Full => directory.sha1_guarded_file_bytes_with_check(
                 name,
                 &guard,
                 expected_size,
                 &mut check,
-            )? != *expected_sha1
-        {
+            ),
+            DigestProof::Reverified => directory.sha1_reverified_file_bytes_with_check(
+                name,
+                &guard,
+                expected_size,
+                &mut check,
+            ),
+        };
+        if guard.size != expected_size || digest? != *expected_sha1 {
             return Err(LoaderError::Verify(
                 "managed runtime file failed integrity verification".to_string(),
             ));
