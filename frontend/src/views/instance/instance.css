@@ -13,12 +13,12 @@
   overflow-y: scroll;
 }
 .cp-instance > .cp-vista {
-  /* The name, the facts and Launch keep nearly bare panel; the picture is whole from just past them, and gone by
-     the pane's first row. */
-  --vista-left-from: 260px;
-  --vista-left-to: 620px;
-  --vista-left-floor: 0.06;
-  --vista-foot-from: 30%;
+  /* A shallow picture of its own off the panel's top-right corner: the building whole, the land to either side
+     of it, and the water's edge. The name, the facts and Launch keep nearly bare panel; the picture is whole
+     only past the middle, and gone by the pane's first row. */
+  --vista-left-from: 2%;
+  --vista-left-to: 70%;
+  --vista-foot-from: 50%;
   /* So does the tabs' row, in a long low lens. */
   --vista-clear: radial-gradient(
     ellipse 1000px 70px at 0 236px,
@@ -34,9 +34,10 @@
     oklch(0 0 0 / 0.985) 96.8%,
     oklch(0 0 0 / 1) 100%
   );
-  width: 100%;
-  height: 312px;
+  width: 76%;
+  height: 288px;
   aspect-ratio: auto;
+  object-position: right top;
 }
 
 .cp-instance-head {

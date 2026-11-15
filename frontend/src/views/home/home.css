@@ -1,8 +1,16 @@
-/* Home reads from the top-left like every page: the hello where a page title sits, then, at the panel's foot, the
-   last-played instance as display type with its facts and Play, standing on the library's one shelf of covers.
-   That instance's world fills the panel above the shelf, whatever the window's shape. */
+/* Home reads from the top-left like every page: the hello where a page title sits, then the last-played instance
+   as display type with its facts and Play, then the library's one shelf of square tiles. Behind them, from the
+   panel's top, lies that instance's world; the panel below the shelf stays bare.
+
+   The picture sets the page's measure. It is as wide as the panel and a set share of that high, and no higher
+   than leaves the shelf its room in a low window. The name stands a set share of the way down it, and the
+   shelf's tiles begin where it ends, whatever the window's size. */
 .cp-home {
-  --home-cover: clamp(120px, 20vh, 200px);
+  --home-cover: 120px;
+  --home-art: min(
+    (100vw - var(--cp-rail-w)) * 0.88 / 2.3,
+    (100vh - var(--chrome-h) - var(--home-cover) - 56px) / 0.944
+  );
   position: relative;
   gap: 0;
   min-height: 100%;
@@ -11,10 +19,18 @@
 .cp-home > :not(.cp-vista) {
   position: relative;
 }
-/* The picture stops short of the shelf: its heading, covers, titles and the page's foot. */
+/* It runs the panel's whole width, a little of its sky and its water left out above and below. Leftwards it thins
+   out slowly, faint under the hello and the name and whole from the middle on, where the building stands; below
+   the building's foot it runs out to nothing. */
 .cp-home > .cp-vista {
-  height: calc(100% - 96px - var(--home-cover));
+  --vista-left-from: 8%;
+  --vista-left-to: 52%;
+  --vista-left-floor: 0.1;
+  --vista-foot-from: 64%;
+  width: 100%;
+  height: var(--home-art);
   aspect-ratio: auto;
+  object-position: right center;
 }
 .cp-home-hello {
   display: flex;
@@ -31,8 +47,10 @@
   flex-direction: column;
   align-items: flex-start;
   min-width: 0;
-  margin-top: auto;
-  padding-top: 24px;
+  /* From under the hello to 38.5% of the way down the picture; then to 94.4%, less the shelf's heading. */
+  min-height: calc(var(--home-art) * 0.559 - 40px);
+  margin-top: max(40px, var(--home-art) * 0.385 - 22px - var(--h-lg));
+  padding-bottom: 40px;
 }
 /* Pulled left by the first letter's side bearing, so its stem shares the chips' and the buttons' edge. */
 .cp-home-name {
@@ -40,10 +58,10 @@
   margin: 0 0 0 -3px;
   overflow: hidden;
   color: var(--text);
-  font-size: clamp(48px, 4vw, 84px);
+  font-size: clamp(48px, 4.375vw, 84px);
   font-weight: 700;
   letter-spacing: -0.028em;
-  line-height: 1.14;
+  line-height: 1.143;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
@@ -62,7 +80,6 @@
 
 .cp-home-shelf {
   min-width: 0;
-  padding-top: clamp(28px, 5vh, 56px);
 }
 .cp-home-shelf .cp-head {
   margin-bottom: 12px;
@@ -75,13 +92,12 @@
   align-items: flex-start;
   gap: 28px;
 }
-/* A cover is the instance's tile until its own world is drawn over it. */
 .cp-home-item {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   flex: none;
-  width: calc(var(--home-cover) * 1.6);
+  width: var(--home-cover);
   padding: 0;
   border: 0;
   border-radius: var(--hold-xl);
@@ -106,15 +122,9 @@
     scale var(--t-pop) var(--ease-out),
     background var(--t-quick) var(--ease-out);
 }
-.cp-home-cover > :is(.cp-tile, .cp-vista) {
+.cp-home-cover > .cp-tile {
   width: 100%;
   height: 100%;
-}
-.cp-home-cover > .cp-vista {
-  aspect-ratio: auto;
-  object-position: center;
-  -webkit-mask-image: none;
-  mask-image: none;
 }
 .cp-home-item:hover .cp-home-cover {
   scale: 1.03;

@@ -6,8 +6,8 @@ const DATABASE = 'axial-vista';
 const PICTURES = 'pictures';
 const RECENT = 'recent';
 const WIDTHS = 'widths';
-/** Raise when the same scene would be drawn or stored differently: everything an earlier one stored is dropped. */
-const DRAWING = 4;
+/** Raise when the same seed would be drawn or stored differently: everything an earlier one stored is dropped. */
+const DRAWING = 21;
 
 interface Stored {
   key: string;

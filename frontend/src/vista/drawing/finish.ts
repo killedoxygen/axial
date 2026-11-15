@@ -1,5 +1,5 @@
-import { clamp01, hash3, type Light } from './light';
-import type { Sky, View } from './sky';
+import { clamp01, hash3 } from './light';
+import type { View } from './sky';
 import { quarter } from './strips';
 
 /** Blurs `src` into `dst` along one axis by a running mean. `step` is the distance between neighbours on that axis. */
@@ -85,48 +85,22 @@ export function bloom(sharp: Float32Array, qw: number, qh: number): Float32Array
   return soft;
 }
 
-/** Light shafts: open sky near the light, smeared away from it, so trunks and crowns cut dark gaps in the haze. */
-export function shafts(open: Float32Array, qw: number, qh: number, view: View, sky: Sky, light: Light): Float32Array {
-  const shafts = new Float32Array(qw * qh);
-  if (!sky.ahead || light.y <= 0) return shafts;
-  const sx = (view.width / 2 + Math.tan(sky.azimuth) * view.focal) / 4;
-  const sy = (view.horizon - light.rise * view.focal) / 4;
-  const taps = 24;
-  for (let y = 0; y < qh; y++) {
-    for (let x = 0; x < qw; x++) {
-      const stepX = ((sx - x) / taps) * 0.95;
-      const stepY = ((sy - y) / taps) * 0.95;
-      let sum = 0;
-      let weight = 1;
-      for (let k = 0; k < taps; k++) {
-        const px = Math.round(x + stepX * k);
-        const py = Math.round(y + stepY * k);
-        if (px >= 0 && py >= 0 && px < qw && py < qh) sum += open[py * qw + px]! * weight;
-        weight *= 0.95;
-      }
-      shafts[y * qw + x] = (sum / taps) * light.rays * 0.08;
-    }
-  }
-  return shafts;
-}
-
-// The shader packs' tone curve ends in display values. They are tabled by the square root of the light, which
-// keeps the darkest tones as finely stepped as the brightest; a night would otherwise fall into bands.
+// The tone curve ends in display values. They are tabled by the square root of the light, which keeps the darkest
+// tones as finely stepped as the brightest; a dusk would otherwise fall into bands.
 const display = new Float32Array(2049);
 for (let i = 0; i <= 2048; i++) display[i] = 255 * (i / 2048) ** (2 / 2.2);
-const rolled = (value: number): number => value / Math.sqrt(value * value + 1);
+/** Light as it is up to four fifths of full; past that it rolls off and never quite gets there. */
+const rolled = (value: number): number => (value <= 0.8 ? value : 0.8 + 0.2 * (1 - Math.exp(-(value - 0.8) / 0.2)));
 const shown = (value: number): number => display[(Math.sqrt(clamp01(value)) * 2048) | 0]!;
 
 /**
- * A strip's light as display pixels: bloom and shafts laid over it, then the shader packs' tone curve (brighten
- * fourfold, let the brightest colours drift toward white, roll off smoothly), display values and dither.
+ * A strip's light as display pixels: bloom laid over it, then a tone curve (let the brightest colours drift toward
+ * white, roll off smoothly), display values and dither.
  */
 export function tone(
   { origin, wide, from, to, hdr }: Lit,
   view: View,
   soft: Float32Array,
-  shafts: Float32Array,
-  light: Light,
 ): Uint8ClampedArray<ArrayBuffer> {
   const H = view.height;
   const qw = quarter(view.width);
@@ -152,14 +126,10 @@ export function tone(
       const c = y1 * qw + x0;
       const d = y1 * qw + x1;
       const o = (y * wide + x - origin) * 3;
-      const shaft =
-        shafts[a]! +
-        (shafts[b]! - shafts[a]!) * fx +
-        (shafts[c]! + (shafts[d]! - shafts[c]!) * fx - shafts[a]! - (shafts[b]! - shafts[a]!) * fx) * fy;
       for (let ch = 0; ch < 3; ch++) {
         const upper = soft[a * 3 + ch]! + (soft[b * 3 + ch]! - soft[a * 3 + ch]!) * fx;
         const lower = soft[c * 3 + ch]! + (soft[d * 3 + ch]! - soft[c * 3 + ch]!) * fx;
-        mixed[ch] = (hdr[o + ch]! * 0.8 + (upper + (lower - upper) * fy) * 0.2 + light.color[ch]! * shaft) * 4;
+        mixed[ch] = hdr[o + ch]! * 0.92 + (upper + (lower - upper) * fy) * 0.08;
       }
       const r = mixed[0]!;
       const g = mixed[1]!;

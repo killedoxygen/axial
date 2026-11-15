@@ -1,16 +1,6 @@
-import { api } from '../api';
-import type { BlockTexturesResponse } from '../generated/BlockTexturesResponse';
 import { Sheet, type Quarter, type Strip } from './drawing/strips';
-import type { TexturePack } from './drawing/textures';
 import type { Order, Picture, Reply } from './drawing/worker';
 import type { World } from './drawing/world';
-
-/** An instance's world in a colour mode. */
-export interface Scene {
-  seed: number;
-  version: string;
-  dark: boolean;
-}
 
 /**
  * Pictures are drawn off the page's thread by a crew of workers: half the machine's threads, which is about its
@@ -30,8 +20,8 @@ const hired = (count: number): Promise<Worker[]> =>
   );
 
 let crew: Promise<Worker[]> | null = null;
-/** The last world built: a scene is often drawn again at once, as a band or for a larger place. */
-let built: { scene: string; world: World } | null = null;
+/** The last world built: a seed is often drawn again at once, for a larger place. */
+let built: { seed: number; world: World } | null = null;
 let leaving = 0;
 
 function dismiss(): void {
@@ -52,54 +42,22 @@ function ask<T extends Reply>(worker: Worker, order: Order, transfer: Transferab
   });
 }
 
-/** Each version's own block textures, read once. A version whose files are not there yet is asked again later. */
-const packs = new Map<string, Promise<TexturePack | null>>();
-
-function textures(version: string): Promise<TexturePack | null> {
-  let pack = packs.get(version);
-  if (!pack) {
-    pack = api('GET', `/versions/${encodeURIComponent(version)}/block-textures`).then(
-      (response) => {
-        const pack = new Map<string, Uint8Array>();
-        for (const { name, rgba } of (response as BlockTexturesResponse).textures) {
-          const texels = Uint8Array.from(atob(rgba), (char) => char.charCodeAt(0));
-          if (texels.length === (name === 'sun' || name === 'moon' ? 4096 : 1024)) pack.set(name, texels);
-        }
-        return pack;
-      },
-      () => {
-        packs.delete(version);
-        return null;
-      },
-    );
-    packs.set(version, pack);
-  }
-  return pack;
-}
-
 /**
- * Draws a scene `width` by `height`. One worker builds the world; then every worker set to the picture takes
- * strips of columns until none are left, and finishes its own with the whole picture's bloom and light shafts.
- * Resolves null once `stopped` says so or there is nothing to draw with. `horizon` is the row the horizon
- * lies on, as a share of the height.
+ * Draws a seed's world `width` by `height`. One worker builds the world; then every worker set to the picture
+ * takes strips of columns until none are left, and finishes its own with the whole picture's bloom.
+ * Resolves null once `stopped` says so or the drawing fails.
  */
 export async function draw(
   stopped: () => boolean,
-  { seed, version, dark }: Scene,
+  seed: number,
   width: number,
   height: number,
-  horizon?: number,
 ): Promise<ImageData | null> {
   window.clearTimeout(leaving);
   try {
-    const [pack, all] = await Promise.all([textures(version), (crew ??= hired(CREW))]);
-    if (!pack || stopped()) return null;
-    const scene = `${seed}:${version}:${dark}`;
-    if (built?.scene !== scene) {
-      const world = await ask<World | null>(all[0]!, { seed, dark, pack });
-      if (!world) return null;
-      built = { scene, world };
-    }
+    const all = await (crew ??= hired(CREW));
+    if (stopped()) return null;
+    if (built?.seed !== seed) built = { seed, world: await ask<World>(all[0]!, { seed }) };
     const { world } = built;
     const workers = all.slice(0, Math.ceil((width * height) / PIXELS_EACH));
     const sheet = new Sheet(width, height);
@@ -107,7 +65,7 @@ export async function draw(
     let next = 0;
     await Promise.all(
       workers.map(async (worker) => {
-        await ask(worker, { world, width, height, horizon });
+        await ask(worker, { world, width, height });
         while (next < width && !stopped()) {
           const from = next;
           next = Math.min(width, from + step);
@@ -118,7 +76,7 @@ export async function draw(
     if (stopped()) return null;
     await Promise.all(
       workers.map(async (worker) => {
-        for (const strip of await ask<Strip[]>(worker, { soft: sheet.soft, open: sheet.open })) sheet.set(strip);
+        for (const strip of await ask<Strip[]>(worker, { soft: sheet.soft })) sheet.set(strip);
       }),
     );
     return new ImageData(sheet.pixels, width, height);

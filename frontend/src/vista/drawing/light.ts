@@ -1,5 +1,6 @@
-import { TEXELS } from './textures';
-import { FACES, FOLIAGE, GRID, LAVA, PLANT, RUNS, type World } from './world';
+import { FOLIAGE, GLOWS, LAMP, LAVA, MAGMA, MATERIALS, RUNS, SEA_PICKLES, WINDOW } from './blocks';
+import { GRID } from './land';
+import type { World } from './world';
 
 export type Rgb = readonly [number, number, number];
 
@@ -12,88 +13,72 @@ export function hash3(x: number, y: number, z: number): number {
   return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
-/** A shader pack's colour setting: display red, green and blue with a strength. */
-const setting = (r: number, g: number, b: number, strength: number): Rgb => [
-  (r / 255) * strength,
-  (g / 255) * strength,
-  (b / 255) * strength,
-];
-/** Shader packs hold their colours as square roots; the light itself is the square. */
-const squared = (color: Rgb): Rgb => [color[0] ** 2, color[1] ** 2, color[2] ** 2];
-const blend = (a: Rgb, b: Rgb, t: number): Rgb => [
-  a[0] + (b[0] - a[0]) * t,
-  a[1] + (b[1] - a[1]) * t,
-  a[2] + (b[2] - a[2]) * t,
-];
+/** A colour at a height in the sky. */
+export type Stop = readonly [number, Rgb];
+
+const scaled = (color: Rgb, by: number): Rgb => [color[0] * by, color[1] * by, color[2] * by];
+
+/** The sky straight overhead: nearly the panel's own dark. */
+const ZENITH: Rgb = [0.0065, 0.0091, 0.007];
+/** How much brighter than its colour what gives light shows. */
+const GLOW = 4.5;
 
 /**
- * The light of one hour, by a shader pack's own settings and blends: warm and low at either end of the day,
- * blue-white at noon, blue under the moon.
+ * The light of a world's evening, as a few colours. The last light is low ahead and warm, and casts long shadows;
+ * a cool one from behind the camera fills the near sides; the air between here and far things is one colour.
  */
 export class Light {
-  /** How much of the day is left: one with the sun well up, zero once it is well down. */
-  readonly daylight: number;
-  /** How near the hour is to noon. */
-  readonly noon: number;
-  /** Whether the sun casts the shadows; otherwise the moon, opposite it, does. */
-  readonly sunUp: boolean;
-  /** Unit vector toward the sun. */
-  readonly sun: Rgb;
-  /** Unit vector toward whichever of the two casts the shadows, and its direction over the ground. */
+  /** Unit vector toward the last light. */
   readonly x: number;
   readonly y: number;
   readonly z: number;
-  readonly towardX: number;
-  readonly towardZ: number;
-  /** The light's run across the ground, and how steeply it climbs over that. */
-  readonly flat: number;
-  readonly rise: number;
-  /** The sun's colour as the pack holds it, and to the power the sky near it takes. */
-  readonly sunRoot: Rgb;
-  readonly sunSky: Rgb;
-  /** What the sun or moon gives a surface it reaches, and what the sky gives one it does not. */
-  readonly color: Rgb;
-  readonly ambient: Rgb;
-  readonly night: Rgb;
-  readonly nightHue: Rgb;
-  readonly lamp = squared(setting(255, 212, 160, 0.85));
-  readonly skyBlue = squared(setting(96, 160, 255, 1));
-  readonly water = squared(setting(64, 160, 255, 0.35));
-  readonly skyExposure: number;
-  /** How strongly shafts of light show in the air. */
-  readonly rays: number;
+  /** What a face turned to the last light takes from it, and what every face takes from the open sky. */
+  readonly key: Rgb;
+  readonly fill: Rgb;
+  /** The light from behind the camera: toward it, and its colour. */
+  readonly back: Rgb;
+  readonly backColor: Rgb;
+  /** What a point of light gives the land round it. */
+  readonly lamp: Rgb = [1.0, 0.56, 0.24];
+  /** The air: how far off it begins and is at its most, how much it then hides, and its colour. */
+  readonly haze: { from: number; to: number; most: number; color: Rgb };
+  /**
+   * The sky as two runs of colour by height, each a list of [how steeply the direction climbs, colour]: the one
+   * toward the light and the one away from it.
+   */
+  readonly ramps: { warm: Stop[]; cool: Stop[] };
+  /** The water's own colour, under what it mirrors. */
+  readonly water: Rgb = [0.004, 0.012, 0.014];
+  /** What each material that gives light shows of itself: three values a material. */
+  readonly glows = new Float32Array(MATERIALS * 3);
 
-  constructor(world: World) {
-    const [sunX, sunY, sunZ] = (this.sun = world.sun);
-    this.daylight = clamp01(sunY * 10 + 0.5);
-    this.noon = Math.max(0, Math.sin(world.time * 2 * Math.PI));
-    const high = 1 - (1 - this.noon) ** 1.5;
-    const moon = setting(104, 168, 255, 0.44);
-    this.sunRoot = blend(setting(255, 160, 80, 1.2), setting(196, 220, 255, 1.4), high);
-    this.color = squared(blend(moon, this.sunRoot, this.daylight));
-    this.ambient = squared(
-      blend(
-        [moon[0] * 0.6, moon[1] * 0.6, moon[2] * 0.6],
-        blend(setting(255, 204, 144, 0.35), setting(120, 172, 255, 0.6), high),
-        this.daylight,
-      ),
-    );
-    this.night = squared(moon);
-    const length = Math.hypot(...this.night);
-    this.nightHue = [this.night[0] / length, this.night[1] / length, this.night[2] / length];
-    this.sunUp = world.time < 0.5325 || world.time > 0.9675;
-    const side = this.sunUp ? 1 : -1;
-    this.x = sunX * side;
-    this.y = sunY * side;
-    this.z = sunZ * side;
-    const flat = (this.flat = Math.hypot(this.x, this.z) || 1);
-    this.towardX = this.x / flat;
-    this.towardZ = this.z / flat;
-    this.rise = Math.max(0, this.y) / flat;
-    this.skyExposure = 2 ** (this.noon * 0.75 - 0.75);
-    const power = 4 - this.daylight;
-    this.sunSky = [this.sunRoot[0] ** power, this.sunRoot[1] ** power, this.sunRoot[2] ** power];
-    this.rays = this.sunUp ? 0.9 - 0.75 * this.noon : 0.3;
+  constructor({ light, dusk }: World) {
+    [this.x, this.y, this.z] = light;
+    this.key = scaled(dusk.glow, 4 / Math.PI);
+    this.fill = scaled(dusk.cool, 0.32);
+    const turn = Math.hypot(this.x, this.z) || 1;
+    this.back = [(-this.x / turn) * 0.788, 0.616, (-this.z / turn) * 0.788];
+    this.backColor = scaled(dusk.fill, 0.95 / Math.PI);
+    this.haze = { from: 55, to: 210, most: 0.93, color: dusk.haze };
+    this.ramps = {
+      warm: [
+        [0, scaled(dusk.glow, 1.25)],
+        [0.06, [0.9, 0.4, 0.2]],
+        [0.14, [0.22, 0.1, 0.14]],
+        [0.22, [0.02, 0.035, 0.045]],
+        [0.32, ZENITH],
+      ],
+      cool: [
+        [0, scaled(dusk.cool, 0.5)],
+        [0.28, ZENITH],
+      ],
+    };
+    const gives = (mat: number, color: Rgb): void => this.glows.set(scaled(color, GLOW * GLOWS[mat]!), mat * 3);
+    gives(LAMP, [0.55, 0.26, 0.07]);
+    gives(WINDOW, [1.0, 0.5, 0.17]);
+    gives(LAVA, [0.5, 0.12, 0.02]);
+    gives(MAGMA, [0.55, 0.075, 0.008]);
+    gives(SEA_PICKLES, [0.22, 0.42, 0.26]);
   }
 }
 
@@ -114,8 +99,7 @@ export class Tops {
       for (let k = 0; k < runCount[i]!; k++) {
         const ro = (i * RUNS + k) * 3;
         const mat = runs[ro + 2]!;
-        if (mat >= PLANT) continue;
-        if (mat >= FOLIAGE && mat < LAVA) leaf[i] = runs[ro + 1]!;
+        if (mat >= FOLIAGE && mat < LAMP) leaf[i] = runs[ro + 1]!;
         else solid[i] = Math.max(solid[i]!, runs[ro + 1]!);
       }
     }
@@ -126,126 +110,5 @@ export class Tops {
         for (const step of around) if (solid[i + step]! > rim[i]!) rim[i] = solid[i + step]!;
       }
     }
-  }
-}
-
-/**
- * The shadow map: the world in front of the camera as the light sees it. Along a ray of light two things stay
- * fixed, so they index the map; each texel keeps the height of the highest thing on its ray, and a point is lit
- * where nothing on its ray stands higher. Foliage casts the shape of its texture, gaps and all.
- */
-export class Shadows {
-  private size = 0;
-  private rows = 0;
-  private scale = 0;
-  private slope = 0;
-  private u0 = 0;
-  private v0 = 0;
-  private map = new Float32Array(0);
-  private readonly towardX: number;
-  private readonly towardZ: number;
-
-  constructor(world: World, light: Light, tops: Tops) {
-    const n = GRID;
-    const { ground, runs, runCount, camera } = world;
-    const atlas = world.atlas.colors;
-    const { towardX, towardZ } = light;
-    this.towardX = towardX;
-    this.towardZ = towardZ;
-    if (light.y <= 0.03) return;
-    const slope = (this.slope = Math.min(14, light.flat / light.y));
-    const x0 = Math.max(1, Math.floor(camera.x) - 66);
-    const x1 = Math.min(n - 1, x0 + 132);
-    const z0 = Math.max(1, Math.floor(camera.z) - 10);
-    const z1 = Math.min(n - 1, z0 + 140);
-    let low = 255;
-    let tall = 0;
-    for (let z = z0; z < z1; z++) {
-      for (let x = x0; x < x1; x++) {
-        const i = z * n + x;
-        if (ground[i]! < low) low = ground[i]!;
-        const most = Math.max(tops.solid[i]!, tops.leaf[i]!);
-        if (most > tall) tall = most;
-      }
-    }
-    let uMin = Infinity;
-    let uMax = -Infinity;
-    let vMin = Infinity;
-    let vMax = -Infinity;
-    for (const x of [x0, x1]) {
-      for (const z of [z0, z1]) {
-        const u = x * towardX + z * towardZ;
-        const v = z * towardX - x * towardZ;
-        uMin = Math.min(uMin, u - tall * slope);
-        uMax = Math.max(uMax, u - low * slope);
-        vMin = Math.min(vMin, v);
-        vMax = Math.max(vMax, v);
-      }
-    }
-    this.u0 = uMin;
-    this.v0 = vMin;
-    const scale = (this.scale = Math.min(4, Math.sqrt(1_000_000 / ((uMax - uMin) * (vMax - vMin)))));
-    const size = (this.size = Math.ceil((uMax - uMin) * scale) + 2);
-    this.rows = Math.ceil((vMax - vMin) * scale) + 2;
-    const map = (this.map = new Float32Array(size * this.rows).fill(-1));
-    // Each block is sampled finely enough to leave no texel uncovered, and each sample's whole height is cast at
-    // once: along its ray it is a run of texels, highest first.
-    const fine = Math.ceil(scale * 1.5);
-    const cast = (px: number, pz: number, from: number, to: number): void => {
-      const along = px * towardX + pz * towardZ - uMin;
-      const row = Math.floor((pz * towardX - px * towardZ - vMin) * scale) * size;
-      const first = Math.floor((along - to * slope) * scale);
-      const last = Math.floor((along - from * slope) * scale);
-      for (let u = first; u <= last; u++) {
-        const y = u === first ? to : (along - u / scale) / slope;
-        if (y > map[row + u]!) map[row + u] = y;
-      }
-    };
-    for (let z = z0; z < z1; z++) {
-      for (let x = x0; x < x1; x++) {
-        const i = z * n + x;
-        const g = ground[i]!;
-        // Below the lowest neighbour a column's side is buried, and casts nothing that is not already cast.
-        const buried = Math.max(g - 12, Math.min(g, ground[i - 1]!, ground[i + 1]!, ground[i - n]!, ground[i + n]!));
-        const count = runCount[i]!;
-        for (let s = 0; s < fine * fine; s++) {
-          const fx = ((s % fine) + 0.5) / fine;
-          const fz = (Math.floor(s / fine) + 0.5) / fine;
-          cast(x + fx, z + fz, buried, g);
-          for (let k = 0; k < count; k++) {
-            const ro = (i * RUNS + k) * 3;
-            const mat = runs[ro + 2]!;
-            if (mat >= PLANT) continue;
-            if (mat >= FOLIAGE && mat < LAVA) {
-              const texel = (FACES[mat * 3]! * TEXELS + Math.floor(fz * 16) * 16 + Math.floor(fx * 16)) * 4;
-              if (atlas[texel + 3]! < 0.5) continue;
-            }
-            cast(x + fx, z + fz, runs[ro]!, runs[ro + 1]!);
-          }
-        }
-      }
-    }
-  }
-
-  /** How much of the light reaches a point: the four texels round it, each lit or not, blended. */
-  lit(x: number, y: number, z: number): number {
-    const { size, map } = this;
-    if (size === 0) return 0;
-    const u = (x * this.towardX + z * this.towardZ - y * this.slope - this.u0) * this.scale - 0.5;
-    const v = (z * this.towardX - x * this.towardZ - this.v0) * this.scale - 0.5;
-    const iu = Math.floor(u);
-    const iv = Math.floor(v);
-    // Beyond the map the world is too far for its shadows to read.
-    if (iu < 0 || iv < 0 || iu >= size - 1 || iv >= this.rows - 1) return 1;
-    const fu = u - iu;
-    const fv = v - iv;
-    const at = iv * size + iu;
-    const level = y + 0.06;
-    return (
-      (level >= map[at]! ? (1 - fu) * (1 - fv) : 0) +
-      (level >= map[at + 1]! ? fu * (1 - fv) : 0) +
-      (level >= map[at + size]! ? (1 - fu) * fv : 0) +
-      (level >= map[at + size + 1]! ? fu * fv : 0)
-    );
   }
 }

@@ -33,30 +33,16 @@ function recentFirst(all: EnrichedInstance[]): EnrichedInstance[] {
   return [...all].sort((a, b) => played(b) - played(a));
 }
 
-const installing = (inst: EnrichedInstance): boolean =>
-  instanceInstallStatus(inst, versionById(inst.version_id)).installing;
-
-const scene = (inst: EnrichedInstance): { seed: number; version: string } => ({
-  seed: artSeedFor(inst),
-  version: inst.version_id,
-});
-
 /**
- * Has the lead's picture ready, so Home's first frame holds it, and the library's drawn behind it while no game
- * is starting or running: that work can wait. Reads the signals the pictures follow.
+ * Has the lead's picture ready, so Home's first frame holds it, and the pictures the other instances' pages
+ * show drawn behind it while no game is starting or running: that work can wait. Reads the signals the pictures
+ * follow.
  */
 export function warmHome(): Promise<void> {
   return warmVistas(
-    recentFirst(instances.value)
-      .filter((inst) => !installing(inst))
-      .map(scene),
+    recentFirst(instances.value).map(artSeedFor),
     launchState.value.status !== 'idle' || Object.keys(launchSessions.value).length > 0,
   );
-}
-
-/** An instance's world, once its version's files are there. */
-function World({ inst }: { inst: EnrichedInstance }): JSX.Element {
-  return <Vista {...scene(inst)} installing={installing(inst)} />;
 }
 
 /** The last-played instance: its name as display type, its facts, and the way in. */
@@ -120,7 +106,7 @@ function Lead({ inst }: { inst: EnrichedInstance }): JSX.Element {
   );
 }
 
-/** One shelf of covers, as many as fit, then the way to add one. */
+/** One shelf of the other instances' tiles, as many as fit, then the way to add one. */
 function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JSX.Element {
   const rowRef = useRef<HTMLDivElement>(null);
   const [fit, setFit] = useState(SHELF_LIMIT);
@@ -165,7 +151,6 @@ function Shelf({ list, total }: { list: EnrichedInstance[]; total: number }): JS
           >
             <span class="cp-home-cover">
               <InstanceTile inst={inst} />
-              <World inst={inst} />
             </span>
             <span class="cp-home-title" title={inst.name}>
               {inst.name}
@@ -202,7 +187,7 @@ export function HomeView(): JSX.Element {
   }
   return (
     <div class="cp-view-page cp-home">
-      <World inst={lead} />
+      <Vista seed={artSeedFor(lead)} />
       <h1 class="cp-home-hello">
         {greetingFor(new Date())}
         {username ? `, ${username}` : ''}.

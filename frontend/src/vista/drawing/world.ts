@@ -1,168 +1,26 @@
 /**
- * A piece of wild terrain built from a seed. A biome decides which blocks, trees and plants belong together; a scene
- * decides the lie of the land and where the camera stands in it.
+ * An instance's world, from its seed: water at dusk, a lit building on its far shore, the country rising round it.
+ * A world is one lie of the land, one of the game's biomes that is found in such a lie, and one building, each
+ * from a short list set down by hand. What the ground is, what grows on it and what the building is made of are
+ * the biome's own, as the game has them. The building always stands right of the middle, where a page shows the
+ * picture whole.
  */
-import * as T from './textures';
+import { BIOMES, type Biome } from './biomes';
+import * as B from './blocks';
+import { BUILDINGS, tallness, type Building } from './buildings';
+import { GRID, ease, fbm, hash, noise } from './land';
+import { LANDS, type Land, type LandName } from './lands';
+import { palette } from './paints';
+import { ASPECT } from './strips';
+import { WOOD, grow, type Plot } from './trees';
 
-export const GRID = 208;
-/** Extra runs a column may carry above its ground: a trunk, foliage layers, a plant. */
-export const RUNS = 5;
-
-let count = 1;
-export const GRASS = count++;
-export const DIRT = count++;
-export const PODZOL = count++;
-export const STONE = count++;
-export const GRAVEL = count++;
-export const SAND = count++;
-export const RED_SAND = count++;
-export const SNOWY_GRASS = count++;
-export const SNOW = count++;
-export const ICE = count++;
-export const OBSIDIAN = count++;
-export const CRYING = count++;
-export const NETHERRACK = count++;
-export const MAGMA = count++;
-/** Banded clay: every level of the world has its own colour. */
-export const TERRACOTTA = count++;
-export const OAK_LOG = count++;
-export const BIRCH_LOG = count++;
-export const SPRUCE_LOG = count++;
-export const DARK_OAK_LOG = count++;
-export const ACACIA_LOG = count++;
-export const CHERRY_LOG = count++;
-export const CACTUS = count++;
-/** From here to `LAVA`, foliage: seen through where its texture has gaps. */
-export const FOLIAGE = count;
-export const OAK_LEAVES = count++;
-export const BIRCH_LEAVES = count++;
-export const SPRUCE_LEAVES = count++;
-/** Spruce foliage with snow lying on it. */
-export const SNOWY_LEAVES = count++;
-export const DARK_OAK_LEAVES = count++;
-export const ACACIA_LEAVES = count++;
-export const CHERRY_LEAVES = count++;
-/** Hangs from foliage as a curtain: it has sides and no top. */
-export const VINE = count++;
-export const LAVA = count++;
-export const WATER = count++;
-/** From here to `DECAL`, plants: upright cut-outs that cast no shadow. */
-export const PLANT = count;
-export const SHORT_GRASS = count++;
-export const TALL_GRASS = count++;
-export const FERN = count++;
-export const POPPY = count++;
-export const DANDELION = count++;
-export const CORNFLOWER = count++;
-export const DAISY = count++;
-export const BLUET = count++;
-export const ALLIUM = count++;
-export const ORCHID = count++;
-export const DEAD_BUSH = count++;
-export const CANE = count++;
-export const RED_CAP = count++;
-export const BROWN_CAP = count++;
-/** From here up, what lies flat on the ground or the water. */
-export const DECAL = count;
-export const LILY = count++;
-export const PETALS = count++;
-export const MATERIALS = count;
-
-/** Texture per material for its top, side and underside; for a plant, its upper and lower block. */
-export const FACES = new Uint8Array(MATERIALS * 3);
-/** Texture per ground material of the soil just under its surface block, and of the rock under that. */
-export const BELOW = new Uint8Array(MATERIALS * 2);
-const faces = (mat: number, top: number, side = top, under = side): void => FACES.set([top, side, under], mat * 3);
-const below = (mat: number, soil: number, rock: number = T.STONE_TEX): void => BELOW.set([soil, rock], mat * 2);
-faces(GRASS, T.GRASS_TOP, T.GRASS_SIDE, T.DIRT_TEX);
-faces(DIRT, T.DIRT_TEX);
-faces(PODZOL, T.PODZOL_TOP, T.PODZOL_SIDE, T.DIRT_TEX);
-faces(STONE, T.STONE_TEX);
-faces(GRAVEL, T.GRAVEL_TEX);
-faces(SAND, T.SAND_TEX);
-faces(RED_SAND, T.RED_SAND_TEX);
-faces(SNOWY_GRASS, T.SNOW_TEX, T.SNOW_SIDE, T.DIRT_TEX);
-faces(SNOW, T.SNOW_TEX);
-faces(ICE, T.ICE_TEX);
-faces(OBSIDIAN, T.OBSIDIAN_TEX);
-faces(CRYING, T.CRYING_TEX);
-faces(NETHERRACK, T.NETHERRACK_TEX);
-faces(MAGMA, T.MAGMA_TEX);
-faces(TERRACOTTA, T.CLAY_PLAIN);
-faces(OAK_LOG, T.OAK_TOP, T.OAK_SIDE, T.OAK_TOP);
-faces(BIRCH_LOG, T.BIRCH_TOP, T.BIRCH_SIDE, T.BIRCH_TOP);
-faces(SPRUCE_LOG, T.SPRUCE_TOP, T.SPRUCE_SIDE, T.SPRUCE_TOP);
-faces(DARK_OAK_LOG, T.DARK_OAK_TOP, T.DARK_OAK_SIDE, T.DARK_OAK_TOP);
-faces(ACACIA_LOG, T.ACACIA_TOP, T.ACACIA_SIDE, T.ACACIA_TOP);
-faces(CHERRY_LOG, T.CHERRY_TOP, T.CHERRY_SIDE, T.CHERRY_TOP);
-faces(CACTUS, T.CACTUS_TOP, T.CACTUS_SIDE);
-faces(OAK_LEAVES, T.OAK_LEAVES_TEX);
-faces(BIRCH_LEAVES, T.BIRCH_LEAVES_TEX);
-faces(SPRUCE_LEAVES, T.SPRUCE_LEAVES_TEX);
-faces(SNOWY_LEAVES, T.SNOW_TEX, T.SPRUCE_LEAVES_TEX);
-faces(DARK_OAK_LEAVES, T.DARK_OAK_LEAVES_TEX);
-faces(ACACIA_LEAVES, T.ACACIA_LEAVES_TEX);
-faces(CHERRY_LEAVES, T.CHERRY_LEAVES_TEX);
-faces(VINE, T.VINE_TEX);
-faces(LAVA, T.LAVA_TEX);
-faces(WATER, T.SAND_TEX);
-faces(SHORT_GRASS, T.SHORT_GRASS_TEX);
-faces(TALL_GRASS, T.TALL_GRASS_HIGH, T.TALL_GRASS_LOW);
-faces(FERN, T.FERN_TEX);
-faces(POPPY, T.POPPY_TEX);
-faces(DANDELION, T.DANDELION_TEX);
-faces(CORNFLOWER, T.CORNFLOWER_TEX);
-faces(DAISY, T.DAISY_TEX);
-faces(BLUET, T.BLUET_TEX);
-faces(ALLIUM, T.ALLIUM_TEX);
-faces(ORCHID, T.ORCHID_TEX);
-faces(DEAD_BUSH, T.DEAD_BUSH_TEX);
-faces(CANE, T.CANE_TEX);
-faces(RED_CAP, T.RED_CAP_TEX);
-faces(BROWN_CAP, T.BROWN_CAP_TEX);
-faces(LILY, T.LILY_TEX);
-faces(PETALS, T.PETALS_TEX);
-for (let mat = 1; mat < FOLIAGE; mat++) below(mat, FACES[mat * 3 + 1]!, FACES[mat * 3 + 1]);
-for (const mat of [GRASS, DIRT, PODZOL, SNOWY_GRASS]) below(mat, T.DIRT_TEX);
-below(GRAVEL, T.GRAVEL_TEX);
-below(SNOW, T.SNOW_TEX);
-below(SAND, T.SAND_TEX, T.SANDSTONE_TEX);
-// Under red sand lies the banded clay; the renderer reads plain clay as "the band of this level".
-below(RED_SAND, T.RED_SAND_TEX, T.CLAY_PLAIN);
-
-/** The light each material gives off, on the game's scale of 0 to 15. */
-export const EMITS = new Uint8Array(MATERIALS);
-EMITS[LAVA] = 15;
-EMITS[CRYING] = 10;
-EMITS[MAGMA] = 3;
-
-/** The clay's colour by level, bottom to top, repeating. */
-export const BANDS: readonly number[] = [
-  T.CLAY_PLAIN,
-  T.CLAY_PLAIN,
-  T.CLAY_ORANGE,
-  T.CLAY_ORANGE,
-  T.CLAY_YELLOW,
-  T.CLAY_PLAIN,
-  T.CLAY_BROWN,
-  T.CLAY_RED,
-  T.CLAY_RED,
-  T.CLAY_ORANGE,
-  T.CLAY_WHITE,
-  T.CLAY_PLAIN,
-  T.CLAY_GREY,
-  T.CLAY_ORANGE,
-  T.CLAY_ORANGE,
-  T.CLAY_PLAIN,
-  T.CLAY_YELLOW,
-  T.CLAY_RED,
-  T.CLAY_PLAIN,
-  T.CLAY_WHITE,
-  T.CLAY_BROWN,
-  T.CLAY_ORANGE,
-];
-
-export type Rgb = readonly [number, number, number];
+/** An evening's colours: the low glow ahead, the sky away from it, the light from behind, and the air. */
+export interface Dusk {
+  glow: readonly [number, number, number];
+  cool: readonly [number, number, number];
+  fill: readonly [number, number, number];
+  haze: readonly [number, number, number];
+}
 
 export interface World {
   seed: number;
@@ -171,588 +29,35 @@ export interface World {
   /** Per column: `runCount` runs of (bottom, top, material), bottom to top. */
   runs: Uint8Array;
   runCount: Uint8Array;
-  /** Per column, what lies flat on its ground or water: a `DECAL` material, or 0. */
-  decal: Uint8Array;
-  /** Highest shadow-casting block per column. */
-  top: Uint8Array;
-  /** The water's level, or 0 in a world with none. */
+  /** The water's level, or 0 where it is frozen over. */
   waterLevel: number;
-  /** Per column, the light from glowing blocks and from the sky at its surface, on the game's scale of 0 to 15. */
-  blockLight: Uint8Array;
+  /** Per column, the sky's light at its surface, on the game's scale of 0 to 15. */
   skyLight: Uint8Array;
-  atlas: T.Atlas;
-  /** The game's own sun and full moon, thirty-two texels a side, where the version has them. */
-  sunTexture: Uint8Array | undefined;
-  moonTexture: Uint8Array | undefined;
-  /** The time of day as a turn of the sky: 0 at sunrise, a quarter at noon, a half at sunset. */
-  time: number;
-  /** Unit vector toward the sun, which is under the horizon at night; the moon stands opposite. */
-  sun: readonly [number, number, number];
-  camera: { x: number; y: number; z: number; yaw: number };
+  /**
+   * What gives light to the land round it, as points of light, five values each: where, how strong, and a column
+   * that is not in its way (-1 for none).
+   */
+  lamps: Float32Array;
+  /** One colour for each paint, as `palette` gives them. */
+  colors: Float32Array;
+  /** Unit vector toward the last light, and the evening's colours. */
+  light: readonly [number, number, number];
+  dusk: Dusk;
+  /**
+   * The lens is the angle a whole picture spans. The horizon, the building's foot and its top lie at shares of a
+   * whole picture's height.
+   */
+  camera: { x: number; y: number; z: number; yaw: number; fov: number; horizon: number; foot: number; top: number };
 }
 
-function hash2(x: number, z: number, seed: number): number {
-  let h = Math.imul(x, 0x27d4eb2d) ^ Math.imul(z, 0x165667b1) ^ Math.imul(seed, 0x9e3779b9);
-  h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
-  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
-}
-
-function smooth(t: number): number {
-  const c = t < 0 ? 0 : t > 1 ? 1 : t;
-  return c * c * (3 - 2 * c);
-}
-
-export function valueNoise(x: number, z: number, seed: number): number {
-  const xi = Math.floor(x);
-  const zi = Math.floor(z);
-  const tx = smooth(x - xi);
-  const tz = smooth(z - zi);
-  const a = hash2(xi, zi, seed);
-  const b = hash2(xi + 1, zi, seed);
-  const c = hash2(xi, zi + 1, seed);
-  const d = hash2(xi + 1, zi + 1, seed);
-  return a + (b - a) * tx + (c - a) * tz + (a - b - c + d) * tx * tz;
-}
-
-function fbm(x: number, z: number, seed: number): number {
-  return (
-    valueNoise(x, z, seed) * 0.55 +
-    valueNoise(x * 2.1, z * 2.1, seed + 17) * 0.3 +
-    valueNoise(x * 4.3, z * 4.3, seed + 31) * 0.15
-  );
-}
-
-/** Mulberry32: a small seeded generator, so one seed always builds the same world. */
-function random(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-type Tree = 'oak' | 'tall oak' | 'swamp oak' | 'birch' | 'spruce' | 'dark oak' | 'acacia' | 'cherry' | 'cactus';
-
-/** What each kind of tree is made of. */
-const WOOD: Record<Tree, number[]> = {
-  oak: [OAK_LOG, OAK_LEAVES],
-  'tall oak': [OAK_LOG, OAK_LEAVES],
-  'swamp oak': [OAK_LOG, OAK_LEAVES, VINE],
-  birch: [BIRCH_LOG, BIRCH_LEAVES],
-  spruce: [SPRUCE_LOG, SPRUCE_LEAVES],
-  'dark oak': [DARK_OAK_LOG, DARK_OAK_LEAVES],
-  acacia: [ACACIA_LOG, ACACIA_LEAVES],
-  cherry: [CHERRY_LOG, CHERRY_LEAVES],
-  cactus: [CACTUS],
-};
-
-/**
- * The lie of the land: along a river, on a lake's shore, on a coast, in open country, under mountains, or in a
- * marsh of shallow pools.
- */
-type Scene = 'river' | 'lake' | 'coast' | 'open' | 'peaks' | 'marsh';
-
-interface Biome {
-  surface: number;
-  /** The ground at the water's edge, and under the water. */
-  shore: number;
-  bed: number;
-  trees: [kind: Tree, share: number][];
-  density: number;
-  /** Rolling of the land, in blocks. */
-  relief: number;
-  plants: [material: number, chance: number][];
-  /** The biome's grass and foliage colours (sRGB), which tint the grey textures. */
-  grass: number;
-  foliage: number;
-  water: number;
-  scenes: Scene[];
-  /** How likely a lava spring is. */
-  lava: number;
-  frozen?: boolean;
-  /** High ground turns to bare stone, then snow. */
-  alpine?: boolean;
-  /** The land rises in flat-topped steps of banded clay. */
-  mesa?: boolean;
-  /** Chances of sugar cane on a bank, lily pads on shallow water, fallen blossom on grass. */
-  cane?: number;
-  lilies?: number;
-  petals?: number;
-  /** A second surface in patches, as leaf litter lies under old spruce. */
-  patches?: number;
-}
-
-const BIOMES: Biome[] = [
-  // Plains.
-  {
-    surface: GRASS,
-    shore: SAND,
-    bed: SAND,
-    trees: [
-      ['oak', 5],
-      ['tall oak', 1],
-    ],
-    density: 0.04,
-    relief: 5,
-    plants: [
-      [SHORT_GRASS, 0.4],
-      [TALL_GRASS, 0.05],
-      [DANDELION, 0.012],
-      [POPPY, 0.01],
-      [BLUET, 0.008],
-      [DAISY, 0.008],
-      [CORNFLOWER, 0.006],
-    ],
-    grass: 0x91bd59,
-    foliage: 0x77ab2f,
-    water: 0x3f76e4,
-    scenes: ['open', 'river', 'lake', 'coast'],
-    lava: 0.25,
-    cane: 0.1,
-  },
-  // Forest.
-  {
-    surface: GRASS,
-    shore: SAND,
-    bed: SAND,
-    trees: [
-      ['oak', 4],
-      ['birch', 2],
-      ['tall oak', 0.4],
-    ],
-    density: 0.5,
-    relief: 7,
-    plants: [
-      [SHORT_GRASS, 0.26],
-      [TALL_GRASS, 0.02],
-      [POPPY, 0.012],
-      [DANDELION, 0.014],
-    ],
-    grass: 0x79c05a,
-    foliage: 0x59ae30,
-    water: 0x3f76e4,
-    scenes: ['river', 'lake', 'peaks', 'coast'],
-    lava: 0.3,
-    alpine: true,
-    cane: 0.06,
-  },
-  // Birch forest.
-  {
-    surface: GRASS,
-    shore: SAND,
-    bed: GRAVEL,
-    trees: [['birch', 1]],
-    density: 0.42,
-    relief: 6,
-    plants: [
-      [SHORT_GRASS, 0.3],
-      [DAISY, 0.01],
-      [DANDELION, 0.01],
-      [ALLIUM, 0.006],
-    ],
-    grass: 0x88bb67,
-    foliage: 0x6ba941,
-    water: 0x3f76e4,
-    scenes: ['river', 'lake', 'open'],
-    lava: 0.2,
-  },
-  // Dark forest.
-  {
-    surface: GRASS,
-    shore: GRASS,
-    bed: GRAVEL,
-    trees: [
-      ['dark oak', 8],
-      ['oak', 1.5],
-      ['birch', 0.5],
-    ],
-    density: 0.6,
-    relief: 5,
-    plants: [
-      [SHORT_GRASS, 0.14],
-      [BROWN_CAP, 0.014],
-      [RED_CAP, 0.012],
-    ],
-    grass: 0x507a32,
-    foliage: 0x59ae30,
-    water: 0x3f76e4,
-    scenes: ['river', 'lake'],
-    lava: 0.3,
-  },
-  // Taiga.
-  {
-    surface: GRASS,
-    shore: GRASS,
-    bed: GRAVEL,
-    trees: [['spruce', 1]],
-    density: 0.55,
-    relief: 9,
-    plants: [
-      [FERN, 0.2],
-      [SHORT_GRASS, 0.14],
-      [BROWN_CAP, 0.005],
-    ],
-    grass: 0x86b783,
-    foliage: 0x68a464,
-    water: 0x3f76e4,
-    scenes: ['river', 'lake', 'peaks'],
-    lava: 0.35,
-    alpine: true,
-    patches: PODZOL,
-  },
-  // Snowy taiga, its water frozen.
-  {
-    surface: SNOWY_GRASS,
-    shore: SNOWY_GRASS,
-    bed: DIRT,
-    trees: [['spruce', 1]],
-    density: 0.36,
-    relief: 8,
-    plants: [],
-    grass: 0x80b497,
-    foliage: 0x60a17b,
-    water: 0x3938c9,
-    scenes: ['river', 'lake', 'peaks'],
-    lava: 0.3,
-    frozen: true,
-    alpine: true,
-  },
-  // Savanna.
-  {
-    surface: GRASS,
-    shore: SAND,
-    bed: SAND,
-    trees: [
-      ['acacia', 6],
-      ['oak', 1],
-    ],
-    density: 0.12,
-    relief: 6,
-    plants: [
-      [SHORT_GRASS, 0.5],
-      [TALL_GRASS, 0.12],
-    ],
-    grass: 0xbfb755,
-    foliage: 0xaea42a,
-    water: 0x3f76e4,
-    scenes: ['open', 'river', 'lake'],
-    lava: 0.3,
-  },
-  // Desert.
-  {
-    surface: SAND,
-    shore: SAND,
-    bed: SAND,
-    trees: [['cactus', 1]],
-    density: 0.05,
-    relief: 6,
-    plants: [[DEAD_BUSH, 0.012]],
-    grass: 0xbfb755,
-    foliage: 0xaea42a,
-    water: 0x3f76e4,
-    scenes: ['open', 'river', 'coast'],
-    lava: 0.5,
-    cane: 0.12,
-  },
-  // Badlands.
-  {
-    surface: RED_SAND,
-    shore: RED_SAND,
-    bed: RED_SAND,
-    trees: [['cactus', 1]],
-    density: 0.03,
-    relief: 26,
-    plants: [[DEAD_BUSH, 0.02]],
-    grass: 0x90814d,
-    foliage: 0x9e814d,
-    water: 0x3f76e4,
-    scenes: ['river', 'open'],
-    lava: 0.5,
-    mesa: true,
-  },
-  // Swamp.
-  {
-    surface: GRASS,
-    shore: GRASS,
-    bed: DIRT,
-    trees: [['swamp oak', 1]],
-    density: 0.13,
-    relief: 2,
-    plants: [
-      [SHORT_GRASS, 0.3],
-      [ORCHID, 0.012],
-      [BROWN_CAP, 0.008],
-      [DEAD_BUSH, 0.004],
-    ],
-    grass: 0x6a7039,
-    foliage: 0x6a7039,
-    water: 0x617b64,
-    scenes: ['marsh'],
-    lava: 0,
-    cane: 0.12,
-    lilies: 0.1,
-  },
-  // Cherry grove.
-  {
-    surface: GRASS,
-    shore: GRASS,
-    bed: GRAVEL,
-    trees: [
-      ['cherry', 6],
-      ['birch', 1],
-    ],
-    density: 0.36,
-    relief: 8,
-    plants: [
-      [SHORT_GRASS, 0.3],
-      [DANDELION, 0.012],
-    ],
-    grass: 0xb6db61,
-    foliage: 0xb6db61,
-    water: 0x5db7ef,
-    scenes: ['peaks', 'lake', 'open'],
-    lava: 0.15,
-    alpine: true,
-    petals: 0.3,
-  },
-  // Meadow under mountains.
-  {
-    surface: GRASS,
-    shore: GRASS,
-    bed: GRAVEL,
-    trees: [
-      ['oak', 2],
-      ['birch', 1],
-    ],
-    density: 0.015,
-    relief: 7,
-    plants: [
-      [SHORT_GRASS, 0.42],
-      [TALL_GRASS, 0.05],
-      [CORNFLOWER, 0.03],
-      [ALLIUM, 0.025],
-      [DAISY, 0.03],
-      [BLUET, 0.03],
-      [POPPY, 0.03],
-      [DANDELION, 0.03],
-    ],
-    grass: 0x83bb6d,
-    foliage: 0x63a948,
-    water: 0x0e4ecf,
-    scenes: ['peaks', 'open', 'lake'],
-    lava: 0.15,
-    alpine: true,
-  },
-];
-
-/**
- * An hour to draw the world at, and where its light stands from straight ahead: the sun by day, the moon by night.
- * Past a quarter turn the light is behind the camera.
- */
-interface Hour {
-  time: number;
-  bearing: number;
-}
-
-const DARK_HOURS: Hour[] = [
-  // The last of the sun, low ahead.
-  { time: 0.512, bearing: 0.06 },
-  // The same hour with the sun to one side.
-  { time: 0.512, bearing: 0.55 },
-  // Afterglow, the sun on the horizon, ahead and then to one side.
-  { time: 0.527, bearing: 0.08 },
-  { time: 0.527, bearing: 0.5 },
-  // Dusk: the sun just gone ahead, the moon rising behind.
-  { time: 0.546, bearing: 3.0 },
-  // Night, the moon low ahead.
-  { time: 0.566, bearing: -0.3 },
-];
-
-const LIGHT_HOURS: Hour[] = [
-  // Morning, the sun ahead.
-  { time: 0.05, bearing: 0.1 },
-  // Noon, the sun over the shoulder.
-  { time: 0.25, bearing: 2.3 },
-  // Afternoon, the sun to one side.
-  { time: 0.38, bearing: -1.2 },
-  // Golden hour, the sun low to one side.
-  { time: 0.44, bearing: 0.55 },
-];
-
-/**
- * @param seed The instance's art seed.
- * @param dark Whether the app is in its dark mode: sunset to night, or daylight.
- * @param pack The instance's own block textures. With too few of them to build any world there is none.
- */
-export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): World | null {
+/** The way runs of blocks are added to a world's columns: `put(x, z, y0, y1, material)`. */
+function putter(ground: Uint8Array, runs: Uint8Array, runCount: Uint8Array): Plot['put'] {
   const n = GRID;
-  const next = random(seed);
-  const has = (mat: number): boolean =>
-    T.hasTexture(pack, FACES[mat * 3]!) &&
-    T.hasTexture(pack, FACES[mat * 3 + 1]!) &&
-    T.hasTexture(pack, FACES[mat * 3 + 2]!);
-  // A version only shows what it has: a biome needs its ground and at least one of its trees.
-  const livable = BIOMES.map((biome) => ({
-    ...biome,
-    trees: biome.trees.filter(([kind]) => WOOD[kind].every(has)),
-    plants: biome.plants.filter(([plant]) => has(plant)),
-    patches: biome.patches && has(biome.patches) ? biome.patches : undefined,
-    lilies: has(LILY) ? biome.lilies : undefined,
-    petals: has(PETALS) ? biome.petals : undefined,
-    cane: has(CANE) ? biome.cane : undefined,
-  })).filter(
-    (biome) =>
-      biome.trees.length > 0 &&
-      [biome.surface, biome.shore, biome.bed].every(has) &&
-      (!biome.mesa || BANDS.every((band) => T.hasTexture(pack, band))) &&
-      (!biome.frozen || (has(ICE) && has(SNOW))),
-  );
-  if (livable.length === 0 || ![STONE, DIRT, GRAVEL, SAND].every(has)) return null;
-  const biome = livable[Math.floor(next() * livable.length)]!;
-  const scene = biome.scenes[Math.floor(next() * biome.scenes.length)]!;
-  const hours = dark ? DARK_HOURS : LIGHT_HOURS;
-  const hour = hours[Math.floor(next() * hours.length)]!;
-
-  const ground = new Uint8Array(n * n);
-  const groundMat = new Uint8Array(n * n);
-  const runs = new Uint8Array(n * n * RUNS * 3);
-  const runCount = new Uint8Array(n * n);
-  const decal = new Uint8Array(n * n);
-  const top = new Uint8Array(n * n);
-  const sea = 14;
-
-  // Every scene is two fields: how far a point lies inland of the water's edge (negative under water), and how
-  // much the land climbs there beyond its rolling. The camera stands near z = 8 and looks up the grid.
-  const mid = n / 2;
-  const phase = next() * 6.28;
-  const side = next() < 0.5 ? -1 : 1;
-  const pond = next() < 0.6;
-  const stream = next() < 0.6;
-  const cameraZ = 8;
-  const riverX = (z: number): number =>
-    mid + 6 + Math.sin(z / 40 + phase) * 7 + (valueNoise(z / 14, 3, seed) - 0.5) * 6;
-  const riverHalf = (z: number): number => 6 + z * 0.14 + valueNoise(z / 18, 9, seed) * 5;
-  const coastX = (z: number): number =>
-    mid + 5 + Math.sin(z / 34 + phase) * 7 + (valueNoise(z / 12, 5, seed) - 0.5) * 8;
-  const valleyX = (z: number): number => mid + Math.sin(z / 45 + phase) * 10;
-  const far = (x: number, z: number): number => smooth(fbm(x / 40, z / 40, seed + 5) * 2.2 - 0.5);
-  let inland: (x: number, z: number) => number;
-  let climb: (x: number, z: number, d: number) => number;
-  /** The water's depth at its deepest, and how far from the edge it gets there. */
-  let basin: [depth: number, reach: number] = [3.2, 6];
-  let standX = mid;
-  let aimX = mid;
-  if (scene === 'river') {
-    inland = (x, z) => {
-      const half = riverHalf(z);
-      return Math.abs(x - riverX(z)) - half + (valueNoise(x / 7, z / 7, seed + 9) - 0.5) * 0.3 * half;
-    };
-    climb = (x, z, d) => Math.max(0, d - 16) * 0.16 * far(x, z);
-    standX = riverX(cameraZ) - riverHalf(cameraZ) - 4;
-    aimX = riverX(70);
-  } else if (scene === 'lake') {
-    const lakeX = mid + 6 * side;
-    // The near shore keeps clear of the camera, which stands on it and not on an islet.
-    inland = (x, z) =>
-      Math.hypot((x - lakeX) / 1.2, z - 62) -
-      44 -
-      (valueNoise(x / 16, z / 16, seed + 9) - 0.5) * 24 +
-      Math.max(0, 26 - z) * 0.6;
-    climb = (x, z, d) =>
-      Math.max(0, d - 8) * 0.24 * far(x, z) + smooth((z - 110) / 60) * 16 * fbm(x / 30, z / 30, seed + 7);
-    basin = [5, 14];
-    standX = mid - 5 * side;
-    aimX = lakeX;
-  } else if (scene === 'coast') {
-    // Land on one side, open sea on the other and ahead.
-    inland = (x, z) =>
-      (coastX(z) - x) * side + (valueNoise(x / 9, z / 9, seed + 9) - 0.5) * 4 - Math.max(0, z - 120) * 0.5;
-    climb = (x, z, d) => Math.max(0, d - 14) * 0.22 * far(x, z);
-    basin = [9, 26];
-    standX = coastX(cameraZ) - 6 * side;
-    aimX = coastX(70) + 10 * side;
-  } else if (scene === 'peaks') {
-    inland = (x, z) => (stream ? Math.abs(x - valleyX(z)) - 2.2 + (valueNoise(x / 6, z / 6, seed + 9) - 0.5) * 2 : 99);
-    // The mountains stand back from the valley floor.
-    climb = (x, z, d) =>
-      Math.max(0, Math.abs(x - valleyX(z)) - 18) * 0.3 * (0.4 + fbm(x / 28, z / 28, seed + 5)) +
-      smooth((z - 64) / 90) * smooth(d / 45) * 62 * (0.25 + fbm(x / 34, z / 34, seed + 7));
-    basin = [1.6, 2];
-    standX = valleyX(cameraZ) - 5 * side;
-    aimX = valleyX(70);
-  } else if (scene === 'marsh') {
-    inland = (x, z) =>
-      (valueNoise(x / 9, z / 9, seed + 9) * 0.6 + valueNoise(x / 24, z / 24, seed + 11) * 0.6 - 0.64) * 16;
-    climb = () => 0;
-    basin = [1.8, 3];
-    aimX = mid + 8 * side;
-  } else {
-    const pondX = mid + 13 * side;
-    inland = (x, z) =>
-      pond ? Math.hypot(x - pondX, (z - 34) * 1.3) - 7 + (valueNoise(x / 5, z / 5, seed + 9) - 0.5) * 4 : 99;
-    climb = (x, z) =>
-      (fbm(x / 50, z / 50, seed + 5) - 0.4) * 10 +
-      smooth((z - 95) / 80) * (biome.alpine ? 44 : 18) * (0.2 + fbm(x / 34, z / 34, seed + 7));
-    basin = [2.2, 5];
-    aimX = mid - 6 * side;
-  }
-  const cameraX = Math.round(standX) + 0.5;
-  const heading = Math.atan2(aimX - cameraX, 62);
-  const headX = Math.sin(heading);
-  const headZ = Math.cos(heading);
-  /** How far ahead of the camera a point lies, and how far to its right. */
-  const aheadOf = (x: number, z: number): number => (z - cameraZ) * headZ + (x - cameraX) * headX;
-  const asideOf = (x: number, z: number): number => (x - cameraX) * headZ - (z - cameraZ) * headX;
-  const beach = scene === 'coast' ? 7 : 2.5;
-  const flat = scene === 'marsh' ? 0 : 1;
-
-  for (let z = 0; z < n; z++) {
-    for (let x = 0; x < n; x++) {
-      const i = z * n + x;
-      const stand = Math.hypot(x - cameraX, z - cameraZ);
-      // Dry footing where the camera stands.
-      const d = Math.max(inland(x, z), 4 - stand);
-      let height: number;
-      if (d < 0) height = sea - 1.2 - smooth(-d / basin[1]) * basin[0];
-      else {
-        const rolling = (fbm(x / 26, z / 26, seed) - 0.35) * biome.relief;
-        // The land lies low round the camera and gathers height with distance, so the view opens out.
-        const open = 0.3 + 0.7 * smooth((stand - 5) / 36);
-        height =
-          sea +
-          0.6 +
-          smooth(d / 0.6) * 1.2 * flat +
-          smooth(d / 10) * (1.6 * flat + (Math.max(-1, rolling) + climb(x, z, d)) * open);
-        // Flat-topped steps with sheer sides.
-        if (biome.mesa && height > sea + 5) height = sea + 5 + Math.floor((height - sea - 5) / 8) * 9;
-        // The camera stands on a slight rise.
-        const knoll = sea + (flat ? 3.5 : 2);
-        if (stand < 9) height = knoll + (height - knoll) * smooth(stand / 9);
-      }
-      const h = Math.max(3, Math.min(200, Math.round(height)));
-      ground[i] = h;
-      const rough = valueNoise(x / 6, z / 6, seed + 13);
-      const pebbly = valueNoise(x / 13, z / 13, seed + 3) > 0.6;
-      if (h < sea) groundMat[i] = pebbly && biome.bed !== RED_SAND ? GRAVEL : biome.bed;
-      else if (h <= sea + 2 && d < beach && (scene === 'coast' || valueNoise(x / 12, z / 12, seed + 19) > 0.5))
-        groundMat[i] = biome.shore;
-      else if (biome.alpine && h > sea + (biome.frozen ? 22 : 46) + rough * 8) groundMat[i] = SNOW;
-      else if (biome.alpine && h > sea + 28 + rough * 10) groundMat[i] = STONE;
-      else if (biome.mesa && h > sea + 5) groundMat[i] = TERRACOTTA;
-      else if (biome.patches && valueNoise(x / 8, z / 8, seed + 15) > 0.56) groundMat[i] = biome.patches;
-      else groundMat[i] = biome.surface;
-    }
-  }
-
-  const addRun = (x: number, z: number, y0: number, y1: number, mat: number): void => {
+  return (x, z, y0, y1, mat) => {
     if (x < 0 || z < 0 || x >= n || z >= n || y1 <= y0 || y0 < ground[z * n + x]!) return;
     const i = z * n + x;
     const count = runCount[i]!;
-    const base = i * RUNS * 3;
+    const base = i * B.RUNS * 3;
     // Runs stay sorted bottom to top. One that meets a run of its own kind joins it; one that would overlap
     // anything else is dropped.
     let at = count;
@@ -762,363 +67,32 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
       if (runs[o + 2] === mat && runs[o]! <= y0) runs[o + 1] = Math.max(runs[o + 1]!, y1);
       if (runs[o + 2] === mat || runs[o + 1]! > y0) return;
     }
-    if (count >= RUNS) return;
+    if (count >= B.RUNS) return;
     for (let k = count; k > at; k--) runs.copyWithin(base + k * 3, base + k * 3 - 3, base + k * 3);
     runs.set([y0, Math.min(255, y1), mat], base + at * 3);
     runCount[i] = count + 1;
   };
+}
 
-  // A light the game itself would put there, always in the same part of the picture and by the water where there
-  // is any: a pool of lava sunk in stone, or a ruined portal on its patch of netherrack.
-  let gladeX = -99;
-  let gladeZ = -99;
-  if (has(LAVA) && (dark || next() < biome.lava)) {
-    // The nearest shore-side land to either side of the view's middle.
-    const wanted = 14 + next() * 4;
-    let best = Infinity;
-    for (let z = cameraZ; z < cameraZ + 110; z++) {
-      for (let x = 8; x < n - 8; x++) {
-        const ahead = aheadOf(x, z);
-        const aside = asideOf(x, z);
-        const wide = Math.abs(aside);
-        if (ahead < 12 || wide < ahead * 0.15 || wide > ahead * 0.92 || ground[z * n + x]! <= sea) continue;
-        // Right of centre for choice; left of it sooner than far away.
-        const score =
-          Math.abs(ahead - wanted) +
-          Math.abs(inland(x, z) - 5) * 0.6 +
-          (aside < 0 ? 6 : 0) +
-          Math.max(0, wide / ahead - 0.6) * 30;
-        if (score < best) {
-          best = score;
-          gladeX = x;
-          gladeZ = z;
-        }
-      }
-    }
-    if (best < Infinity) {
-      // The pool lies in the lowest ground it covers, so it sinks into the land and never stands above it.
-      let foot = 255;
-      for (let dz = -3; dz <= 3; dz++)
-        for (let dx = -3; dx <= 3; dx++)
-          foot = Math.min(foot, Math.max(sea + 1, ground[(gladeZ + dz) * n + gladeX + dx]!));
-      // By night a standing frame shows where a pool lying flat would not.
-      const portal = has(OBSIDIAN) && has(NETHERRACK) && has(MAGMA) && next() < (hour.time > 0.54 ? 0.85 : 0.5);
-      for (let dz = -8; dz <= 8; dz++) {
-        for (let dx = -8; dx <= 8; dx++) {
-          const i = (gladeZ + dz) * n + gladeX + dx;
-          const rough = hash2(gladeX + dx, gladeZ + dz, seed + 21);
-          const d = Math.hypot(dx, dz * 1.3) + rough;
-          if (d > 8) continue;
-          // Stone holds the pool in where the land or the water beside it lies lower.
-          if (d < 5.6 && ground[i]! < foot) {
-            ground[i] = foot;
-            groundMat[i] = STONE;
-          }
-          if (ground[i]! < sea) continue;
-          // The land about it eases down to its level, so nothing walls the light in.
-          const most = foot + (d < 5 ? 0 : Math.ceil((d - 5) * 0.5));
-          ground[i] = d < 5 ? foot : Math.min(ground[i]!, most);
-          if (portal) {
-            if (d < 4.6) groundMat[i] = rough > 0.66 ? LAVA : rough > 0.5 ? MAGMA : NETHERRACK;
-          } else if (d < 4.4) groundMat[i] = LAVA;
-          else if (d < 5.6) groundMat[i] = STONE;
-        }
-      }
-      // Nothing between the camera and the light stands above the straight slope from the one's footing to the
-      // other's; to either side of that line the land climbs back gently, so no trench shows.
-      const eyeGround = ground[cameraZ * n + Math.floor(cameraX)]!;
-      const run = Math.hypot(gladeX - cameraX, gladeZ - cameraZ);
-      for (let z = cameraZ; z <= gladeZ + 8; z++) {
-        for (let x = 1; x < n - 1; x++) {
-          const along = ((x - cameraX) * (gladeX - cameraX) + (z - cameraZ) * (gladeZ - cameraZ)) / run;
-          const off = Math.abs((x - cameraX) * (gladeZ - cameraZ) - (z - cameraZ) * (gladeX - cameraX)) / run;
-          if (along < 0 || along > run - 4) continue;
-          const i = z * n + x;
-          const slope = Math.round(
-            eyeGround + (Math.min(eyeGround, foot) - eyeGround) * Math.min(1, along / (run - 5)),
-          );
-          const most = Math.max(sea + 1, slope) + Math.ceil(Math.max(0, off - 2 - along * 0.4) * 0.5);
-          if (ground[i]! > most) ground[i] = most;
-        }
-      }
-      // Lava lies in the ground: where the land falls away beside it, stone holds it in.
-      for (let dz = -4; dz <= 4; dz++) {
-        for (let dx = -4; dx <= 4; dx++) {
-          const i = (gladeZ + dz) * n + gladeX + dx;
-          if (groundMat[i] !== LAVA) continue;
-          if (Math.min(ground[i - 1]!, ground[i + 1]!, ground[i - n]!, ground[i + n]!) < ground[i]!)
-            groundMat[i] = portal ? NETHERRACK : STONE;
-        }
-      }
-      if (portal) {
-        // The frame: two pillars and a lintel, some of it fallen, some of it weeping.
-        const block = (x: number, y: number): void => {
-          const roll = hash2(x, y, seed + 23);
-          if (roll > 0.14) addRun(x, gladeZ, y, y + 1, has(CRYING) && roll > 0.74 ? CRYING : OBSIDIAN);
-        };
-        for (let dx = -2; dx <= 1; dx++) {
-          const x = gladeX + dx;
-          const g = ground[gladeZ * n + x]!;
-          groundMat[gladeZ * n + x] = OBSIDIAN;
-          if (dx === -2 || dx === 1) for (let y = g; y < g + 5; y++) block(x, y);
-          else block(x, foot + 4);
-        }
-      }
-    }
-  }
-
-  /** The game's small tree: two wide layers of foliage, then two narrow ones, the top a plus. */
-  const oak = (x: number, z: number, height: number, leaf: number, log: number, spread = 2): void => {
-    const g = ground[z * n + x]!;
-    const crown = g + height;
-    addRun(x, z, g, crown, log);
-    addRun(x, z, crown, crown + 2, leaf);
-    for (let dz = -spread; dz <= spread; dz++) {
-      for (let dx = -spread; dx <= spread; dx++) {
-        const ax = Math.abs(dx);
-        const az = Math.abs(dz);
-        if (ax + az === 0) continue;
-        const keep = hash2(x + dx, z + dz, seed + 31) > 0.45;
-        const rim = ax === spread || az === spread;
-        if (rim && ax === az && !keep) continue;
-        const inner = ax < 2 && az < 2;
-        addRun(x + dx, z + dz, crown - 2, crown + (!inner ? 0 : ax + az === 1 ? 2 : keep ? 1 : 0), leaf);
-        // A swamp's oaks trail vines from the rim of the crown.
-        if (spread > 2 && rim && hash2(x + dx, z + dz, seed + 35) > 0.45)
-          addRun(x + dx, z + dz, crown - 3 - Math.floor(hash2(x + dx, z + dz, seed + 37) * 3), crown - 2, VINE);
-      }
-    }
-  };
-
-  /** A tall trunk carrying several rounded clumps of foliage. */
-  const tallOak = (x: number, z: number, height: number): void => {
-    const g = ground[z * n + x]!;
-    const crown = g + height;
-    addRun(x, z, g, crown, OAK_LOG);
-    addRun(x, z, crown, crown + 3, OAK_LEAVES);
-    for (let clump = 0; clump < 4; clump++) {
-      const ox = clump === 0 ? 0 : Math.round((hash2(x + clump, z, seed + 61) - 0.5) * 6);
-      const oz = clump === 0 ? 0 : Math.round((hash2(x, z + clump, seed + 63) - 0.5) * 6);
-      const oy = crown - (clump === 0 ? 0 : 1 + clump);
-      const radius = clump === 0 ? 2.7 : 2.2;
-      for (let dz = -3; dz <= 3; dz++) {
-        for (let dx = -3; dx <= 3; dx++) {
-          const reach = radius * radius - dx * dx - dz * dz;
-          if (reach < 0 || (ox + dx === 0 && oz + dz === 0)) continue;
-          const half = Math.floor(Math.sqrt(reach) + 0.4);
-          addRun(x + ox + dx, z + oz + dz, oy - half, oy + half + 1, OAK_LEAVES);
-        }
-      }
-    }
-  };
-
-  const spruce = (x: number, z: number, height: number, leaf: number): void => {
-    const g = ground[z * n + x]!;
-    // From the tip down, the foliage steps out and in.
-    const radii = [0, 1, 2, 1, 2, 3, 2, 3];
-    const layers = Math.min(height - 1, radii.length);
-    addRun(x, z, g, g + height, SPRUCE_LOG);
-    addRun(x, z, g + height, g + height + 1, leaf);
-    for (let dz = -3; dz <= 3; dz++) {
-      for (let dx = -3; dx <= 3; dx++) {
-        const d = Math.max(Math.abs(dx), Math.abs(dz));
-        if (d === 0) continue;
-        const corner = Math.abs(dx) === d && Math.abs(dz) === d;
-        let from = -1;
-        for (let layer = layers - 1; layer >= -1; layer--) {
-          const y = g + height - layer;
-          const leafy = layer >= 0 && radii[layer]! >= d && !(corner && radii[layer] === d);
-          if (leafy && from < 0) from = y;
-          if (!leafy && from >= 0) {
-            addRun(x + dx, z + dz, from, y, leaf);
-            from = -1;
-          }
-        }
-      }
-    }
-  };
-
-  /** Four trunks side by side under one broad, deep crown. */
-  const darkOak = (x: number, z: number, height: number): void => {
-    const crown = ground[z * n + x]! + height;
-    for (let dz = -3; dz <= 4; dz++) {
-      for (let dx = -3; dx <= 4; dx++) {
-        const d = Math.hypot(dx - 0.5, dz - 0.5);
-        if (d < 1) {
-          addRun(x + dx, z + dz, ground[(z + dz) * n + x + dx]!, crown, DARK_OAK_LOG);
-          addRun(x + dx, z + dz, crown, crown + 2, DARK_OAK_LEAVES);
-        } else if (d < 4.1 && (d < 3.4 || hash2(x + dx, z + dz, seed + 31) > 0.4))
-          addRun(x + dx, z + dz, crown - 2, crown + (d < 2.2 ? 2 : d < 3.3 ? 1 : 0), DARK_OAK_LEAVES);
-      }
-    }
-  };
-
-  /** A trunk that leans over, then a wide flat crown two layers deep. */
-  const acacia = (x: number, z: number, height: number): void => {
-    const g = ground[z * n + x]!;
-    const turn = Math.floor(hash2(x, z, seed + 65) * 4);
-    const lx = turn === 0 ? 1 : turn === 1 ? -1 : 0;
-    const lz = turn === 2 ? 1 : turn === 3 ? -1 : 0;
-    addRun(x, z, g, g + height, ACACIA_LOG);
-    addRun(x + lx, z + lz, g + height, g + height + 1, ACACIA_LOG);
-    const cx = x + lx * 2;
-    const cz = z + lz * 2;
-    const crown = g + height + 3;
-    addRun(cx, cz, crown - 2, crown - 1, ACACIA_LOG);
-    for (let dz = -3; dz <= 3; dz++) {
-      for (let dx = -3; dx <= 3; dx++) {
-        const ax = Math.abs(dx);
-        const az = Math.abs(dz);
-        if (ax + az > 4) continue;
-        const inner = ax < 3 && az < 3 && ax + az < 4;
-        addRun(cx + dx, cz + dz, crown - 1, crown + (inner ? 1 : 0), ACACIA_LEAVES);
-      }
-    }
-  };
-
-  const cherry = (x: number, z: number, height: number): void => {
-    const g = ground[z * n + x]!;
-    const radius = 3 + (hash2(x, z, seed + 33) > 0.5 ? 1 : 0);
-    addRun(x, z, g, g + height, CHERRY_LOG);
-    for (let dz = -radius; dz <= radius; dz++) {
-      for (let dx = -radius; dx <= radius; dx++) {
-        const d = Math.hypot(dx, dz);
-        if (d > radius + 0.3) continue;
-        const rim = d > radius - 1.2 ? 1 : 0;
-        addRun(x + dx, z + dz, g + height - 1 + rim, g + height + 2 - rim + (d < 1.5 ? 1 : 0), CHERRY_LEAVES);
-      }
-    }
-  };
-
-  let shares = 0;
-  for (const [, share] of biome.trees) shares += share;
-  const grow = (x: number, z: number, size: number, roll: number): void => {
-    let kind = biome.trees[0]![0];
-    let at = roll * shares;
-    for (const [tree, share] of biome.trees) {
-      kind = tree;
-      if ((at -= share) < 0) break;
-    }
-    const g = ground[z * n + x]!;
-    if (kind === 'oak') oak(x, z, 4 + Math.floor(size * 3), OAK_LEAVES, OAK_LOG);
-    else if (kind === 'swamp oak') oak(x, z, 5 + Math.floor(size * 3), OAK_LEAVES, OAK_LOG, 3);
-    else if (kind === 'tall oak') tallOak(x, z, 7 + Math.floor(size * 5));
-    else if (kind === 'birch') oak(x, z, 5 + Math.floor(size * 3), BIRCH_LEAVES, BIRCH_LOG);
-    else if (kind === 'spruce') spruce(x, z, 6 + Math.floor(size * 5), biome.frozen ? SNOWY_LEAVES : SPRUCE_LEAVES);
-    else if (kind === 'dark oak') darkOak(x, z, 6 + Math.floor(size * 3));
-    else if (kind === 'acacia') acacia(x, z, 4 + Math.floor(size * 2));
-    else if (kind === 'cherry') cherry(x, z, 4 + Math.floor(size * 2));
-    else addRun(x, z, g, g + 2 + Math.floor(size * 2), CACTUS);
-  };
-
-  const sandy = (mat: number): boolean => mat === SAND || mat === RED_SAND;
-  const fertile = (mat: number): boolean => mat === GRASS || mat === PODZOL || mat === SNOWY_GRASS;
-  /** Whether the ground of a column is bare and of a kind things grow in. A swamp's trees also stand in its shallows. */
-  const bare = (i: number): boolean => {
-    const first = runCount[i]! > 0 && runs[i * RUNS * 3] === ground[i];
-    if (first) return false;
-    if (ground[i]! < sea) return scene === 'marsh' && ground[i]! >= sea - 2;
-    return fertile(groundMat[i]!) || sandy(groundMat[i]!) || groundMat[i] === TERRACOTTA;
-  };
-  const cactus = biome.trees[0]![0] === 'cactus';
-  for (let z = 4; z < n - 5; z += 3) {
-    for (let x = 4; x < n - 5; x += 3) {
-      const jx = x + Math.floor(hash2(x, z, seed + 41) * 3);
-      const jz = z + Math.floor(hash2(x, z, seed + 43) * 3);
-      const i = jz * n + jx;
-      if (!bare(i) || (sandy(groundMat[i]!) || groundMat[i] === TERRACOTTA) !== cactus) continue;
-      // Keep the camera's footing, the view straight ahead of it and the water's edge clear.
-      const ahead = aheadOf(jx, jz);
-      const aside = Math.abs(asideOf(jx, jz));
-      if (Math.hypot(jx - cameraX, jz - cameraZ) < 8 || (ahead > 0 && ahead < 32 && aside < 4 + ahead * 0.3)) continue;
-      if (scene !== 'marsh' && inland(jx, jz) < 2) continue;
-      if (Math.hypot(jx - gladeX, jz - gladeZ) < 7) continue;
-      const thicket = valueNoise(jx / 15, jz / 15, seed + 51);
-      if (hash2(jx, jz, seed + 47) > biome.density * (0.25 + thicket * 1.5)) continue;
-      grow(jx, jz, hash2(jx, jz, seed + 59), hash2(jx, jz, seed + 53));
-    }
-  }
-  const gladeReach = Math.hypot(gladeX - cameraX, gladeZ - cameraZ);
-  for (let i = 0; i < n * n; i++) {
-    const count = runCount[i]!;
-    top[i] = count > 0 ? Math.max(ground[i]!, runs[(i * RUNS + count - 1) * 3 + 1]!) : ground[i]!;
-  }
-
-  // Undergrowth, after the shadow heights so it casts none. Flowers keep to drifts; cane to the banks.
-  for (let z = 1; z < n - 1; z++) {
-    for (let x = 1; x < n - 1; x++) {
-      const i = z * n + x;
-      const g = ground[i]!;
-      if (g < sea) {
-        if (biome.lilies && g >= sea - 2 && hash2(x, z, seed + 69) < biome.lilies) decal[i] = LILY;
-        continue;
-      }
-      const close = Math.hypot(x - cameraX, z - cameraZ);
-      if (!bare(i) || close < 5 || Math.hypot(x - gladeX, z - gladeZ) < 8) continue;
-      // Nothing grows between the camera and its light.
-      const along = ((x - cameraX) * (gladeX - cameraX) + (z - cameraZ) * (gladeZ - cameraZ)) / gladeReach;
-      if (
-        along > 0 &&
-        along < gladeReach &&
-        Math.abs((x - cameraX) * (gladeZ - cameraZ) - (z - cameraZ) * (gladeX - cameraX)) < gladeReach * 3.5
-      )
-        continue;
-      const mat = groundMat[i]!;
-      const bank =
-        g <= sea + 1 && (ground[i - 1]! < sea || ground[i + 1]! < sea || ground[i - n]! < sea || ground[i + n]! < sea);
-      if (bank && close > 6 && biome.cane && (fertile(mat) || sandy(mat)) && hash2(x, z, seed + 75) < biome.cane) {
-        addRun(x, z, g, g + 1 + Math.floor(hash2(x, z, seed + 77) * 3), CANE);
-        continue;
-      }
-      if (mat !== biome.surface && mat !== biome.patches && mat !== TERRACOTTA) continue;
-      if (biome.petals && mat === GRASS && valueNoise(x / 6, z / 6, seed + 79) > 0.45 && hash2(x, z, seed + 81) < 0.6)
-        decal[i] = PETALS;
-      const drift = valueNoise(x / 9, z / 9, seed + 71) > 0.55 ? 2.6 : 0.3;
-      const tuft = 0.3 + valueNoise(x / 11, z / 11, seed + 73);
-      let roll = hash2(x, z, seed + 67);
-      for (const [plant, chance] of biome.plants) {
-        const odds = chance * (plant >= POPPY && plant <= ORCHID ? drift : plant <= FERN ? tuft : 1);
-        if (roll < odds && (plant !== TALL_GRASS || close > 10)) {
-          addRun(x, z, g, g + (plant === TALL_GRASS ? 2 : 1), plant);
-          break;
-        }
-        roll -= odds;
-      }
-    }
-  }
-  let wet = false;
-  for (let i = 0; i < n * n; i++) {
-    if (ground[i]! >= sea) continue;
-    wet = true;
-    if (!biome.frozen) continue;
-    ground[i] = sea;
-    groundMat[i] = ICE;
-    top[i] = Math.max(top[i]!, sea);
-  }
-
-  // Light as the game spreads it: one level lost for every block travelled, across or up and down. The sky's
-  // light also thins by a level for each layer of foliage it passes.
-  const blockLight = new Uint8Array(n * n);
+/**
+ * The sky's light on each column, as the game spreads it: thinned by a level for each layer of foliage it passes,
+ * shut out under anything solid, and one level lost for every block it travels across.
+ */
+function skyLit(runs: Uint8Array, runCount: Uint8Array): Uint8Array {
+  const n = GRID;
   const skyLight = new Uint8Array(n * n);
   for (let i = 0; i < n * n; i++) {
-    let glow = EMITS[groundMat[i]!]!;
     let shade = 0;
     for (let k = 0; k < runCount[i]!; k++) {
-      const o = (i * RUNS + k) * 3;
+      const o = (i * B.RUNS + k) * 3;
       const mat = runs[o + 2]!;
-      if (mat >= PLANT) continue;
-      if (mat < FOLIAGE) shade = 15;
-      else if (mat < LAVA) shade += runs[o + 1]! - runs[o]!;
-      glow = Math.max(glow, EMITS[mat]!);
+      if (mat < B.FOLIAGE) shade = 15;
+      else if (mat < B.LAMP) shade += runs[o + 1]! - runs[o]!;
     }
-    blockLight[i] = glow;
     skyLight[i] = Math.max(0, 15 - shade);
   }
   const spread = (from: number, to: number): void => {
-    if (from < 0 || from >= n * n) return;
-    const lamp = blockLight[from]! - 1 - Math.abs(ground[from]! - ground[to]!);
-    if (lamp > blockLight[to]!) blockLight[to] = lamp;
-    if (skyLight[from]! - 1 > skyLight[to]!) skyLight[to] = skyLight[from]! - 1;
+    if (from >= 0 && from < n * n && skyLight[from]! - 1 > skyLight[to]!) skyLight[to] = skyLight[from]! - 1;
   };
   for (let pass = 0; pass < 4; pass++) {
     const forward = (pass & 1) === 0;
@@ -1129,34 +103,399 @@ export function buildWorld(seed: number, dark: boolean, pack: T.TexturePack): Wo
       spread(forward ? i - n : i + n, i);
     }
   }
+  return skyLight;
+}
 
-  const yaw = heading + (next() - 0.5) * 0.06;
-  // The sun's height follows from the hour; by night the hour's bearing is the moon's, opposite the sun.
-  const turn = (((hour.time + 0.75) % 1) + 1) % 1;
-  const arc = (turn + (0.5 - Math.cos(turn * Math.PI) * 0.5 - turn) / 3) * 2 * Math.PI;
-  const height = Math.cos(arc) * 0.766;
-  const bearing =
-    yaw +
-    hour.bearing * (hour.bearing > 0.2 && hour.bearing < 1.5 ? side : 1) +
-    (height < 0 ? Math.PI : 0) +
-    (next() - 0.5) * 0.08;
-  const level = Math.sqrt(1 - height * height);
+const SEA = 14;
+/** A land's own ground lies about a middle well inside the grid. */
+const X0 = -110;
+const Y0 = -52;
+
+/** What a picture is of: which lie of the land, which biome, which building. */
+export interface Choice {
+  land: LandName;
+  biome: string;
+  building: keyof typeof BUILDINGS;
+}
+
+/** The lens: the angle a picture spans, and the rows of a whole picture, as a share of its height, to a unit of slope. */
+const FOV = 2 * Math.atan(18 / 35);
+const ROWS = ASPECT / (2 * Math.tan(FOV / 2));
+/**
+ * Where a building's foot stands in every picture, as a share of its height, so that a page may show any picture
+ * the same way; and the most of a picture's height a building may take: a taller one is not put on that land.
+ */
+const FOOT = 0.66;
+const TALLEST = 0.5;
+
+/** How high the land stands above the water at a place, before anything is built on it. */
+function rise(land: Land, biome: Biome, xs: number, ys: number): number {
+  const { seed, water } = land;
+  // A biome's land lies as rolling and stands as high as the game has it, against the spruce hills' own.
+  const rolling = Math.min(1.1, Math.max(0.45, biome.relief / 7));
+  const lofty = Math.min(1.4, Math.max(0.3, biome.rise / 26));
+  const d = Math.hypot((xs - water.x) / water.wide, ys - water.y);
+  const n1 = fbm(xs * 0.022, ys * 0.022, seed);
+  const n2 = fbm(xs * 0.07 + 40, ys * 0.07 + 40, seed + 5, 3);
+  const n3 = fbm(xs * 0.011 + 90, ys * 0.011 + 90, seed + 9, 3);
+  const shore = Math.min(2.2, Math.max(-4, (d - water.r) * 0.24));
+  const front = ease(8, -18, ys);
+  const hills = Math.max(0, d - water.r - 6) * 0.13 * land.hills * rolling * (1 + 0.9 * n1) * (1 - 0.85 * front);
+  const far = ease(60, 150, ys) * (10 + 12 * n3 + 4 * n1) * land.far * lofty;
+  const aside = land.open ? xs - water.x : Math.abs(xs - water.x);
+  // An open land's rise is a cape: it runs out to sea again further off.
+  const cape = land.open ? ease(125, 85, ys) : 1;
+  const sides = ease(34, 95, aside) * (9 + 9 * n1) * land.sides * Math.sqrt(lofty) * (1 - 0.6 * front) * cape;
+  const near = ease(-22, -46, ys) * (1.5 + 1.5 * n2);
+  const h = Math.round(shore + hills + far + sides + near + 1.3 * n2);
+  // Flat-topped steps with sheer sides.
+  return biome.mesa && h > 4 ? 4 + Math.floor((h - 4) / 7) * 8 : h;
+}
+
+/** How much of a picture's height a building takes on a land, and how far off it stands. */
+function sized(land: Land, building: Building): { span: number; off: number; aheadX: number; aheadY: number } {
+  const { camera, look, site } = land;
+  const ahead = Math.hypot(look.x - camera.x, look.y - camera.y);
+  const aheadX = (look.x - camera.x) / ahead;
+  const aheadY = (look.y - camera.y) / ahead;
+  // The building stands about the middle of its site, whatever its width.
+  const off = (site.x + 5 - camera.x) * aheadX + (site.y - camera.y) * aheadY;
+  return { span: (tallness(building) / off) * ROWS, off, aheadX, aheadY };
+}
+
+/**
+ * How a picture is taken: from the near shore, level, a little above the ground, looking the land's own way. The
+ * horizon is set so that the building's foot stands at one height in every picture.
+ */
+function framing(
+  land: Land,
+  biome: Biome,
+  building: Building,
+): { eye: number; aheadX: number; aheadY: number; horizon: number; top: number } {
+  const { camera, site } = land;
+  const { span, off, aheadX, aheadY } = sized(land, building);
+  const eye = SEA + rise(land, biome, camera.x + 0.5, camera.y + 0.5) + 5;
+  return { eye, aheadX, aheadY, horizon: FOOT - ((eye - SEA - site.rise) / off) * ROWS, top: FOOT - span };
+}
+
+/**
+ * Every picture there is: each land in each biome found in such a lie, with each building that is not too tall
+ * for it.
+ */
+export const CHOICES: readonly Choice[] = (Object.keys(LANDS) as Choice['land'][]).flatMap((land) =>
+  BIOMES.filter(({ lies }) => lies.includes(LANDS[land].lie)).flatMap(({ name }) =>
+    (Object.keys(BUILDINGS) as Choice['building'][])
+      .filter((building) => sized(LANDS[land], BUILDINGS[building]).span <= TALLEST)
+      .map((building) => ({ land, biome: name, building })),
+  ),
+);
+
+/** The picture a seed has. */
+export const chosen = (seed: number): Choice =>
+  CHOICES[Math.floor(hash(seed, 5, 71) * CHOICES.length) % CHOICES.length]!;
+
+const named = (choice: Choice): [Land, Biome, Building] => [
+  LANDS[choice.land],
+  BIOMES.find(({ name }) => name === choice.biome)!,
+  BUILDINGS[choice.building],
+];
+
+/** The world a seed has; or, for looking at one, the world of a `choice`. */
+export function buildWorld(seed: number, choice = chosen(seed)): World {
+  const [land, biome, building] = named(choice);
+  const { seed: SEED, camera: CAMERA, look: LOOK, water: LAKE } = land;
+  const YARD = land.site.rise;
+  // The building stands about the middle of its site, whatever its width.
+  const x0 = land.site.x + 5 - (building.wide >> 1);
+  const y0 = land.site.y;
+  // What gives light by the shore lies beside the building, clear of it, on the side of the water's middle.
+  const n = GRID;
+  const ground = new Uint8Array(n * n);
+  const groundMat = new Uint8Array(n * n);
+  const runs = new Uint8Array(n * n * B.RUNS * 3);
+  const runCount = new Uint8Array(n * n);
+  const door = x0 + building.door;
+  const add = putter(ground, runs, runCount);
+  /** A block of the scene, by its own coordinates: across, away from the camera, and up from the water. */
+  const put = (x: number, y: number, z: number, mat: number, tall = 1): void =>
+    add(x - X0, y - Y0, SEA + z, SEA + z + tall, mat);
+  const heights = new Int16Array(n * n);
+  const top = (x: number, y: number): number => heights[(y - Y0) * n + x - X0]!;
+  /** How far outside the building's footprint a place lies. */
+  const yard = (x: number, y: number): number =>
+    Math.hypot(
+      Math.max(0, Math.abs(x + 0.5 - x0 - building.wide / 2) - building.wide / 2),
+      Math.max(0, Math.abs(y + 0.5 - y0 - building.deep / 2) - building.deep / 2),
+    );
+
+  const roughs = new Float32Array(n * n);
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const xs = i + X0 + 0.5;
+      const ys = j + Y0 + 0.5;
+      let h = rise(land, biome, xs, ys);
+      // A flat yard for the building, eased into the land round it.
+      const out = yard(i + X0, j + Y0);
+      if (out < 4.5) h = YARD;
+      else if (out < 9.5) h = Math.round(YARD + (h - YARD) * ease(4.5, 9.5, out));
+      heights[j * n + i] = h;
+      // Frozen water is a floor of ice.
+      ground[j * n + i] = SEA + (biome.frozen && h < 0 ? 0 : h);
+      roughs[j * n + i] = (fbm(xs * 0.07 + 40, ys * 0.07 + 40, SEED + 5, 3) + 1) / 2;
+    }
+  }
+  // The ground, as the game lays it: the bed under water, the shore by it, bare rock where the land is steep or
+  // stands high, then snow; else the biome's own surface, with its patches.
+  const sandy = biome.surface === B.SAND || biome.surface === B.RED_SAND;
+  const rock = sandy ? B.SANDSTONE : B.STONE;
+  for (let j = 0; j < n; j++) {
+    for (let i = 0; i < n; i++) {
+      const at = j * n + i;
+      const h = heights[at]!;
+      const rough = roughs[at]!;
+      const inner = i > 0 && j > 0 && i < n - 1 && j < n - 1;
+      const steep = inner ? h - Math.min(heights[at - 1]!, heights[at + 1]!, heights[at - n]!, heights[at + n]!) : 0;
+      const patchy = noise((i + X0) / 9, (j + Y0) / 9, SEED + 15);
+      if (h < 0) groundMat[at] = biome.frozen ? B.ICE : patchy > 0.3 && biome.bed !== B.RED_SAND ? B.GRAVEL : biome.bed;
+      else if (biome.mesa && h > 4) groundMat[at] = B.TERRACOTTA;
+      else if (h > (biome.frozen ? 14 : 46) + rough * 8) groundMat[at] = B.SNOW;
+      else if (steep > 2 || (biome.alpine && h > 36 + rough * 8)) groundMat[at] = rock;
+      else if (h <= 1) groundMat[at] = biome.shore;
+      else if (biome.patches && patchy > 0.25) groundMat[at] = biome.patches;
+      else groundMat[at] = biome.surface;
+    }
+  }
+
+  // Light the land gives of itself. In dry country lava lies open, a pool on the shore beside the building; in
+  // high country it springs from the rock and runs down to the water. Trees keep off both.
+  const lamps: number[] = [];
+  const molten = new Uint8Array(n * n);
+  const flow: [number, number][] = [];
+  const lava = (i: number, j: number): void => {
+    groundMat[j * n + i] = B.LAVA;
+    flow.push([i + X0, j + Y0]);
+    for (let dj = -3; dj <= 3; dj++) for (let di = -3; di <= 3; di++) molten[(j + dj) * n + i + di] = 1;
+  };
+  const beside = land.site.x > LAKE.x ? x0 - 8 : x0 + building.wide + 7;
+  if (sandy) {
+    const px = beside;
+    for (let py = y0 + 10; py > Y0 + 4; py--) {
+      if (!(top(px, py) > 1 && top(px, py - 1) <= 1)) continue;
+      const floor = top(px, py + 3);
+      for (let dy = -3; dy <= 3; dy++) {
+        for (let dx = -5; dx <= 5; dx++) {
+          const at = (py + 3 + dy - Y0) * n + px + dx - X0;
+          if ((dx / 5.2) ** 2 + (dy / 3.2) ** 2 > 1 + (hash(px + dx, py + dy, seed + 77) - 0.5) * 0.5) continue;
+          heights[at] = floor - 1;
+          ground[at] = SEA + floor - 1;
+          lava(px + dx - X0, py + 3 + dy - Y0);
+        }
+      }
+      lamps.push(px - X0 + 0.5, SEA + floor + 1.2, py + 3.5 - Y0, 700 / (4 * Math.PI * Math.PI), -1);
+      break;
+    }
+  } else if (land.lie === 'range' || land.lie === 'fjord' || land.lie === 'cliffs') {
+    // The spring: the first ground high enough, going up the slope beside the building.
+    let i = beside - X0;
+    let j = y0 + 2 - Y0;
+    while (j < n - 8 && heights[j * n + i]! < 13) j++;
+    for (let step = 0; step < 90 && j < n - 8; step++) {
+      const h = heights[j * n + i]!;
+      // Lava never lies in water: where it would meet it, it has set to stone.
+      if (h <= 1) {
+        if (h > 0) groundMat[j * n + i] = B.STONE;
+        break;
+      }
+      // Bare rock either side of it, and the lava in its bed.
+      for (const [di, dj] of [
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ] as const)
+        if (groundMat[(j + dj) * n + i + di] !== B.LAVA && heights[(j + dj) * n + i + di]! > 0)
+          groundMat[(j + dj) * n + i + di] = rock;
+      lava(i, j);
+      if (hash(i, j, seed + 85) < 0.6 && heights[j * n + i + 1]! > 1) lava(i + 1, j);
+      if (step % 6 === 0) lamps.push(i + 0.5, SEA + h + 1.2, j - 0.6, 260 / (4 * Math.PI * Math.PI), -1);
+      // It runs the steepest way down, and toward the water where the ground is level.
+      let next = j - 1;
+      let across = i;
+      let lowest = heights[(j - 1) * n + i]!;
+      for (const di of [-1, 1]) {
+        if (heights[j * n + i + di]! < lowest) {
+          lowest = heights[j * n + i + di]!;
+          next = j;
+          across = i + di;
+        }
+      }
+      if (lowest > h) break;
+      i = across;
+      j = next;
+    }
+  }
+
+  // Under the water, seldom: a block of magma on the deep of the bed, or two or three together. A warm sea has a
+  // few sea pickles in its shallows.
+  if (!biome.frozen && hash(seed, 3, 91) < 0.3) {
+    const spots = 1 + Math.floor(hash(seed, 5, 93) * 2);
+    for (let spot = 0; spot < spots; spot++) {
+      // Somewhere in the water between where it is seen from and the building.
+      const along = 0.4 + 0.3 * spot + hash(seed, spot, 95) * 0.15;
+      const i = Math.round(CAMERA.x + (door - CAMERA.x) * along + (hash(seed, spot, 97) - 0.5) * 16) - X0;
+      const j = Math.round(CAMERA.y + (y0 - CAMERA.y) * along) - Y0;
+      const blocks = 1 + Math.floor(hash(seed, spot, 99) * 3);
+      for (let block = 0; block < blocks; block++) {
+        const at = (j + (block === 2 ? 1 : 0)) * n + i + (block === 1 ? 1 : 0);
+        if (heights[at]! <= -3) groundMat[at] = B.MAGMA;
+      }
+    }
+  }
+  if (land.open && (biome.name === 'savanna' || biome.name === 'desert')) {
+    for (let j = 8; j < n - 8; j++)
+      for (let i = 8; i < n - 8; i++) {
+        const h = heights[j * n + i]!;
+        if (h < 0 && h >= -3 && hash(i, j, seed + 75) < 0.012) groundMat[j * n + i] = B.SEA_PICKLES;
+      }
+  }
+
+  // Trees, in the biome's own kinds and shares, as thick as it grows them. None in the yard, over the camera,
+  // across its view of the water, or before the building; and only in ground their kind takes root in.
+  const plot: Plot = { seed, ground, put: add };
+  const main = biome.trees[0]![0];
+  let shares = 0;
+  for (const [, share] of biome.trees) shares += share;
+  const fertile = (mat: number): boolean => mat === B.GRASS || mat === B.PODZOL || mat === B.SNOWY_GRASS;
+  const slope = (LOOK.x - CAMERA.x) / (LOOK.y - CAMERA.y);
+  const reach = Math.hypot(LOOK.x - CAMERA.x, LOOK.y - CAMERA.y);
+  const toX = (LOOK.x - CAMERA.x) / reach;
+  const toY = (LOOK.y - CAMERA.y) / reach;
+  /** How far off a place is, and how far to the right of straight ahead it is seen, as a slope. */
+  const seen = (x: number, y: number): [number, number] => {
+    const off = (x - CAMERA.x) * toX + (y - CAMERA.y) * toY;
+    return [off, ((x - CAMERA.x) * toY - (y - CAMERA.y) * toX) / off];
+  };
+  const corners = [
+    seen(x0, y0),
+    seen(x0 + building.wide, y0),
+    seen(x0, y0 + building.deep),
+    seen(x0 + building.wide, y0 + building.deep),
+  ];
+  const nearest = Math.min(...corners.map(([off]) => off));
+  const leftmost = Math.min(...corners.map(([, across]) => across));
+  const rightmost = Math.max(...corners.map(([, across]) => across));
+  /** Whether a tree at a place would stand before the building. */
+  const hides = (x: number, y: number): boolean => {
+    const [off, across] = seen(x + 0.5, y + 0.5);
+    return off > 0 && off < nearest && across > leftmost - 5 / off && across < rightmost + 5 / off;
+  };
+  // Nor does one stand before the lava, on the side it is seen from.
+  const lit = flow.map(([x, y]) => seen(x + 0.5, y + 0.5));
+  const veils = (x: number, y: number): boolean => {
+    const [off, across] = seen(x + 0.5, y + 0.5);
+    return off > 0 && lit.some(([far, at]) => off < far && Math.abs(across - at) < 4 / off);
+  };
+  for (let j = 4; j < n - 9; j++) {
+    for (let i = 8; i < n - 9; i++) {
+      const x = i + X0;
+      const y = j + Y0;
+      const h = top(x, y);
+      const mat = groundMat[j * n + i]!;
+      // A swamp's trees stand in its shallows too; a cactus wants sand or clay.
+      if (
+        h < 0
+          ? !biome.flooded || h < -2
+          : main === 'cactus'
+            ? mat !== biome.surface && mat !== B.TERRACOTTA
+            : !fertile(mat)
+      )
+        continue;
+      if (yard(x, y) < 7.5 || hides(x, y) || molten[j * n + i]) continue;
+      if (
+        Math.hypot(x - CAMERA.x, y - CAMERA.y) < 24 ||
+        (Math.abs(x - CAMERA.x - (y - CAMERA.y) * slope) < 10 && y < 8)
+      )
+        continue;
+      if (Math.abs(top(x + 1, y) - h) + Math.abs(top(x, y + 1) - h) > 2) continue;
+      const forest = fbm((x + 0.5) * 0.05 + 7, (y + 0.5) * 0.05 + 7, SEED + 3, 3);
+      const density = ((0.01 + 0.05 * Math.max(0, forest + 0.25) + 0.0006 * Math.min(h, 30)) * biome.density) / 0.55;
+      if (hash(x, y, seed + 41) >= density || runCount[j * n + i]! > 0) continue;
+      if (veils(x, y)) continue;
+      let pick = hash(x, y, seed + 43) * shares;
+      let kind = main;
+      for (const [each, share] of biome.trees) {
+        kind = each;
+        if ((pick -= share) < 0) break;
+      }
+      grow(plot, kind, i, j, hash(x, y, seed + 47), biome.frozen || mat === B.SNOW);
+    }
+  }
+  // A tree or two of the biome's chief kind near enough to frame the view, where it has trees.
+  if (WOOD[main].length > 1)
+    for (const [x, y, tall] of land.frame)
+      if (!hides(x, y) && fertile(groundMat[(y - Y0) * n + x - X0]!))
+        grow(plot, main, x - X0, y - Y0, tall / 12, !!biome.frozen);
+
+  // Posts and corner posts are of the biome's chief tree, or of what it builds with where it has none.
+  const timber = WOOD[main].length > 1 ? WOOD[main][0]! : biome.walls;
+  // The building, on cobbles; then a path from its door to the water and a dock.
+  const lamp = (x: number, y: number, z: number): void => {
+    put(x, y, z, B.LAMP);
+    // Its light hangs on the side the picture is seen from, so it falls on what faces that way.
+    lamps.push(x - X0 + 0.5, SEA + z + 0.5, y - Y0 - 0.4, 420 / (4 * Math.PI * Math.PI), (y - Y0) * n + x - X0);
+  };
+  for (const [px, py, wide, deep] of building.plots ?? [[0, 0, building.wide, building.deep]])
+    for (let x = x0 + px - 1; x <= x0 + px + wide; x++)
+      for (let y = y0 + py - 1; y <= y0 + py + deep; y++) groundMat[(y - Y0) * n + x - X0] = B.GRAVEL;
+  building.raise({
+    walls: biome.walls,
+    roof: biome.roof,
+    timber,
+    put: (x, y, z, mat, tall) => put(x0 + x, y0 + y, YARD + z, mat, tall),
+    lamp: (x, y, z) => lamp(x0 + x, y0 + y, YARD + z),
+  });
+  let y = y0 - 2;
+  while (top(door, y) > 0 && y > Y0 + 2) {
+    groundMat[(y - Y0) * n + door - X0] = B.GRAVEL;
+    groundMat[(y - Y0) * n + door + 1 - X0] = B.GRAVEL;
+    y--;
+  }
+  for (let k = 0; k < 9; k++) {
+    put(door, y - k, 0, biome.walls);
+    put(door + 1, y - k, 0, biome.walls);
+    if (k % 4 === 0 && k < 8) {
+      put(door - 1, y - k, -1, timber);
+      put(door + 2, y - k, -1, timber);
+    }
+  }
+  for (const dx of [-1, 2]) put(door + dx, y - 8, -1, timber, 2);
+  // Light spilling from the windows onto the yard.
+  lamps.push(door + 1 - X0, SEA + YARD + 2, y0 - 2.2 - Y0, 900 / (4 * Math.PI * Math.PI), -1);
+
+  const { eye, aheadX, aheadY, horizon, top: head } = framing(land, biome, building);
+  // The last light is low ahead.
+  const low = (14 * Math.PI) / 180;
   return {
-    seed,
+    seed: SEED,
     ground,
     groundMat,
     runs,
     runCount,
-    decal,
-    top,
-    waterLevel: wet && !biome.frozen ? sea : 0,
-    blockLight,
-    skyLight,
-    atlas: T.buildAtlas(pack, biome.grass, biome.foliage),
-    sunTexture: pack.get('sun'),
-    moonTexture: pack.get('moon'),
-    time: hour.time,
-    sun: [Math.sin(bearing) * level, height, Math.cos(bearing) * level],
-    camera: { x: cameraX, y: ground[cameraZ * n + Math.floor(cameraX)]! + 1.62, z: cameraZ + 0.5, yaw },
+    waterLevel: biome.frozen ? 0 : SEA,
+    skyLight: skyLit(runs, runCount),
+    lamps: Float32Array.from(lamps),
+    colors: palette(biome),
+    light: [aheadX * Math.cos(low), Math.sin(low), aheadY * Math.cos(low)],
+    dusk: biome.dusk,
+    camera: {
+      x: CAMERA.x - X0,
+      y: eye,
+      z: CAMERA.y - Y0,
+      yaw: Math.atan2(aheadX, aheadY),
+      fov: FOV,
+      horizon,
+      foot: FOOT,
+      top: head,
+    },
   };
 }

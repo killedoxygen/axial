@@ -1259,12 +1259,6 @@ function accountListResponse(): AccountListResponse {
 }
 
 const handlers: Record<string, Handler> = {
-  'GET /versions/{id}/block-textures': async () => {
-    const { paintedTextures } = await import('./block-textures');
-    return {
-      textures: [...paintedTextures()].map(([name, rgba]) => ({ name, rgba: btoa(String.fromCharCode(...rgba)) })),
-    };
-  },
   'GET /accounts': accountListResponse,
   'POST /accounts/{id}/select': (_body, path = '') => {
     const id = decodeURIComponent(path.split('/')[2] ?? '');
@@ -1633,7 +1627,6 @@ function handlerKey(method: string, path: string): string {
   if (Object.prototype.hasOwnProperty.call(handlers, exact)) return exact;
   if (method === 'PUT' && path.startsWith('/flags/')) return 'PUT /flags/{key}';
   if (/^\/accounts\/[^/]+\/select$/.test(path)) return `${method} /accounts/{id}/select`;
-  if (/^\/versions\/[^/]+\/block-textures$/.test(path)) return `${method} /versions/{id}/block-textures`;
   if (/^\/instances\/[^/]+\/content$/.test(path)) return `${method} /instances/{id}/content`;
   if (/^\/instances\/[^/]+\/content\/uninstall$/.test(path)) return `${method} /instances/{id}/content/uninstall`;
   if (/^\/instances\/[^/]+\/content\/updates$/.test(path)) return `${method} /instances/{id}/content/updates`;

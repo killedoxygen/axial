@@ -258,7 +258,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
 
   return (
     <div class="cp-view-page cp-instance" data-running={playing}>
-      <Vista seed={artSeedFor(inst)} version={inst.version_id} installing={installStatus.installing} />
+      <Vista seed={artSeedFor(inst)} />
       <header class="cp-instance-head">
         <h1 class="cp-instance-name" title={inst.name}>
           {inst.name}
