@@ -153,40 +153,6 @@ pub enum RuntimeOverride {
     ExecutablePath(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum RuntimeProbeSource {
-    #[default]
-    None,
-    Fresh,
-    Receipt,
-    FreshAfterReceiptMismatch,
-}
-
-impl RuntimeProbeSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Fresh => "fresh",
-            Self::Receipt => "receipt",
-            Self::FreshAfterReceiptMismatch => "fresh_after_receipt_mismatch",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RuntimeProbeUsage {
-    pub spawn_count: u8,
-    pub source: RuntimeProbeSource,
-}
-
-#[derive(Debug)]
-pub struct RuntimeEnsureResult {
-    pub requested: Option<RuntimeRecord>,
-    pub effective: RuntimeRecord,
-    pub probe_usage: RuntimeProbeUsage,
-    pub managed_launch: Option<super::layout::ManagedRuntimeLaunchReceipt>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEnsureEvent {
     DownloadingManagedRuntime {
@@ -225,7 +191,3 @@ pub enum JavaRuntimeLookupError {
     #[error("managed runtime mutation was refused before effects")]
     ManagedMutationRefused,
 }
-
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("managed runtime mutation was refused")]
-pub struct ManagedRuntimeMutationRefused;

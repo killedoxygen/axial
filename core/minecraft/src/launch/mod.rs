@@ -855,7 +855,8 @@ pub fn maven_to_path(coordinate: &str) -> PathBuf {
 /// Reads one installed fixture version without inheritance resolution.
 #[cfg(test)]
 pub(crate) fn resolve_version(mc_dir: &Path, version_id: &str) -> std::io::Result<VersionJson> {
-    let path = crate::paths::versions_dir(mc_dir)
+    let path = mc_dir
+        .join("versions")
         .join(version_id)
         .join(format!("{version_id}.json"));
     let mut version: VersionJson = serde_json::from_slice(&std::fs::read(path)?)?;

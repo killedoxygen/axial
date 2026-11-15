@@ -67,14 +67,6 @@ pub(crate) async fn fetch_fresh_install_version_manifest_at_test_endpoint(
     parse_manifest_body(&body)
 }
 
-pub async fn fetch_version_manifest_cached(
-    operation: &ManagedLibraryOperation,
-) -> Result<VersionManifest, String> {
-    fetch_version_manifest_cached_cancellable(operation, std::future::pending())
-        .await
-        .map_err(|error| error.to_string())
-}
-
 /// Only live acquisition is cancellable; cache publication remains owned through settlement.
 pub async fn fetch_version_manifest_cached_cancellable(
     operation: &ManagedLibraryOperation,

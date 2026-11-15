@@ -1797,7 +1797,6 @@ mod tests {
     };
     use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
     use crate::manifest::VersionManifest;
-    use crate::paths::versions_dir;
     use crate::rules::default_environment;
     use crate::runtime::ManagedRuntimeCache;
     #[cfg(unix)]
@@ -1955,7 +1954,7 @@ mod tests {
             let library_root = test_library_operation(&root);
             let install_downloader = test_downloader(library_root.operation(), manifest.clone());
             let base_receipt = install_downloader
-                .install_version(base_id, |_| {})
+                .install_version_with_facts(base_id, |_| {}, |_| {})
                 .await
                 .expect("install authenticated vanilla base");
             drop(install_downloader);
@@ -2171,7 +2170,7 @@ mod tests {
             let library_root = test_library_operation(&root);
             let install_downloader = test_downloader(library_root.operation(), manifest.clone());
             let base_receipt = install_downloader
-                .install_version(&plan.record.minecraft_version, |_| {})
+                .install_version_with_facts(&plan.record.minecraft_version, |_| {}, |_| {})
                 .await
                 .expect("install authenticated base");
             drop(install_downloader);
@@ -2226,7 +2225,7 @@ mod tests {
             assert_eq!(version_server.request_count(), 2);
             assert_eq!(client_server.request_count(), 1);
             assert_eq!(snapshot_tree(&root), before);
-            assert!(!versions_dir(&root).join(&plan.record.version_id).exists());
+            assert!(!root.join("versions").join(&plan.record.version_id).exists());
             for server in [
                 client_server,
                 version_server,
@@ -2284,7 +2283,7 @@ mod tests {
         let library_root = test_library_operation(&root);
         let install_downloader = test_downloader(library_root.operation(), manifest.clone());
         let base_receipt = install_downloader
-            .install_version(base_id, |_| {})
+            .install_version_with_facts(base_id, |_| {}, |_| {})
             .await
             .expect("install authenticated vanilla base");
         drop(install_downloader);
@@ -2423,7 +2422,7 @@ mod tests {
         let library_root = test_library_operation(&root);
         let install_downloader = test_downloader(library_root.operation(), manifest.clone());
         let base_receipt = install_downloader
-            .install_version(&record.minecraft_version, |_| {})
+            .install_version_with_facts(&record.minecraft_version, |_| {}, |_| {})
             .await
             .expect("install authenticated legacy vanilla base");
         drop(install_downloader);
@@ -3014,7 +3013,7 @@ printf '%s' 'processor-terminal' > "$last"
         let library_root = test_library_operation(&root);
         let downloader = test_downloader(library_root.operation(), manifest.clone());
         let base_receipt = downloader
-            .install_version(base_id, |_| {})
+            .install_version_with_facts(base_id, |_| {}, |_| {})
             .await
             .expect("install authenticated vanilla base");
         drop(downloader);
@@ -3180,7 +3179,7 @@ printf '%s' 'processor-terminal' > "$last"
             let library_root = test_library_operation(&root);
             let install_downloader = test_downloader(library_root.operation(), manifest.clone());
             let base_receipt = install_downloader
-                .install_version(&record.minecraft_version, |_| {})
+                .install_version_with_facts(&record.minecraft_version, |_| {}, |_| {})
                 .await
                 .expect("install authenticated vanilla base");
             drop(install_downloader);
@@ -3301,7 +3300,7 @@ printf '%s' 'processor-terminal' > "$last"
         let library = test_library_operation(&root);
         let downloader = test_downloader(library.operation(), manifest);
         let base = downloader
-            .install_version(&record.minecraft_version, |_| {})
+            .install_version_with_facts(&record.minecraft_version, |_| {}, |_| {})
             .await
             .unwrap();
         checkpoint_and_ack_version_bundle(library.operation(), &record.minecraft_version).await;
@@ -3525,7 +3524,10 @@ printf '%s' 'processor-terminal' > "$last"
             };
             let library = test_library_operation(&root);
             let downloader = test_downloader(library.operation(), manifest);
-            let base = downloader.install_version("1.4.7", |_| {}).await.unwrap();
+            let base = downloader
+                .install_version_with_facts("1.4.7", |_| {}, |_| {})
+                .await
+                .unwrap();
             let wrong_contract = base.activation_contract_id().unwrap();
             checkpoint_and_ack_version_bundle(library.operation(), "1.4.7").await;
             let historical = super::publish_loader_managed_install(
@@ -3694,7 +3696,7 @@ printf '%s' 'processor-terminal' > "$last"
         let library_root = test_library_operation(&root);
         let install_downloader = test_downloader(library_root.operation(), manifest.clone());
         install_downloader
-            .install_version(&plan.record.minecraft_version, |_| {})
+            .install_version_with_facts(&plan.record.minecraft_version, |_| {}, |_| {})
             .await
             .expect("install authenticated vanilla evidence");
         checkpoint_and_ack_version_bundle(library_root.operation(), &plan.record.minecraft_version)
@@ -3855,7 +3857,7 @@ printf '%s' 'processor-terminal' > "$last"
             write_base_version(&root, &record.minecraft_version);
             if legacy {
                 fs::write(
-                    versions_dir(&root)
+                    root.join("versions")
                         .join(&record.minecraft_version)
                         .join(format!("{}.jar", record.minecraft_version)),
                     zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]),
@@ -4133,7 +4135,8 @@ printf '%s' 'processor-terminal' > "$last"
         );
         assert_eq!(phases.last().copied(), Some("done"));
         assert_eq!(fs::read(&destination).expect("fresh library"), fresh);
-        let version_path = versions_dir(&root)
+        let version_path = root
+            .join("versions")
             .join(&record.version_id)
             .join(format!("{}.json", record.version_id));
         let written: crate::launch::VersionJson =
@@ -4282,7 +4285,8 @@ printf '%s' 'processor-terminal' > "$last"
             )
         };
         write_base_version(&root, &record.minecraft_version);
-        let base_path = versions_dir(&root)
+        let base_path = root
+            .join("versions")
             .join(&record.minecraft_version)
             .join(format!("{}.json", record.minecraft_version));
         let mut base: serde_json::Value =
@@ -4309,7 +4313,7 @@ printf '%s' 'processor-terminal' > "$last"
                 Err(LoaderError::ArtifactDownloadFailed { .. })
             ));
             assert_eq!(library_server.request_count(), 1);
-            assert!(!versions_dir(&root).join(&record.version_id).exists());
+            assert!(!root.join("versions").join(&record.version_id).exists());
             assert!(!root.join("libraries").join(&artifact_path).exists());
             proof_server.unwrap().stop();
             profile_server.stop();
@@ -4319,7 +4323,8 @@ printf '%s' 'processor-terminal' > "$last"
             return;
         }
         let receipt = result.expect("quilt profile install");
-        let version_path = versions_dir(&root)
+        let version_path = root
+            .join("versions")
             .join(&record.version_id)
             .join(format!("{}.json", record.version_id));
         let written: crate::launch::VersionJson =
@@ -4373,7 +4378,7 @@ printf '%s' 'processor-terminal' > "$last"
         canonicalize_record_identity(&mut record);
         write_base_version(&root, &record.minecraft_version);
         let base_client = fs::read(
-            versions_dir(&root)
+            root.join("versions")
                 .join(&record.minecraft_version)
                 .join(format!("{}.jar", record.minecraft_version)),
         )
@@ -4391,12 +4396,12 @@ printf '%s' 'processor-terminal' > "$last"
             .expect_err("injected loader publication failure");
 
         assert!(matches!(error, LoaderError::Verify(_)));
-        let child = versions_dir(&root).join(&record.version_id);
+        let child = root.join("versions").join(&record.version_id);
         assert!(!child.join(format!("{}.json", record.version_id)).exists());
         assert!(!child.join(format!("{}.jar", record.version_id)).exists());
         assert_eq!(
             fs::read(
-                versions_dir(&root)
+                root.join("versions")
                     .join(&record.minecraft_version)
                     .join(format!("{}.jar", record.minecraft_version))
             )
@@ -4458,7 +4463,7 @@ printf '%s' 'processor-terminal' > "$last"
         let library_root = test_library_operation(&root);
         let base = test_downloader(library_root.operation(), manifest)
             .with_test_asset_object_base_url(asset_object_server.url.clone())
-            .install_version(&record.minecraft_version, |_| {})
+            .install_version_with_facts(&record.minecraft_version, |_| {}, |_| {})
             .await
             .expect("install inherited assets base");
         checkpoint_and_ack_version_bundle(library_root.operation(), &record.minecraft_version)
@@ -4559,7 +4564,8 @@ printf '%s' 'processor-terminal' > "$last"
             .send(())
             .expect("release detached loader publication");
 
-        let child_jar = versions_dir(&root)
+        let child_jar = root
+            .join("versions")
             .join(&record.version_id)
             .join(format!("{}.jar", record.version_id));
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4728,7 +4734,7 @@ printf '%s' 'processor-terminal' > "$last"
         let processor_path = "example/processor-only/1.0/processor-only-1.0.jar";
         let installed_version: serde_json::Value = serde_json::from_slice(
             &fs::read(
-                versions_dir(&root)
+                root.join("versions")
                     .join(&record.version_id)
                     .join(format!("{}.json", record.version_id)),
             )
@@ -4796,7 +4802,7 @@ printf '%s' 'processor-terminal' > "$last"
             } else {
                 assert!(matches!(error, LoaderError::InvalidProfile(_)));
             }
-            assert!(!versions_dir(&root).join(&record.version_id).exists());
+            assert!(!root.join("versions").join(&record.version_id).exists());
             installer_server.stop();
             let _ = fs::remove_dir_all(root);
         }
@@ -4812,7 +4818,8 @@ printf '%s' 'processor-terminal' > "$last"
         let coordinate = "net.minecraftforge:forge:1.21.5-55.0.0:universal";
         let relative_path =
             "net/minecraftforge/forge/1.21.5-55.0.0/forge-1.21.5-55.0.0-universal.jar";
-        let base_version_path = versions_dir(&root)
+        let base_version_path = root
+            .join("versions")
             .join(minecraft_version)
             .join(format!("{minecraft_version}.json"));
         let mut base_version: serde_json::Value =
@@ -4856,7 +4863,7 @@ printf '%s' 'processor-terminal' > "$last"
         ));
         assert!(!zip_contains(&library_path, "example/Base.class"));
         let version_json = fs::read(
-            versions_dir(&root)
+            root.join("versions")
                 .join(&record.version_id)
                 .join(format!("{}.json", record.version_id)),
         )
@@ -4894,7 +4901,7 @@ printf '%s' 'processor-terminal' > "$last"
         let version_id =
             installed_version_id_for(LoaderComponentId::Forge, minecraft_version, loader_version)
                 .expect("canonical installed version id");
-        let base_dir = versions_dir(&root).join(minecraft_version);
+        let base_dir = root.join("versions").join(minecraft_version);
         fs::create_dir_all(&base_dir).expect("base version dir");
         let signed_client = zip_entries(&[
             ("META-INF/MANIFEST.MF", b"signed manifest".as_slice()),
@@ -5006,7 +5013,8 @@ printf '%s' 'processor-terminal' > "$last"
                 .all(|progress| progress.phase != "client_jar")
         );
 
-        let child_jar = versions_dir(&root)
+        let child_jar = root
+            .join("versions")
             .join(&version_id)
             .join(format!("{version_id}.jar"));
         assert!(zip_contains(
@@ -5036,7 +5044,7 @@ printf '%s' 'processor-terminal' > "$last"
 
         let child_jar_bytes = fs::read(&child_jar).expect("read child jar");
         let version_json = fs::read_to_string(
-            versions_dir(&root)
+            root.join("versions")
                 .join(&version_id)
                 .join(format!("{version_id}.json")),
         )
@@ -5078,7 +5086,7 @@ printf '%s' 'processor-terminal' > "$last"
         );
         let root = temp_dir("legacy-fml-prerequisite-conflict");
         write_base_version(&root, "1.4.7");
-        let base_dir = versions_dir(&root).join("1.4.7");
+        let base_dir = root.join("versions").join("1.4.7");
         fs::write(
             base_dir.join("1.4.7.jar"),
             zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]),
@@ -5120,7 +5128,7 @@ printf '%s' 'processor-terminal' > "$last"
         }
         let base_after = snapshot_tree(&base_dir);
         let collision_after = fs::read(&collision).expect("retained conflicting library");
-        let child_exists = versions_dir(&root).join(&record.version_id).exists();
+        let child_exists = root.join("versions").join(&record.version_id).exists();
         let requests = server.request_count();
         server.stop();
         drop(result);
@@ -5151,7 +5159,7 @@ printf '%s' 'processor-terminal' > "$last"
     async fn legacy_archive_overlays_base_client_without_mutating_base() {
         let root = temp_dir("legacy-archive-overlay");
         let base_version_id = "1.2.5";
-        let base_dir = versions_dir(&root).join(base_version_id);
+        let base_dir = root.join("versions").join(base_version_id);
         fs::create_dir_all(&base_dir).expect("base version dir");
         fs::write(
             base_dir.join(format!("{base_version_id}.json")),
@@ -5228,7 +5236,8 @@ printf '%s' 'processor-terminal' > "$last"
                 .map(|progress| progress.phase.as_str()),
             Some("done")
         );
-        let installed_jar = versions_dir(&root)
+        let installed_jar = root
+            .join("versions")
             .join(&record.version_id)
             .join(format!("{}.jar", record.version_id));
         assert!(zip_contains(
@@ -5268,7 +5277,7 @@ printf '%s' 'processor-terminal' > "$last"
         assert_eq!(digest.as_str(), sha1_hex(&installed_jar_bytes));
         assert_eq!(size, installed_jar_bytes.len() as u64);
         let installed_version_json = fs::read_to_string(
-            versions_dir(&root)
+            root.join("versions")
                 .join(&record.version_id)
                 .join(format!("{}.json", record.version_id)),
         )
@@ -5307,7 +5316,7 @@ printf '%s' 'processor-terminal' > "$last"
         write_base_version(&root, base_version_id);
         let base_receipt = test_authenticated_receipt(&root, base_version_id);
         fs::write(
-            versions_dir(&root)
+            root.join("versions")
                 .join(base_version_id)
                 .join(format!("{base_version_id}.jar")),
             b"corrupt base client",
@@ -5341,7 +5350,7 @@ printf '%s' 'processor-terminal' > "$last"
         assert!(
             matches!(error, LoaderError::Verify(message) if message.contains("authenticate base client"))
         );
-        assert!(!versions_dir(&root).join(record.version_id).exists());
+        assert!(!root.join("versions").join(record.version_id).exists());
         server.stop();
         let _ = fs::remove_dir_all(root);
     }
@@ -5399,7 +5408,7 @@ printf '%s' 'processor-terminal' > "$last"
         let base_version_id = "1.2.5";
         write_base_version(&root, base_version_id);
         fs::write(
-            versions_dir(&root)
+            root.join("versions")
                 .join(base_version_id)
                 .join(format!("{base_version_id}.jar")),
             zip_entries(&[("net/minecraft/client/Minecraft.class", b"base".as_slice())]),
@@ -5407,7 +5416,7 @@ printf '%s' 'processor-terminal' > "$last"
         .expect("valid base client");
         let base_receipt = test_authenticated_receipt(&root, base_version_id);
         let mut record = legacy_archive_record();
-        let child_path = versions_dir(&root).join(&record.version_id);
+        let child_path = root.join("versions").join(&record.version_id);
         std::os::unix::fs::symlink(&outside, &child_path).expect("symlink child version");
         let server = TestByteServer::start_with_sha1(zip_entries(&[(
             "net/minecraftforge/Forge.class",
@@ -6296,7 +6305,7 @@ esac
         );
         let receipt = test_downloader(library_root, manifest.clone())
             .with_test_runtime_source(runtime.clone())
-            .install_version(&record.minecraft_version, |_| {})
+            .install_version_with_facts(&record.minecraft_version, |_| {}, |_| {})
             .await
             .expect("install processor fixture base");
         checkpoint_and_ack_version_bundle(library_root, &record.minecraft_version).await;
@@ -6864,7 +6873,7 @@ esac
     }
 
     fn write_base_version(root: &std::path::Path, version_id: &str) {
-        let version_dir = versions_dir(root).join(version_id);
+        let version_dir = root.join("versions").join(version_id);
         fs::create_dir_all(&version_dir).expect("create base version dir");
         fs::write(
             version_dir.join(format!("{version_id}.json")),
@@ -6929,7 +6938,8 @@ esac
     }
 
     fn add_test_base_log_config(root: &Path, version_id: &str, log_id: &str, bytes: &[u8]) {
-        let version_path = versions_dir(root)
+        let version_path = root
+            .join("versions")
             .join(version_id)
             .join(format!("{version_id}.json"));
         let mut version = serde_json::from_slice::<serde_json::Value>(
@@ -6959,7 +6969,7 @@ esac
 
     fn test_client_integrity(root: &std::path::Path, version_id: &str) -> ExpectedIntegrity {
         let client = fs::read(
-            versions_dir(root)
+            root.join("versions")
                 .join(version_id)
                 .join(format!("{version_id}.jar")),
         )
@@ -7014,8 +7024,8 @@ esac
         backend_version_id: &str,
         upstream_version_id: &str,
     ) {
-        let backend_dir = versions_dir(root).join(backend_version_id);
-        let upstream_dir = versions_dir(root).join(upstream_version_id);
+        let backend_dir = root.join("versions").join(backend_version_id);
+        let upstream_dir = root.join("versions").join(upstream_version_id);
         assert!(backend_dir.is_dir());
         assert!(!upstream_dir.exists());
         let version_json = fs::read(backend_dir.join(format!("{backend_version_id}.json")))

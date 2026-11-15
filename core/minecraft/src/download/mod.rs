@@ -26,7 +26,7 @@ pub use install::{
     Downloader, RecordedVersionMetadata, classify_managed_install_publication,
     classify_managed_install_publication_candidates, verify_managed_install_loader_base_checkpoint,
     verify_managed_install_publication_evidence_root,
-    verify_managed_install_reconstruction_checkpoint, verify_registered_known_good_bootstrap,
+    verify_managed_install_reconstruction_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use install::{
@@ -61,11 +61,8 @@ pub use model::{
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallPublicationRecovery,
     ManagedInstallReceiptVerificationFailure, ManagedInstallRollbackEffect,
-    ManagedInstallRolledBackEvidence, RegisteredKnownGoodBootstrapVerificationFailure,
-    RegisteredKnownGoodBootstrapVerificationFailureKind,
-    RegisteredKnownGoodBootstrapVerificationRecovery, SelectedDownloadArtifactKind,
+    ManagedInstallRolledBackEvidence, SelectedDownloadArtifactKind,
     VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
-    VerifiedRegisteredKnownGoodBootstrap,
 };
 #[cfg(feature = "test-support")]
 pub use test_support::InstallTestEndpoints;
@@ -73,20 +70,19 @@ pub(crate) use transfer::{AuthenticatedSelectedArtifactSource, acquire_processor
 #[cfg(test)]
 pub(crate) use transfer::{TestProcessorMappingsTransport, acquire_test_processor_mappings};
 pub use transient_transfer::{
-    CreateOnlyTransferTarget, ExpectedTransferDigests, MAX_MANAGED_TRANSFER_BYTES,
-    ManagedTransferAuthority, ManagedTransferEffectAuthority, ManagedTransferTerminalAuthority,
-    PinnedTransferOrigin, PinnedTransferOriginError, RetryPolicy, RetryPolicyError,
-    SourceOnlyTransferTarget, TransferByteContract, TransferCancellation,
-    TransferCancellationSender, TransferCleanupObligation, TransferCleanupResolution,
-    TransferClient, TransferClientBuildError, TransferClientConfig, TransferClientConfigError,
-    TransferContract, TransferContractError, TransferDigestAlgorithm, TransferDigestParseError,
-    TransferFailureEvent, TransferFailureKind, TransferFailureReport, TransferOrigin,
-    TransferOriginError, TransferOutcome, TransferPublicationObligation,
-    TransferPublicationOutcome, TransferReport, TransferTargetCancelObligation,
-    TransferTargetCancelOutcome, TransferTask, TransferTimeoutKind, TransferUnsettledObligation,
-    VerifiedCreateOnly, VerifiedSource, VerifiedTransferDigests, VerifiedTransferDiscardObligation,
-    VerifiedTransferDiscardOutcome, start_create_only_transfer, start_source_transfer,
-    transfer_cancellation_channel,
+    CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority,
+    ManagedTransferEffectAuthority, ManagedTransferTerminalAuthority, PinnedTransferOrigin,
+    PinnedTransferOriginError, RetryPolicy, RetryPolicyError, SourceOnlyTransferTarget,
+    TransferByteContract, TransferCancellation, TransferCancellationSender,
+    TransferCleanupObligation, TransferCleanupResolution, TransferClient, TransferClientBuildError,
+    TransferClientConfig, TransferClientConfigError, TransferContract, TransferContractError,
+    TransferDigestAlgorithm, TransferDigestParseError, TransferFailureEvent, TransferFailureKind,
+    TransferFailureReport, TransferOrigin, TransferOriginError, TransferOutcome,
+    TransferPublicationObligation, TransferPublicationOutcome, TransferReport,
+    TransferTargetCancelObligation, TransferTargetCancelOutcome, TransferTask, TransferTimeoutKind,
+    TransferUnsettledObligation, VerifiedCreateOnly, VerifiedSource, VerifiedTransferDigests,
+    VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome, start_create_only_transfer,
+    start_source_transfer, transfer_cancellation_channel,
 };
 pub(crate) use transient_transfer::{
     LocalTransferReader, copy_create_only_transfer, fail_create_only_transfer,

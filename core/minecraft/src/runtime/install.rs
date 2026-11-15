@@ -1198,25 +1198,6 @@ pub(super) fn managed_runtime_tree_matches_manifest(
     manifest: &ComponentManifest,
     cancellation: &ThreadCancellation,
 ) -> bool {
-    managed_runtime_tree_matches_manifest_inner(component, root, manifest, cancellation, true)
-}
-
-pub(super) fn managed_runtime_tree_matches_manifest_without_ready_marker(
-    component: &RuntimeId,
-    root: &ManagedDir,
-    manifest: &ComponentManifest,
-    cancellation: &ThreadCancellation,
-) -> bool {
-    managed_runtime_tree_matches_manifest_inner(component, root, manifest, cancellation, false)
-}
-
-fn managed_runtime_tree_matches_manifest_inner(
-    component: &RuntimeId,
-    root: &ManagedDir,
-    manifest: &ComponentManifest,
-    cancellation: &ThreadCancellation,
-    ready_marker_present: bool,
-) -> bool {
     // One validation window for the whole tree; a failed close refuses it.
     matches!(
         root.observe_validated(
@@ -1226,7 +1207,6 @@ fn managed_runtime_tree_matches_manifest_inner(
                     root,
                     manifest,
                     cancellation,
-                    ready_marker_present,
                 ))
             },
             |error| error,
@@ -1240,7 +1220,6 @@ fn managed_runtime_tree_matches(
     root: &ManagedDir,
     manifest: &ComponentManifest,
     cancellation: &ThreadCancellation,
-    ready_marker_present: bool,
 ) -> bool {
     let Ok(expected_proof) = component_manifest_proof_bytes(manifest) else {
         return false;
@@ -1255,14 +1234,10 @@ fn managed_runtime_tree_matches(
     ) {
         return false;
     }
-    if ready_marker_present {
-        if !matches!(
-            root.read_authenticated(".axial-ready", Some(5), None),
-            Ok(actual) if actual == b"ready"
-        ) {
-            return false;
-        }
-    } else if !matches!(root.exact_entry_kind(".axial-ready"), Ok(None)) {
+    if !matches!(
+        root.read_authenticated(".axial-ready", Some(5), None),
+        Ok(actual) if actual == b"ready"
+    ) {
         return false;
     }
 
@@ -1274,13 +1249,11 @@ fn managed_runtime_tree_matches(
     ) {
         return false;
     }
-    if ready_marker_present
-        && !insert_runtime_tree_node(
-            &mut expected,
-            PathBuf::from(".axial-ready"),
-            RuntimeTreeNodeKind::File,
-        )
-    {
+    if !insert_runtime_tree_node(
+        &mut expected,
+        PathBuf::from(".axial-ready"),
+        RuntimeTreeNodeKind::File,
+    ) {
         return false;
     }
     for (relative, file) in &manifest.files {

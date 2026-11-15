@@ -39,8 +39,7 @@ pub mod managed_path {
         ManagedLibraryBinding, ManagedLibraryFile, ManagedLibraryFileBatch,
         ManagedLibraryOperation, ManagedLibraryRoot, ManagedLibraryWitness, ManagedNativeDirectory,
         ManagedNativePublicationFailure, ManagedTreeCopyFailure, ManagedTreeCopyLimits,
-        ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRetirement,
-        ManagedTreeRoot,
+        ManagedTreeCopyOutcome, ManagedTreeDirectory, ManagedTreeOperation, ManagedTreeRoot,
     };
 }
 pub mod manifest;
@@ -66,14 +65,11 @@ pub use download::{
     ManagedInstallPublicationCandidatesError, ManagedInstallPublicationEvidenceId,
     ManagedInstallPublicationEvidenceIdError, ManagedInstallReceiptVerificationFailure,
     ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence, RecordedVersionMetadata,
-    RegisteredKnownGoodBootstrapVerificationFailure,
-    RegisteredKnownGoodBootstrapVerificationFailureKind,
-    RegisteredKnownGoodBootstrapVerificationRecovery, VerifiedManagedInstallCheckpointReceipt,
-    VerifiedManagedInstallReceipt, VerifiedRegisteredKnownGoodBootstrap,
+    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
     classify_managed_install_publication, classify_managed_install_publication_candidates,
     verify_managed_install_loader_base_checkpoint,
     verify_managed_install_publication_evidence_root,
-    verify_managed_install_reconstruction_checkpoint, verify_registered_known_good_bootstrap,
+    verify_managed_install_reconstruction_checkpoint,
 };
 pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 #[cfg(feature = "test-support")]
@@ -99,21 +95,20 @@ pub use loaders::{
     LoaderPreOperationFailureKind, LoaderProviderFailureKind, LoaderSelectionMeta,
     LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     LoaderVersionIndex, MaterializedLoaderProfile, VerifiedLoaderInstallBaseCheckpoint,
-    VerifiedLoaderInstallBaseCommit, build_id_for, continue_install_build_after_base, fetch_builds,
-    fetch_cached_builds, fetch_components, fetch_supported_versions, install_build,
-    installed_version_id_for, is_canonical_installed_loader_id, loader_components, parse_build_id,
-    resolve_build_record_for_install, resume_install_build_after_base,
-    validate_materialized_loader_profile,
+    VerifiedLoaderInstallBaseCommit, build_id_for, continue_install_build_after_base,
+    fetch_components, install_build, installed_version_id_for, is_canonical_installed_loader_id,
+    loader_components, parse_build_id, resolve_build_record_for_install,
+    resume_install_build_after_base, validate_materialized_loader_profile,
 };
 #[cfg(feature = "test-support")]
 pub use loaders::{
-    persist_loader_build_cache_fixture_for_test,
+    fetch_cached_builds, persist_loader_build_cache_fixture_for_test,
     persist_loader_supported_versions_cache_fixture_for_test,
 };
 #[cfg(feature = "test-support")]
 pub use manifest::persist_version_manifest_cache_fixture_for_test;
-pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
-pub use paths::{libraries_dir, versions_dir};
+pub use manifest::{ManifestEntry, VersionManifest};
+pub use paths::libraries_dir;
 pub use rules::default_environment;
 #[cfg(feature = "test-support")]
 pub use runtime::runtime_publication_lock_available_for_test;
@@ -121,10 +116,9 @@ pub use runtime::{
     JavaArchitecture, JavaProbeError, JavaProbeReceipt, JavaRuntimeInfo, JavaRuntimeLookupError,
     JavaRuntimeResult, ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeComponent,
     ManagedRuntimeFailureReceipt, ManagedRuntimeLaunchReceipt, ManagedRuntimeMarkerState,
-    ManagedRuntimeMutationRefused, ManagedRuntimeQuarantineObligation,
-    ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError, RuntimeEnsureEvent,
-    RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
-    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
+    ManagedRuntimeQuarantineObligation, ManagedRuntimeQuarantineObservation,
+    ManagedRuntimeRebuildError, RuntimeEnsureEvent, RuntimeId, RuntimeInstallState,
+    RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
     RuntimeSourceFailureKind, is_known_runtime_component, list_java_runtimes,
     parse_runtime_override, preferred_runtime_component, probe_java, runtime_requirement,
 };

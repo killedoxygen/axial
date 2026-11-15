@@ -1,6 +1,6 @@
 use super::layout::{
-    ManagedRuntimeCache, ManagedRuntimeComponent, managed_runtime_executable_present,
-    managed_runtime_executable_ready, runtime_java_relative_path,
+    ManagedRuntimeCache, ManagedRuntimeComponent, managed_runtime_executable_ready,
+    runtime_java_relative_path,
 };
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, MAX_RUNTIME_MANIFEST_BYTES,
@@ -181,12 +181,6 @@ impl ManagedRuntimeComponent {
         }
     }
 
-    pub fn executable_present(&self) -> bool {
-        self.validate_projection().is_ok()
-            && managed_runtime_executable_present(&self.root)
-            && self.validate_projection().is_ok()
-    }
-
     pub fn executable_ready(&self) -> bool {
         self.validate_projection().is_ok()
             && managed_runtime_executable_ready(&self.root)
@@ -235,10 +229,6 @@ impl ManagedRuntimeComponent {
         Some(manifest)
     }
 
-    pub fn manifest_proof_valid(&self) -> bool {
-        self.persisted_manifest().is_some()
-    }
-
     pub fn contents_verified(&self) -> bool {
         let Some(manifest) = self.persisted_manifest() else {
             return false;
@@ -253,70 +243,6 @@ impl ManagedRuntimeComponent {
             &manifest,
             &cancellation.thread(),
         ) && self.validate_projection().is_ok()
-    }
-
-    pub fn repair_ready_marker(&self) -> std::io::Result<()> {
-        self.validate_projection()?;
-        if self.marker_state() != ManagedRuntimeMarkerState::Missing || !self.executable_ready() {
-            return Err(std::io::Error::other(
-                "managed runtime ready marker repair precondition was refused",
-            ));
-        }
-        let manifest = self
-            .persisted_manifest()
-            .ok_or_else(|| std::io::Error::other("managed runtime manifest proof is invalid"))?;
-        let component = RuntimeId::from(self.component.clone());
-        let (_sender, cancellation) = crate::cancellation::channel();
-        let cancellation = cancellation.thread();
-        if !super::install::managed_runtime_tree_matches_manifest_without_ready_marker(
-            &component,
-            &self.root,
-            &manifest,
-            &cancellation,
-        ) || self.marker_state() != ManagedRuntimeMarkerState::Missing
-        {
-            return Err(std::io::Error::other(
-                "managed runtime without its ready marker failed exact verification",
-            ));
-        }
-        let guard = match self.root.write_new_exact_retained(".axial-ready", b"ready") {
-            Ok(guard) => guard,
-            Err(crate::managed::fs::ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
-                return Err(std::io::Error::other(error.to_string()));
-            }
-            Err(crate::managed::fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
-                final_guard: Some(guard),
-            }) => {
-                self.root
-                    .remove_guarded_file(".axial-ready", &guard)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                return Err(std::io::Error::other(
-                    "managed runtime ready marker publication failed verification",
-                ));
-            }
-            Err(crate::managed::fs::ManagedCreateOnlyWriteFailure::PromotionAttempted {
-                final_guard: None,
-            }) => {
-                return Err(std::io::Error::other(
-                    "managed runtime ready marker publication remains unsettled",
-                ));
-            }
-        };
-        if super::install::managed_runtime_tree_matches_manifest(
-            &component,
-            &self.root,
-            &manifest,
-            &cancellation,
-        ) && self.validate_projection().is_ok()
-        {
-            return Ok(());
-        }
-        self.root
-            .remove_guarded_file(".axial-ready", &guard)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Err(std::io::Error::other(
-            "managed runtime ready marker repair failed postcondition verification",
-        ))
     }
 }
 

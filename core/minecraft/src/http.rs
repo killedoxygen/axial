@@ -196,10 +196,6 @@ impl Body {
         self.response.headers()
     }
 
-    pub fn declared_length(&self) -> Option<u64> {
-        self.declared
-    }
-
     pub async fn chunk(&mut self) -> Result<Option<impl AsRef<[u8]>>, FetchError> {
         match self.response.chunk().await.map_err(request_error)? {
             Some(chunk) => {

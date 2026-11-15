@@ -285,7 +285,6 @@ enum ManagedLibraryAdmission {
 
 struct ManagedAuthorityLifecycle {
     state: Mutex<ManagedAuthorityLifecycleState>,
-    active: tokio::sync::watch::Sender<usize>,
 }
 
 struct ManagedAuthorityLifecycleState {
@@ -358,7 +357,6 @@ impl Drop for ManagedOperationPin {
             .active
             .checked_sub(1)
             .expect("managed authority operation count is balanced");
-        self.lifecycle.active.send_replace(state.active);
     }
 }
 
@@ -391,7 +389,6 @@ impl ManagedAuthorityLifecycle {
                 open: true,
                 active: 0,
             }),
-            active: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -401,7 +398,6 @@ impl ManagedAuthorityLifecycle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.open = false;
-        self.active.send_replace(state.active);
     }
 
     fn acquire_pin(
@@ -422,38 +418,11 @@ impl ManagedAuthorityLifecycle {
             .active
             .checked_add(1)
             .ok_or_else(|| io::Error::other("managed authority operation count overflowed"))?;
-        self.active.send_replace(state.active);
         Ok(Arc::new(ManagedOperationPin {
             lifecycle: Arc::clone(self),
             admission,
             _retained: None,
         }))
-    }
-
-    fn is_drained(&self) -> io::Result<bool> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("managed authority lifecycle lock was poisoned"))?;
-        if state.open {
-            return Err(io::Error::other(
-                "managed authority retirement has not fenced acquisition",
-            ));
-        }
-        Ok(state.active == 0)
-    }
-
-    async fn drain(&self) -> io::Result<()> {
-        let mut active = self.active.subscribe();
-        loop {
-            if *active.borrow_and_update() == 0 {
-                return Ok(());
-            }
-            active
-                .changed()
-                .await
-                .map_err(|_| io::Error::other("managed authority retirement witness was closed"))?;
-        }
     }
 }
 
@@ -5070,6 +5039,7 @@ impl ManagedLibraryOperation {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn prepare_layout(&self) -> io::Result<()> {
         let root = self.managed_directory().map_err(loader_io)?;
         for name in ["versions", "libraries", "assets"] {
@@ -5821,7 +5791,7 @@ pub enum ManagedTreeCopyOutcome {
     Indeterminate(io::Error),
 }
 
-#[must_use = "managed tree roots must be retired so retained effects are settled"]
+#[must_use = "managed tree roots retain the tree's effect settlement authority"]
 pub struct ManagedTreeRoot {
     authority: Arc<ManagedTreeAuthority>,
 }
@@ -5837,11 +5807,6 @@ pub struct ManagedTreeOperation {
     pin: Arc<ManagedOperationPin>,
 }
 
-#[must_use = "retiring managed tree authority must be drained and settled"]
-pub struct ManagedTreeRetirement {
-    authority: Arc<ManagedTreeAuthority>,
-}
-
 impl std::fmt::Debug for ManagedTreeRoot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -5854,14 +5819,6 @@ impl std::fmt::Debug for ManagedTreeOperation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ManagedTreeOperation")
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for ManagedTreeRetirement {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ManagedTreeRetirement")
             .finish_non_exhaustive()
     }
 }
@@ -5898,13 +5855,6 @@ impl ManagedTreeRoot {
 
     pub fn try_acquire(&self) -> io::Result<ManagedTreeOperation> {
         self.authority.try_acquire()
-    }
-
-    pub fn begin_retirement(self) -> ManagedTreeRetirement {
-        self.authority.lifecycle.close();
-        ManagedTreeRetirement {
-            authority: Arc::clone(&self.authority),
-        }
     }
 
     fn revalidate(&self) -> io::Result<()> {
@@ -5944,30 +5894,6 @@ impl ManagedTreeOperation {
         self.pin.verify_admission()?;
         self.authority.revalidate()?;
         self.pin.verify_admission()
-    }
-}
-
-impl ManagedTreeRetirement {
-    pub fn try_drain_and_settle(&self) -> io::Result<Option<()>> {
-        if !self.authority.lifecycle.is_drained()? {
-            return Ok(None);
-        }
-        self.settle_drained()?;
-        Ok(Some(()))
-    }
-
-    pub async fn wait_for_drain(&self) -> io::Result<()> {
-        self.authority.lifecycle.drain().await
-    }
-
-    pub fn settle_drained(&self) -> io::Result<()> {
-        if !self.authority.lifecycle.is_drained()? {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "managed tree retirement still has active operations",
-            ));
-        }
-        self.authority.root.settle().map_err(loader_io)
     }
 }
 
@@ -7882,45 +7808,6 @@ mod library_lifecycle_tests {
         }
     }
 
-    #[test]
-    fn layout_preparation_creates_exact_children_and_refuses_aliases() {
-        let temporary = tempfile::Builder::new()
-            .prefix("axial-managed-library-layout-")
-            .tempdir_in(crate::test_temp_root())
-            .expect("temporary library");
-        let root =
-            ManagedLibraryRoot::open_for_test(temporary.path()).expect("managed library root");
-        let operation = root.try_acquire().expect("managed library operation");
-        operation.prepare_layout().expect("prepare managed layout");
-        for relative in ["versions", "libraries", "assets", "cache/loaders/catalog"] {
-            assert!(
-                temporary.path().join(relative).is_dir(),
-                "missing {relative}"
-            );
-        }
-        drop((operation, root));
-
-        let aliased = tempfile::Builder::new()
-            .prefix("axial-managed-library-layout-alias-")
-            .tempdir_in(crate::test_temp_root())
-            .expect("temporary aliased library");
-        std::fs::create_dir(aliased.path().join("Versions")).expect("version alias");
-        let root = ManagedLibraryRoot::open_for_test(aliased.path())
-            .expect("aliased managed library root");
-        let operation = root.try_acquire().expect("aliased library operation");
-        let entry_names = || {
-            let mut names = std::fs::read_dir(aliased.path())
-                .expect("aliased library entries")
-                .map(|entry| entry.expect("library entry").file_name())
-                .collect::<Vec<_>>();
-            names.sort();
-            names
-        };
-        let before = entry_names();
-        assert!(operation.prepare_layout().is_err());
-        assert_eq!(entry_names(), before);
-    }
-
     #[tokio::test]
     async fn derived_reader_and_identity_pin_the_authority_until_release() {
         async fn check(root: ManagedLibraryRoot) {
@@ -7935,24 +7822,21 @@ mod library_lifecycle_tests {
                 .expect("source guard");
             let identity = guard.identity();
             let reader = guard.into_bounded_reader(6).expect("bounded reader");
-            let authority = Arc::clone(&root.authority);
-            authority.close();
-            let mut drain = tokio::spawn(async move { authority.lifecycle.drain().await });
+            let active = || {
+                root.authority
+                    .lifecycle
+                    .state
+                    .lock()
+                    .expect("lifecycle")
+                    .active
+            };
             drop(directory);
             drop(operation);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(25), &mut drain)
-                    .await
-                    .is_err()
-            );
+            assert_ne!(active(), 0);
             reader.cancel();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(25), &mut drain)
-                    .await
-                    .is_err()
-            );
+            assert_ne!(active(), 0);
             drop(identity);
-            drain.await.expect("drain task").expect("drained authority");
+            assert_eq!(active(), 0);
             root.settle().expect("settled library");
         }
 
@@ -8024,7 +7908,6 @@ mod library_lifecycle_tests {
 #[cfg(test)]
 mod managed_tree_lifecycle_tests {
     use super::*;
-    use std::time::Duration;
 
     fn managed_tree(prefix: &str) -> (tempfile::TempDir, RootSession, PathBuf, ManagedTreeRoot) {
         let temporary = tempfile::Builder::new()
@@ -8045,7 +7928,7 @@ mod managed_tree_lifecycle_tests {
     }
 
     #[test]
-    fn child_capabilities_pin_retirement_and_closed_root_refuses_acquisition() {
+    fn child_capabilities_pin_a_closed_root_that_refuses_acquisition() {
         let (_temporary, _session, _tree_path, root) = managed_tree("child-pin");
         let authority = Arc::clone(&root.authority);
         let operation = root.try_acquire().expect("tree operation");
@@ -8056,43 +7939,12 @@ mod managed_tree_lifecycle_tests {
         drop(directory);
         drop(operation);
 
-        let retirement = root.begin_retirement();
+        let active = || authority.lifecycle.state.lock().expect("lifecycle").active;
+        drop(root);
         assert!(authority.try_acquire().is_err());
-        assert!(
-            retirement
-                .try_drain_and_settle()
-                .expect("retirement probe")
-                .is_none()
-        );
+        assert_eq!(active(), 1);
         drop(child);
-        assert_eq!(
-            retirement
-                .try_drain_and_settle()
-                .expect("settled retirement"),
-            Some(())
-        );
-    }
-
-    #[tokio::test]
-    async fn async_retirement_waits_for_derived_directory_and_can_resume() {
-        let (_temporary, _session, _tree_path, root) = managed_tree("async-drain");
-        let operation = root.try_acquire().expect("tree operation");
-        let directory = operation.directory().expect("operation directory");
-        let child = directory
-            .open_or_create_child("child")
-            .expect("managed child");
-        let retirement = root.begin_retirement();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), retirement.wait_for_drain(),)
-                .await
-                .is_err()
-        );
-        drop((child, directory, operation));
-        tokio::time::timeout(Duration::from_secs(1), retirement.wait_for_drain())
-            .await
-            .expect("retirement drain did not resume")
-            .expect("retirement drained");
-        retirement.settle_drained().expect("retirement settled");
+        assert_eq!(active(), 0);
     }
 
     #[test]
@@ -8108,50 +7960,14 @@ mod managed_tree_lifecycle_tests {
         assert!(operation.revalidate().is_err());
         assert!(directory.open_or_create_child("must-not-appear").is_err());
         drop((directory, operation));
-        let retirement = root.begin_retirement();
-        assert!(retirement.try_drain_and_settle().is_err());
+        assert!(root.try_acquire().is_err());
         assert_eq!(
             std::fs::read(tree_path.join("replacement-marker"))
                 .expect("replacement remains readable"),
             b"replacement",
-            "retirement must not settle effects against a lexical replacement",
+            "acquisition must not settle effects against a lexical replacement",
         );
         assert!(!tree_path.join("must-not-appear").exists());
-    }
-
-    #[test]
-    fn retirement_settles_retained_tree_cleanup() {
-        let (_temporary, _session, tree_path, root) = managed_tree("settlement");
-        let operation = root.try_acquire().expect("tree operation");
-        let directory = operation.directory().expect("operation directory");
-        let stage = directory
-            .directory
-            .create_child_new("stage")
-            .expect("create stage");
-        let managed_root = directory.directory.inner.root.clone();
-        {
-            let transition = managed_root.transition();
-            managed_root.retain_continuation_locked(
-                &transition,
-                ManagedEffectContinuation::TreeCleanup {
-                    parent: ManagedDirDescriptor::capture(&directory.directory),
-                    stage_name: PortableFileName::new_exact("stage").expect("stage name"),
-                    stage: ManagedDirDescriptor::capture(&stage),
-                },
-            );
-        }
-        let retirement = root.begin_retirement();
-        drop((stage, directory, operation));
-        assert_eq!(
-            retirement
-                .try_drain_and_settle()
-                .expect("retained cleanup settles"),
-            Some(())
-        );
-        assert!(!tree_path.join("stage").exists());
-        managed_root
-            .require_settled()
-            .expect("managed root settled");
     }
 
     #[test]
@@ -8181,10 +7997,6 @@ mod managed_tree_lifecycle_tests {
             .require_settled()
             .expect("managed root settled");
         drop(operation);
-        root.begin_retirement()
-            .try_drain_and_settle()
-            .expect("retirement settles")
-            .expect("retirement is drained");
     }
 
     #[test]
@@ -8244,10 +8056,7 @@ mod managed_tree_lifecycle_tests {
         assert!(!tree_path.join("target").join("stage").exists());
 
         drop((target, source, directory, operation));
-        root.begin_retirement()
-            .try_drain_and_settle()
-            .expect("retirement settles")
-            .expect("retirement is drained");
+        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
@@ -8286,10 +8095,7 @@ mod managed_tree_lifecycle_tests {
         );
 
         drop((target, source, directory, operation));
-        root.begin_retirement()
-            .try_drain_and_settle()
-            .expect("retirement settles")
-            .expect("retirement is drained");
+        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
@@ -8323,10 +8129,7 @@ mod managed_tree_lifecycle_tests {
         );
 
         drop((owned, directory, operation));
-        root.begin_retirement()
-            .try_drain_and_settle()
-            .expect("retirement settles")
-            .expect("retirement is drained");
+        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
@@ -8365,10 +8168,7 @@ mod managed_tree_lifecycle_tests {
         target.settle().expect("cleanup effects settled");
 
         drop((target, source, directory, operation));
-        root.begin_retirement()
-            .try_drain_and_settle()
-            .expect("retirement settles")
-            .expect("retirement is drained");
+        drop(root.try_acquire().expect("retained tree effects settle"));
     }
 
     #[test]
