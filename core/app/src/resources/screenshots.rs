@@ -43,12 +43,8 @@ pub enum ScreenshotError {
     FileTypeChange,
     #[error("screenshot not found")]
     NotFound,
-    #[error("screenshot already exists")]
-    AlreadyExists,
     #[error("screenshot changed; refresh and try again")]
     Changed,
-    #[error("a screenshot update needs to finish before another change")]
-    Pending,
     #[error("screenshot file is too large")]
     TooLarge,
     #[error("instance resources exceed safe scan limits")]
@@ -57,8 +53,6 @@ pub enum ScreenshotError {
     UnsupportedEntry,
     #[error("Could not read screenshot files. Check instance folder permissions and try again.")]
     Read,
-    #[error("Could not update screenshot files. Check instance folder permissions and try again.")]
-    Write,
 }
 
 // The caller first validates the complete portable leaf name. MIME selection

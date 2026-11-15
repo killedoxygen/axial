@@ -458,7 +458,6 @@ async fn verify(
                     .expect("SHA1 policy selected the hasher")
                     .finalize()
                     .to_vec(),
-                HashAlgorithm::Sha256 => sha256.clone(),
                 HashAlgorithm::Sha512 => sha512
                     .expect("SHA512 policy selected the hasher")
                     .finalize()

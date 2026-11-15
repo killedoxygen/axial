@@ -1921,7 +1921,13 @@ mod tests {
                 .await,
             Err(ProfileMediaError::InvalidTexture)
         );
-        service.accounts.create_offline_account("Steve").unwrap();
+        service
+            .accounts
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         assert!(
             service
                 .profile_file_for_identity(Some(FIRST_URL), Some(PROFILE_ID), None)

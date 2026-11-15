@@ -44,12 +44,10 @@ impl From<worlds::WorldError> for ResourceError {
         use worlds::WorldError;
         match error {
             WorldError::InvalidName => Self::InvalidName,
-            WorldError::NotFound | WorldError::IconNotFound => Self::NotFound,
-            WorldError::AlreadyExists | WorldError::Changed => Self::Conflict,
-            WorldError::Busy => Self::Busy,
+            WorldError::IconNotFound => Self::NotFound,
+            WorldError::Changed => Self::Conflict,
             WorldError::Capacity => Self::Limit,
             WorldError::UnsupportedEntry => Self::Unsupported,
-            WorldError::SettlementRequired => Self::Pending,
             WorldError::Io => Self::Files,
         }
     }
@@ -60,14 +58,10 @@ impl From<mods::ModFilesError> for ResourceError {
         use mods::ModFilesError;
         match error {
             ModFilesError::InvalidName => Self::InvalidName,
-            ModFilesError::InstanceNotFound | ModFilesError::NotFound => Self::NotFound,
-            ModFilesError::Busy | ModFilesError::Unavailable => Self::Busy,
-            ModFilesError::AlreadyExists | ModFilesError::Changed => Self::Conflict,
-            ModFilesError::Managed => Self::Managed,
+            ModFilesError::Changed => Self::Conflict,
             ModFilesError::ScanLimit => Self::Limit,
             ModFilesError::UnsupportedEntry => Self::Unsupported,
-            ModFilesError::SettlementRequired => Self::Pending,
-            ModFilesError::Read | ModFilesError::Write => Self::Files,
+            ModFilesError::Read => Self::Files,
         }
     }
 }
@@ -78,11 +72,10 @@ impl From<screenshots::ScreenshotError> for ResourceError {
         match error {
             ScreenshotError::InvalidName | ScreenshotError::FileTypeChange => Self::InvalidName,
             ScreenshotError::NotFound => Self::NotFound,
-            ScreenshotError::AlreadyExists | ScreenshotError::Changed => Self::Conflict,
-            ScreenshotError::Pending => Self::Pending,
+            ScreenshotError::Changed => Self::Conflict,
             ScreenshotError::TooLarge | ScreenshotError::ScanLimit => Self::Limit,
             ScreenshotError::UnsupportedEntry => Self::Unsupported,
-            ScreenshotError::Read | ScreenshotError::Write => Self::Files,
+            ScreenshotError::Read => Self::Files,
         }
     }
 }

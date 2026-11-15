@@ -98,30 +98,14 @@ pub(crate) fn validate_import(
 pub enum ModFilesError {
     #[error("invalid mod filename")]
     InvalidName,
-    #[error("instance not found")]
-    InstanceNotFound,
-    #[error("mod not found")]
-    NotFound,
-    #[error("another launch or content operation is already using this instance")]
-    Busy,
-    #[error("application shutdown or update is in progress; try the mod change again")]
-    Unavailable,
-    #[error("the mod toggle destination is already occupied")]
-    AlreadyExists,
     #[error("mod files changed; refresh and try again")]
     Changed,
-    #[error("managed mods must be removed through content operations")]
-    Managed,
     #[error("instance resources exceed safe scan limits")]
     ScanLimit,
     #[error("instance resources contain unsupported filesystem entries")]
     UnsupportedEntry,
-    #[error("mod changes require settlement before another operation can proceed")]
-    SettlementRequired,
     #[error("could not read mod files; check instance folder permissions and try again")]
     Read,
-    #[error("could not update mod files; check instance folder permissions and try again")]
-    Write,
 }
 
 /// Lists only the fixed `mods` resource directory below a scoped game root.

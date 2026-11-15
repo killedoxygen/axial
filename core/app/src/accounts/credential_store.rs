@@ -419,17 +419,6 @@ impl CredentialStore {
         .await
     }
 
-    pub async fn flush_cleanup(&self, account_id: &str) -> Result<(), CredentialError> {
-        let account = parse_account(account_id)?;
-        self.run(move |store| {
-            if let Some(mut head) = store.head(account)? {
-                store.clean_retired(account, &mut head)?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
     async fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&Self) -> Result<T, CredentialError> + Send + 'static,
@@ -1174,7 +1163,8 @@ mod tests {
             CredentialError::CleanupPending
         );
         keyring.faults.lock().unwrap().reject_deletes = false;
-        restart(&store).flush_cleanup(ACCOUNT).await.unwrap();
+        let retried = restart(&store).delete(ACCOUNT, Some(2)).await.unwrap();
+        assert!(!retried.cleanup_pending());
         assert!(!store.status(ACCOUNT).await.unwrap().cleanup_pending);
         assert_eq!(keyring.values.lock().unwrap().len(), 1);
     }

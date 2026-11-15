@@ -670,17 +670,35 @@ mod tests {
             SessionExitReason::StartupStalled
         );
     }
-    use super::super::crash::{MAX_CRASH_ARTIFACT_BYTES, parse_crash_evidence};
+    const OUT_OF_MEMORY: &str = "java.lang.OutOfMemoryError";
 
-    fn report(raw: &str) -> CrashEvidence {
-        parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, raw.as_bytes())
-            .expect("Minecraft crash evidence")
+    fn report(exception_class: &str, suspected_mods: &[&str], truncated: bool) -> CrashEvidence {
+        serde_json::from_value(serde_json::json!({
+            "source": "minecraft_crash_report",
+            "truncated": truncated,
+            "failure_phase": null,
+            "exception_class": exception_class,
+            "suspected_mods": suspected_mods
+                .iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>(),
+            "problematic_frame": null,
+            "names_out_of_memory": exception_class == OUT_OF_MEMORY,
+        }))
+        .expect("Minecraft crash evidence")
     }
 
-    fn hs_err(frame_kind: char, module: &str) -> CrashEvidence {
-        let raw = format!("# Problematic frame:\n# {frame_kind}  [{module}.dll+0x12] crash+0x1");
-        parse_crash_evidence(CrashArtifactKind::JvmFatalError, raw.as_bytes())
-            .expect("JVM fatal-error evidence")
+    fn hs_err(frame_kind: &str, module: &str) -> CrashEvidence {
+        serde_json::from_value(serde_json::json!({
+            "source": "jvm_fatal_error",
+            "truncated": false,
+            "failure_phase": "native",
+            "exception_class": null,
+            "suspected_mods": [],
+            "problematic_frame": { "kind": frame_kind, "module": module, "symbol": "crash" },
+            "names_out_of_memory": false,
+        }))
+        .expect("JVM fatal-error evidence")
     }
 
     #[test]
@@ -873,8 +891,7 @@ mod tests {
 
     #[test]
     fn exit_status_table_distinguishes_clean_and_failed_processes_exactly() {
-        let oom =
-            report("Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space");
+        let oom = report(OUT_OF_MEMORY, &[], false);
         let semantic = [FailureClass::JvmUnsupportedOption];
         for (exit_code, classes, evidence, expected) in [
             (Some(0), &[][..], None, None),
@@ -905,27 +922,27 @@ mod tests {
         ];
         let cases = [
             (
-                report(
-                    "Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space\nSuspected Mods: Example Mod (example)",
-                ),
+                report(OUT_OF_MEMORY, &["Example Mod"], false),
                 FailureClass::OutOfMemory,
             ),
             (
                 report(
-                    "Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing\nSuspected Mods: Example Mod (example)",
+                    "net.minecraftforge.fml.common.MissingModsException",
+                    &["Example Mod"],
+                    false,
                 ),
                 FailureClass::MissingDependency,
             ),
             (
                 report(
-                    "Description: Loading game\norg.spongepowered.asm.mixin.transformer.throwables.MixinApplyError: failed\nSuspected Mods: Example Mod (example)",
+                    "org.spongepowered.asm.mixin.transformer.throwables.MixinApplyError",
+                    &["Example Mod"],
+                    false,
                 ),
                 FailureClass::ModTransformationFailure,
             ),
             (
-                report(
-                    "Description: Rendering game\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Mod (example)",
-                ),
+                report("java.lang.IllegalStateException", &["Example Mod"], false),
                 FailureClass::ModAttributedCrash,
             ),
         ];
@@ -936,7 +953,7 @@ mod tests {
             );
         }
 
-        let graphics = hs_err('C', "nvoglv64");
+        let graphics = hs_err("native", "nvoglv64");
         assert_eq!(
             classify_launch_failure(&stdout, Some(1), Some(&graphics)),
             Some(FailureClass::GraphicsDriverCrash)
@@ -950,8 +967,7 @@ mod tests {
             Some(FailureClass::LauncherManagedArtifactSignature)
         );
 
-        let oom =
-            report("Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space");
+        let oom = report(OUT_OF_MEMORY, &[], false);
         assert_eq!(
             classify_launch_failure(&[FailureClass::JavaRuntimeMismatch], Some(1), Some(&oom),),
             Some(FailureClass::JavaRuntimeMismatch)
@@ -979,7 +995,7 @@ mod tests {
             assert!(!is_graphics_driver_module(module), "{module}");
         }
 
-        let vm_frame = hs_err('V', "nvoglv64");
+        let vm_frame = hs_err("vm", "nvoglv64");
         assert_eq!(
             classify_launch_failure(&[], Some(1), Some(&vm_frame)),
             Some(FailureClass::Unknown)
@@ -988,36 +1004,23 @@ mod tests {
 
     #[test]
     fn evidence_requires_a_complete_report_and_its_declared_source() {
-        let truncated = |text: &[u8]| {
-            let mut raw = text.to_vec();
-            raw.resize(MAX_CRASH_ARTIFACT_BYTES + 1, b'x');
-            let evidence = parse_crash_evidence(CrashArtifactKind::MinecraftCrashReport, &raw)
-                .expect("truncated report evidence");
-            assert!(evidence.truncated);
-            evidence
-        };
-        let attributed = truncated(b"Description: Rendering game\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Mod (example)\n");
-        assert!(!attributed.suspected_mods.is_empty());
-        let mut missing = report(
-            "Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing",
-        );
+        const MISSING_MODS: &str = "net.minecraftforge.fml.common.MissingModsException";
+        let attributed = report("java.lang.IllegalStateException", &["Example Mod"], true);
+        let mut missing = report(MISSING_MODS, &[], false);
         missing.source = CrashArtifactKind::JvmFatalError;
-        let mut graphics = hs_err('C', "nvoglv64");
+        let mut graphics = hs_err("native", "nvoglv64");
         graphics.source = CrashArtifactKind::MinecraftCrashReport;
         for (evidence, expected) in [
             (attributed, FailureClass::Unknown),
-            (hs_err('C', "libjvm"), FailureClass::Unknown),
+            (hs_err("native", "libjvm"), FailureClass::Unknown),
             (missing, FailureClass::Unknown),
             (graphics, FailureClass::Unknown),
             // Exact exception and memory evidence survive truncation.
             (
-                truncated(b"Description: Loading game\nnet.minecraftforge.fml.common.MissingModsException: missing\n"),
+                report(MISSING_MODS, &[], true),
                 FailureClass::MissingDependency,
             ),
-            (
-                truncated(b"Description: Rendering game\njava.lang.OutOfMemoryError: Java heap space\n"),
-                FailureClass::OutOfMemory,
-            ),
+            (report(OUT_OF_MEMORY, &[], true), FailureClass::OutOfMemory),
         ] {
             assert_eq!(
                 classify_launch_failure(&[], Some(1), Some(&evidence)),

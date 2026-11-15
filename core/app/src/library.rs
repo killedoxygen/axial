@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(test)]
 use std::time::Duration;
 
 use axial_fs::{
@@ -143,8 +144,6 @@ pub enum LibraryError {
     AdmissionUnresolved,
     #[error("a previous game process has not been proven settled")]
     UnsettledLaunch,
-    #[error("library pins did not drain before the deadline")]
-    DrainTimeout,
     #[error("filesystem authority check failed")]
     Files(#[source] io::Error),
     #[error("external root session could not be acquired")]
@@ -1166,7 +1165,11 @@ impl LibraryLifecycle {
         state.retiring.is_empty()
     }
 
-    pub async fn wait_for_pins(&self, timeout: Duration) -> Result<(), LibraryError> {
+    #[cfg(test)]
+    pub async fn wait_for_pins(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), tokio::time::error::Elapsed> {
         tokio::time::timeout(timeout, async {
             loop {
                 // Register before observing counters, preventing lost wakeups.
@@ -1188,7 +1191,6 @@ impl LibraryLifecycle {
             }
         })
         .await
-        .map_err(|_| LibraryError::DrainTimeout)
     }
 
     /// Transfer only after every application owner drains. Any failure leaves
@@ -1862,10 +1864,7 @@ mod tests {
         ));
         escaped.revalidate().unwrap();
         drop(escaped);
-        assert!(matches!(
-            owner.wait_for_pins(Duration::from_millis(1)).await,
-            Err(LibraryError::DrainTimeout)
-        ));
+        assert!(owner.wait_for_pins(Duration::from_millis(1)).await.is_err());
         drop(witness);
         owner.wait_for_pins(Duration::from_secs(1)).await.unwrap();
         assert!(matches!(

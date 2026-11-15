@@ -64,27 +64,9 @@ impl Fixture {
 }
 
 impl Builder {
-    /// Whole-budget fixtures choose their own capacity so unrelated waiters
-    /// cannot consume it.
-    pub(crate) fn tasks(mut self, capacity: usize) -> Self {
-        self.tasks = capacity;
-        self
-    }
-
-    /// Only for owners that must observe an absent or partial schema.
-    pub(crate) fn schema(mut self, migrations: &'static [Migration]) -> Self {
-        self.schema = migrations;
-        self
-    }
-
     /// Keeps metadata in memory instead of `metadata.sqlite` under the root.
     pub(crate) fn in_memory(mut self) -> Self {
         self.memory = true;
-        self
-    }
-
-    pub(crate) fn storage_limits(mut self, limits: StorageLimits) -> Self {
-        self.limits = limits;
         self
     }
 
@@ -214,7 +196,6 @@ impl Reply {
 #[derive(Clone, Debug)]
 pub(crate) struct Request {
     pub line: String,
-    pub head: String,
     pub body: Vec<u8>,
 }
 
@@ -277,13 +258,8 @@ impl Server {
         crate::network::OriginPolicy::loopback_for_tests([&self.origin], 0).unwrap()
     }
 
-    /// The next request, observed after its reply head was written. The
-    /// server's real-time accept bound applies even under paused test time.
-    pub(crate) async fn request(&mut self) -> Request {
-        self.requests.recv().await.expect("scripted server stopped")
-    }
-
-    /// `request` for a thread outside any async runtime.
+    /// The next request, observed after its reply head was written, for a
+    /// thread outside any async runtime.
     pub(crate) fn blocking_request(&mut self) -> Request {
         self.requests
             .blocking_recv()
@@ -346,7 +322,6 @@ fn read_request(stream: &mut TcpStream) -> Request {
             return Request {
                 line: head.lines().next().unwrap_or_default().to_owned(),
                 body: bytes[end + 4..end + 4 + length].to_vec(),
-                head,
             };
         }
     }

@@ -147,7 +147,6 @@ impl ResponseLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HashAlgorithm {
     Sha1,
-    Sha256,
     Sha512,
 }
 
@@ -161,7 +160,6 @@ impl Checksum {
     pub fn from_hex(algorithm: HashAlgorithm, value: &str) -> Result<Self, DownloadError> {
         let length = match algorithm {
             HashAlgorithm::Sha1 => 20,
-            HashAlgorithm::Sha256 => 32,
             HashAlgorithm::Sha512 => 64,
         };
         if value.len() != length * 2 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -182,7 +180,6 @@ impl Checksum {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnhashedReason {
     ProviderMetadata,
-    ProviderDoesNotPublishChecksum,
 }
 
 #[derive(Clone, Debug)]

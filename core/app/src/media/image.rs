@@ -465,10 +465,6 @@ pub fn is_valid_normalized_skin_cache_png(bytes: &[u8]) -> bool {
     })
 }
 
-pub fn is_valid_cape_texture_png(bytes: &[u8]) -> bool {
-    normalize_cape_png(bytes).is_ok()
-}
-
 pub fn normalize_cape_png(bytes: &[u8]) -> Result<Vec<u8>, MediaError> {
     if bytes.len() > CAPE_PNG_MAX_BYTES {
         return Err(MediaError::TooLarge);

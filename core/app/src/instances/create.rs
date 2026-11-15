@@ -899,6 +899,7 @@ impl InstanceService {
 
     /// Playing sessions may lend their existing admission for next-launch
     /// metadata. File mutations and deletion still require a fresh exclusion.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn update_with_sessions(
         &self,
         id: &InstanceId,

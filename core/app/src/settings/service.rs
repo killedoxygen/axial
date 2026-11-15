@@ -331,7 +331,12 @@ mod tests {
     #[tokio::test]
     async fn account_selection_is_authoritative_over_saved_settings() {
         let f = unconfigured();
-        f.accounts.create_offline_account("Alex").unwrap();
+        f.accounts
+            .create_offline_with_preconditions(
+                "Alex",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let current = f.settings.config().await.unwrap();
         assert_eq!(
             (
@@ -347,7 +352,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((saved.username.as_str(), saved.revision), ("Alex", 1));
-        f.accounts.create_offline_account("Third").unwrap();
+        f.accounts
+            .create_offline_with_preconditions(
+                "Third",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         assert_eq!(f.settings.config().await.unwrap().username, "Third");
         assert_eq!(f.settings.store.current().unwrap().revision, 1);
     }
@@ -356,7 +366,12 @@ mod tests {
     async fn short_authenticated_names_survive_settings_edits() {
         for name in ["A", "A1"] {
             let f = unconfigured();
-            f.accounts.create_offline_account("Alex").unwrap();
+            f.accounts
+                .create_offline_with_preconditions(
+                    "Alex",
+                    crate::accounts::model::AccountPreconditions::default(),
+                )
+                .unwrap();
             select_microsoft(&f.accounts, name);
             let accounts = f.accounts.snapshot().unwrap();
             let current = f.settings.config().await.unwrap();
@@ -401,7 +416,12 @@ mod tests {
     #[tokio::test]
     async fn failed_commit_preserves_accounts_and_onboarding() {
         let f = unconfigured();
-        f.accounts.create_offline_account("Alex").unwrap();
+        f.accounts
+            .create_offline_with_preconditions(
+                "Alex",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let accounts = f.accounts.snapshot().unwrap();
         reject_settings_writes(&f.metadata);
         let error = f

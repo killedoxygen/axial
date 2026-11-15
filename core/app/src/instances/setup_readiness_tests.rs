@@ -548,7 +548,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                     .revalidate()
                     .unwrap();
             }
-            accounts.create_offline_account("PressurePlayer").unwrap();
+            accounts.create_offline_with_preconditions("PressurePlayer", crate::accounts::model::AccountPreconditions::default()).unwrap();
             let instance =
                 super::super::create::tests::create(&service.instances, "Pressure").await;
             let request = serde_json::from_value(serde_json::json!({
@@ -3765,7 +3765,12 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
     let account_block = service.enrich(instance.clone(), &versions).await;
     assert_eq!(account_block.launch_action.primary_action, LaunchPrimaryAction::Blocked);
     assert!(account_block.status_detail.contains("account"));
-    accounts.create_offline_account("FixturePlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "FixturePlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     let pin = service.instances.directories().library().admit().unwrap();
     let operation = pin.managed_library().unwrap();
     let publication =
@@ -3820,7 +3825,12 @@ fn list_summary_leaves_content_integrity_to_strict_preflight() {
     let outcome = runtime.block_on(
         std::panic::AssertUnwindSafe(async {
             crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
-            accounts.create_offline_account("SummaryPlayer").unwrap();
+            accounts
+                .create_offline_with_preconditions(
+                    "SummaryPlayer",
+                    crate::accounts::model::AccountPreconditions::default(),
+                )
+                .unwrap();
             use_probe_java(root.path(), &service, "");
             let instance = super::super::create::tests::create(&service.instances, "Summary").await;
             let healthy = service.list().await;
@@ -3932,7 +3942,12 @@ async fn absent_or_unready_catalog_does_not_turn_launch_blocks_into_install_perm
         assert!(blocked.install_target.is_some());
     }
 
-    accounts.create_offline_account("FixturePlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "FixturePlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     let pin = service.instances.directories().library().admit().unwrap();
     let operation = pin.managed_library().unwrap();
     let publication =
@@ -4016,7 +4031,12 @@ async fn unavailable_install_metadata_does_not_offer_reinstall() {
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
     let instance = super::super::create::tests::create(&service.instances, "Readiness").await;
     let versions = service.installed().await.unwrap();
-    accounts.create_offline_account("FixturePlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "FixturePlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     service
         .instances
         .registry()
@@ -4106,7 +4126,12 @@ async fn accepted_setup_fixture() -> (tempfile::TempDir, SetupService, SetupWork
 
     let (root, mut service, accounts) = fixture();
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
-    accounts.create_offline_account("FixturePlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "FixturePlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     use_probe_java(root.path(), &service, "");
     let client = ProviderClient::new(ClientConfig::default()).unwrap();
     let content = Arc::new(ContentService::new(client.clone()).unwrap());
@@ -4688,7 +4713,12 @@ async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
     let instance = super::super::create::tests::create(&service.instances, "Readiness").await;
     let versions = service.installed().await.unwrap();
-    accounts.create_offline_account("FixturePlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "FixturePlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     use_probe_java(root.path(), &service, "");
     let ready = service.enrich(instance.clone(), &versions).await;
     assert!(ready.launchable, "{}", ready.status_detail);
@@ -4710,7 +4740,12 @@ async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
 async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
     let (root, service, accounts) = fixture();
     crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
-    accounts.create_offline_account("GroupedPlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "GroupedPlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     std::fs::write(root.path().join("probe-release"), b"release").unwrap();
     use_probe_java(
         root.path(),
@@ -4915,7 +4950,12 @@ async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe(
     for version in ["1.20.1", "1.21.4"] {
         crate::install::queue::tests::install_ready_fixture(&service.installs, version).await;
     }
-    accounts.create_offline_account("GroupedPlayer").unwrap();
+    accounts
+        .create_offline_with_preconditions(
+            "GroupedPlayer",
+            crate::accounts::model::AccountPreconditions::default(),
+        )
+        .unwrap();
     let java = root.path().join("java");
     std::fs::write(&java, format!(
         "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\n  major=21\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\n  major=17\nfi\nprintf 'java.version = %s.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' \"$major\" >&2\n",
@@ -5038,7 +5078,7 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
     let mut publication = None;
     let journey = runtime.block_on(std::panic::AssertUnwindSafe(async {
         crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
-        accounts.create_offline_account("GroupedPlayer").unwrap();
+        accounts.create_offline_with_preconditions("GroupedPlayer", crate::accounts::model::AccountPreconditions::default()).unwrap();
         std::fs::write(root.path().join("probe-first"), b"").unwrap();
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
         use_probe_java(root.path(), &service, "probe_dir=${0%/*}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\nfi\n");

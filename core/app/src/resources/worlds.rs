@@ -40,12 +40,6 @@ pub struct WorldIcon {
 pub enum WorldError {
     #[error("invalid world name")]
     InvalidName,
-    #[error("world not found")]
-    NotFound,
-    #[error("world already exists")]
-    AlreadyExists,
-    #[error("World changes are unavailable while this instance is in use.")]
-    Busy,
     #[error("World resources exceed safe filesystem limits.")]
     Capacity,
     #[error("World resources contain unsupported filesystem entries.")]
@@ -54,8 +48,6 @@ pub enum WorldError {
     Changed,
     #[error("Could not complete the world operation. Check folder permissions and try again.")]
     Io,
-    #[error("World operation requires settlement. Existing files have been preserved.")]
-    SettlementRequired,
     #[error("world icon not found")]
     IconNotFound,
 }

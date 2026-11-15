@@ -260,9 +260,6 @@ impl ManifestEntry {
     pub fn enabled(&self) -> bool {
         self.enabled
     }
-    pub fn installed_at(&self) -> &str {
-        &self.installed_at
-    }
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
@@ -296,15 +293,6 @@ impl ManifestEntry {
     ) -> ContentResult<()> {
         let mut candidate = self.clone();
         candidate.pack_installation = Some(proof);
-        candidate.validate()?;
-        *self = candidate;
-        Ok(())
-    }
-
-    pub fn record_authenticated_file(&mut self, size: u64, sha512: String) -> ContentResult<()> {
-        let mut candidate = self.clone();
-        candidate.size = Some(size);
-        candidate.sha512 = Some(sha512);
         candidate.validate()?;
         *self = candidate;
         Ok(())

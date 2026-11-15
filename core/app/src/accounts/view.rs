@@ -392,7 +392,12 @@ mod tests {
     async fn offline_list_exposes_identity_without_credentials() {
         let directory =
             Arc::new(AccountDirectory::new(Arc::new(MetadataStore::in_memory().unwrap())).unwrap());
-        directory.create_offline_account("Steve").unwrap();
+        directory
+            .create_offline_with_preconditions(
+                "Steve",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let service = AuthService::new(
             directory,
             Arc::new(CredentialStore::isolated_for_tests()),

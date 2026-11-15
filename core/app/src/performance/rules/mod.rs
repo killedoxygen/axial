@@ -217,6 +217,7 @@ impl PerformanceRules {
         self.hardware.clone()
     }
 
+    #[cfg(feature = "test-support")]
     pub fn uses_metadata(&self, metadata: &Arc<MetadataStore>) -> bool {
         Arc::ptr_eq(&self.storage, metadata)
     }

@@ -371,6 +371,7 @@ impl ManagedCompositionAuthority {
         .map_err(|error| classify_install_reconciliation_error("remove", error))
     }
 
+    #[cfg(test)]
     pub async fn rollback_managed(
         &self,
         identity: &ManagedInstanceIdentity,

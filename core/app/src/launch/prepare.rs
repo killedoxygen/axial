@@ -359,7 +359,12 @@ pub(super) mod tests {
             .await
             .unwrap();
         let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());
-        accounts.create_offline_account("Player").unwrap();
+        accounts
+            .create_offline_with_preconditions(
+                "Player",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         let settings = Arc::new(SettingsStore::new(storage).unwrap());
         let operation = instance.generation().managed_library().unwrap();
         let library_dir = instance.generation().read_projection().unwrap();
@@ -466,7 +471,10 @@ pub(super) mod tests {
             if change_account {
                 prepared
                     .accounts
-                    .create_offline_account("Elsewhere")
+                    .create_offline_with_preconditions(
+                        "Elsewhere",
+                        crate::accounts::model::AccountPreconditions::default(),
+                    )
                     .unwrap();
                 assert!(matches!(
                     construct(prepared),
@@ -503,7 +511,10 @@ pub(super) mod tests {
             let expected = if change_account {
                 let changed = prepared
                     .accounts
-                    .create_offline_account("Elsewhere")
+                    .create_offline_with_preconditions(
+                        "Elsewhere",
+                        crate::accounts::model::AccountPreconditions::default(),
+                    )
                     .unwrap();
                 prepared
                     .accounts

@@ -512,8 +512,18 @@ mod tests {
 
     fn accounts(metadata: Arc<MetadataStore>) {
         let accounts = AccountDirectory::new(metadata).unwrap();
-        accounts.create_offline_account("Alice").unwrap();
-        accounts.create_offline_account("Bob").unwrap();
+        accounts
+            .create_offline_with_preconditions(
+                "Alice",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
+        accounts
+            .create_offline_with_preconditions(
+                "Bob",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
     }
 
     fn png(red: u8) -> Vec<u8> {

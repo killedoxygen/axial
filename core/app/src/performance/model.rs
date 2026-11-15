@@ -439,6 +439,4 @@ pub enum PlanInputError {
         "instance version metadata is unavailable; install the version before resolving performance files"
     )]
     VersionUnavailable,
-    #[error("game_version query parameter is required")]
-    GameVersionRequired,
 }
