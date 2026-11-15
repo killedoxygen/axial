@@ -294,9 +294,11 @@ impl ManagedRuntimeComponent {
     }
 
     /// `contents_verified`, returning the SHA-256 of the verified manifest
-    /// proof: the identity of the exact runtime build these contents are.
-    pub fn verified_manifest(&self) -> Option<[u8; 32]> {
+    /// proof (the identity of the exact runtime build these contents are)
+    /// and the number of tree entries the verification walked.
+    pub fn verified_manifest(&self) -> Option<([u8; 32], u64)> {
         let (manifest, digest) = self.persisted_manifest()?;
+        let entries = manifest.files.len() as u64 + 2;
         if !self.executable_ready() {
             return None;
         }
@@ -308,7 +310,7 @@ impl ManagedRuntimeComponent {
             crate::managed::fs::DigestProof::Reverified,
             &cancellation.thread(),
         ) && self.validate_projection().is_ok())
-        .then_some(digest)
+        .then_some((digest, entries))
     }
 }
 

@@ -221,10 +221,11 @@ impl LaunchCoordinator {
         scan: Option<Arc<crate::catalog::InstalledSnapshot>>,
         budget: InventoryBudget,
     ) -> PreflightProjection {
+        let budget = Arc::new(Mutex::new(budget));
         PreflightProjection {
             current: None,
             inventories: Some(Arc::new(Mutex::new(Vec::new()))),
-            budget: Arc::new(Mutex::new(budget)),
+            budget: budget.clone(),
             scan: scan.map(Ok),
             finalize_scan: false,
             context: (|| {
@@ -241,7 +242,7 @@ impl LaunchCoordinator {
             diagnostics: false,
             inspection: Inspection::Reverified,
             installs: self.installs.clone(),
-            runtimes: RuntimeProjection::default(),
+            runtimes: RuntimeProjection::new(budget.clone()),
             credentials: Arc::default(),
         }
     }
@@ -627,7 +628,7 @@ impl LaunchCoordinator {
                                 runtime_absence = Some(absence);
                                 None
                             }
-                            Ok(RuntimeObservation::Outdated) => {
+                            Ok(RuntimeObservation::Outdated(_)) => {
                                 runtime_replaced = true;
                                 None
                             }

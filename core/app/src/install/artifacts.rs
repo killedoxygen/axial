@@ -22,7 +22,7 @@ use std::{
     sync::Arc,
 };
 
-const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
+pub(crate) const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Inspection {

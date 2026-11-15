@@ -43,27 +43,45 @@ struct ProvenProbe {
 pub(crate) struct SelectedRuntime {
     pub probe: JavaProbeReceipt,
     pub managed: Option<ManagedRuntimeLaunchReceipt>,
-    manifest: Option<[u8; 32]>,
+    /// The verified manifest digest and the entries its walk covers.
+    manifest: Option<([u8; 32], u64)>,
 }
 
 #[derive(Clone)]
 pub(crate) enum RuntimeObservation {
     Ready(SelectedRuntime),
     Missing(Arc<axial_minecraft::runtime::RuntimeAbsence>),
-    /// The app-managed runtime is below the admitted floor; launch replaces it.
-    Outdated,
+    /// This exact app-managed runtime is below the admitted floor; launch
+    /// replaces it. Its evidence is rechecked like a ready runtime's.
+    Outdated(SelectedRuntime),
 }
 
-/// Selections shared by every row of one admitted projection, keyed by the
-/// exact requirement and override text. Recheck with `revalidate` once before
-/// the projection is published.
-#[derive(Clone, Default)]
+/// Distinct runtime requirements one projection may observe and retain.
+const MAX_PROJECTION_RUNTIMES: usize = 8;
+
+/// Successful observations shared by every row of one admitted projection,
+/// keyed by the exact requirement and override text. Refusals are not shared.
+/// Every observation and recheck is charged to the projection's budget before
+/// its walk; `revalidate` rechecks all of them once before publication.
+#[derive(Clone)]
 pub(crate) struct RuntimeProjection {
-    observed:
-        Arc<Mutex<HashMap<(i32, String, String), Result<RuntimeObservation, JavaDiscoveryError>>>>,
+    observed: Arc<Mutex<HashMap<(i32, String, String), RuntimeObservation>>>,
+    budget: Arc<Mutex<crate::install::artifacts::InventoryBudget>>,
+}
+
+impl Default for RuntimeProjection {
+    fn default() -> Self {
+        Self::new(Arc::new(Mutex::new(
+            crate::install::artifacts::InventoryBudget::projection(),
+        )))
+    }
 }
 
 impl SelectedRuntime {
+    fn checks(&self) -> u64 {
+        self.manifest.map_or(1, |(_, entries)| entries)
+    }
+
     /// Rechecks the complete managed tree against the same manifest, the
     /// retained executable binding and the probed executable fingerprint.
     /// This never starts a process.
@@ -97,27 +115,49 @@ impl SelectedRuntime {
 }
 
 impl RuntimeObservation {
+    fn checks(&self) -> u64 {
+        match self {
+            Self::Ready(selected) | Self::Outdated(selected) => selected.checks(),
+            Self::Missing(_) => 1,
+        }
+    }
+
     async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
         match self {
-            Self::Ready(selected) => selected.revalidate().await,
+            Self::Ready(selected) | Self::Outdated(selected) => selected.revalidate().await,
             Self::Missing(absence) => absence
                 .revalidate()
                 .map_err(|_| JavaDiscoveryError::Replaced),
-            Self::Outdated => Ok(()),
         }
     }
 }
 
 impl RuntimeProjection {
+    pub(crate) fn new(budget: Arc<Mutex<crate::install::artifacts::InventoryBudget>>) -> Self {
+        Self {
+            observed: Arc::default(),
+            budget,
+        }
+    }
+
+    fn charge(&self, checks: u64) -> Result<(), JavaDiscoveryError> {
+        self.budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve_checks(checks)
+            .map_err(|_| JavaDiscoveryError::Failed)
+    }
+
     pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
         let observed = self
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
-            .filter_map(|observed| observed.as_ref().ok().cloned())
+            .cloned()
             .collect::<Vec<_>>();
         for observation in observed {
+            self.charge(observation.checks())?;
             observation.revalidate().await?;
         }
         Ok(())
@@ -306,23 +346,27 @@ impl RuntimeDiscovery {
             java.component.clone(),
             override_value.trim().to_owned(),
         );
-        if let Some(observed) = projection
+        {
+            let observed = projection
+                .observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(observation) = observed.get(&key) {
+                return Ok(observation.clone());
+            }
+            if observed.len() >= MAX_PROJECTION_RUNTIMES {
+                return Err(JavaDiscoveryError::Failed);
+            }
+        }
+        projection.charge(1)?;
+        let observation = self.observe(java, override_value, cancellation).await?;
+        projection.charge(observation.checks().saturating_sub(1))?;
+        projection
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
-            return observed.clone();
-        }
-        let observed = self.observe(java, override_value, cancellation).await;
-        if !matches!(observed, Err(JavaDiscoveryError::Cancelled)) {
-            projection
-                .observed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key, observed.clone());
-        }
-        observed
+            .insert(key, observation.clone());
+        Ok(observation)
     }
 
     async fn observe(
@@ -344,12 +388,16 @@ impl RuntimeDiscovery {
                 return Ok(RuntimeObservation::Missing(Arc::new(absence)));
             }
         }
-        match self.select(java, override_value, cancellation).await {
+        let (selected, admitted) = self.select_with_admission(java, override_value, cancellation).await?;
+        match admitted {
+            Ok(()) => Ok(RuntimeObservation::Ready(selected)),
             // Launch replaces an outdated app-managed runtime before spawning.
-            Err(JavaDiscoveryError::OutdatedJava8) if override_value.trim().is_empty() => {
-                Ok(RuntimeObservation::Outdated)
+            Err(JavaDiscoveryError::OutdatedJava8)
+                if override_value.trim().is_empty() && selected.managed.is_some() =>
+            {
+                Ok(RuntimeObservation::Outdated(selected))
             }
-            selected => selected.map(RuntimeObservation::Ready),
+            Err(error) => Err(error),
         }
     }
 
@@ -359,6 +407,20 @@ impl RuntimeDiscovery {
         override_value: &str,
         cancellation: &CancellationToken,
     ) -> Result<SelectedRuntime, JavaDiscoveryError> {
+        let (selected, admitted) = self
+            .select_with_admission(java, override_value, cancellation)
+            .await?;
+        admitted.map(|()| selected)
+    }
+
+    /// The verified, probed runtime and, separately, whether it meets the
+    /// requirement, so a refused runtime's exact evidence can be retained.
+    async fn select_with_admission(
+        &self,
+        java: &JavaVersion,
+        override_value: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(SelectedRuntime, Result<(), JavaDiscoveryError>), JavaDiscoveryError> {
         let requirement = JavaSelectionRequirement::for_current_host(
             u32::try_from(java.major_version).map_err(|_| JavaDiscoveryError::InvalidVersion)?,
         );
@@ -388,8 +450,8 @@ impl RuntimeDiscovery {
                 manifest: None,
             }
         };
-        requirement.validate(selected.probe.info(), selected.probe.architecture())?;
-        Ok(selected)
+        let admitted = requirement.validate(selected.probe.info(), selected.probe.architecture());
+        Ok((selected, admitted))
     }
 
     /// Verifies the component's complete tree and reuses the probe of the same
@@ -419,7 +481,7 @@ impl RuntimeDiscovery {
             .try_spawn(admitted.clone(), move |cancel| async move {
                 let mut proven = slot.lock().await;
                 let checked = admitted.clone();
-                let manifest = process_physical_work()
+                let verified = process_physical_work()
                     .admit(PhysicalWorkRequest::foreground(
                         PhysicalIoClass::Read,
                         VERIFY_SCRATCH_BYTES,
@@ -431,6 +493,7 @@ impl RuntimeDiscovery {
                     .map_err(|_| JavaDiscoveryError::Failed)?
                     // A marker alone is insufficient: the manifest's complete tree must match.
                     .ok_or(JavaDiscoveryError::Replaced)?;
+                let manifest = verified.0;
                 let receipt = admitted
                     .launch_receipt()
                     .map_err(|_| JavaDiscoveryError::Replaced)?;
@@ -460,7 +523,7 @@ impl RuntimeDiscovery {
                 Ok(SelectedRuntime {
                     probe,
                     managed: Some(receipt),
-                    manifest: Some(manifest),
+                    manifest: Some(verified),
                 })
             })
             .map_err(|_| JavaDiscoveryError::Failed)?;
@@ -771,12 +834,37 @@ mod proof_tests {
             .unwrap();
         let cancel = CancellationToken::new();
         let selected = discovery.select(&legacy, "", &cancel).await.err();
+        let projection = RuntimeProjection::default();
         let observed = discovery
-            .observe_for_preflight(&RuntimeProjection::default(), &legacy, "", &cancel)
+            .observe_for_preflight(&projection, &legacy, "", &cancel)
             .await;
+        let unchanged = projection.revalidate().await;
+        let executable = match &observed {
+            Ok(RuntimeObservation::Outdated(selected)) => selected.probe.executable().to_owned(),
+            _ => panic!("outdated runtime was not retained with its evidence"),
+        };
+        let original = std::fs::read(&executable).unwrap();
+        std::fs::write(&executable, b"#!/bin/sh\nexit 1\n").unwrap();
+        let replaced = projection.revalidate().await;
+        std::fs::write(&executable, original).unwrap();
+
+        // Every observation and recheck is charged before its walk.
+        let exhausted = RuntimeProjection::default();
+        exhausted
+            .budget
+            .lock()
+            .unwrap()
+            .reserve_checks(crate::install::artifacts::MAX_INVENTORY_ENTRIES as u64)
+            .unwrap();
+        let refused = discovery
+            .observe_for_preflight(&exhausted, &legacy, "", &cancel)
+            .await
+            .err();
         tasks.shutdown(Duration::from_secs(5)).await.unwrap();
         assert_eq!(selected, Some(JavaDiscoveryError::OutdatedJava8));
-        assert!(matches!(observed, Ok(RuntimeObservation::Outdated)));
+        assert_eq!(unchanged, Ok(()));
+        assert_eq!(replaced, Err(JavaDiscoveryError::Replaced));
+        assert_eq!(refused, Some(JavaDiscoveryError::Failed));
     }
 
     #[tokio::test]
