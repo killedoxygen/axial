@@ -147,7 +147,7 @@ export function Primitives(): JSX.Element {
       <Group title="Chips, keys, slider, progress">
         <Line>
           <Chip>Fabric</Chip>
-          <Chip mono>1.21.5</Chip>
+          <Chip>1.21.5</Chip>
           <Chip tone="accent" icon="arrow-up">
             3 updates
           </Chip>

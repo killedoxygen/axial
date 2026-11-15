@@ -75,7 +75,7 @@ export function ScreenshotLightbox({
           <div class="cp-shot-lightbox-title">
             <strong title={shot.name}>{shot.name}</strong>
             <div class="cp-chips">
-              <Chip mono>{formatBytes(shot.size)}</Chip>
+              <Chip>{formatBytes(shot.size)}</Chip>
               <Chip icon="clock">{fmtRelative(shot.modified_at)}</Chip>
             </div>
           </div>

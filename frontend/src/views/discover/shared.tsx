@@ -84,7 +84,7 @@ export function FitFacts({ fit }: { fit: { loaderLabel: string; gameVersion: str
   return (
     <>
       <Chip>{fit.loaderLabel}</Chip>
-      <Chip mono>{fit.gameVersion}</Chip>
+      <Chip>{fit.gameVersion}</Chip>
     </>
   );
 }

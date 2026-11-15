@@ -10,7 +10,7 @@ import { navigate, openCreate } from '../../ui-state';
 import { errMessage, showError } from '../../utils';
 import { useNowTicker } from '../../hooks/use-now';
 import { KIND_ICON } from '../discover/shared';
-import { loaderKeyFromComponentId } from '../create/defaults';
+import { loaderKeyFromComponentId } from '../../create/defaults';
 import { LoaderLogo } from '../create/loader-logos';
 import { installItemFromQueuedViewModel } from '../../install-item';
 import type { InstallItem } from '../../types-install';
@@ -93,7 +93,7 @@ function Target({ item }: { item: InstallItem }): JSX.Element | null {
       </span>
     );
   }
-  return item.loader ? <Chip mono>{item.loader.minecraftVersion}</Chip> : null;
+  return item.loader ? <Chip>{item.loader.minecraftVersion}</Chip> : null;
 }
 
 function Row({
@@ -208,7 +208,7 @@ export function DownloadsView(): JSX.Element {
               <div class="cp-dl-step">
                 <Ring progress={step ? step.progress_pct : null} size={14} />
                 <span>{step?.label ?? active.label}</span>
-                {ratio && <Chip mono>{ratio}</Chip>}
+                {ratio && <Chip>{ratio}</Chip>}
                 {active.startedAt !== null && (
                   <span class="cp-dl-elapsed">{formatElapsedTime(active.startedAt, now)}</span>
                 )}

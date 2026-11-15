@@ -124,14 +124,10 @@ export function VersionsTable({
                   <Chip key={entry}>{tagLabel(entry)}</Chip>
                 ))}
                 {version.game_versions.slice(0, GAME_VERSIONS_SHOWN).map((entry) => (
-                  <Chip key={entry} mono>
-                    {entry}
-                  </Chip>
+                  <Chip key={entry}>{entry}</Chip>
                 ))}
                 {hidden > 0 && (
-                  <Chip mono title={version.game_versions.slice(GAME_VERSIONS_SHOWN).join(', ')}>
-                    +{hidden}
-                  </Chip>
+                  <Chip title={version.game_versions.slice(GAME_VERSIONS_SHOWN).join(', ')}>+{hidden}</Chip>
                 )}
               </span>
               <span role="cell">{formatDate(version.published)}</span>

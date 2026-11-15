@@ -506,8 +506,8 @@
 }
 .cp-content-meta .cp-chip--bare b {
   color: var(--text-dim);
-  font-family: var(--font-mono);
   font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
   font-weight: 500;
 }
 .cp-content-meta a {
@@ -658,8 +658,8 @@
 .cp-content-version strong {
   overflow: hidden;
   color: var(--text);
-  font-family: var(--font-mono);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
 }

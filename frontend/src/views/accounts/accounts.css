@@ -101,8 +101,8 @@
   padding: 0 10px;
   background: var(--fill);
   color: var(--text);
-  font-family: var(--font-mono);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
   font-weight: 500;
 }
 .cp-account-more:hover,

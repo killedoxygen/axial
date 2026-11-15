@@ -150,17 +150,15 @@ export function Chip({
   children,
   tone = 'neutral',
   icon,
-  mono,
   title,
 }: {
   children?: ComponentChildren;
   tone?: ChipTone;
   icon?: IconName;
-  mono?: boolean;
   title?: string;
 }): JSX.Element {
   const look = tone === 'ok' || tone === 'info' ? 'accent' : tone;
-  const cls = `cp-chip${look !== 'neutral' ? ` cp-chip--${look}` : ''}${mono ? ' cp-chip--mono' : ''}`;
+  const cls = `cp-chip${look !== 'neutral' ? ` cp-chip--${look}` : ''}`;
   return (
     <span class={cls} title={title}>
       {icon && <Icon name={icon} size={11} stroke={2} />}
@@ -341,9 +339,32 @@ export function Toggle({
   );
 }
 
+/* Keys with a drawn form are shown by their icon; the glyphs are only how callers name them. */
+const KEY_ICONS: Record<string, IconName> = {
+  '↵': 'enter',
+  '↑': 'arrow-up',
+  '↓': 'arrow-down',
+  '←': 'arrow-left',
+  '→': 'arrow-right',
+  '⌘': 'command',
+  '⇧': 'shift',
+  '⌥': 'option',
+};
+
 export function Kbd({ children }: { children: ComponentChildren }): JSX.Element {
-  const oneGlyph = typeof children === 'string' && [...children].length === 1;
-  return <span class={oneGlyph ? 'cp-kbd cp-kbd--key' : 'cp-kbd'}>{children}</span>;
+  if (typeof children !== 'string') return <span class="cp-kbd">{children}</span>;
+  const keys = [...children];
+  const drawn = keys.some((key) => key in KEY_ICONS);
+  return (
+    <span class={keys.length === 1 ? 'cp-kbd cp-kbd--key' : 'cp-kbd'} aria-label={drawn ? children : undefined}>
+      {drawn
+        ? keys.map((key) => {
+            const icon = KEY_ICONS[key];
+            return icon ? <Icon name={icon} size={11} stroke={2.4} /> : key;
+          })
+        : children}
+    </span>
+  );
 }
 
 /** A key combination, one cap per key. */

@@ -72,7 +72,7 @@ export function Options({
                 .sort((a, b) => Number(b.id === 'default') - Number(a.id === 'default'))
                 .map((preset) => ({ value: preset.id, label: preset.label }))}
             />
-            <Chip mono>{windowPreset.id === 'default' ? 'Game default' : `${windowPreset.w} × ${windowPreset.h}`}</Chip>
+            <Chip>{windowPreset.id === 'default' ? 'Game default' : `${windowPreset.w} × ${windowPreset.h}`}</Chip>
           </div>
 
           <span class="cp-cr-key">Profile</span>

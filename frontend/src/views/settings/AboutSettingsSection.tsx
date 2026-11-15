@@ -110,7 +110,7 @@ export function AboutSettingsSection(): JSX.Element {
         <div class="cp-about-name">
           <h2>Axial</h2>
           <span class="cp-chips">
-            <Chip mono>{appVersion.value.replace(/^[vV]/, '')}</Chip>
+            <Chip>{appVersion.value.replace(/^[vV]/, '')}</Chip>
             <Chip>{releaseChannel}</Chip>
           </span>
         </div>

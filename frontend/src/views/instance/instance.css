@@ -192,8 +192,8 @@
   padding: 0 5px;
   border-radius: var(--rad-chip);
   background: color-mix(in oklab, var(--accent) 22%, transparent);
-  font-family: var(--font-mono);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
   font-weight: 500;
 }
 /* The toolbar's free space says what is being done to the files. */
@@ -254,7 +254,6 @@
   max-width: 100%;
   overflow: hidden;
   color: var(--text-mute);
-  font-family: var(--font-mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
@@ -269,7 +268,7 @@
 .cp-entry-update.cp-btn {
   gap: 4px;
   padding: 0 11px 0 8px;
-  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   font-size: 12px;
   font-weight: 500;
 }

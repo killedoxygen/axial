@@ -177,11 +177,7 @@ export function Tray(): JSX.Element | null {
                   {tagLabel(KIND_NOUN[item.kind])}
                 </Chip>
                 <span class="cp-head-fill" />
-                {item.version_label && (
-                  <Chip mono title="Pinned to this version">
-                    {item.version_label}
-                  </Chip>
-                )}
+                {item.version_label && <Chip title="Pinned to this version">{item.version_label}</Chip>}
                 {pack?.fit && <FitFacts fit={pack.fit} />}
                 {out && (
                   <Chip tone="warn" icon="alert" title={out.why}>

@@ -9,7 +9,7 @@ export function InstanceFacts({ inst }: { inst: Pick<EnrichedInstance, 'version_
   return (
     <>
       <Chip>{inst.version_display.loader_label}</Chip>
-      <Chip mono>{inst.version_display.minecraft_label}</Chip>
+      <Chip>{inst.version_display.minecraft_label}</Chip>
     </>
   );
 }

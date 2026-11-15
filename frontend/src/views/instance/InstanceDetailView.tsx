@@ -269,7 +269,7 @@ function InstanceDetailContent({ id }: { id: string }): JSX.Element {
             {loader.loader_label}
             {loader.loader_version_label ? ` ${loader.loader_version_label}` : ''}
           </Chip>
-          <Chip mono>{loader.minecraft_label}</Chip>
+          <Chip>{loader.minecraft_label}</Chip>
           {inst.last_played_at && (
             <Chip icon="clock" title={`Last played ${fmtRelative(inst.last_played_at)}`}>
               {fmtRelative(inst.last_played_at)}

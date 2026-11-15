@@ -156,7 +156,7 @@ function StatusPill(): JSX.Element | null {
     content = (
       <>
         <span class="cp-status-pill-label">{label}</span>
-        {tag && <Chip mono>{tag}</Chip>}
+        {tag && <Chip>{tag}</Chip>}
       </>
     );
   } else if (install) {
@@ -182,7 +182,7 @@ function StatusPill(): JSX.Element | null {
     content = (
       <>
         <span class="cp-status-pill-label">{flowLabel || launch.label}</span>
-        {prepTag && <Chip mono>{prepTag}</Chip>}
+        {prepTag && <Chip>{prepTag}</Chip>}
       </>
     );
   } else if (queueState.items.length > 0) {
