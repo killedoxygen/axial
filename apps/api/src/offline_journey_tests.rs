@@ -1042,6 +1042,24 @@ async fn real_prepared_performance_resumes_or_rejects_without_blocking_startup()
     }
 }
 
+/// The composition owner's inspection of recovered managed files.
+async fn composition_health(services: &DesktopServices, instance: &str) -> Value {
+    use axial_app::performance::model::BundleHealth;
+    let inspection = services
+        .performance
+        .inspect(&instance.parse().unwrap())
+        .await
+        .unwrap();
+    json!({
+        "state_id": match inspection.health {
+            BundleHealth::Healthy => "healthy",
+            BundleHealth::Disabled => "disabled",
+            BundleHealth::Invalid => "invalid",
+        },
+        "state": serde_json::to_value(&inspection.state).unwrap(),
+    })
+}
+
 async fn prepared_performance_restart_journey(queued: bool, action: &str, changed_graph: bool) {
     use axial_app::{
         instances::create::{CreateInstanceRequest, CreateTarget},
@@ -1287,11 +1305,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
             .unwrap(),
         0
     );
-    let health = api
-        .get(&format!(
-            "/api/v1/performance/health?instance_id={instance}"
-        ))
-        .await;
+    let health = composition_health(&services, &instance).await;
     let transferred = provider.artifact_requests();
     if changed_graph {
         assert!(
@@ -1299,7 +1313,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
             "a newly resolved graph cannot replace the accepted Prepared graph"
         );
         assert!(health["state"].is_null(), "{health}");
-        assert_eq!(health["view_model"]["state_id"], "disabled");
+        assert_eq!(health["state_id"], "disabled");
         assert_eq!(std::fs::read_dir(&mods).unwrap().count(), 1);
         api.request(
             reqwest::Method::PUT,
@@ -1308,7 +1322,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
         )
         .await;
     } else {
-        assert_eq!(health["view_model"]["state_id"], "healthy", "{health}");
+        assert_eq!(health["state_id"], "healthy", "{health}");
         assert_eq!(
             health["state"]["graph_sha512"],
             prepared["expected"]["graph_sha512"]
@@ -1338,10 +1352,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     let api = Api::new(&services);
     assert_eq!(performance_operation(&services, &command), completed);
     assert_eq!(
-        api.get(&format!(
-            "/api/v1/performance/health?instance_id={instance}"
-        ))
-        .await,
+        composition_health(&services, &instance).await,
         health
     );
     services.server.shutdown().await.unwrap();
