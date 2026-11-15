@@ -351,3 +351,48 @@ async fn sync_stale_or_unpublished_completion_cannot_change_ownership() {
     assert!(capture.owns_minecraft_java());
     assert_eq!(f.auth.credentials(&capture).await.unwrap(), f.bundle);
 }
+
+#[tokio::test]
+async fn credential_head_checks_refuse_pending_deleted_and_replaced_heads() {
+    let f = fixture().await;
+    let capture = f.directory.capture_selected().unwrap();
+    let credentials = f.auth.launch_credentials(&capture).await.unwrap();
+    f.auth.credential_head_matches(&capture).await.unwrap();
+    f.auth
+        .revalidate_launch_credentials(&capture, &credentials)
+        .await
+        .unwrap();
+
+    // A refresh that has durably begun but not committed leaves a pending head.
+    let pending = f
+        .credentials
+        .begin_change(capture.account_id(), capture.credential_revision())
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.auth.credential_head_matches(&capture).await,
+        Err(AuthError::SignInRequired)
+    ));
+    assert!(matches!(
+        f.auth.revalidate_launch_credentials(&capture, &credentials).await,
+        Err(AuthError::SignInRequired)
+    ));
+
+    // A newer published head with unchanged account metadata is refused too.
+    let replaced = f.credentials.save(&pending, f.bundle.clone()).await.unwrap();
+    assert_ne!(replaced.revision(), capture.credential_revision());
+    assert!(f.auth.credential_head_matches(&capture).await.is_err());
+
+    // A deleted head never reads as an absent-but-valid credential.
+    f.credentials
+        .delete(capture.account_id(), Some(replaced.revision()))
+        .await
+        .unwrap();
+    assert!(f.auth.credential_head_matches(&capture).await.is_err());
+    assert!(
+        f.auth
+            .revalidate_launch_credentials(&capture, &credentials)
+            .await
+            .is_err()
+    );
+}

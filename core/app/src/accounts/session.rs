@@ -259,7 +259,10 @@ impl AuthService {
 
     /// Whether the secure-store head still holds the exact live credential
     /// revision `capture` names. Reads no credential blob.
+    /// Runs under the same mutation gate as credential writes, so a refresh
+    /// cannot publish between the head read and the capture recheck.
     pub async fn credential_head_matches(&self, capture: &CapturedAccount) -> Result<(), AuthError> {
+        let _gate = self.mutation.lock().await;
         self.directory.validate_account_capture(capture)?;
         let head = self.credentials.status(capture.account_id()).await?;
         if head.state != super::credential_store::CredentialState::Ready
@@ -267,7 +270,9 @@ impl AuthService {
         {
             return Err(AuthError::SignInRequired);
         }
-        Ok(())
+        self.directory
+            .validate_account_capture(capture)
+            .map_err(AuthError::from)
     }
 
     /// Rechecks, by its secure-store head alone, credentials this launch
