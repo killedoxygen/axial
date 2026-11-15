@@ -215,11 +215,19 @@ export async function refreshInstallQueue(
   return response;
 }
 
+function isRevision(value: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
 export async function applyInstallQueueResponse(
   response: InstallQueueStateResponse,
   options: { showNotice?: boolean; connectActive?: boolean; requireInstalledState?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
   if (options.connectActive) ensureQueueSubscription();
+  // Revisions are u64 on the wire; one beyond a safe integer cannot be ordered exactly here.
+  if (!isRevision(response.revision) || !isRevision(response.registry_revision)) {
+    throw new Error('Install queue revision is outside the range this window can order.');
+  }
   const previous = queueSnapshot.value;
   if (retiredQueueEpochs.has(response.queue_epoch)) return response;
   if (previous?.queue_epoch === response.queue_epoch) {

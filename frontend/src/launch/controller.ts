@@ -71,7 +71,8 @@ export async function launchGame(): Promise<void> {
   const acceptLaunch = (snapshot: SessionSnapshot): void => {
     if (snapshot.instance_id !== inst.id) throw new Error('Launch response did not match the requested instance.');
     const sessionId = snapshot.session_id;
-    const initialStatus = launchStatusUpdate(snapshot, sessionId) as LaunchStatusUpdate;
+    const initialStatus = launchStatusUpdate(snapshot, sessionId);
+    if (!initialStatus) throw new Error('Launch response was not a consistent session status.');
     const launchedAt = snapshot.launched_at;
     updateLaunchPrepView(inst.id, initialStatus.viewModel);
     confirmLaunch(inst.id, {
@@ -215,8 +216,7 @@ function makeLaunchStatusPoller(
           snapshot.process_alive !== false ||
           snapshot.stop_allowed !== false ||
           snapshot.tree_settled !== true ||
-          snapshot.output_drained !== true ||
-          !snapshot.outcome
+          snapshot.output_drained !== true
         )
           return;
         const update = launchStatusUpdate(snapshot, sessionId);
