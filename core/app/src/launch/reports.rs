@@ -230,15 +230,6 @@ impl LaunchReportStore {
         Ok(Self { metadata })
     }
 
-    /// Already-redacted collector entries are rechecked at the durable boundary.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn record_session(&self, input: SessionReportInput) -> Result<(), ReportError> {
-        self.record(
-            LaunchProofRecord::from_session(input),
-            &Redactor::new(Vec::new()),
-        )
-    }
-
     pub fn record(
         &self,
         mut report: LaunchProofRecord,

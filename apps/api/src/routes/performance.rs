@@ -411,25 +411,33 @@ mod tests {
                 );
                 let mut health = Box::pin(get_json(fixture.router(), &health_path));
                 let waiting = futures_util::poll!(health.as_mut()).is_pending();
-                let refused = fixture.profile.services.instances.update_with_sessions(
-                    &fixture.instance,
-                    InstancePatch {
-                        expected_revision: Some(instance.revision),
-                        max_memory_mb: Some(2048),
-                        ..Default::default()
-                    },
-                    &fixture.profile.services.sessions,
-                );
+                let refused = fixture
+                    .profile
+                    .services
+                    .instances
+                    .update_record_with_sessions(
+                        &fixture.instance,
+                        InstancePatch {
+                            expected_revision: Some(instance.revision),
+                            max_memory_mb: Some(2048),
+                            ..Default::default()
+                        },
+                        &fixture.profile.services.sessions,
+                    );
                 let result = health.await;
-                let saved = fixture.profile.services.instances.update_with_sessions(
-                    &fixture.instance,
-                    InstancePatch {
-                        expected_revision: Some(instance.revision),
-                        max_memory_mb: Some(2048),
-                        ..Default::default()
-                    },
-                    &fixture.profile.services.sessions,
-                );
+                let saved = fixture
+                    .profile
+                    .services
+                    .instances
+                    .update_record_with_sessions(
+                        &fixture.instance,
+                        InstancePatch {
+                            expected_revision: Some(instance.revision),
+                            max_memory_mb: Some(2048),
+                            ..Default::default()
+                        },
+                        &fixture.profile.services.sessions,
+                    );
                 move || {
                     assert!(waiting);
                     assert!(matches!(
@@ -437,7 +445,7 @@ mod tests {
                         Err(axial_app::instances::model::InstanceError::Busy)
                     ));
                     assert_eq!(result.0, StatusCode::OK, "{}", result.1);
-                    assert_eq!(saved.unwrap().settings.max_memory_mb, 2048);
+                    assert_eq!(saved.unwrap().instance.settings.max_memory_mb, 2048);
                 }
             })
             .catch_unwind()
