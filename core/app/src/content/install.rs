@@ -35,6 +35,7 @@ use axial_minecraft::{
         TransferOrigin, transfer_cancellation_channel,
     },
     managed_path::*,
+    portable_path::{managed_content_name_is_reserved, managed_content_name_key},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
@@ -1392,7 +1393,7 @@ impl ContentMutations {
     ) -> Result<Option<Receipt>, MutationError> {
         let raw = read_path(instance.game_directory(), MANIFEST_FILE)?;
         let before = ContentManifest::decode_managed(raw.as_deref())?;
-        let key = crate::files::portable::managed_content_name_key(from);
+        let key = managed_content_name_key(from);
         let Some(entry) = before.entries().iter().find(|entry| {
             entry.kind() == ContentKind::Mod
                 && entry
@@ -1492,11 +1493,9 @@ impl ContentMutations {
         let mut taken = present
             .iter()
             .map(|listed| {
-                Ok(
-                    crate::files::portable::managed_content_name_key(&portable(&listed.name)?)
-                        .as_str()
-                        .to_owned(),
-                )
+                Ok(managed_content_name_key(&portable(&listed.name)?)
+                    .as_str()
+                    .to_owned())
             })
             .collect::<Result<HashSet<_>, MutationError>>()?;
         taken.extend(
@@ -1520,7 +1519,7 @@ impl ContentMutations {
                     break;
                 }
             }
-            if taken.contains(crate::files::portable::managed_content_name_key(&name).as_str())
+            if taken.contains(managed_content_name_key(&name).as_str())
                 || repeats_installed
                 || repeats_present
             {
@@ -2505,10 +2504,10 @@ fn validate_import_receipt(
                 .strip_prefix("mods/")
                 .ok_or(MutationError::Changed)?,
         )?;
-        let key = crate::files::portable::managed_content_name_key(&name);
+        let key = managed_content_name_key(&name);
         let proof = change.after.as_ref().ok_or(MutationError::Changed)?;
         if !name.key().as_str().ends_with(".jar")
-            || crate::files::portable::managed_content_name_is_reserved(&name)
+            || managed_content_name_is_reserved(&name)
             || owned.contains(key.as_str())
             || !names.insert(key)
             || change.before.is_some()
@@ -2560,7 +2559,7 @@ fn validate_local_mod_receipt(
     {
         return Err(MutationError::Changed);
     }
-    let key = crate::files::portable::managed_content_name_key(&source_name);
+    let key = managed_content_name_key(&source_name);
     let entry = recorded
         .entries()
         .iter()

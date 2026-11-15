@@ -1,7 +1,9 @@
 //! World saves are user data. Names select children of an admitted game directory;
 //! they never admit a caller-authored filesystem path.
 
-use crate::files::PortableFileName;
+use axial_minecraft::portable_path::{
+    MAX_PORTABLE_FILE_NAME_BYTES, MAX_PORTABLE_FILE_NAME_UTF16_UNITS, PortableFileName,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ts_rs::TS;
@@ -74,8 +76,9 @@ pub(crate) fn backup_name(
     let mut stem = String::new();
     let mut utf16_units = 0;
     for character in world.as_str().chars() {
-        if stem.len() + character.len_utf8() + suffix.len() > 255
-            || utf16_units + character.len_utf16() + suffix.encode_utf16().count() > 255
+        if stem.len() + character.len_utf8() + suffix.len() > MAX_PORTABLE_FILE_NAME_BYTES
+            || utf16_units + character.len_utf16() + suffix.encode_utf16().count()
+                > MAX_PORTABLE_FILE_NAME_UTF16_UNITS
         {
             break;
         }

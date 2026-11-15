@@ -11,15 +11,15 @@ use super::model::{
 use super::resolve::{
     ContentResolution, ResolutionSelection, ResolutionTarget, pick_filtered_version, pick_version,
 };
-use crate::files::portable::{
-    PortableFileName, PortableRelativePath, managed_content_name_is_reserved,
-};
 use crate::network::{
     Checksum, DownloadError, DownloadRequest, HashAlgorithm, IntegrityPolicy, OriginPolicy,
     ProviderClient, ResponseLimits,
 };
 use crate::tasks::CancellationToken;
 use axial_minecraft::loaders::LoaderComponentId;
+use axial_minecraft::portable_path::{
+    PortableFileName, PortableRelativePath, managed_content_name_is_reserved,
+};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use sha1::Sha1;
