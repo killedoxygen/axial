@@ -9,9 +9,8 @@ use super::metadata::{
 };
 use super::{ResourceError, timestamp};
 use crate::content::model::ContentKind;
-use crate::files::{
-    PortableName, ScopedDirectory, ScopedPath, portable::managed_content_name_is_reserved,
-};
+use crate::files::{PortableName, ScopedDirectory, ScopedPath};
+use axial_minecraft::portable_path::managed_content_name_is_reserved;
 use serde::Serialize;
 use std::io;
 use ts_rs::TS;

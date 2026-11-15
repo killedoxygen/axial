@@ -4,7 +4,7 @@
 //! rename and its provenance update share one settlement obligation.
 
 use crate::files::ScopedDirectory;
-use crate::files::portable::{
+use axial_minecraft::portable_path::{
     PortableFileName, managed_content_name_is_reserved, managed_content_name_key,
 };
 use serde::{Deserialize, Serialize};

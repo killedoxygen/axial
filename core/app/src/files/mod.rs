@@ -6,11 +6,11 @@
 //! their returned generation pin with every escaped capability or obligation.
 
 mod park;
-pub(crate) mod portable;
 
+pub(crate) use axial_minecraft::portable_path::{
+    PortableFileName as PortableName, PortableRelativePath as ScopedPath,
+};
 pub(crate) use park::{DirectoryParkReceipt, RecoveredDirectoryPark};
-pub(crate) use portable::PortableFileName;
-pub(crate) use portable::{PortableFileName as PortableName, PortableRelativePath as ScopedPath};
 
 use crate::library::GenerationPin;
 use axial_fs::{Directory, DirectoryRevision, FileCapability, FileRevision, LeafName};

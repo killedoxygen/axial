@@ -10,6 +10,7 @@ use crate::{
     instances::{directory::InstanceDirectories, model::InstanceId},
     tasks::{RetainedEffects, TaskHandle, TaskOwner},
 };
+use axial_minecraft::portable_path::managed_content_name_key;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{io, sync::Arc};
@@ -396,7 +397,7 @@ impl ResourceService {
         let (manifest, live, _) = crate::content::install::observe(read.game_directory())
             .map_err(|_| ResourceError::Busy)?;
         read.validate_current().map_err(|_| ResourceError::Busy)?;
-        let key = crate::files::portable::managed_content_name_key(&portable(name)?);
+        let key = managed_content_name_key(&portable(name)?);
         if let Some(entry) = manifest.entries().iter().find(|entry| {
             entry.kind() == crate::content::model::ContentKind::Mod
                 && live.contains(entry)
@@ -480,7 +481,7 @@ impl ResourceService {
         let mut digests = std::collections::HashSet::new();
         for (name, bytes) in files {
             let name = mods::validate_import(&name, &bytes)?;
-            if !keys.insert(crate::files::portable::managed_content_name_key(&name))
+            if !keys.insert(managed_content_name_key(&name))
                 || !digests.insert(Sha256::digest(&bytes))
             {
                 return Err(ModImportError::Repeated(name.as_str().into()));
@@ -611,7 +612,7 @@ impl ResourceService {
                     let (manifest, _, _) =
                         crate::content::install::observe(instance.game_directory())
                             .map_err(|_| ResourceError::Busy)?;
-                    let key = crate::files::portable::managed_content_name_key(&name);
+                    let key = managed_content_name_key(&name);
                     if manifest.entries().iter().any(|entry| {
                         entry.kind() == kind
                             && entry
@@ -794,12 +795,7 @@ impl ResourceService {
                             .map_err(read_error)?;
                         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
                         let final_names = (1..=worlds::BACKUP_NAME_ATTEMPTS)
-                            .map(|attempt| {
-                                axial_minecraft::portable_path::PortableFileName::new_exact(
-                                    worlds::backup_name(&name, &timestamp, attempt).as_str(),
-                                )
-                                .expect("portable generated name")
-                            })
+                            .map(|attempt| worlds::backup_name(&name, &timestamp, attempt))
                             .collect::<Vec<_>>();
                         let stage = axial_minecraft::portable_path::PortableFileName::new_exact(
                             &format!("stage-{}", uuid::Uuid::new_v4()),

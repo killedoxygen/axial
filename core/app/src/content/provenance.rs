@@ -2,7 +2,7 @@
 
 use super::catalog::{ContentError, ContentResult};
 use super::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
-use crate::files::portable::{
+use axial_minecraft::portable_path::{
     PortableFileName, PortablePathError, PortablePathKey, managed_content_name_is_reserved,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
