@@ -62,15 +62,15 @@ function Toast({ toast }: { toast: ToastItem }): JSX.Element {
       ref={leaving}
       class="cp-toast cp-toast--full cp-pop"
       role="status"
-      onMouseEnter={() => holdToast(toast.id, true)}
-      onMouseLeave={() => holdToast(toast.id, false)}
+      onMouseEnter={() => holdToast(toast.id, 'pointer', true)}
+      onMouseLeave={() => holdToast(toast.id, 'pointer', false)}
       onFocusIn={(e) => {
         const from = e.relatedTarget;
         if (from instanceof HTMLElement && !e.currentTarget.contains(from)) cameFrom.current = from;
-        holdToast(toast.id, true);
+        holdToast(toast.id, 'focus', true);
       }}
       onFocusOut={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) holdToast(toast.id, false);
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) holdToast(toast.id, 'focus', false);
       }}
     >
       <Face {...FACE_FOR[toast.type]} />

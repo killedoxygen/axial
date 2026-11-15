@@ -3,6 +3,9 @@ import type { ToastAction, ToastItem, ToastKind } from './types-ui';
 
 let nextToastId = 1;
 const toastTimers = new Map<number, ReturnType<typeof setTimeout>>();
+/** What keeps each notice up: the pointer over it, focus inside it, or both. */
+const toastHolds = new Map<number, Set<ToastHold>>();
+export type ToastHold = 'pointer' | 'focus';
 
 export function dismissToast(id: number): void {
   const timer = toastTimers.get(id);
@@ -10,6 +13,7 @@ export function dismissToast(id: number): void {
     clearTimeout(timer);
     toastTimers.delete(id);
   }
+  toastHolds.delete(id);
   toasts.value = toasts.value.filter((toast) => toast.id !== id);
 }
 
@@ -20,12 +24,17 @@ function scheduleToastRemoval(item: ToastItem, duration = item.type === 'error' 
   );
 }
 
-/** A notice being read or reached for stays; it leaves a moment after the pointer does. */
-export function holdToast(id: number, held: boolean): void {
+/** A notice being read or reached for stays; it leaves a moment after neither the pointer nor focus is on it. */
+export function holdToast(id: number, by: ToastHold, held: boolean): void {
+  if (!toasts.value.some((toast) => toast.id === id)) return;
+  const holds = toastHolds.get(id) ?? new Set<ToastHold>();
+  if (held) holds.add(by);
+  else holds.delete(by);
+  toastHolds.set(id, holds);
   const timer = toastTimers.get(id);
   if (timer) clearTimeout(timer);
   toastTimers.delete(id);
-  if (!held)
+  if (holds.size === 0)
     toastTimers.set(
       id,
       setTimeout(() => dismissToast(id), 3000),
