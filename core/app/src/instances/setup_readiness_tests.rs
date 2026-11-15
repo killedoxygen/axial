@@ -5101,16 +5101,16 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
         let versions_root = root.path().join("versions");
         let revision_before = std::fs::metadata(&versions_root).unwrap().modified().unwrap();
         std::fs::write(root.path().join("probes"), b"").unwrap();
-        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        // The projection probes its shared runtime once; hold that probe.
+        std::fs::write(root.path().join("probe-first"), b"hold").unwrap();
         std::fs::write(root.path().join("probe-release"), b"").unwrap();
         waiter = Some(tokio::spawn({
             let service = service.clone();
             let input = input.clone();
             async move { service.enrich_all(input).await.unwrap() }
         }));
-        // The first row has completed before the second actual Java probe pauses.
         let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while std::fs::read_to_string(root.path().join("probes")).unwrap().lines().count() < 2 {
+            while std::fs::read_to_string(root.path().join("probes")).unwrap().lines().count() < 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }).await;
@@ -5147,8 +5147,8 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
         };
         let restored = service.enrich_all(input.clone()).await.unwrap();
         move || {
-            assert!(paused.is_ok() && still_pending, "second probe did not remain pending");
-            assert_eq!(probe_count, 2);
+            assert!(paused.is_ok() && still_pending, "the shared probe did not remain pending");
+            assert_eq!(probe_count, 1);
             assert!(absent_before);
             if publication_starts {
                 assert!(lane_absent, "cached rows must capture the absent publication lane");
