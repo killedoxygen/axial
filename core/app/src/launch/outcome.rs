@@ -15,10 +15,8 @@ pub enum FailureClass {
     RosettaRequired,
     OutOfMemory,
     GraphicsUnavailable,
-    GraphicsDriverCrash,
     MissingDependency,
     ModTransformationFailure,
-    ModAttributedCrash,
     ClasspathModuleConflict,
     LauncherManagedArtifactSignature,
     AuthModeIncompatible,
@@ -143,7 +141,7 @@ pub fn classify_session_outcome(
     let failure_class = if stalled {
         Some(FailureClass::StartupStalled)
     } else {
-        classify_launch_failure(&evidence.failure_classes, facts.exit_code, None)
+        classify_launch_failure(&evidence.failure_classes, facts.exit_code)
     };
     let abnormal = facts.signal.is_some() || facts.exit_code.is_some_and(|code| code != 0);
     let (kind, reason) = if stalled {
@@ -214,9 +212,7 @@ pub fn boot_marker_detected(text: &str) -> bool {
             && (text.contains("textures/atlas/") || text.contains("-atlas")))
 }
 
-use super::crash::{
-    CrashArtifactKind, CrashEvidence, CrashNativeFrameKind, is_out_of_memory_failure_line,
-};
+use super::crash::is_out_of_memory_failure_line;
 
 pub fn classify_startup_failure_text(text: &str) -> FailureClass {
     if is_graphics_unavailable_failure(text) {
@@ -311,63 +307,20 @@ fn is_graphics_unavailable_failure(text: &str) -> bool {
 pub fn classify_launch_failure(
     stdout_classes: &[FailureClass],
     exit_code: Option<i32>,
-    crash_evidence: Option<&CrashEvidence>,
 ) -> Option<FailureClass> {
     if exit_code == Some(0) {
         return stdout_classes
             .contains(&FailureClass::GraphicsUnavailable)
             .then_some(FailureClass::GraphicsUnavailable);
     }
-
-    let stdout_class = stdout_classes
-        .iter()
-        .copied()
-        .filter(|class| *class != FailureClass::StartupStalled)
-        .reduce(stronger_failure_class);
-    let evidence_class = crash_evidence.and_then(classify_crash_evidence);
-
-    Some(match (stdout_class, evidence_class) {
-        (Some(stdout), Some(evidence)) => stronger_failure_class(stdout, evidence),
-        (Some(class), None) | (None, Some(class)) => class,
-        (None, None) => FailureClass::Unknown,
-    })
-}
-
-fn classify_crash_evidence(evidence: &CrashEvidence) -> Option<FailureClass> {
-    if evidence.names_out_of_memory {
-        return Some(FailureClass::OutOfMemory);
-    }
-    if evidence.source == CrashArtifactKind::JvmFatalError
-        && evidence.problematic_frame.as_ref().is_some_and(|frame| {
-            frame.kind == CrashNativeFrameKind::Native
-                && is_graphics_driver_module(frame.module.as_str())
-        })
-    {
-        return Some(FailureClass::GraphicsDriverCrash);
-    }
-    if evidence.source == CrashArtifactKind::MinecraftCrashReport
-        && evidence
-            .exception_class
-            .as_ref()
-            .is_some_and(|class| is_missing_dependency_exception(class.as_str()))
-    {
-        return Some(FailureClass::MissingDependency);
-    }
-    if evidence.source == CrashArtifactKind::MinecraftCrashReport
-        && evidence
-            .exception_class
-            .as_ref()
-            .is_some_and(|class| is_mod_transformation_exception(class.as_str()))
-    {
-        return Some(FailureClass::ModTransformationFailure);
-    }
-    if evidence.source == CrashArtifactKind::MinecraftCrashReport
-        && !evidence.truncated
-        && !evidence.suspected_mods.is_empty()
-    {
-        return Some(FailureClass::ModAttributedCrash);
-    }
-    None
+    Some(
+        stdout_classes
+            .iter()
+            .copied()
+            .filter(|class| *class != FailureClass::StartupStalled)
+            .reduce(stronger_failure_class)
+            .unwrap_or(FailureClass::Unknown),
+    )
 }
 
 fn stronger_failure_class(left: FailureClass, right: FailureClass) -> FailureClass {
@@ -389,60 +342,13 @@ fn failure_class_precedence(class: FailureClass) -> u8 {
         FailureClass::OutOfMemory => 6,
         FailureClass::LauncherManagedArtifactSignature => 7,
         FailureClass::GraphicsUnavailable => 8,
-        FailureClass::GraphicsDriverCrash => 9,
-        FailureClass::MissingDependency => 10,
-        FailureClass::ModTransformationFailure => 11,
-        FailureClass::ModAttributedCrash => 12,
-        FailureClass::ClasspathModuleConflict => 13,
-        FailureClass::LoaderBootstrapFailure => 14,
-        FailureClass::AuthModeIncompatible => 15,
-        FailureClass::Unknown => 16,
+        FailureClass::MissingDependency => 9,
+        FailureClass::ModTransformationFailure => 10,
+        FailureClass::ClasspathModuleConflict => 11,
+        FailureClass::LoaderBootstrapFailure => 12,
+        FailureClass::AuthModeIncompatible => 13,
+        FailureClass::Unknown => 14,
     }
-}
-
-fn is_graphics_driver_module(module: &str) -> bool {
-    matches!(
-        module.to_ascii_lowercase().as_str(),
-        "nvoglv32"
-            | "nvoglv64"
-            | "nvwgf2um"
-            | "nvwgf2umx"
-            | "atioglxx"
-            | "atio6axx"
-            | "amdxx32"
-            | "amdxx64"
-            | "ig4icd32"
-            | "ig4icd64"
-            | "ig9icd32"
-            | "ig9icd64"
-            | "igd10iumd32"
-            | "igd10iumd64"
-            | "libglx_nvidia"
-            | "libnvidia-glcore"
-            | "radeonsi_dri"
-            | "iris_dri"
-            | "i965_dri"
-    )
-}
-
-fn is_missing_dependency_exception(class: &str) -> bool {
-    matches!(
-        class,
-        "net.minecraftforge.fml.common.MissingModsException"
-            | "cpw.mods.fml.common.MissingModsException"
-    )
-}
-
-fn is_mod_transformation_exception(class: &str) -> bool {
-    matches!(
-        class,
-        "org.spongepowered.asm.mixin.transformer.throwables.MixinApplyError"
-            | "org.spongepowered.asm.mixin.transformer.throwables.MixinTransformerError"
-            | "org.spongepowered.asm.mixin.transformer.throwables.InvalidMixinException"
-            | "org.spongepowered.asm.mixin.injection.throwables.InjectionError"
-            | "org.spongepowered.asm.mixin.injection.throwables.InvalidInjectionException"
-            | "org.spongepowered.asm.mixin.injection.throwables.InjectionValidationException"
-    )
 }
 
 fn contains_out_of_memory_failure(text: &str) -> bool {
@@ -670,37 +576,6 @@ mod tests {
             SessionExitReason::StartupStalled
         );
     }
-    const OUT_OF_MEMORY: &str = "java.lang.OutOfMemoryError";
-
-    fn report(exception_class: &str, suspected_mods: &[&str], truncated: bool) -> CrashEvidence {
-        serde_json::from_value(serde_json::json!({
-            "source": "minecraft_crash_report",
-            "truncated": truncated,
-            "failure_phase": null,
-            "exception_class": exception_class,
-            "suspected_mods": suspected_mods
-                .iter()
-                .map(|name| serde_json::json!({ "name": name }))
-                .collect::<Vec<_>>(),
-            "problematic_frame": null,
-            "names_out_of_memory": exception_class == OUT_OF_MEMORY,
-        }))
-        .expect("Minecraft crash evidence")
-    }
-
-    fn hs_err(frame_kind: &str, module: &str) -> CrashEvidence {
-        serde_json::from_value(serde_json::json!({
-            "source": "jvm_fatal_error",
-            "truncated": false,
-            "failure_phase": "native",
-            "exception_class": null,
-            "suspected_mods": [],
-            "problematic_frame": { "kind": frame_kind, "module": module, "symbol": "crash" },
-            "names_out_of_memory": false,
-        }))
-        .expect("JVM fatal-error evidence")
-    }
-
     #[test]
     fn startup_failure_text_classification_is_bounded_to_failure_class() {
         for (output, expected) in [
@@ -875,156 +750,38 @@ mod tests {
             FailureClass::StartupStalled,
         ];
         assert_eq!(
-            classify_launch_failure(&candidates, Some(1), None),
+            classify_launch_failure(&candidates, Some(1)),
             Some(FailureClass::JvmUnsupportedOption)
         );
         candidates.reverse();
         assert_eq!(
-            classify_launch_failure(&candidates, Some(1), None),
+            classify_launch_failure(&candidates, Some(1)),
             Some(FailureClass::JvmUnsupportedOption)
         );
         assert_eq!(
-            classify_launch_failure(&[FailureClass::StartupStalled], Some(1), None),
+            classify_launch_failure(&[FailureClass::StartupStalled], Some(1)),
             Some(FailureClass::Unknown)
         );
     }
 
     #[test]
     fn exit_status_table_distinguishes_clean_and_failed_processes_exactly() {
-        let oom = report(OUT_OF_MEMORY, &[], false);
         let semantic = [FailureClass::JvmUnsupportedOption];
-        for (exit_code, classes, evidence, expected) in [
-            (Some(0), &[][..], None, None),
-            (Some(0), &semantic[..], Some(&oom), None),
-            (Some(1), &[][..], None, Some(FailureClass::Unknown)),
-            (None, &[][..], None, Some(FailureClass::Unknown)),
+        for (exit_code, classes, expected) in [
+            (Some(0), &[][..], None),
+            (Some(0), &semantic[..], None),
+            (Some(1), &[][..], Some(FailureClass::Unknown)),
+            (None, &[][..], Some(FailureClass::Unknown)),
             (
                 Some(-1),
                 &semantic[..],
-                None,
                 Some(FailureClass::JvmUnsupportedOption),
             ),
-            (None, &[][..], Some(&oom), Some(FailureClass::OutOfMemory)),
         ] {
             assert_eq!(
-                classify_launch_failure(classes, exit_code, evidence),
+                classify_launch_failure(classes, exit_code),
                 expected,
                 "exit code {exit_code:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn structured_evidence_and_stdout_share_the_same_precedence() {
-        let stdout = [
-            FailureClass::AuthModeIncompatible,
-            FailureClass::ClasspathModuleConflict,
-        ];
-        let cases = [
-            (
-                report(OUT_OF_MEMORY, &["Example Mod"], false),
-                FailureClass::OutOfMemory,
-            ),
-            (
-                report(
-                    "net.minecraftforge.fml.common.MissingModsException",
-                    &["Example Mod"],
-                    false,
-                ),
-                FailureClass::MissingDependency,
-            ),
-            (
-                report(
-                    "org.spongepowered.asm.mixin.transformer.throwables.MixinApplyError",
-                    &["Example Mod"],
-                    false,
-                ),
-                FailureClass::ModTransformationFailure,
-            ),
-            (
-                report("java.lang.IllegalStateException", &["Example Mod"], false),
-                FailureClass::ModAttributedCrash,
-            ),
-        ];
-        for (evidence, expected) in cases {
-            assert_eq!(
-                classify_launch_failure(&stdout, Some(1), Some(&evidence)),
-                Some(expected)
-            );
-        }
-
-        let graphics = hs_err("native", "nvoglv64");
-        assert_eq!(
-            classify_launch_failure(&stdout, Some(1), Some(&graphics)),
-            Some(FailureClass::GraphicsDriverCrash)
-        );
-        assert_eq!(
-            classify_launch_failure(
-                &[FailureClass::LauncherManagedArtifactSignature],
-                Some(1),
-                Some(&graphics),
-            ),
-            Some(FailureClass::LauncherManagedArtifactSignature)
-        );
-
-        let oom = report(OUT_OF_MEMORY, &[], false);
-        assert_eq!(
-            classify_launch_failure(&[FailureClass::JavaRuntimeMismatch], Some(1), Some(&oom),),
-            Some(FailureClass::JavaRuntimeMismatch)
-        );
-    }
-
-    #[test]
-    fn graphics_driver_detection_uses_only_native_frames_and_the_closed_module_table() {
-        for module in [
-            "nvoglv64",
-            "atio6axx",
-            "ig9icd64",
-            "libGLX_nvidia",
-            "iris_dri",
-        ] {
-            assert!(is_graphics_driver_module(module), "{module}");
-        }
-        for module in [
-            "libjvm",
-            "opengl32",
-            "nvidia",
-            "nvoglv64_helper",
-            "private-nvoglv64",
-        ] {
-            assert!(!is_graphics_driver_module(module), "{module}");
-        }
-
-        let vm_frame = hs_err("vm", "nvoglv64");
-        assert_eq!(
-            classify_launch_failure(&[], Some(1), Some(&vm_frame)),
-            Some(FailureClass::Unknown)
-        );
-    }
-
-    #[test]
-    fn evidence_requires_a_complete_report_and_its_declared_source() {
-        const MISSING_MODS: &str = "net.minecraftforge.fml.common.MissingModsException";
-        let attributed = report("java.lang.IllegalStateException", &["Example Mod"], true);
-        let mut missing = report(MISSING_MODS, &[], false);
-        missing.source = CrashArtifactKind::JvmFatalError;
-        let mut graphics = hs_err("native", "nvoglv64");
-        graphics.source = CrashArtifactKind::MinecraftCrashReport;
-        for (evidence, expected) in [
-            (attributed, FailureClass::Unknown),
-            (hs_err("native", "libjvm"), FailureClass::Unknown),
-            (missing, FailureClass::Unknown),
-            (graphics, FailureClass::Unknown),
-            // Exact exception and memory evidence survive truncation.
-            (
-                report(MISSING_MODS, &[], true),
-                FailureClass::MissingDependency,
-            ),
-            (report(OUT_OF_MEMORY, &[], true), FailureClass::OutOfMemory),
-        ] {
-            assert_eq!(
-                classify_launch_failure(&[], Some(1), Some(&evidence)),
-                Some(expected)
             );
         }
     }
