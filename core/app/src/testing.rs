@@ -64,6 +64,14 @@ impl Fixture {
 }
 
 impl Builder {
+    /// Whole-budget fixtures choose their own capacity so unrelated waiters
+    /// cannot consume it.
+    #[cfg(windows)]
+    pub(crate) fn tasks(mut self, capacity: usize) -> Self {
+        self.tasks = capacity;
+        self
+    }
+
     /// Keeps metadata in memory instead of `metadata.sqlite` under the root.
     pub(crate) fn in_memory(mut self) -> Self {
         self.memory = true;
