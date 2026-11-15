@@ -7,6 +7,7 @@ use crate::types::VersionEntry;
 use crate::{ManifestEntry, manifest::VersionManifest};
 use parse::{ParsedVersionId, VersionShape, parse_version_id};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use std::cmp::Ordering;
 use tokenize::{TokenKind, tokenize_version_id};
 
@@ -16,7 +17,7 @@ pub struct ReleaseReference {
     pub release_time: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub struct MinecraftVersionMeta {
     #[serde(default)]
     pub family: String,

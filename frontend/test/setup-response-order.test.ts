@@ -1,87 +1,88 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import * as contracts from '../src/dto-contract';
-import * as core from '../src/dto-core';
-import * as installs from '../src/dto-install';
-import * as items from '../src/install-item';
-import * as presenters from '../src/create-presenters';
-import * as launchAdapters from '../src/launch-response-adapters';
-import * as downloadViews from '../src/machines/download-view-models';
-import type { InstallQueueStateResponse } from '../src/types-install';
-import type { LaunchSession } from '../src/types-launch';
+import { apiModule, loadSource, requireDependency } from './source';
+import { enrichedInstance, queueSnapshot } from './wire';
+import * as items from '../src/install/item';
+import * as presenters from '../src/create/presenters';
+import * as downloadViews from '../src/install/presenters';
+import type { CreateInstanceResponse } from '../src/generated/CreateInstanceResponse';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
+import type { InstallQueueStateResponse } from '../src/generated/InstallQueueStateResponse';
+import type { LaunchSession } from '../src/launch/state';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
 const signals: typeof import('@preact/signals') = requireDependency('@preact/signals');
 
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
-  });
-  const exports = {};
-  vm.runInNewContext(compiled.outputText, {
-    exports, Error, encodeURIComponent, structuredClone, setTimeout, clearTimeout,
-    require(id: string): unknown {
-      if (id === '@preact/signals') return signals;
-      if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-      throw new Error(`Unreviewed setup ordering dependency: ${id}`);
-    },
-    ...globals,
-  }, { filename });
-  return exports as T;
+function source<T>(path: string, stubs: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
+  return loadSource<T>(path, { '@preact/signals': signals, ...stubs }, globals);
 }
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
   return { promise, resolve };
 }
 
 const flush = (): Promise<void> => new Promise((done) => setImmediate(done));
 
-function instance(launchable = false) {
-  return {
-    id: 'fixture-instance', name: 'Fixture pack', version_id: '1.21.4', created_at: '2026-09-27T00:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
-    launchable, install_target: null,
-    launch_action: { state_id: launchable ? 'ready' : 'busy', label: launchable ? 'Play' : 'Busy',
-      tone: launchable ? 'ok' : 'warn', launchable, primary_action: launchable ? 'launch' : 'blocked' },
-    version_display: { loader_key: 'vanilla', loader_label: 'Vanilla', minecraft_label: '1.21.4',
-      loader_version_label: '', loader_detail_label: '', summary_label: '1.21.4', supports_mods: false },
-    saves_count: 0, mods_count: 0, resource_count: 0, shader_count: 0,
-  };
+function instance(launchable = false): EnrichedInstance {
+  return enrichedInstance({
+    name: 'Fixture pack',
+    launchable,
+    launch_action: {
+      state_id: launchable ? 'ready' : 'busy',
+      label: launchable ? 'Play' : 'Busy',
+      tone: launchable ? 'ok' : 'warn',
+      launchable,
+      primary_action: launchable ? 'launch' : 'blocked',
+    },
+  });
 }
 
 function queue(revision: number, registryRevision: number): InstallQueueStateResponse {
-  return { queue_epoch: 'setup-queue', revision, registry_revision: registryRevision, active: null, items: [], failures: [],
-    view_model: { state_id: 'idle', status_label: 'Idle', title: 'Downloads', summary: 'Ready', queued_count: 0,
-      queued_count_label: 'No queued downloads', queued_item_label: 'No items queued', section_title: 'Queue',
-      empty_title: 'Nothing downloading', empty_summary: 'Ready' } };
+  return queueSnapshot({ queue_epoch: 'setup-queue', revision, registry_revision: registryRevision, failures: [] });
 }
 
-function response(snapshot: InstallQueueStateResponse | null = queue(3, 0)) {
-  return { ...instance(), view_model: { tone: 'success', summary: 'Setup accepted.', detail: null }, install_queue: snapshot };
+function response(snapshot: InstallQueueStateResponse | null = queue(3, 0)): CreateInstanceResponse {
+  return {
+    ...instance(),
+    view_model: { state_id: 'setup_queued', tone: 'ok', title: 'Setup', summary: 'Setup accepted.', detail: null },
+    ...(snapshot ? { install_queue: snapshot } : {}),
+  };
 }
 
 function queuedSetup(): InstallQueueStateResponse {
-  return installs.installQueueStateResponse({
+  return {
     ...queue(4, 1),
-    items: [{ queue_id: 'queued-setup', state_id: 'queued', kind: 'content', title: 'Content', label: 'Fixture pack',
-      summary: 'Waiting', detail: '', position: 1, total: 1,
-      install_item: { version_id: '1.21.4', content: { instance_id: 'fixture-instance', label: 'Setting up Fixture pack',
-        action: { kind: 'install', allow_incompatible: false,
-          selections: [{ canonical_id: 'modrinth:fixture', kind: 'mod', version_id: 'v1' }] } } },
-      remove_action: { action: 'remove_from_queue', label: 'Remove', enabled: true } }],
+    items: [
+      {
+        queue_id: 'queued-setup',
+        state_id: 'queued',
+        kind: 'content',
+        title: 'Content',
+        label: 'Fixture pack',
+        summary: 'Waiting',
+        detail: '',
+        position: 1,
+        total: 1,
+        install_item: {
+          version_id: '1.21.4',
+          content: {
+            instance_id: 'fixture-instance',
+            label: 'Setting up Fixture pack',
+            action: {
+              kind: 'install',
+              allow_incompatible: false,
+              selections: [{ canonical_id: 'modrinth:fixture', kind: 'mod', version_id: 'v1' }],
+            },
+          },
+        },
+        remove_action: { action: 'remove_from_queue', label: 'Remove', enabled: true },
+      },
+    ],
     view_model: { ...queue(4, 1).view_model, state_id: 'queued', queued_count: 1, queued_count_label: '1 queued' },
-  });
+  };
 }
 
 function harness(create = false) {
@@ -93,15 +94,9 @@ function harness(create = false) {
   let backend = create ? [] : [instance()];
   let currentQueue = queue(3, 0);
   let readInstance: () => Promise<unknown> = async () => backend[0];
-  let readInstances: () => Promise<unknown> = async () => ({ instances: backend, last_instance_id: null });
+  let readInstances: () => Promise<unknown> = async () => ({ instances: [...backend], last_instance_id: null });
   let subscription: ((snapshot: InstallQueueStateResponse) => void) | undefined;
-  const store = {
-    config: signals.signal(null), instances: signals.signal(backend.map(core.enrichedInstanceResponse)),
-    versions: signals.signal([]), lastInstanceId: signals.signal<string | null>(null),
-    launchSessions: signals.signal<Record<string, LaunchSession>>({}),
-    launchState: signals.signal({ status: 'idle' }),
-  };
-  const api = { async api(method: string, path: string) {
+  const call = async (method: string, path: string) => {
     requests.push([method, path]);
     if (method === 'POST') return reply.promise;
     assert.equal(method, 'GET');
@@ -110,36 +105,82 @@ function harness(create = false) {
     if (path === '/versions') return { versions: [] };
     if (path === '/install/queue') return currentQueue;
     throw new Error(`Unexpected setup read: ${path}`);
-  } };
-  const utils = { errMessage: String, showError: (message: string) => errors.push(message) };
-  const toast = { toast: (...args: unknown[]) => notices.push(args) };
-  const actions = source<typeof import('../src/actions')>('actions.ts', {
-    './store': store, './launch-response-adapters': launchAdapters,
-  });
-  const readiness = source<typeof import('../src/instance-readiness')>('instance-readiness.ts', {
-    './api': api, './dto-core': core, './store': store, './utils': utils,
-  }, { window: { setTimeout: (callback: () => void) => queueMicrotask(callback) } });
-  const downloads = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
-    '../api': api, '../utils': utils, '../toast': toast, '../store': store,
-    '../loaders/api': { connectInstallQueueSSE(next: typeof subscription) { subscription = next; return () => {}; } },
-    '../content-activity': { markContentChanged() {} }, '../dto-install': installs, '../dto-core': core,
-    '../install-item': items, './download-view-models': downloadViews,
+  };
+  const instancesApi = apiModule('instances/api.ts', call);
+  const toast = {
+    toast: (...args: unknown[]) => notices.push(args),
+    errMessage: String,
+    showError: (message: string) => errors.push(message),
+  };
+  const shared = {
+    config: signals.signal(null),
+    launchSessions: signals.signal<Record<string, LaunchSession>>({}),
+    launchState: signals.signal({ status: 'idle' }),
+  };
+  const store = source<typeof import('../src/instances/state')>('instances/state.ts', {});
+  store.instances.value = [...backend];
+  const readiness = source<typeof import('../src/instances/readiness')>(
+    'instances/readiness.ts',
+    {
+      'instances/api': instancesApi,
+      'settings/state': shared,
+      'instances/state': store,
+      'launch/state': shared,
+      'app/toast': toast,
+    },
+    { window: { setTimeout: (callback: () => void) => queueMicrotask(callback) } },
+  );
+  const downloads = source<typeof import('../src/install/queue')>('install/queue.ts', {
+    'app/toast': toast,
+    'install/api': apiModule('install/api.ts', call, (_path, options) => {
+      subscription = (snapshot) => options.onValue(snapshot, 'message', snapshot.revision);
+      return () => {};
+    }),
+    'instances/api': instancesApi,
+    'settings/state': shared,
+    'instances/state': store,
+    'launch/state': shared,
+    'content/activity': { markContentChanged() {} },
+    'install/item': items,
+    'install/presenters': downloadViews,
   });
   const dependencies = {
-    './api': api, './actions': actions, './store': store, './create-presenters': presenters,
-    './dto-contract': contracts, './dto-core': core, './dto-install': installs,
-    './instance-readiness': readiness, './machines/downloads': downloads, './toast': toast, './utils': utils,
-    './ui-state': { navigate: (target: unknown) => navigation.push(target) },
+    'instances/api': instancesApi,
+    'create/api': apiModule('create/api.ts', call),
+    'instances/state': store,
+    'create/presenters': presenters,
+    'instances/readiness': readiness,
+    'install/queue': downloads,
+    'app/toast': toast,
+    'app/route': { navigate: (target: unknown) => navigation.push(target) },
   };
-  const setup = source<typeof import('../src/instance-setup')>('instance-setup.ts', dependencies);
-  const creation = source<typeof import('../src/instance-create')>('instance-create.ts', dependencies);
+  const setup = source<typeof import('../src/instances/setup')>('instances/setup.ts', dependencies);
+  const creation = source<typeof import('../src/create/create-instance')>('create/create-instance.ts', dependencies);
   return {
-    requests, errors, notices, navigation, reply, store, downloads, setup, creation,
-    ready(): void { backend = [instance(true)]; },
-    registered(): void { backend = [instance()]; },
-    removed(): void { backend = []; },
-    readInstance(next: typeof readInstance): void { readInstance = next; },
-    readInstances(next: typeof readInstances): void { readInstances = next; },
+    requests,
+    errors,
+    notices,
+    navigation,
+    reply,
+    store,
+    downloads,
+    setup,
+    creation,
+    ready(): void {
+      backend = [instance(true)];
+    },
+    registered(): void {
+      backend = [instance()];
+    },
+    removed(): void {
+      backend = [];
+    },
+    readInstance(next: typeof readInstance): void {
+      readInstance = next;
+    },
+    readInstances(next: typeof readInstances): void {
+      readInstances = next;
+    },
     emit(snapshot: InstallQueueStateResponse): void {
       currentQueue = snapshot;
       assert.ok(subscription);
@@ -148,7 +189,13 @@ function harness(create = false) {
   };
 }
 
-const createArgs = { name: 'Fixture pack', selectionId: 'minecraft|1.21.4', icon: 'stack', accent: 'verdant', setupPlanId: 'plan-1' };
+const createArgs = {
+  name: 'Fixture pack',
+  selectionId: 'minecraft|1.21.4',
+  icon: 'stack',
+  accent: 'verdant',
+  setupPlanId: 'plan-1',
+};
 
 for (const cursor of ['older', 'equal'] as const) {
   test(`a delayed resume response cannot replace readiness from a newer SSE observation (${cursor} queue cursor)`, async (t) => {
@@ -161,7 +208,9 @@ for (const cursor of ['older', 'equal'] as const) {
     await flush();
     assert.equal(h.store.instances.value[0].launchable, true);
     const published: boolean[] = [];
-    const stop = signals.effect(() => { published.push(h.store.instances.value[0].launchable); });
+    const stop = signals.effect(() => {
+      published.push(h.store.instances.value[0].launchable);
+    });
     t.after(stop);
     h.reply.resolve(response(cursor === 'older' ? queue(3, 0) : queue(4, 1)));
     assert.equal(await work, true);
@@ -198,17 +247,25 @@ test('accepted resume refreshes readiness even when the response has no queue sn
   h.reply.resolve(response(null));
   assert.equal(await work, true);
   assert.equal(h.store.instances.value[0].launch_action.label, 'Play');
-  assert.deepEqual(h.requests.map(([method]) => method), ['POST', 'GET']);
+  assert.deepEqual(
+    h.requests.map(([method]) => method),
+    ['POST', 'GET'],
+  );
 });
 
 test('failed readiness reads preserve accepted resume and expose the read failure without replaying it', async () => {
   const h = harness();
-  h.readInstance(async () => { throw new Error('Read unavailable'); });
+  h.readInstance(async () => {
+    throw new Error('Read unavailable');
+  });
   const work = h.setup.resumeInstanceSetup('fixture-instance');
   h.reply.resolve(response(null));
   assert.equal(await work, true);
   assert.equal(h.store.instances.value[0].launchable, false);
-  assert.deepEqual(h.requests.map(([method]) => method), ['POST', 'GET', 'GET']);
+  assert.deepEqual(
+    h.requests.map(([method]) => method),
+    ['POST', 'GET', 'GET'],
+  );
   assert.equal(h.errors.length, 1);
   assert.match(h.errors[0], /Could not refresh launch availability/);
 });
@@ -243,13 +300,21 @@ for (const readFailure of [false, true]) {
     await flush();
     assert.equal(h.store.instances.value.length, 0);
     const published: number[] = [];
-    const stop = signals.effect(() => { published.push(h.store.instances.value.length); });
+    const stop = signals.effect(() => {
+      published.push(h.store.instances.value.length);
+    });
     t.after(stop);
-    if (readFailure) h.readInstances(async () => { throw new Error('Registry unavailable'); });
+    if (readFailure)
+      h.readInstances(async () => {
+        throw new Error('Registry unavailable');
+      });
     h.reply.resolve(response(accepted));
     const result = await work;
     assert.equal(result.ok, true, 'creation was accepted before the later removal');
-    assert.ok(published.every((length) => length === 0), 'the removed instance must never reappear');
+    assert.ok(
+      published.every((length) => length === 0),
+      'the removed instance must never reappear',
+    );
     assert.equal(result.instance, undefined);
     assert.equal(h.navigation.length, 0, 'do not navigate to a deleted instance');
     assert.equal(h.requests.filter(([method]) => method === 'POST').length, 1);

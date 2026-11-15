@@ -1,47 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import * as logContract from '../src/dto-launch';
-import type { EnrichedInstance } from '../src/types-instance';
-import type { LaunchSession } from '../src/types-launch';
+import { apiModule, loadSource as source, requireDependency } from './source';
+import { enrichedInstance } from './wire';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
+import type { LaunchSession } from '../src/launch/state';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
-type PaneProps = Parameters<typeof import('../src/views/instance/tabs/LogsPane').LogsPane>[0];
+type PaneProps = Parameters<typeof import('../src/instances/detail/tabs/LogsPane').LogsPane>[0];
 type Node = { type: unknown; props: Record<string, unknown> & { children?: unknown } };
-
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.CommonJS,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    compiled.outputText,
-    {
-      exports,
-      Error,
-      encodeURIComponent,
-      require(id: string): unknown {
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed live log dependency: ${id}`);
-      },
-      ...globals,
-    },
-    { filename },
-  );
-  return exports as T;
-}
 
 function session(id = 'session-1'): LaunchSession {
   return {
@@ -61,22 +26,10 @@ function session(id = 'session-1'): LaunchSession {
 }
 
 function instance(): EnrichedInstance {
-  return {
+  return enrichedInstance({
     id: 'instance-1',
     name: 'Example',
     version_id: '1.20.1',
-    created_at: '2026-09-27T09:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
-    version_display: {
-      loader_key: 'vanilla',
-      loader_label: 'Vanilla',
-      minecraft_label: '1.20.1',
-      loader_version_label: '',
-      loader_detail_label: '',
-      summary_label: '1.20.1',
-      supports_mods: false,
-    },
     launchable: false,
     launch_action: {
       state_id: 'blocked',
@@ -85,11 +38,7 @@ function instance(): EnrichedInstance {
       launchable: false,
       primary_action: 'blocked',
     },
-    saves_count: 0,
-    mods_count: 0,
-    resource_count: 0,
-    shader_count: 0,
-  };
+  });
 }
 
 function history(text: string, sequence = 1, truncated = false) {
@@ -187,36 +136,34 @@ function harness() {
   let refreshes = 0;
   let read: (path: string) => Promise<unknown> = async () => history('Game started');
   const store = { launchSessions: { value: { 'instance-1': session() } as Record<string, LaunchSession> } };
-  const logs = source<typeof import('../src/views/instance/logs')>('views/instance/logs.ts', {
-    '../../api': {
-      api: async (method: string, path: string) => {
-        assert.equal(method, 'GET');
-        calls.push(path);
-        return read(path);
-      },
-    },
-    '../../dto-launch': logContract,
+  const call = async (method: string, path: string) => {
+    assert.equal(method, 'GET');
+    calls.push(path);
+    return read(path);
+  };
+  const logs = source<typeof import('../src/instances/detail/logs')>('instances/detail/logs.ts', {
+    'instances/api': apiModule('instances/api.ts', call),
+    'launch/api': apiModule('launch/api.ts', call),
   });
-  const pane = source<typeof import('../src/views/instance/tabs/LogsPane')>(
-    'views/instance/tabs/LogsPane.tsx',
+  const pane = source<typeof import('../src/instances/detail/tabs/LogsPane')>(
+    'instances/detail/tabs/LogsPane.tsx',
     {
       'preact/hooks': hooks,
       'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
-      '../../../ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', IconButton: 'IconButton' },
-      '../../../ui/Segmented': { Segmented: 'Segmented' },
-      '../../../ui/Select': { SelectField: 'SelectField' },
-      '../../../ui/Icons': { Icon: 'Icon' },
-      '../../../format': { formatBytes: String, fmtRelative: String },
-      '../../../utils': { errMessage: (error: unknown) => (error instanceof Error ? error.message : String(error)) },
-      '../../../store': store,
-      '../logs': logs,
-      '../instance-actions': {
+      'ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', IconButton: 'IconButton' },
+      'ui/Segmented': { Segmented: 'Segmented' },
+      'ui/Select': { SelectField: 'SelectField' },
+      'ui/format': { formatBytes: String, fmtRelative: String },
+      'app/toast': { errMessage: (error: unknown) => (error instanceof Error ? error.message : String(error)) },
+      'launch/state': store,
+      'instances/detail/logs': logs,
+      'instances/detail/instance-actions': {
         openInstanceFolder: async (...args: string[]) => {
           folders.push(args);
         },
       },
-      '../components/pane': { Pane: 'Pane', PaneBar: 'PaneBar' },
-      '../components/log-line': { LogLines: 'LogLines' },
+      'instances/detail/components/pane': { Pane: 'Pane', PaneBar: 'PaneBar' },
+      'instances/detail/components/log-line': { LogLines: 'LogLines' },
     },
     { window: clock },
   );
@@ -404,7 +351,7 @@ test('settlement returns to file logs and keeps compressed archives selectable w
   h.unmount();
 });
 
-test('session history uses the existing decoder and discloses retained or truncated output', async () => {
+test('session history discloses retained or truncated output', async () => {
   const h = harness();
   h.read(async () => history('Retained line', 8, true));
   h.render();
@@ -412,8 +359,7 @@ test('session history uses the existing decoder and discloses retained or trunca
   const tree = h.render();
   assert.equal(node(tree, 'LogLines').props.text, 'Retained line [truncated]');
   assert.match(text(tree), /Some session output was truncated/);
-  h.read(async () => ({ entries: [history('Later', 3).entries[0], history('Earlier', 2).entries[0]] }));
-  await assert.rejects(h.logs.fetchSessionLog('session/encoded'), /not ordered/);
+  await h.logs.fetchSessionLog('session/encoded');
   assert.equal(h.calls[h.calls.length - 1], '/launch/session%2Fencoded/logs');
   h.unmount();
 });

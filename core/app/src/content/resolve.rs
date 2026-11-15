@@ -12,6 +12,7 @@ use super::model::{
 use super::packs::{PackError, PackFileSelection};
 use super::provenance::{ContentManifest, LiveManagedContent, ManifestEntry};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 const MAX_RESOLUTION_SELECTIONS: usize = 256;
 const MAX_RESOLUTION_NODES: usize = 256;
@@ -25,14 +26,14 @@ const MAX_CONTENT_GRAPH_BYTES: u64 = 512 * 1024 * 1024;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionReason {
     Selected,
     Dependency,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionConflictKind {
     Unavailable,
@@ -107,11 +108,12 @@ impl ResolutionTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ResolutionSelection {
     pub canonical_id: String,
     pub kind: ContentKind,
+    #[ts(optional = nullable)]
     pub version_id: Option<String>,
 }
 
@@ -1251,7 +1253,7 @@ fn apply_metadata_titles(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 pub struct AvailableUpdate {
     pub canonical_id: CanonicalId,
     pub kind: ContentKind,
@@ -1260,17 +1262,20 @@ pub struct AvailableUpdate {
     pub latest_version_number: String,
     pub latest_channel: ReleaseChannel,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub title: Option<String>,
     /// The modpack that installed this exact file. Its members are coupled to
     /// the pack, so bulk updates leave them alone.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub pack: Option<UpdatePack>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 pub struct UpdatePack {
     pub canonical_id: CanonicalId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub title: Option<String>,
 }
 

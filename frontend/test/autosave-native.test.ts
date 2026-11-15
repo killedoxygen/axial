@@ -1,60 +1,22 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import * as contract from '../src/dto-contract';
-import * as dto from '../src/dto-core';
-import * as installDto from '../src/dto-install';
-import * as performanceDto from '../src/dto-performance';
-import * as installItems from '../src/install-item';
-import * as downloadViews from '../src/machines/download-view-models';
-import * as preferences from '../src/preferences/local';
-import type { Config } from '../src/types-settings';
-import type { EnrichedInstance } from '../src/types-instance';
-import type { NativePreferencesRequest } from '../src/native';
-import type { InstallQueueStateResponse } from '../src/types-install';
-import type { LaunchSession } from '../src/types-launch';
-import type { LaunchState } from '../src/store';
+import { apiModule, isApiError, loadSource, requireDependency } from './source';
+import { enrichedInstance, queueSnapshot } from './wire';
+import * as installItems from '../src/install/item';
+import * as downloadViews from '../src/install/presenters';
+import * as preferences from '../src/app/preferences/local';
+import type { ConfigView } from '../src/generated/ConfigView';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
+import type { NativePreferencesRequest } from '../src/platform/native';
+import type { InstallQueueStateResponse } from '../src/generated/InstallQueueStateResponse';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const dependencies = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = dependencies('typescript');
-const signals: typeof import('@preact/signals') = dependencies('@preact/signals');
-const jsx = dependencies('preact/jsx-runtime');
+const signals: typeof import('@preact/signals') = requireDependency('@preact/signals');
+const jsx = requireDependency('preact/jsx-runtime');
 const tick = (): Promise<void> => new Promise((done) => setImmediate(done));
 type Node = { type: unknown; props: Record<string, unknown> };
 
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.CommonJS,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    compiled.outputText,
-    {
-      exports,
-      Error,
-      URLSearchParams,
-      require(id: string): unknown {
-        if (id === '@preact/signals') return signals;
-        if (id === 'preact/jsx-runtime') return jsx;
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed autosave dependency: ${id}`);
-      },
-      ...globals,
-    },
-    { filename },
-  );
-  return exports as T;
+function source<T>(path: string, stubs: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
+  return loadSource<T>(path, { '@preact/signals': signals, 'preact/jsx-runtime': jsx, ...stubs }, globals);
 }
 
 function deferred<T>() {
@@ -103,8 +65,11 @@ function hooks() {
     useMemo<T>(calculate: () => T, dependencies: unknown[]): T {
       const index = cursor++;
       const previous = values[index] as { dependencies: unknown[]; value: T } | undefined;
-      if (!previous || dependencies.length !== previous.dependencies.length ||
-        dependencies.some((value, offset) => !Object.is(value, previous.dependencies[offset]))) {
+      if (
+        !previous ||
+        dependencies.length !== previous.dependencies.length ||
+        dependencies.some((value, offset) => !Object.is(value, previous.dependencies[offset]))
+      ) {
         values[index] = { dependencies, value: calculate() };
       }
       return (values[index] as { value: T }).value;
@@ -126,7 +91,7 @@ function hooks() {
   };
 }
 
-function config(): Config {
+function config(): ConfigView {
   return {
     revision: 4,
     account_selection_revision: 2,
@@ -153,29 +118,12 @@ function config(): Config {
   };
 }
 
-const instance: EnrichedInstance = {
+const instance: EnrichedInstance = enrichedInstance({
   id: '94d4ec3a-4a90-4d70-9e97-a5774f1c0a8a',
   revision: 6,
   name: 'Autosave fixture',
   version_id: '1.20.1',
-  created_at: '2026-09-08T12:00:00Z',
-  java_selection: { kind: 'inherited' },
-  version_display: {
-    loader_key: 'vanilla',
-    loader_label: 'Vanilla',
-    minecraft_label: '1.20.1',
-    loader_version_label: '',
-    loader_detail_label: '',
-    summary_label: 'Minecraft 1.20.1',
-    supports_mods: false,
-  },
-  launchable: true,
-  launch_action: { state_id: 'ready', label: 'Launch', tone: 'ok', launchable: true, primary_action: 'launch' },
-  saves_count: 0,
-  mods_count: 0,
-  resource_count: 0,
-  shader_count: 0,
-};
+});
 
 function controls(value: unknown): Node[] {
   if (Array.isArray(value)) return value.flatMap(controls);
@@ -185,27 +133,26 @@ function controls(value: unknown): Node[] {
 }
 
 function queue(revision = 1): InstallQueueStateResponse {
-  return {
-    queue_epoch: 'current-process', revision, registry_revision: 2,
-    active: null, items: [], failures: [],
-    view_model: { state_id: 'empty', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,
-      queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' },
-  };
+  return queueSnapshot({ queue_epoch: 'current-process', revision, registry_revision: 2, failures: [] });
 }
 
 function harness() {
   const viewHooks = hooks();
   const javaHooks = hooks();
-  const configState = signals.signal(config());
-  const instances = signals.signal([structuredClone(instance)]);
-  const store = {
-    config: configState, instances, versions: signals.signal([]), lastInstanceId: signals.signal<string | null>(null),
-    launchSessions: signals.signal<Record<string, LaunchSession>>({}),
-    launchState: signals.signal<LaunchState>({ status: 'idle' }),
-  };
+  const settingsState = source<typeof import('../src/settings/state')>('settings/state.ts', {});
+  settingsState.config.value = config();
+  const instanceState = source<typeof import('../src/instances/state')>('instances/state.ts', {});
+  instanceState.instances.value = [structuredClone(instance)];
+  const instances = instanceState.instances;
+  const launchState = source<typeof import('../src/launch/state')>('launch/state.ts', {});
+  const store = { ...settingsState, ...instanceState, ...launchState };
   let storedConfig = config();
   let storedInstance = structuredClone(instance);
-  const publicInstance = (): EnrichedInstance => ({ ...structuredClone(storedInstance), java_path: '', extra_jvm_args: '' });
+  const publicInstance = (): EnrichedInstance => ({
+    ...structuredClone(storedInstance),
+    java_path: '',
+    extra_jvm_args: '',
+  });
   const writes: Array<{ path: string; patch: Record<string, unknown> }> = [];
   const reads: string[] = [];
   const notices: string[] = [];
@@ -226,10 +173,12 @@ function harness() {
       timers.set(id, run);
       return id;
     },
-    clearTimeout(id: number) { timers.delete(id); },
+    clearTimeout(id: number) {
+      timers.delete(id);
+    },
   };
-  const api = {
-    async api(method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
+  const transport = {
+    async request(method: string, path: string, body?: Record<string, unknown>): Promise<unknown> {
       if (method === 'GET') {
         reads.push(path);
         if (path === '/java') return { runtimes: [] };
@@ -257,49 +206,65 @@ function harness() {
       assert.equal(path, `/instances/${instance.id}`);
       const { expected_revision, ...patch } = body;
       if (expected_revision !== undefined && expected_revision !== storedInstance.revision) {
-        throw Object.assign(new Error('The instance changed. Refresh and try again.'), { name: 'ApiError', status: 409 });
+        throw Object.assign(new Error('The instance changed. Refresh and try again.'), {
+          name: 'ApiError',
+          status: 409,
+        });
       }
       storedInstance = { ...storedInstance, ...patch, revision: storedInstance.revision + 1 };
       return respond(path, publicInstance());
     },
-    isApiError: (error: unknown) => error instanceof Error && 'status' in error,
   };
-  const actions = source<typeof import('../src/actions')>('actions.ts', {
-    './store': store,
-    './launch-response-adapters': {},
-  });
-  const readiness = source<typeof import('../src/instance-readiness')>('instance-readiness.ts', {
-    './api': api, './dto-core': dto, './store': store,
-    './utils': { showError: (message: string) => notices.push(message) },
-  }, { window: clock });
-  const downloads = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
-    '../api': api,
-    '../utils': { errMessage: String, showError: (message: string) => notices.push(message) },
-    '../toast': { toast: (message: string) => notices.push(message) },
-    '../loaders/api': { connectInstallQueueSSE(next: typeof queueSubscription) {
-      queueSubscription = next;
-      return () => { queueSubscription = undefined; };
-    } },
-    '../store': store, '../content-activity': { markContentChanged() {} },
-    '../dto-install': installDto, '../dto-core': dto, '../install-item': installItems,
-    './download-view-models': downloadViews,
-  }, clock);
-  const autosave = source<typeof import('../src/hooks/use-autosave')>('hooks/use-autosave.ts', {
-    'preact/hooks': viewHooks,
-    '../actions': actions,
-    '../api': api,
-    '../dto-core': dto,
-    '../store': { config: configState },
-    '../toast': { toast: (message: string) => notices.push(message) },
-    '../utils': { errMessage: (error: Error) => error.message },
-  });
-  const music = source<typeof import('../src/music')>(
-    'music.ts',
+  const call = transport.request as (method: string, path: string, body?: unknown) => Promise<unknown>;
+  const settingsApi = apiModule('settings/api.ts', call);
+  const instancesApi = apiModule<typeof import('../src/instances/api')>('instances/api.ts', call);
+  const toast = {
+    toast: (message: string) => notices.push(message),
+    showError: (message: string) => notices.push(message),
+    errMessage: (error: Error) => error.message,
+  };
+  const readiness = source<typeof import('../src/instances/readiness')>(
+    'instances/readiness.ts',
     {
-      './api': { apiResourceUrl: (path: string) => path },
-      './hooks/use-autosave': autosave,
-      './store': { config: configState },
-      './toast': { toast: (message: string) => notices.push(message) },
+      'instances/api': instancesApi,
+      'settings/state': settingsState,
+      'instances/state': instanceState,
+      'launch/state': launchState,
+      'app/toast': toast,
+    },
+    { window: clock },
+  );
+  const downloads = source<typeof import('../src/install/queue')>(
+    'install/queue.ts',
+    {
+      'app/toast': { ...toast, errMessage: String },
+      'install/api': apiModule('install/api.ts', call, (_path, options) => {
+        queueSubscription = (snapshot) => options.onValue(snapshot, 'message', snapshot.revision);
+        return () => {};
+      }),
+      'instances/api': instancesApi,
+      'settings/state': settingsState,
+      'instances/state': instanceState,
+      'launch/state': launchState,
+      'content/activity': { markContentChanged() {} },
+      'install/item': installItems,
+      'install/presenters': downloadViews,
+    },
+    clock,
+  );
+  const autosave = source<typeof import('../src/settings/autosave')>('settings/autosave.ts', {
+    'preact/hooks': viewHooks,
+    'settings/state': settingsState,
+    'settings/api': settingsApi,
+    'app/toast': toast,
+  });
+  const music = source<typeof import('../src/music/music')>(
+    'music/music.ts',
+    {
+      'music/api': { trackUrl: (track: number) => `/music/track?t=${track}` },
+      'settings/autosave': autosave,
+      'settings/state': settingsState,
+      'app/toast': toast,
     },
     {
       setTimeout(run: () => void) {
@@ -312,9 +277,9 @@ function harness() {
       },
     },
   );
-  const native = source<typeof import('../src/native')>(
-    'native.ts',
-    { './dto-contract': contract },
+  const native = source<typeof import('../src/platform/native')>(
+    'platform/native.ts',
+    {},
     {
       window: {
         __TAURI__: {
@@ -335,15 +300,15 @@ function harness() {
       },
     },
   );
-  const owner = source<typeof import('../src/preferences/persistence')>(
-    'preferences/persistence.ts',
+  const owner = source<typeof import('../src/app/preferences/persistence')>(
+    'app/preferences/persistence.ts',
     {
-      '../api': api,
-      '../dto-contract': contract,
-      '../native': native,
-      '../hooks/use-autosave': autosave,
-      '../toast': { toast: (message: string) => notices.push(message) },
-      './local': preferences,
+      'platform/transport': { isApiError },
+      'settings/api': settingsApi,
+      'platform/native': native,
+      'settings/autosave': autosave,
+      'app/toast': toast,
+      'app/preferences/local': preferences,
     },
     {
       location: {
@@ -354,91 +319,83 @@ function harness() {
     },
   );
   const primitive = (...names: string[]) => Object.fromEntries(names.map((name) => [name, name]));
-  const runtimeFields = source<typeof import('../src/ui/RuntimeFields')>('ui/RuntimeFields.tsx', {
+  const runtimeFields = source<typeof import('../src/launch/RuntimeFields')>('launch/RuntimeFields.tsx', {
     'preact/hooks': javaHooks,
-    './Select': primitive('SelectField'),
-    './Icons': primitive('Icon'),
-    './Popover': primitive('Popover'),
-    '../api': api,
-    '../dto-contract': contract,
+    'ui/Select': primitive('SelectField'),
+    'ui/Icons': primitive('Icon'),
+    'ui/Popover': primitive('Popover'),
+    'instances/api': instancesApi,
   });
   const common = {
     'preact/hooks': viewHooks,
     ui: primitive('OverrideChip', 'SettingRow', 'SettingsSection'),
     presets: {
-      useJvmPresets: () => ({ options: [], selectable: [] }),
+      useJvmPresets: () => [],
       normalizeJvmPreset: () => '',
-      jvmPresetSelectLabel: () => '',
     },
     memory: { MemoryField: 'MemoryField', recommendedHeapRange: () => [1, 4] },
     format: {
       fmtMem: (value: number) => String(value),
       memoryGb: (value: number, fallback: number) => (value || fallback) / 1024,
     },
-    store: { config: configState, instances, systemInfo: signals.signal(null) },
+    store: { ...settingsState, ...instanceState },
   };
-  const launching = source<typeof import('../src/views/settings/LaunchingSection')>(
-    'views/settings/LaunchingSection.tsx',
-    {
-      'preact/hooks': viewHooks,
-      '../../actions': actions,
-      '../../ui/Atoms': primitive('Toggle'),
-      '../../ui/Select': primitive('SelectField'),
-      '../../ui/SettingsSheet': common.ui,
-      '../../ui/MemoryField': common.memory,
-      '../../ui/WindowField': primitive('WindowField'),
-      '../../ui/RuntimeFields': primitive('JavaPathField'),
-      '../../hooks/use-jvm-presets': common.presets,
-      '../../hooks/use-autosave': autosave,
-      '../../store': common.store,
-      '../../format': common.format,
-    },
-  );
-  const audio = source<typeof import('../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
+  const launching = source<typeof import('../src/settings/LaunchingSection')>('settings/LaunchingSection.tsx', {
     'preact/hooks': viewHooks,
-    '../../ui/Atoms': primitive('Toggle'),
-    '../../ui/Slider': primitive('Slider'),
-    '../../ui/SettingsSheet': common.ui,
-    '../../music': music,
-    '../../sound': { Sound: {} },
-    '../../state': {
+    'ui/Atoms': primitive('Toggle', 'Chip'),
+    'ui/Select': primitive('SelectField'),
+    'ui/SettingsSheet': common.ui,
+    'ui/MemoryField': common.memory,
+    'ui/WindowField': primitive('WindowField'),
+    'launch/RuntimeFields': primitive('JavaPathField'),
+    'launch/jvm-presets': common.presets,
+    'settings/autosave': autosave,
+    'settings/state': settingsState,
+    'ui/format': common.format,
+  });
+  const audio = source<typeof import('../src/settings/AudioSection')>('settings/AudioSection.tsx', {
+    'preact/hooks': viewHooks,
+    'ui/Atoms': primitive('Toggle', 'Chip'),
+    'ui/Slider': primitive('Slider'),
+    'ui/SettingsSheet': common.ui,
+    'music/music': music,
+    'app/sound': { Sound: {} },
+    'app/local-state': {
       local: preferences.defaultLocalPreferences(),
       canEditPreferences: owner.canEditPreferences,
       saveLocalState() {},
     },
   });
-  const performanceMode = source<typeof import('../src/views/instance/performance-mode')>(
-    'views/instance/performance-mode.ts',
-    { '../../api': api, '../../store': common.store, '../../dto-performance': performanceDto },
+  const performanceMode = source<typeof import('../src/instances/detail/performance-mode')>(
+    'instances/detail/performance-mode.ts',
+    { 'settings/state': settingsState },
   );
-  const settings = source<typeof import('../src/views/instance/tabs/SettingsPane')>(
-    'views/instance/tabs/SettingsPane.tsx',
+  const settings = source<typeof import('../src/instances/detail/tabs/SettingsPane')>(
+    'instances/detail/tabs/SettingsPane.tsx',
     {
       'preact/hooks': viewHooks,
-      '../../../ui/Icons': primitive('Icon'),
-      '../../../ui/Atoms': primitive('Chip', 'Notice'),
-      '../../../ui/Select': primitive('SelectField'),
-      '../../../ui/ChoicePills': primitive('ChoicePills'),
-      '../../../ui/SettingsSheet': common.ui,
-      '../../../ui/MemoryField': common.memory,
-      '../../../ui/WindowField': primitive('WindowField'),
-      '../../../ui/RuntimeFields': { JavaPathField: runtimeFields.JavaPathField, JvmArgsInput: 'JvmArgsInput' },
-      '../../../hooks/use-autosave': autosave,
-      '../../../hooks/use-jvm-presets': common.presets,
-      '../../../api': api,
-      '../../../instance-readiness': readiness,
-      '../../../store': common.store,
-      '../../../actions': actions,
-      '../../../format': common.format,
-      '../../../dto-core': dto,
-      '../../../performance-presenters': { performanceHealthNotice: () => null },
-      '../performance-mode': {
-        ...performanceMode,
-        fetchPerformanceHealth: async () => {
+      'ui/Atoms': primitive('Chip', 'Notice'),
+      'ui/Select': primitive('SelectField'),
+      'ui/ChoicePills': primitive('ChoicePills'),
+      'ui/SettingsSheet': common.ui,
+      'ui/MemoryField': common.memory,
+      'ui/WindowField': primitive('WindowField'),
+      'launch/RuntimeFields': { JavaPathField: runtimeFields.JavaPathField, JvmArgsInput: 'JvmArgsInput' },
+      'settings/autosave': autosave,
+      'launch/jvm-presets': common.presets,
+      'instances/api': {
+        ...instancesApi,
+        performanceHealth: async () => {
           healthReads++;
           return null;
         },
       },
+      'instances/readiness': readiness,
+      'settings/state': settingsState,
+      'instances/state': instanceState,
+      'ui/format': common.format,
+      'performance/presenters': { performanceHealthNotice: () => null },
+      'instances/detail/performance-mode': performanceMode,
     },
     {
       window: {
@@ -468,13 +425,17 @@ function harness() {
     timers,
     config: () => storedConfig,
     instance: () => storedInstance,
-    serverInstance(value: EnrichedInstance) { storedInstance = structuredClone(value); },
+    serverInstance(value: EnrichedInstance) {
+      storedInstance = structuredClone(value);
+    },
     reloads: () => reloads,
     healthReads: () => healthReads,
     respond(next: typeof respond) {
       respond = next;
     },
-    readInstance(next: typeof readInstance) { readInstance = next; },
+    readInstance(next: typeof readInstance) {
+      readInstance = next;
+    },
     emitQueue(snapshot: InstallQueueStateResponse) {
       currentQueue = snapshot;
       assert.ok(queueSubscription);
@@ -552,25 +513,38 @@ function settleOn(h: Harness, trigger: 'flush' | 'reload') {
 
 test('cold instance Java settings retain redacted selection and explicit edits', async (context) => {
   const component = 'java-runtime-delta';
-  for (const scenario of ['untouched custom', 'clear custom', 'replace custom', 'inherit global custom', 'component'] as const) {
+  for (const scenario of [
+    'untouched custom',
+    'clear custom',
+    'replace custom',
+    'inherit global custom',
+    'component',
+  ] as const) {
     await context.test(scenario, async () => {
       const h = harness();
       const inherited = scenario === 'inherit global custom';
-      const selection = inherited ? { kind: 'inherited' } : scenario === 'component'
-        ? { kind: 'component', component } : { kind: 'custom' };
+      const selection = inherited
+        ? { kind: 'inherited' }
+        : scenario === 'component'
+          ? { kind: 'component', component }
+          : { kind: 'custom' };
       const detail = { ...instance, java_path: '', extra_jvm_args: '', java_selection: selection };
       h.readInstance(async () => JSON.parse(JSON.stringify(detail)));
       h.store.config.value = { ...config(), java_path_override: inherited ? '/fixture/global-java' : '' };
       const clears = scenario === 'clear custom' || scenario === 'component';
       h.respond(async () => ({
-        ...detail, revision: 7, java_selection: clears ? { kind: 'inherited' } : { kind: 'custom' },
+        ...detail,
+        revision: 7,
+        java_selection: clears ? { kind: 'inherited' } : { kind: 'custom' },
       }));
       const render = (): unknown => {
         h.render('instance');
         return h.renderJava();
       };
       const select = (tree: unknown) => {
-        const node = controls(tree).find((entry) => entry.type === 'SelectField' && entry.props.ariaLabel === 'Java runtime');
+        const node = controls(tree).find(
+          (entry) => entry.type === 'SelectField' && entry.props.ariaLabel === 'Java runtime',
+        );
         assert.ok(node, 'the real JavaPathField must render its selector');
         return node.props as {
           value: string;
@@ -579,7 +553,9 @@ test('cold instance Java settings retain redacted selection and explicit edits',
         };
       };
       const input = (tree: unknown) => {
-        const node = controls(tree).find((entry) => entry.type === 'input' && entry.props['aria-label'] === 'Custom Java path');
+        const node = controls(tree).find(
+          (entry) => entry.type === 'input' && entry.props['aria-label'] === 'Custom Java path',
+        );
         assert.ok(node, 'the real JavaPathField must render its custom editor');
         return node.props as {
           value: string;
@@ -599,8 +575,10 @@ test('cold instance Java settings retain redacted selection and explicit edits',
         assert.equal(h.reads.filter((path) => path === '/java').length, 1);
         assert.equal(h.store.instances.value[0].java_path, '');
         assert.equal(h.store.instances.value[0].extra_jvm_args, '');
-        assert.equal(chooser.options.find((option) => option.value === chooser.value)?.label,
-          inherited ? 'Inherit global Java' : scenario === 'component' ? component : 'Custom path…');
+        assert.equal(
+          chooser.options.find((option) => option.value === chooser.value)?.label,
+          inherited ? 'Inherit global Java' : scenario === 'component' ? component : 'Custom path…',
+        );
         assert.equal(chooser.options.find((option) => option.value === '')?.label, 'Inherit global Java');
         assert.equal(chooser.value, inherited ? '' : scenario === 'component' ? component : '__custom__');
         assert.equal(h.writes.length, 0, 'cold detail hydration must not write a redacted value back');
@@ -615,12 +593,18 @@ test('cold instance Java settings retain redacted selection and explicit edits',
         } else if (clears) {
           chooser.onChange('');
           await tick();
-          assert.deepEqual(h.writes, [{ path: `/instances/${instance.id}`, patch: { expected_revision: 6, java_path: '' } }]);
+          assert.deepEqual(h.writes, [
+            { path: `/instances/${instance.id}`, patch: { expected_revision: 6, java_path: '' } },
+          ]);
           tree = render();
           assert.equal(select(tree).value, '', 'the acknowledged clear must display inherited selection');
         } else {
           assert.equal(input(tree).value, '', 'saved private paths must not populate the editor');
-          assert.match(input(tree).placeholder, /^Saved custom path/, 'the redacted editor must show that a path is saved');
+          assert.match(
+            input(tree).placeholder,
+            /^Saved custom path/,
+            'the redacted editor must show that a path is saved',
+          );
           input(tree).onBlur();
           await tick();
           assert.equal(h.writes.length, 0, 'an untouched redacted editor must not clear the saved override');
@@ -629,11 +613,17 @@ test('cold instance Java settings retain redacted selection and explicit edits',
             tree = render();
             input(tree).onBlur();
             await tick();
-            assert.deepEqual(h.writes, [{
-              path: `/instances/${instance.id}`, patch: { expected_revision: 6, java_path: '/fixture/replacement-java' },
-            }]);
+            assert.deepEqual(h.writes, [
+              {
+                path: `/instances/${instance.id}`,
+                patch: { expected_revision: 6, java_path: '/fixture/replacement-java' },
+              },
+            ]);
             tree = render();
-            assert.equal(select(tree).options.find((option) => option.value === select(tree).value)?.label, 'Custom path…');
+            assert.equal(
+              select(tree).options.find((option) => option.value === select(tree).value)?.label,
+              'Custom path…',
+            );
             assert.equal(h.store.instances.value[0].java_path, '');
             assert.equal(h.store.instances.value[0].extra_jvm_args, '');
           }
@@ -650,7 +640,11 @@ test('cold instance Java settings retain redacted selection and explicit edits',
 test('a stale Runtime Reset carries its captured revision and preserves a newer component', async () => {
   const h = harness();
   const captured = {
-    ...instance, revision: 6, java_path: '', extra_jvm_args: '', java_selection: { kind: 'custom' },
+    ...instance,
+    revision: 6,
+    java_path: '',
+    extra_jvm_args: '',
+    java_selection: { kind: 'custom' },
   };
   const newer = { ...captured, revision: 7, java_selection: { kind: 'component', component: 'jre-legacy' } };
   const cleared = { ...captured, revision: 8, java_selection: { kind: 'inherited' } };
@@ -682,10 +676,16 @@ test('a stale Runtime Reset carries its captured revision and preserves a newer 
     h.dispose();
     await tick();
   }
-  assert.deepEqual(h.writes, [{
-    path: `/instances/${instance.id}`,
-    patch: { expected_revision: 6, jvm_preset: '', java_path: '' },
-  }], 'Reset must bind the rendered revision, not omit it or refresh its evidence before sending');
+  assert.deepEqual(
+    h.writes,
+    [
+      {
+        path: `/instances/${instance.id}`,
+        patch: { expected_revision: 6, jvm_preset: '', java_path: '' },
+      },
+    ],
+    'Reset must bind the rendered revision, not omit it or refresh its evidence before sending',
+  );
   assert.ok(h.notices.some((notice) => notice.includes('Could not save runtime: The instance changed.')));
   assert.ok(!h.notices.includes('Saved'));
   assert.deepEqual(refreshed?.java_selection, { kind: 'component', component: 'jre-legacy' });
@@ -721,7 +721,10 @@ test('native flush joins two rapid instance controls through their own acknowled
     await tick();
     h.dispose();
   }
-  assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), [6, 7]);
+  assert.deepEqual(
+    h.writes.map((write) => write.patch.expected_revision),
+    [6, 7],
+  );
   assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: true }]);
   assert.equal(h.store.instances.value[0].revision, 8);
   assert.equal(h.store.instances.value[0].min_memory_mb, 1024);
@@ -832,7 +835,7 @@ test('a refused queued preference restores the latest acknowledged value', async
     },
     {
       view: 'global' as const,
-      stored: (h: Harness) => h.store.config.value.java_path_override,
+      stored: (h: Harness) => h.store.config.value?.java_path_override,
       server: (h: Harness) => h.config().java_path_override,
       revisions: [4, 5],
       status: 400,
@@ -885,7 +888,10 @@ test('a refused queued preference restores the latest acknowledged value', async
         await tick();
         h.render(owner.view);
         assert.equal(h.writes.length, 2, 'the refused edit must not replay');
-        assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), owner.revisions);
+        assert.deepEqual(
+          h.writes.map((write) => write.patch.expected_revision),
+          owner.revisions,
+        );
         assert.equal(owner.server(h), firstValue);
         assert.equal(owner.stored(h), acknowledgedValue);
         assert.equal(h.control<{ value: string }>(control).value, acknowledgedValue);
@@ -934,18 +940,29 @@ test('an older rendered control cannot borrow an independently admitted revision
     await tick();
     h.dispose();
   }
-  assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), [7, 6]);
+  assert.deepEqual(
+    h.writes.map((write) => write.patch.expected_revision),
+    [7, 6],
+  );
   assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: false }]);
   assert.ok(h.notices.some((notice) => notice.includes('Could not save memory: The instance changed.')));
   assert.equal(h.instance().revision, 8);
   assert.equal(h.instance().window_width, 1000);
-  assert.equal(h.instance().max_memory_mb, undefined);
+  assert.equal(h.instance().max_memory_mb, instance.max_memory_mb);
   assert.equal(h.store.instances.value[0].revision, 8);
   assert.equal(h.timers.size, 0);
 });
 
 test('pending instance controls cannot borrow external changes or untrusted acknowledgements', async (context) => {
-  for (const outcome of ['external change', 'refusal', 'lost reply', 'missing revision', 'fractional revision', 'wrong instance', 'jumped revision'] as const) {
+  for (const outcome of [
+    'external change',
+    'refusal',
+    'lost reply',
+    'missing revision',
+    'fractional revision',
+    'wrong instance',
+    'jumped revision',
+  ] as const) {
     await context.test(outcome, async () => {
       const h = harness();
       const first = deferred<unknown>();
@@ -955,11 +972,15 @@ test('pending instance controls cannot borrow external changes or untrusted ackn
         h.render('instance');
         await tick();
         h.render('instance');
-        if (outcome === 'refusal') h.admit(() => {
-          if (h.writes.length === 1) {
-            throw Object.assign(new Error('The instance changed. Refresh and try again.'), { name: 'ApiError', status: 409 });
-          }
-        });
+        if (outcome === 'refusal')
+          h.admit(() => {
+            if (h.writes.length === 1) {
+              throw Object.assign(new Error('The instance changed. Refresh and try again.'), {
+                name: 'ApiError',
+                status: 409,
+              });
+            }
+          });
         h.respond(async (_path, value) => {
           if (h.writes.length !== 1) return value;
           firstResponse = value;
@@ -981,7 +1002,8 @@ test('pending instance controls cannot borrow external changes or untrusted ackn
           } else if (outcome === 'lost reply') first.reject(new Error('Fixture response lost'));
           else if (outcome === 'missing revision') first.resolve({ ...response, revision: undefined });
           else if (outcome === 'fractional revision') first.resolve({ ...response, revision: 7.5 });
-          else if (outcome === 'wrong instance') first.resolve({ ...response, id: 'f33cdfc2-1b22-4b6c-8140-ad3cfe8a7104' });
+          else if (outcome === 'wrong instance')
+            first.resolve({ ...response, id: 'f33cdfc2-1b22-4b6c-8140-ad3cfe8a7104' });
           else first.resolve({ ...response, revision: 8 });
           await tick();
         }
@@ -990,25 +1012,43 @@ test('pending instance controls cannot borrow external changes or untrusted ackn
         await tick();
         h.dispose();
       }
-      assert.deepEqual(h.writes.map((write) => write.patch.expected_revision), outcome === 'external change' ? [6, 7] : [6, 6]);
+      assert.deepEqual(
+        h.writes.map((write) => write.patch.expected_revision),
+        outcome === 'external change' ? [6, 7] : [6, 6],
+      );
       assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: false }]);
-      assert.equal(h.writes.filter((write) => 'max_memory_mb' in write.patch).length, 1, 'the first intent must never replay');
-      assert.equal(h.writes.filter((write) => 'window_width' in write.patch).length, 1, 'the queued intent must never replay');
+      assert.equal(
+        h.writes.filter((write) => 'max_memory_mb' in write.patch).length,
+        1,
+        'the first intent must never replay',
+      );
+      assert.equal(
+        h.writes.filter((write) => 'window_width' in write.patch).length,
+        1,
+        'the queued intent must never replay',
+      );
       assert.ok(h.notices.some((notice) => notice.startsWith('Could not save')));
-      assert.equal(h.notices.filter((notice) => notice === 'Saved').length, outcome === 'external change' || outcome === 'refusal' ? 1 : 0);
+      assert.equal(
+        h.notices.filter((notice) => notice === 'Saved').length,
+        outcome === 'external change' || outcome === 'refusal' ? 1 : 0,
+      );
       if (outcome === 'external change') {
         assert.equal(h.instance().revision, 8);
         assert.equal(h.instance().window_width, 1600);
-        assert.equal(h.store.instances.value[0].revision, 8, 'the late valid revision 7 reply must not replace the current revision 8 detail');
+        assert.equal(
+          h.store.instances.value[0].revision,
+          8,
+          'the late valid revision 7 reply must not replace the current revision 8 detail',
+        );
         assert.equal(h.store.instances.value[0].window_width, 1600);
       } else if (outcome === 'refusal') {
         assert.equal(h.instance().revision, 7);
-        assert.equal(h.instance().max_memory_mb, undefined);
+        assert.equal(h.instance().max_memory_mb, instance.max_memory_mb);
         assert.equal(h.instance().window_width, 1000);
       } else {
         assert.equal(h.instance().revision, 7);
         assert.equal(h.instance().max_memory_mb, 5120);
-        assert.equal(h.instance().window_width, undefined);
+        assert.equal(h.instance().window_width, instance.window_width);
         assert.equal(h.store.instances.value[0].revision, 6, 'an untrusted acknowledgement must not publish');
       }
       assert.equal(h.timers.size, 0);
@@ -1016,21 +1056,20 @@ test('pending instance controls cannot borrow external changes or untrusted ackn
   }
 });
 
-test('instance detail decoding requires a positive lossless integer revision', () => {
-  for (const revision of [undefined, null, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, '6']) {
-    assert.throws(() => dto.enrichedInstanceResponse({ ...instance, revision }), /Instance revision/);
-  }
-  assert.equal(dto.enrichedInstanceResponse({ ...instance, revision: 1 }).revision, 1);
-  assert.equal(dto.enrichedInstanceResponse({ ...instance, revision: Number.MAX_SAFE_INTEGER }).revision, Number.MAX_SAFE_INTEGER);
-});
-
 test('a delayed settings detail cannot replace newer Ready from the download registry', async () => {
   const h = harness();
   const oldReply = deferred<unknown>();
   const busy: EnrichedInstance = {
-    ...structuredClone(instance), launchable: false,
-    launch_action: { state_id: 'blocked', label: 'Unavailable', tone: 'warn', launchable: false,
-      primary_action: 'blocked', disabled_reason: 'The instance is busy. Wait for its current operation to finish.' },
+    ...structuredClone(instance),
+    launchable: false,
+    launch_action: {
+      state_id: 'blocked',
+      label: 'Unavailable',
+      tone: 'warn',
+      launchable: false,
+      primary_action: 'blocked',
+      disabled_reason: 'The instance is busy. Wait for its current operation to finish.',
+    },
   };
   h.store.instances.value = [busy];
   h.readInstance(() => oldReply.promise);
@@ -1096,10 +1135,21 @@ test('unmounting an older settings read cannot clear a newer readiness read or i
   h.render('instance');
   await tick();
   let reads = 0;
-  h.readInstance(async (value) => ++reads === 1 ? {
-    ...value, launchable: false,
-    launch_action: { state_id: 'blocked', label: 'Unavailable', tone: 'warn', launchable: false, primary_action: 'blocked' },
-  } : value);
+  h.readInstance(async (value) =>
+    ++reads === 1
+      ? {
+          ...value,
+          launchable: false,
+          launch_action: {
+            state_id: 'blocked',
+            label: 'Unavailable',
+            tone: 'warn',
+            launchable: false,
+            primary_action: 'blocked',
+          },
+        }
+      : value,
+  );
   const current = h.readiness.refreshInstanceReadiness(instance.id);
   try {
     await tick();
@@ -1127,10 +1177,21 @@ test('unmounting an older settings read cannot clear a newer readiness read or i
 test('mounting settings cannot preempt the active readiness settlement retry', async () => {
   const h = harness();
   let settled = false;
-  h.readInstance(async (value) => settled ? value : {
-    ...value, launchable: false,
-    launch_action: { state_id: 'blocked', label: 'Unavailable', tone: 'warn', launchable: false, primary_action: 'blocked' },
-  });
+  h.readInstance(async (value) =>
+    settled
+      ? value
+      : {
+          ...value,
+          launchable: false,
+          launch_action: {
+            state_id: 'blocked',
+            label: 'Unavailable',
+            tone: 'warn',
+            launchable: false,
+            primary_action: 'blocked',
+          },
+        },
+  );
   const current = h.readiness.refreshInstanceReadiness(instance.id);
   try {
     await tick();
@@ -1240,7 +1301,8 @@ test('native flush and Reload submit the real instance and audio drafts before t
         response = value;
         return reply.promise;
       });
-      if (view === 'instance') h.control<{ onChange(value: string): void }>('JvmArgsInput').onChange('-Daxial.fixture=true');
+      if (view === 'instance')
+        h.control<{ onChange(value: string): void }>('JvmArgsInput').onChange('-Daxial.fixture=true');
       else h.control<{ onChange(value: number): void }>('Slider').onChange(70);
       assert.equal(h.writes.length, 0, label);
       const settlement = settleOn(h, trigger);
@@ -1270,7 +1332,7 @@ test('native flush and Reload submit the real instance and audio drafts before t
 test('native discard joins the sent write, parks the queued config or instance control, and resumes it once on release', async () => {
   for (const { view, target, revision, width } of [
     { view: 'global', target: (h: Harness) => h.config().window_width, revision: 5, width: 854 },
-    { view: 'instance', target: (h: Harness) => h.instance().window_width, revision: 7, width: undefined },
+    { view: 'instance', target: (h: Harness) => h.instance().window_width, revision: 7, width: instance.window_width },
   ] as const) {
     const h = harness();
     await h.hydrate();
@@ -1314,7 +1376,9 @@ test('native discard parks a debounced instance or audio draft and late edits un
     await h.hydrate();
     if (view === 'audio') h.music.applyConfig({ music_enabled: true, music_volume: 20, music_track: 0 });
     h.render(view);
-    const control = h.control<{ onChange(value: string | number): void }>(view === 'instance' ? 'JvmArgsInput' : 'Slider');
+    const control = h.control<{ onChange(value: string | number): void }>(
+      view === 'instance' ? 'JvmArgsInput' : 'Slider',
+    );
     const pending = view === 'instance' ? '-Daxial.pending=true' : 70;
     control.onChange(pending);
     h.emit('discard');
@@ -1443,7 +1507,7 @@ test('a refused JVM draft keeps the existing revert and error behavior without a
   h.emit('flush');
   await tick();
   assert.deepEqual(h.completions, [{ requestId: 'preferences-1', saved: false }]);
-  assert.equal(h.instance().extra_jvm_args, undefined);
+  assert.equal(h.instance().extra_jvm_args, instance.extra_jvm_args);
   h.render('instance');
   assert.equal(h.control<{ value: string }>('JvmArgsInput').value, '');
   assert.ok(h.notices.some((notice) => notice.includes('Could not save JVM arguments: Fixture refusal')));
@@ -1463,9 +1527,9 @@ function musicPlayback() {
   class Player {
     volume = 1;
     paused = true;
-    src = "";
+    src = '';
     loop = false;
-    preload = "";
+    preload = '';
     pauses = 0;
     plays = 0;
     constructor() {
@@ -1481,17 +1545,17 @@ function musicPlayback() {
       this.paused = true;
     }
   }
-  const { Music } = source<typeof import("../src/music")>(
-    "music.ts",
+  const { Music } = source<typeof import('../src/music/music')>(
+    'music/music.ts',
     {
-      "./api": { apiResourceUrl: (path: string) => path },
-      "./hooks/use-autosave": {
+      'music/api': { trackUrl: (track: number) => `/music/track?t=${track}` },
+      'settings/autosave': {
         canAutoSave: () => true,
         registerAutoSaveDraft() {},
         async saveConfigPatch() {},
       },
-      "./store": { config: { value: null } },
-      "./toast": { toast() {} },
+      'settings/state': { config: { value: null } },
+      'app/toast': { toast() {} },
     },
     {
       Audio: Player,
@@ -1543,12 +1607,12 @@ function musicPlayback() {
         timers.delete(due[0]);
         due[1].run();
       }
-      assert.fail("music timer fixture did not settle");
+      assert.fail('music timer fixture did not settle');
     },
   };
 }
 
-test("game suppression completes with held animation frames and resumes without a toggle", async () => {
+test('game suppression completes with held animation frames and resumes without a toggle', async () => {
   const h = musicPlayback();
   await h.play();
   h.music.suppress();
@@ -1566,7 +1630,7 @@ test("game suppression completes with held animation frames and resumes without 
   assert.equal(h.player().volume, 0.05);
 });
 
-test("native Pause and Next complete when animation frames are held", async () => {
+test('native Pause and Next complete when animation frames are held', async () => {
   const paused = musicPlayback();
   await paused.play();
   paused.music.toggle();
@@ -1580,21 +1644,19 @@ test("native Pause and Next complete when animation frames are held", async () =
   next.music.nextTrack();
   next.advance(800);
   await tick();
-  assert.equal(next.player().src, "/music/track?t=1");
+  assert.equal(next.player().src, '/music/track?t=1');
   assert.equal(next.player().plays, 2);
   next.advance(800);
   assert.equal(next.player().paused, false);
   assert.equal(next.player().volume, 0.05);
 });
 
-test("superseded suppression callbacks cannot pause or change a resumed fade", async () => {
+test('superseded suppression callbacks cannot pause or change a resumed fade', async () => {
   const h = musicPlayback();
   await h.play();
   h.music.suppress();
   const staleFrame = [...h.frames.values()][0];
-  const staleDeadline = [...h.timers.values()].find(
-    (timer) => timer.at === 1600,
-  )?.run;
+  const staleDeadline = [...h.timers.values()].find((timer) => timer.at === 1600)?.run;
   assert.ok(staleDeadline);
   h.advance(200);
   h.music.unsuppress();
@@ -1611,13 +1673,11 @@ test("superseded suppression callbacks cannot pause or change a resumed fade", a
   assert.equal(h.timers.size, 0);
 });
 
-test("normal frames retain the fade and completion cancels its queued deadline", async () => {
+test('normal frames retain the fade and completion cancels its queued deadline', async () => {
   const h = musicPlayback();
   await h.play();
   h.music.stop();
-  const staleDeadline = [...h.timers.values()].find(
-    (timer) => timer.at === 1600,
-  )?.run;
+  const staleDeadline = [...h.timers.values()].find((timer) => timer.at === 1600)?.run;
   assert.ok(staleDeadline);
   h.frame(1200);
   assert.equal(h.player().volume, 0.025);
@@ -1630,30 +1690,28 @@ test("normal frames retain the fade and completion cancels its queued deadline",
   assert.equal(h.player().pauses, 1);
 });
 
-test("superseded Next callbacks cannot publish an old track or play twice", async () => {
+test('superseded Next callbacks cannot publish an old track or play twice', async () => {
   const h = musicPlayback();
   await h.play();
   h.music.nextTrack();
   const staleFrame = [...h.frames.values()][0];
-  const staleDeadline = [...h.timers.values()].find(
-    (timer) => timer.at === 1600,
-  )?.run;
+  const staleDeadline = [...h.timers.values()].find((timer) => timer.at === 1600)?.run;
   assert.ok(staleDeadline);
   h.music.nextTrack();
   staleFrame(1600);
   staleDeadline();
-  assert.equal(h.player().src, "/music/track?t=0");
+  assert.equal(h.player().src, '/music/track?t=0');
   assert.equal(h.player().paused, false);
   assert.equal(h.player().plays, 1);
   assert.equal(h.frames.size, 1);
   h.advance(800);
   await tick();
-  assert.equal(h.player().src, "/music/track?t=0");
+  assert.equal(h.player().src, '/music/track?t=0');
   assert.equal(h.player().plays, 2);
   assert.equal(h.player().pauses, 1);
 });
 
-test("volume retargeting restarts the current fade deadline", async () => {
+test('volume retargeting restarts the current fade deadline', async () => {
   const h = musicPlayback();
   await h.play();
   h.music.suppress();

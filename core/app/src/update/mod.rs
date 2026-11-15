@@ -29,8 +29,6 @@ pub struct UpdateInfo {
     pub available: bool,
     pub platform: String,
     pub arch: String,
-    pub kind: String,
-    pub install_mode: String,
     pub notes_url: String,
     pub action_url: String,
     pub checksum_url: Option<String>,
@@ -238,13 +236,6 @@ impl UpdateService {
             available: release.is_some(),
             platform: inner.platform.clone(),
             arch: inner.arch.clone(),
-            kind: if release.is_some() {
-                "release-asset"
-            } else {
-                "none"
-            }
-            .into(),
-            install_mode: "in-app".into(),
             action_url: notes_url.clone(),
             notes_url,
             checksum_url: None,

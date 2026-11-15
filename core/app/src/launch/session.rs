@@ -10,6 +10,7 @@ use super::{
 };
 use crate::{
     instances::{directory::RegisteredInstance, model::InstanceId},
+    public::Tone,
     tasks::{CancellationToken, TaskOwner},
     telemetry::{
         Telemetry, TelemetryErrorKind, TelemetryEvent, TelemetryLaunchOutcome, TelemetryLoader,
@@ -17,6 +18,7 @@ use crate::{
 };
 use axial_minecraft::process::{OwnedProcess, ProcessOutput, SpawnError};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -84,7 +86,7 @@ impl LaunchAttemptTelemetry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
     Starting,
@@ -95,7 +97,7 @@ pub enum SessionPhase {
     Exited,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 pub struct SessionViewModel {
     pub state_id: String,
     pub label: String,
@@ -106,23 +108,23 @@ pub struct SessionViewModel {
     pub can_stop: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 pub struct SessionNotice {
     pub message: String,
-    pub tone: String,
+    pub tone: Tone,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct SessionsResponse {
     pub sessions: Vec<SessionSnapshot>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct SessionLogsResponse {
     pub entries: Vec<LogEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
 pub struct SessionSnapshot {
     pub session_id: String,
     pub instance_id: InstanceId,
@@ -196,7 +198,7 @@ impl SessionSnapshot {
             message:
                 "The session ended and cleanup is complete, but its launch report is unavailable."
                     .into(),
-            tone: "warned".into(),
+            tone: Tone::Warn,
         });
     }
 
@@ -204,17 +206,16 @@ impl SessionSnapshot {
         self.notice = if self.phase == SessionPhase::Unresolved {
             Some(SessionNotice {
                 message: "Session cleanup is unfinished. The instance remains in use.".to_owned(),
-                tone: "warned".to_owned(),
+                tone: Tone::Warn,
             })
         } else if self.phase == SessionPhase::Exited {
             self.outcome.as_ref().map(|outcome| SessionNotice {
                 message: outcome.summary().to_owned(),
                 tone: if outcome.kind == super::outcome::SessionOutcomeKind::Failed {
-                    "error"
+                    Tone::Err
                 } else {
-                    "info"
-                }
-                .to_owned(),
+                    Tone::Info
+                },
             })
         } else {
             None
@@ -1517,7 +1518,7 @@ mod settlement_tests {
             notice,
             serde_json::json!({
                 "message": "The game could not create a window because OpenGL is unavailable.",
-                "tone": "error"
+                "tone": "err"
             })
         );
         let saved_wire = serde_json::to_string(&saved).unwrap();

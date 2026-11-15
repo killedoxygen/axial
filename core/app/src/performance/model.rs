@@ -1,8 +1,10 @@
 //! Performance wire data and canonical leaf models. Filesystem authorities stay private.
 
+pub use crate::public::Tone;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub enum VersionFamily {
     #[serde(rename = "A")]
     A,
@@ -26,7 +28,7 @@ pub enum PerformanceMode {
     Custom,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CompositionTier {
     Extended,
@@ -34,7 +36,7 @@ pub enum CompositionTier {
     VanillaEnhanced,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedArtifactRole {
     Root,
@@ -57,7 +59,7 @@ pub enum EmergencyDisableTarget {
     Artifact,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnershipClass {
     CompositionManaged,
@@ -71,7 +73,7 @@ pub enum ManagedArtifactType {
     Mod,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ManagedArtifactProvider {
     Modrinth,
@@ -83,7 +85,7 @@ pub enum ManagedArtifactChecksumPolicy {
     ProviderSha512,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedArtifactSource {
     pub provider: ManagedArtifactProvider,
@@ -108,7 +110,7 @@ pub struct ManagedArtifactDefinition {
     pub ownership_class: OwnershipClass,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedArtifactIntegrity {
     pub sha512: String,
@@ -221,7 +223,7 @@ pub struct HardwareProfile {
     pub gpu_arch: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledMod {
     pub project_id: String,
@@ -234,7 +236,7 @@ pub struct InstalledMod {
     pub integrity: ManagedArtifactIntegrity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedDependencyStateEdge {
     pub parent_project_id: String,
@@ -242,7 +244,7 @@ pub struct ManagedDependencyStateEdge {
     pub child_version_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionState {
     pub composition_id: String,
@@ -256,7 +258,7 @@ pub struct CompositionState {
     pub installed_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum BundleHealth {
     Healthy,
@@ -343,41 +345,36 @@ pub struct EmergencyDisableDiagnostic {
     pub tiers: Vec<CompositionTier>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ViewModelTone {
-    Ok,
-    Warn,
-    Err,
-    Mute,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct ViewModelAction {
     pub command: PerformanceCommand,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub action: Option<String>,
     pub label: String,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub disabled_reason: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub enum PerformanceCommand {
     ApplyPerformancePlan,
     RefreshPerformanceRules,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct PerformancePlanSummaryViewModel {
     pub state_id: String,
     pub title: String,
     pub detail: String,
-    pub tone: ViewModelTone,
+    pub tone: Tone,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub health: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub composition_id: Option<String>,
     #[serde(default)]
     pub managed_artifact_count: usize,
@@ -397,7 +394,7 @@ pub struct PerformanceRulesStatusViewModel {
     pub source_label: String,
     pub channel_label: String,
     pub validation_label: String,
-    pub validation_tone: ViewModelTone,
+    pub validation_tone: Tone,
     pub validation_icon: String,
     pub summary: String,
     pub refresh_label: String,
@@ -410,7 +407,7 @@ pub struct PerformanceRulesStatusViewModel {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct PerformanceManagedArtifactSummary {
     pub project_id: String,
     pub version_id: String,

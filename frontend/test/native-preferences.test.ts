@@ -1,19 +1,13 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import * as contract from '../src/dto-contract';
-import * as preferences from '../src/preferences/local';
-import type { Config } from '../src/types-settings';
+import { apiModule, loadSource } from './source';
+import * as preferences from '../src/app/preferences/local';
+import type { ConfigView } from '../src/generated/ConfigView';
 import type { InterfacePreferences } from '../src/generated/InterfacePreferences';
 import type { InterfacePreferencesSnapshot } from '../src/generated/InterfacePreferencesSnapshot';
 import type { InterfacePreferencesUpdate } from '../src/generated/InterfacePreferencesUpdate';
-import type { NativePreferencesRequest } from '../src/native';
+import type { NativePreferencesRequest } from '../src/platform/native';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
 const tick = (): Promise<void> => new Promise((done) => setImmediate(done));
 function computed<T>(read: () => T) {
   return {
@@ -27,34 +21,8 @@ function signal<T>(value: T) {
   return { value };
 }
 
-function source<T>(path: string, imports: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.CommonJS,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  const exports = {};
-  vm.runInNewContext(
-    compiled.outputText,
-    {
-      exports,
-      Error,
-      URLSearchParams,
-      require(id: string): unknown {
-        if (id === '@preact/signals') return { signal, computed };
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed preference dependency: ${id}`);
-      },
-      ...globals,
-    },
-    { filename },
-  );
-  return exports as T;
+function source<T>(path: string, stubs: Record<string, unknown>, globals: Record<string, unknown> = {}): T {
+  return loadSource<T>(path, { '@preact/signals': { signal, computed }, ...stubs }, globals);
 }
 
 function deferred<T>() {
@@ -67,7 +35,7 @@ function deferred<T>() {
   return { promise, resolve: resolveValue, reject };
 }
 
-function config(patch: Partial<Config> = {}): Config {
+function config(patch: Partial<ConfigView> = {}): ConfigView {
   return {
     revision: 0,
     account_selection_revision: 0,
@@ -146,8 +114,8 @@ function harness(
     return { revision: backend.snapshot.revision };
   }
   let write: (update: InterfacePreferencesUpdate) => Promise<unknown> = async (update) => commit(update);
-  const api = {
-    api: async (method: string, path: string, body?: unknown): Promise<unknown> => {
+  const transport = {
+    request: async (method: string, path: string, body?: unknown): Promise<unknown> => {
       if (method === 'GET') {
         reads.push(path);
         return read();
@@ -185,20 +153,20 @@ function harness(
       },
     },
   };
-  const native = source<typeof import('../src/native')>(
-    'native.ts',
-    { './dto-contract': contract },
+  const native = source<typeof import('../src/platform/native')>(
+    'platform/native.ts',
+    {},
     { window: nativeEnabled ? nativeWindow : {} },
   );
-  const owner = source<typeof import('../src/preferences/persistence')>(
-    'preferences/persistence.ts',
+  const owner = source<typeof import('../src/app/preferences/persistence')>(
+    'app/preferences/persistence.ts',
     {
-      '../api': api,
-      '../dto-contract': contract,
-      '../native': native,
-      '../hooks/use-autosave': { prepareAutoSaves: () => ({ done: Promise.resolve(true), release() {} }) },
-      '../toast': { toast: (message: string) => notices.push(message) },
-      './local': preferences,
+      'platform/transport': transport,
+      'settings/api': apiModule('settings/api.ts', transport.request),
+      'platform/native': native,
+      'settings/autosave': { prepareAutoSaves: () => ({ done: Promise.resolve(true), release() {} }) },
+      'app/toast': { toast: (message: string) => notices.push(message) },
+      'app/preferences/local': preferences,
     },
     {
       location: {
@@ -220,21 +188,21 @@ function harness(
       storage.delete(key);
     },
   };
-  const state = source<typeof import('../src/state')>(
-    'state.ts',
+  const state = source<typeof import('../src/app/local-state')>(
+    'app/local-state.ts',
     {
-      './preferences/local': preferences,
-      './preferences/persistence': owner,
-      './native': native,
+      'app/preferences/local': preferences,
+      'app/preferences/persistence': owner,
+      'platform/native': native,
     },
     { localStorage },
   );
-  const ui = source<typeof import('../src/ui-state')>(
-    'ui-state.ts',
+  const ui = source<typeof import('../src/app/route')>(
+    'app/route.ts',
     {
-      './preferences/local': preferences,
-      './preferences/persistence': owner,
-      './native': native,
+      'app/preferences/local': preferences,
+      'app/preferences/persistence': owner,
+      'platform/native': native,
     },
     { localStorage },
   );
@@ -249,21 +217,21 @@ function harness(
   const configWrites: unknown[] = [];
   const configState = signal(config());
   const css = new Map<string, string>();
-  const theme = source<typeof import('../src/theme')>(
-    'theme.ts',
+  const theme = source<typeof import('../src/app/theme')>(
+    'app/theme.ts',
     {
-      './state': state,
-      './hooks/use-autosave': {
+      'app/local-state': state,
+      'settings/autosave': {
         saveConfigPatch: async (value: unknown) => {
           configWrites.push(value);
         },
       },
-      './store': { config: configState },
-      './sound': { Sound },
-      './tokens': { buildTheme: (value: unknown) => value, neutralVars: () => ({}) },
-      './toast': { toast: (message: string) => notices.push(message) },
-      './native': native,
-      './preferences/persistence': owner,
+      'settings/state': { config: configState },
+      'app/sound': { Sound },
+      'app/tokens': { buildTheme: (value: unknown) => value, neutralVars: () => ({}) },
+      'app/toast': { toast: (message: string) => notices.push(message) },
+      'platform/native': native,
+      'app/preferences/persistence': owner,
     },
     {
       document: {
@@ -274,29 +242,29 @@ function harness(
       },
     },
   );
-  const shortcuts = source<typeof import('../src/shortcuts')>('shortcuts.ts', {
-    './ui-state': ui,
-    './store': {},
-    './actions': {},
-    './launch': {},
-    './sound': { Sound },
-    './state': state,
-    './native': { isMacPlatform: () => false, desktopPlatform: () => 'linux' },
+  const shortcuts = source<typeof import('../src/app/shortcuts')>('app/shortcuts.ts', {
+    'app/route': ui,
+    'instances/state': {},
+    'launch/state': {},
+    'launch/controller': {},
+    'app/sound': { Sound },
+    'app/local-state': state,
+    'platform/native': { isMacPlatform: () => false, desktopPlatform: () => 'linux' },
   });
-  const skin = source<typeof import('../src/player-skin')>('player-skin.ts', {
-    './api': api,
-    './default-skins': {
+  const skin = source<typeof import('../src/accounts/player-skin')>('accounts/player-skin.ts', {
+    'accounts/api': apiModule('accounts/api.ts', transport.request),
+    'accounts/default-skins': {
       DEFAULT_SKINS: [
         { id: 'steve', src: 'steve.png' },
         { id: 'alex', src: 'alex.png' },
       ],
     },
-    './machines/accounts-state': {
+    'accounts/snapshot': {
       accountsSnapshot: signal({ state: 'loading', accounts: [], status: null }),
       activeAccount: () => null,
     },
-    './state': state,
-    './store': { config: signal(config()) },
+    'app/local-state': state,
+    'settings/state': { config: signal(config()) },
   });
   return {
     owner,
@@ -542,69 +510,59 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
   const deferredCalls: string[] = [];
   const response: Record<string, unknown> = {
     '/config': config({ theme: 'nether' }),
-    '/status': { dev_mode: false, setup_required: false },
+    '/status': { dev_mode: false, setup_required: false, warnings: [] },
     '/system': {},
     '/music/status': { count: 0 },
     '/versions': { versions: [] },
     '/instances': { instances: [], last_instance_id: null },
-    '/launch/sessions': {},
+    '/launch/sessions': { sessions: [] },
   };
-  const bootstrap = source<typeof import('../src/bootstrap')>(
-    'bootstrap.ts',
+  const call = async (_method: string, path: string) => {
+    assert.ok(path in response);
+    return response[path];
+  };
+  const bootstrap = source<typeof import('../src/app/bootstrap')>(
+    'app/bootstrap.ts',
     {
-      './api': {
-        initializeApiBase: async () => {},
-        api: async (_method: string, path: string) => {
-          assert.ok(path in response);
-          return response[path];
-        },
-      },
-      './App': {
+      'platform/transport': { initializeApiBase: async () => {} },
+      'app/App': {
         preloadDeferredViews() {
           deferredCalls.push('views');
         },
       },
-      './dto-contract': contract,
-      './dto-core': Object.fromEntries(
-        [
-          'configResponse',
-          'instancesResponse',
-          'launcherStatusResponse',
-          'musicStatusResponse',
-          'systemInfoResponse',
-          'versionsResponse',
-        ].map((name) => [name, (value: unknown) => value]),
-      ),
-      './machines/downloads': { refreshInstallQueue: async () => {} },
-      './launch': {},
-      './launch-response-adapters': { launchSessionsResponse: (value: unknown) => value },
-      './music': { Music: { setTrackCount() {}, applyConfig() {}, enabled: false } },
-      './native': h.native,
-      './preferences/persistence': h.owner,
-      './state': h.state,
-      './store': store,
-      './sound': {
+      'settings/api': apiModule('settings/api.ts', call),
+      'music/api': apiModule('music/api.ts', call),
+      'launch/api': apiModule('launch/api.ts', call),
+      'install/queue': { refreshInstallQueue: async () => {} },
+      'launch/controller': {},
+      'music/music': { Music: { setTrackCount() {}, applyConfig() {}, enabled: false } },
+      'platform/native': h.native,
+      'app/preferences/persistence': h.owner,
+      'app/local-state': h.state,
+      'app/store': store,
+      'settings/state': store,
+      'instances/state': store,
+      'launch/state': { launchSessions: store.launchSessions, liveSessions: () => ({}) },
+      'app/sound': {
         Sound: h.Sound,
         bindButtonSounds() {
           deferredCalls.push('buttons');
         },
       },
-      './machines/accounts': {
+      'accounts/state': {
         async refreshAccountsData() {
           deferredCalls.push('skin');
         },
       },
-      './startup-warnings': { startupWarningMessages: () => [] },
-      './theme': h.theme,
-      './toast': { toast() {} },
-      './ui-state': h.ui,
-      './updater': {
+      'app/theme': h.theme,
+      'app/toast': { toast() {}, errMessage: (error: Error) => error.message },
+      'app/route': h.ui,
+      'update/updater': {
         scheduleAutoUpdateCheck() {
           deferredCalls.push('updater');
         },
       },
-      './utils': { errMessage: (error: Error) => error.message },
-      './views/home/HomeView': { warmHome: async () => {} },
+      'home/HomeView': { warmHome: async () => {} },
     },
     {
       window: {
@@ -673,15 +631,15 @@ test('an already rendered audio control cannot mutate local sound or audio state
   await h.hydrate();
   type Node = { props: { children?: Node[]; title?: string; control?: { props: { onChange: () => void } } } };
   const jsx = (_type: unknown, props: Node['props']): Node => ({ props });
-  const audio = source<typeof import('../src/views/settings/AudioSection')>('views/settings/AudioSection.tsx', {
+  const audio = source<typeof import('../src/settings/AudioSection')>('settings/AudioSection.tsx', {
     'preact/jsx-runtime': { jsx, jsxs: jsx },
     'preact/hooks': { useState: (value: unknown) => [value, () => {}], useEffect() {} },
-    '../../ui/Atoms': { Toggle: 'Toggle' },
-    '../../ui/Slider': {},
-    '../../ui/SettingsSheet': { SettingRow: 'SettingRow', SettingsSection: 'SettingsSection' },
-    '../../state': h.state,
-    '../../sound': { Sound: h.Sound },
-    '../../music': { musicStateVersion: signal(0), Music: { enabled: false, volume: 50 } },
+    'ui/Atoms': { Toggle: 'Toggle', Chip: 'Chip' },
+    'ui/Slider': {},
+    'ui/SettingsSheet': { SettingRow: 'SettingRow', SettingsSection: 'SettingsSection' },
+    'app/local-state': h.state,
+    'app/sound': { Sound: h.Sound },
+    'music/music': { musicStateVersion: signal(0), Music: { enabled: false, volume: 50 } },
   });
   const node = audio.AudioSection() as unknown as Node;
   const toggle = node.props.children?.find((child) => child && child.props.title === 'UI sounds')?.props.control;

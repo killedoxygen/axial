@@ -7,6 +7,7 @@ use super::model::JavaRuntimeInfo;
 use super::rosetta::{is_rosetta_exec_error, rosetta_required_error_for_current_host};
 use crate::process::{OwnedProcess, SpawnError};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::future::Future;
@@ -21,7 +22,7 @@ const MAX_EXECUTABLE_BYTES: u64 = 64 << 20;
 const MAX_OUTPUT_BYTES: usize = 64 << 10;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum JavaArchitecture {
     X86,

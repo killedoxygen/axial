@@ -108,6 +108,7 @@ fn has_long_secret_like_run(value: &str) -> bool {
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use super::outcome::LaunchEvidence;
 
@@ -119,14 +120,14 @@ pub const MAX_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
 pub const REDACTED_LINE: &str = "[Private launch output redacted]";
 pub const OVERSIZED_LINE: &str = "[Oversized launch output omitted]";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum LogStream {
     Stdout,
     Stderr,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
 pub struct LogEntry {
     pub sequence: u64,

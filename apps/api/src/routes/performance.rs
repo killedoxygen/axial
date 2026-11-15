@@ -6,7 +6,7 @@ use axial_app::{
     performance::{
         PerformanceService,
         health::{
-            PerformanceHealthResponse, PerformanceInstanceOperationResponse,
+            PerformanceHealthResponse,
             disabled_health_response, resolved_health_response,
         },
         model::{PerformanceMode, ResolutionRequest},
@@ -16,7 +16,7 @@ use axial_app::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Query, State, rejection::QueryRejection},
+    extract::{DefaultBodyLimit, Query, State, rejection::QueryRejection},
     http::StatusCode,
     routing::get,
 };
@@ -32,10 +32,6 @@ struct PerformanceApi {
 pub fn router(service: Arc<PerformanceService>, settings: Arc<SettingsStore>) -> Router {
     Router::new()
         .route("/api/v1/performance/health", get(health))
-        .route(
-            "/api/v1/performance/instances/{id}/operation",
-            get(instance_operation),
-        )
         .layer(DefaultBodyLimit::max(8192))
         .with_state(PerformanceApi { service, settings })
 }
@@ -58,16 +54,6 @@ async fn health(
     }
     let resolved = api.service.resolve_and_inspect(&id, request).await?;
     Ok(Json(resolved_health_response(resolved)))
-}
-
-async fn instance_operation(
-    State(api): State<PerformanceApi>,
-    Path(id): Path<String>,
-) -> ApiResult<PerformanceInstanceOperationResponse> {
-    let id = id.parse().map_err(|_| invalid())?;
-    Ok(Json(PerformanceInstanceOperationResponse {
-        operation: api.service.instance_operation(&id)?.map(Into::into),
-    }))
 }
 
 fn resolution(api: &PerformanceApi, id: &InstanceId) -> Result<ResolutionRequest, ApiError> {

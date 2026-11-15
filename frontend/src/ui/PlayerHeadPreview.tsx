@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { DEFAULT_SKINS } from '../default-skins';
+import { DEFAULT_SKINS } from '../accounts/default-skins';
 
 export function PlayerHeadPreview({
   textureSrc,

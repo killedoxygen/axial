@@ -1,0 +1,338 @@
+import type { JSX } from 'preact';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { SelectField } from '../ui/Select';
+import { Icon } from '../ui/Icons';
+import { Popover } from '../ui/Popover';
+import { listJavaRuntimes } from '../instances/api';
+import type { JavaRuntimeResult } from '../generated/JavaRuntimeResult';
+import type { JavaSelection } from '../generated/JavaSelection';
+
+type JavaRuntime = JavaRuntimeResult;
+
+const MANAGED_VALUE = '';
+const CUSTOM_VALUE = '__custom__';
+
+let runtimeCache: JavaRuntime[] | null = null;
+let runtimeRequest: Promise<JavaRuntime[]> | null = null;
+
+async function loadRuntimes(): Promise<JavaRuntime[]> {
+  if (runtimeCache) return runtimeCache;
+  runtimeRequest ??= (async () => {
+    try {
+      const valid = (await listJavaRuntimes()).runtimes.filter((runtime) => runtime.path);
+      if (valid.length > 0) runtimeCache = valid;
+      return valid;
+    } catch {
+      return [];
+    } finally {
+      runtimeRequest = null;
+    }
+  })();
+  return runtimeRequest;
+}
+
+function runtimeLabel(runtime: JavaRuntime): string {
+  const major = /(\d+)/.exec(runtime.component)?.[1];
+  const name = major ? `Java ${major}` : runtime.component || 'Java runtime';
+  const tail = runtime.path.split(/[\\/]/).filter(Boolean).slice(-2).join('/');
+  return tail ? `${name} (…/${tail})` : name;
+}
+
+export function JavaPathField({
+  value,
+  onChange,
+  onCommit,
+  disabled,
+  className,
+  label = 'Java runtime',
+  selection,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onCommit?: (value: string) => void;
+  disabled?: boolean;
+  className?: string;
+  label?: string;
+  selection?: JavaSelection;
+}): JSX.Element {
+  const [runtimes, setRuntimes] = useState<JavaRuntime[]>(runtimeCache ?? []);
+  const component = selection?.kind === 'component' ? selection.component : undefined;
+  const trimmed = value.trim();
+  const matchesDetected = runtimes.some((runtime) => runtime.path === trimmed);
+  const matchesComponent = component !== undefined && (trimmed === '' || trimmed === component);
+  const isCustom = trimmed.length > 0 && !matchesDetected && !matchesComponent;
+  const savedCustom = selection?.kind === 'custom' && trimmed === '';
+  const [customOpen, setCustomOpen] = useState(selection ? false : isCustom);
+  const edited = useRef(false);
+
+  useEffect(() => {
+    if (runtimeCache) return;
+    let alive = true;
+    void loadRuntimes().then((list) => {
+      if (alive && list.length > 0) setRuntimes(list);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selection && isCustom) setCustomOpen(true);
+  }, [isCustom, selection?.kind]);
+
+  useEffect(() => {
+    if (selection) {
+      setCustomOpen(false);
+      edited.current = false;
+    }
+  }, [selection?.kind, component]);
+
+  const selectValue =
+    customOpen || isCustom || savedCustom ? CUSTOM_VALUE : matchesDetected ? trimmed : (component ?? MANAGED_VALUE);
+
+  const options = useMemo(() => {
+    const base = [{ value: MANAGED_VALUE, label: selection ? 'Inherit global Java' : 'Managed (automatic)' }];
+    const selected = component ? [{ value: component, label: component }] : [];
+    const detected = runtimes.map((runtime) => ({ value: runtime.path, label: runtimeLabel(runtime) }));
+    return [...base, ...selected, ...detected, { value: CUSTOM_VALUE, label: 'Custom path…' }];
+  }, [runtimes, Boolean(selection), component]);
+
+  const handleSelect = (next: string): void => {
+    if (next === CUSTOM_VALUE) {
+      setCustomOpen(true);
+      return;
+    }
+    setCustomOpen(false);
+    edited.current = false;
+    onChange(next);
+    onCommit?.(next);
+  };
+
+  return (
+    <label class={`cp-ovr-field${className ? ` ${className}` : ''}`}>
+      {label && <span>{label}</span>}
+      <SelectField
+        value={selectValue}
+        disabled={disabled}
+        ariaLabel="Java runtime"
+        onChange={handleSelect}
+        options={options}
+      />
+      {(customOpen || isCustom || savedCustom) && (
+        <div class="cp-field cp-ovr-path">
+          <Icon name="folder" size={15} />
+          <input
+            type="text"
+            value={value}
+            placeholder={savedCustom ? 'Saved custom path (hidden). Type to replace.' : '/path/to/java'}
+            autocomplete="off"
+            spellcheck={false}
+            disabled={disabled}
+            aria-label="Custom Java path"
+            onInput={(event) => {
+              edited.current = true;
+              onChange((event.currentTarget as HTMLInputElement).value);
+            }}
+            onBlur={() => {
+              if (selection && !edited.current) return;
+              edited.current = false;
+              onCommit?.(value.trim());
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') (event.currentTarget as HTMLInputElement).blur();
+            }}
+          />
+        </div>
+      )}
+    </label>
+  );
+}
+
+type ArgKind = 'memory' | 'gc' | 'system' | 'module' | 'assert' | 'tuning' | 'unknown';
+
+type ArgInfo = { kind: ArgKind; label: string };
+
+function classifyArg(token: string): ArgInfo {
+  if (/^-Xm[sx]\S*/i.test(token)) return { kind: 'memory', label: 'Heap size' };
+  if (/^-X(ss|mn)\S*/i.test(token)) return { kind: 'memory', label: 'Memory tuning' };
+  if (/^-XX:[+-]?Use\w*GC$/i.test(token)) return { kind: 'gc', label: 'Garbage collector' };
+  if (/^-XX:/.test(token)) return { kind: 'tuning', label: 'JVM tuning flag' };
+  if (/^-D\S+/.test(token)) return { kind: 'system', label: 'System property' };
+  if (/^--(add|enable|illegal|patch)-\S+/.test(token)) return { kind: 'module', label: 'Module flag' };
+  if (/^-(ea|da|enableassertions|disableassertions)\b/.test(token)) return { kind: 'assert', label: 'Assertions' };
+  return { kind: 'unknown', label: 'Custom flag' };
+}
+
+type Suggestion = { insert: string; label: string; desc: string; template?: boolean };
+
+const SUGGESTIONS: Suggestion[] = [
+  { insert: '-Xmx', label: '-Xmx<size>', desc: 'Maximum heap, e.g. -Xmx4G', template: true },
+  { insert: '-Xms', label: '-Xms<size>', desc: 'Initial heap, e.g. -Xms1G', template: true },
+  { insert: '-XX:+UseG1GC', label: '-XX:+UseG1GC', desc: 'G1 garbage collector' },
+  { insert: '-XX:+UseZGC', label: '-XX:+UseZGC', desc: 'Low-pause ZGC' },
+  { insert: '-XX:+UseShenandoahGC', label: '-XX:+UseShenandoahGC', desc: 'Low-pause Shenandoah GC' },
+  { insert: '-XX:MaxGCPauseMillis=', label: '-XX:MaxGCPauseMillis=<ms>', desc: 'Target GC pause', template: true },
+  { insert: '-XX:+AlwaysPreTouch', label: '-XX:+AlwaysPreTouch', desc: 'Pre-touch heap pages at start' },
+  { insert: '-Dfile.encoding=UTF-8', label: '-Dfile.encoding=UTF-8', desc: 'Force UTF-8 encoding' },
+  { insert: '-Dsun.java2d.opengl=true', label: '-Dsun.java2d.opengl=true', desc: 'Enable OpenGL pipeline' },
+  { insert: '-ea', label: '-ea', desc: 'Enable assertions' },
+];
+
+function tokenize(value: string): string[] {
+  return value.trim().length ? value.trim().split(/\s+/) : [];
+}
+
+export function JvmArgsInput({
+  value,
+  onChange,
+  disabled,
+  label = 'Extra JVM arguments',
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  label?: string;
+}): JSX.Element {
+  const tokens = useMemo(() => tokenize(value), [value]);
+  const [draft, setDraft] = useState('');
+  const [focused, setFocused] = useState(false);
+  // Dismissed suggestions return with the next keystroke or focus.
+  const [dismissed, setDismissed] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+
+  const commit = (next: string[]): void => onChange(next.join(' '));
+
+  const addToken = (token: string): void => {
+    const clean = token.trim();
+    if (!clean) return;
+    commit([...tokens, clean]);
+    setDraft('');
+  };
+
+  const removeAt = (index: number): void => {
+    commit(tokens.filter((_, i) => i !== index));
+  };
+
+  const editAt = (index: number): void => {
+    setDraft(tokens[index]);
+    commit(tokens.filter((_, i) => i !== index));
+    inputRef.current?.focus();
+  };
+
+  const suggestions = useMemo(() => {
+    const q = draft.trim().toLowerCase();
+    if (!focused || dismissed) return [];
+    const pool = SUGGESTIONS.filter((s) => !tokens.includes(s.insert));
+    if (!q) return pool.slice(0, 6);
+    return pool.filter((s) => s.insert.toLowerCase().includes(q) || s.label.toLowerCase().includes(q)).slice(0, 6);
+  }, [draft, dismissed, focused, tokens]);
+
+  const applySuggestion = (suggestion: Suggestion): void => {
+    if (suggestion.template) {
+      setDraft(suggestion.insert);
+      inputRef.current?.focus();
+      return;
+    }
+    addToken(suggestion.insert);
+    inputRef.current?.focus();
+  };
+
+  return (
+    <div class="cp-ovr-field cp-ovr-args">
+      {label && <span>{label}</span>}
+      <div
+        ref={boxRef}
+        class={`cp-argbox${focused ? ' cp-argbox--focus' : ''}`}
+        data-disabled={disabled ? 'true' : 'false'}
+      >
+        <div class="cp-argbox-tokens" onMouseDown={() => inputRef.current?.focus()}>
+          {tokens.map((token, index) => {
+            const info = classifyArg(token);
+            return (
+              <span key={`${token}-${index}`} class="cp-argchip" data-kind={info.kind} title={info.label}>
+                <button
+                  type="button"
+                  class="cp-argchip-text"
+                  disabled={disabled}
+                  onClick={() => editAt(index)}
+                  title={`${info.label}; click to edit`}
+                >
+                  {token}
+                </button>
+                <button
+                  type="button"
+                  class="cp-argchip-x"
+                  aria-label={`Remove ${token}`}
+                  disabled={disabled}
+                  onClick={() => removeAt(index)}
+                >
+                  <Icon name="x" size={11} />
+                </button>
+              </span>
+            );
+          })}
+          <input
+            ref={inputRef}
+            type="text"
+            class="cp-argbox-input"
+            value={draft}
+            placeholder={tokens.length ? '' : '-Xmx4G -XX:+UseG1GC ...'}
+            autocomplete="off"
+            spellcheck={false}
+            disabled={disabled}
+            aria-label="Add JVM argument"
+            onInput={(event) => {
+              setDismissed(false);
+              setDraft((event.currentTarget as HTMLInputElement).value);
+            }}
+            onFocus={() => {
+              setDismissed(false);
+              setFocused(true);
+            }}
+            onBlur={() => {
+              window.setTimeout(() => setFocused(false), 120);
+              addToken(draft);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === ' ' || event.key === 'Enter' || event.key === 'Tab') {
+                if (draft.trim()) {
+                  event.preventDefault();
+                  addToken(draft);
+                }
+              } else if (event.key === 'Backspace' && !draft && tokens.length) {
+                event.preventDefault();
+                editAt(tokens.length - 1);
+              }
+            }}
+          />
+        </div>
+        {suggestions.length > 0 && (
+          // Keyed by the token count, so it re-hangs when the box wraps to another line.
+          <Popover
+            key={tokens.length}
+            anchor={boxRef}
+            fit="anchor"
+            gap={4}
+            onDismiss={() => setDismissed(true)}
+            class="cp-pop cp-menu"
+            role="listbox"
+          >
+            {suggestions.map((suggestion) => (
+              <button
+                key={suggestion.insert}
+                type="button"
+                class="cp-menu-item cp-argbox-suggest-row"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => applySuggestion(suggestion)}
+              >
+                <code>{suggestion.label}</code>
+                <span>{suggestion.desc}</span>
+              </button>
+            ))}
+          </Popover>
+        )}
+      </div>
+    </div>
+  );
+}

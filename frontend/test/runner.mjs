@@ -503,14 +503,18 @@ export async function runFrontendTests({
 
     const testEnvironment = { ...process.env };
     delete testEnvironment.NODE_TEST_CONTEXT;
-    const testRun = await runBoundedChild(process.execPath, ['--experimental-vm-modules', '--test', `--test-timeout=${testTimeoutMs}`, ...outputs], {
-      cwd: frontendRoot,
-      env: testEnvironment,
-      graceMs,
-      settlementMs,
-      stdio,
-      timeoutMs: wholeRunTimeoutMs,
-    });
+    const testRun = await runBoundedChild(
+      process.execPath,
+      ['--experimental-vm-modules', '--test', `--test-timeout=${testTimeoutMs}`, ...outputs],
+      {
+        cwd: frontendRoot,
+        env: testEnvironment,
+        graceMs,
+        settlementMs,
+        stdio,
+        timeoutMs: wholeRunTimeoutMs,
+      },
+    );
     if (testRun.timedOut) throw new Error('Frontend test execution exceeded its deadline');
     return testRun.code;
   } finally {

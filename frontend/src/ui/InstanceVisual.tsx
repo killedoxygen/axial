@@ -1,16 +1,16 @@
 import type { JSX } from 'preact';
-import { versionById } from '../store';
-import { instanceInstallStatus } from '../instance-install-status';
-import { hashStr } from '../tokens';
-import { useTheme } from '../hooks/use-theme';
-import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../create/defaults';
-import { loaderLogoSrc } from '../views/create/loader-logos';
+import { versionById } from '../instances/state';
+import { hashStr } from '../app/tokens';
+import { useTheme } from '../app/use-theme';
+import { loaderKeyFromVersion, type LoaderKey } from '../create/defaults';
+import { loaderLogoSrc } from '../create/loader-logos';
 import { resolveTileHue } from './look-guardian';
-import type { Theme } from '../tokens';
-import type { Version } from '../types-version';
-import type { Instance, InstanceVersionDisplay } from '../types-instance';
+import type { Theme } from '../app/tokens';
+import type { VersionEntry } from '../generated/VersionEntry';
+import type { EnrichedInstance } from '../generated/EnrichedInstance';
+import type { InstanceVersionDisplay } from '../generated/InstanceVersionDisplay';
 
-export type VisualInstance = Pick<Instance, 'id' | 'name' | 'version_id' | 'art_seed'> & {
+export type VisualInstance = Pick<EnrichedInstance, 'id' | 'name' | 'version_id' | 'art_seed'> & {
   version_display?: Pick<InstanceVersionDisplay, 'loader_key'>;
 };
 
@@ -39,14 +39,11 @@ function isLoaderKey(value: string | undefined): value is LoaderKey {
   return value === 'vanilla' || value === 'fabric' || value === 'quilt' || value === 'forge' || value === 'neoforge';
 }
 
-function loaderKeyForInstance(inst: VisualInstance, version: Version | undefined): LoaderKey {
+function loaderKeyForInstance(inst: VisualInstance, version: VersionEntry | undefined): LoaderKey {
   if (isLoaderKey(inst.version_display?.loader_key)) {
     return inst.version_display.loader_key;
   }
-  const versionLoader = loaderKeyFromVersion(version);
-  if (versionLoader !== 'vanilla') return versionLoader;
-  const installLoader = instanceInstallStatus(inst, version).item?.loader;
-  return loaderKeyFromComponentId(installLoader?.componentId);
+  return loaderKeyFromVersion(version);
 }
 
 function GlyphMark({ loader, className }: { loader: LoaderKey; className: string }): JSX.Element {

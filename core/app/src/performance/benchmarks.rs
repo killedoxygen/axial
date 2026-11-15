@@ -2,6 +2,7 @@
 
 use crate::{
     instances::{directory::Registry, model::InstanceId},
+    public::Tone,
     launch::{
         coordinator::{LaunchCoordinator, LaunchIntentStatus, LaunchRequest},
         reports::{LaunchProofScenario, LaunchReportStore},
@@ -14,6 +15,7 @@ use crate::{
     tasks::{CancellationToken, TaskOwner},
 };
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -29,7 +31,7 @@ const MAX_STORED_DRIVERS: usize = 4096;
 const RESTART_INTERRUPTED_ERROR: &str = "Driver interrupted by application restart";
 const RESTART_LIMIT_ERROR: &str = "driver ignored after restart resume limit";
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 pub struct BenchmarkMatrix {
     pub schema: &'static str,
     pub schema_version: u32,
@@ -40,20 +42,20 @@ pub struct BenchmarkMatrix {
     pub limits: BenchmarkMatrixLimits,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 pub struct BenchmarkModeDescriptor {
     pub id: &'static str,
     pub description: &'static str,
     pub intended_use: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 pub struct BenchmarkRunTypeDescriptor {
     pub id: &'static str,
     pub description: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 pub struct BenchmarkProfileDescriptor {
     pub id: &'static str,
     pub scenario: &'static str,
@@ -61,7 +63,7 @@ pub struct BenchmarkProfileDescriptor {
     pub intended_use: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 pub struct BenchmarkTargetDescriptor {
     pub id: &'static str,
     pub family: &'static str,
@@ -73,7 +75,7 @@ pub struct BenchmarkTargetDescriptor {
     pub intended_use: &'static str,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, TS)]
 pub struct BenchmarkMatrixLimits {
     pub max_payload_bytes: usize,
     pub custom_post_values_allowed: bool,
@@ -764,8 +766,9 @@ pub struct BenchmarkSuiteManifestRun {
     pub launch_intent: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
+#[ts(optional_fields)]
 pub struct BenchmarkLaunchRequest {
     pub instance_id: Option<InstanceId>,
     pub username: Option<String>,
@@ -781,7 +784,7 @@ pub struct BenchmarkLaunchRequest {
     pub interval_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkSuiteDriverStatus {
     pub id: String,
@@ -1044,7 +1047,7 @@ impl BenchmarkService {
         &self,
         suite_id: &str,
         performance: &super::PerformanceService,
-    ) -> Result<serde_json::Value, BenchmarkError> {
+    ) -> Result<super::qualification::QualificationResponse, BenchmarkError> {
         let suite = self.suite(suite_id)?.ok_or(BenchmarkError::NotFound)?;
         let mut proofs = Vec::new();
         for run in &suite.runs {
@@ -1539,7 +1542,7 @@ impl BenchmarkService {
     pub fn driver_views(
         &self,
         drivers: Vec<BenchmarkSuiteDriverStatus>,
-    ) -> Result<Vec<serde_json::Value>, BenchmarkError> {
+    ) -> Result<Vec<BenchmarkDriverView>, BenchmarkError> {
         let mut actions = self.resume_actions(&drivers)?;
         drivers
             .into_iter()
@@ -1555,7 +1558,7 @@ impl BenchmarkService {
     pub fn driver_view(
         &self,
         driver: BenchmarkSuiteDriverStatus,
-    ) -> Result<serde_json::Value, BenchmarkError> {
+    ) -> Result<BenchmarkDriverView, BenchmarkError> {
         let mut views = self.driver_views(vec![driver])?;
         views.pop().ok_or(BenchmarkError::Unavailable)
     }
@@ -1762,21 +1765,65 @@ fn validate_suite(suite: &BenchmarkSuiteManifest) -> Result<(), BenchmarkError> 
     Ok(())
 }
 
-fn driver_payload(driver: BenchmarkSuiteDriverStatus, can_resume: bool) -> serde_json::Value {
+fn driver_payload(driver: BenchmarkSuiteDriverStatus, can_resume: bool) -> BenchmarkDriverView {
     let running = matches!(driver.state.as_str(), "running" | "waiting");
-    serde_json::json!({"status":"ok","suite":{"suite_id":driver.suite_id,"mode":driver.mode,"run_count":driver.run_count,
-        "launched_run_count":driver.launched_run_count,"pending_run_index":driver.pending_run_index},
-        "view_model":{"state_label":driver.state,"state_tone":if driver.state=="complete" {"ok"} else if matches!(driver.state.as_str(), "stopped" | "failed" | "interrupted") {"warn"} else {"neutral"},
-            "can_stop":running,"can_resume":can_resume,"can_check_family_c_qualification":driver.mode=="release_validation"},"driver":driver})
+    BenchmarkDriverView {
+        status: "ok",
+        suite: BenchmarkDriverSuite {
+            suite_id: driver.suite_id.clone(),
+            mode: driver.mode.clone(),
+            run_count: driver.run_count,
+            launched_run_count: driver.launched_run_count,
+            pending_run_index: driver.pending_run_index,
+        },
+        view_model: BenchmarkDriverViewModel {
+            state_label: driver.state.clone(),
+            state_tone: match driver.state.as_str() {
+                "complete" => Tone::Ok,
+                "stopped" | "failed" | "interrupted" => Tone::Warn,
+                _ => Tone::Mute,
+            },
+            can_stop: running,
+            can_resume,
+            can_check_family_c_qualification: driver.mode == "release_validation",
+        },
+        driver,
+    }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct BenchmarkDriverView {
+    pub status: &'static str,
+    pub suite: BenchmarkDriverSuite,
+    pub view_model: BenchmarkDriverViewModel,
+    pub driver: BenchmarkSuiteDriverStatus,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct BenchmarkDriverSuite {
+    pub suite_id: String,
+    pub mode: String,
+    pub run_count: usize,
+    pub launched_run_count: usize,
+    pub pending_run_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct BenchmarkDriverViewModel {
+    pub state_label: String,
+    pub state_tone: Tone,
+    pub can_stop: bool,
+    pub can_resume: bool,
+    pub can_check_family_c_qualification: bool,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct BenchmarkDriversResponse {
     pub status: &'static str,
-    pub drivers: Vec<serde_json::Value>,
+    pub drivers: Vec<BenchmarkDriverView>,
 }
 
-pub fn qualification_preview() -> serde_json::Value {
+pub fn qualification_preview() -> super::qualification::QualificationResponse {
     let mode = super::qualification::FAMILY_C_QUALIFICATION_MODE;
     let plan = benchmark_suite_plan(mode).expect("qualification mode has a suite plan");
     let now = now();

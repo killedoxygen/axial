@@ -2,16 +2,16 @@ use super::error::{ApiResult, Extracted};
 use axial_app::performance::{
     PerformanceService,
     benchmarks::{
-        BenchmarkDriversResponse, BenchmarkError, BenchmarkLaunchRequest, BenchmarkMatrix,
-        BenchmarkService, benchmark_matrix, qualification_preview,
+        BenchmarkDriverView, BenchmarkDriversResponse, BenchmarkError, BenchmarkLaunchRequest,
+        BenchmarkMatrix, BenchmarkService, benchmark_matrix, qualification_preview,
     },
+    qualification::QualificationResponse,
 };
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     routing::{get, post},
 };
-use serde_json::Value;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -53,10 +53,10 @@ type Request = Result<Json<BenchmarkLaunchRequest>, JsonRejection>;
 async fn matrix() -> Json<BenchmarkMatrix> {
     Json(benchmark_matrix())
 }
-async fn preview() -> Json<Value> {
+async fn preview() -> Json<QualificationResponse> {
     Json(qualification_preview())
 }
-async fn start(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<Value> {
+async fn start(State(api): State<BenchmarkApi>, request: Request) -> ApiResult<BenchmarkDriverView> {
     let input = request.or_refuse(|| BenchmarkError::Invalid)?;
     let driver = api.benchmarks.start_driver(input).await?;
     Ok(Json(api.benchmarks.driver_view(driver)?))
@@ -68,13 +68,13 @@ async fn drivers(State(api): State<BenchmarkApi>) -> ApiResult<BenchmarkDriversR
         drivers,
     }))
 }
-async fn stop(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
+async fn stop(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<BenchmarkDriverView> {
     Ok(Json(
         api.benchmarks
             .driver_view(api.benchmarks.stop_driver(&id)?)?,
     ))
 }
-async fn resume(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<Value> {
+async fn resume(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiResult<BenchmarkDriverView> {
     Ok(Json(
         api.benchmarks
             .driver_view(api.benchmarks.resume_driver(&id)?)?,
@@ -83,7 +83,7 @@ async fn resume(State(api): State<BenchmarkApi>, Path(id): Path<String>) -> ApiR
 async fn qualification(
     State(api): State<BenchmarkApi>,
     Path(id): Path<String>,
-) -> ApiResult<Value> {
+) -> ApiResult<QualificationResponse> {
     Ok(Json(
         api.benchmarks.qualification(&id, &api.performance).await?,
     ))
@@ -91,11 +91,10 @@ async fn qualification(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::fixture::Profile;
     use axial_app::storage::StorageError;
     use reqwest::{Method, StatusCode};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     const DRIVERS: &str = "/api/v1/launch/benchmark/suite/drivers";
 
@@ -200,7 +199,7 @@ mod tests {
         assert_eq!(
             targets[0]["suite_run"],
             json!({
-                "present":true, "run_index":0, "profile":"vanilla_baseline", "run_type":"coldish",
+                "run_index":0, "profile":"vanilla_baseline", "run_type":"coldish",
                 "target_id":"family_c_forge_1_12_2_vanilla_baseline",
                 "benchmark_id":"benchmark-cb555607e50285e6", "session_id":null, "state":"pending",
             })
@@ -208,7 +207,7 @@ mod tests {
         assert_eq!(
             targets[1]["suite_run"],
             json!({
-                "present":true, "run_index":1, "profile":"managed_default", "run_type":"coldish",
+                "run_index":1, "profile":"managed_default", "run_type":"coldish",
                 "target_id":"family_c_forge_1_12_2_family_c_forge_core",
                 "benchmark_id":"benchmark-83e6d2fae9587b9c", "session_id":null, "state":"pending",
             })
@@ -231,7 +230,7 @@ mod tests {
             ])
         );
         for target in targets {
-            assert_eq!(target["proof"], json!({"present":false}));
+            assert_eq!(target["proof"], Value::Null);
         }
     }
 

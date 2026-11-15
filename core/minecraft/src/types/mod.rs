@@ -2,8 +2,9 @@ use crate::lifecycle::LifecycleMeta;
 use crate::loaders::types::{LoaderBuildMetadata, LoaderComponentId};
 use crate::version_meta::MinecraftVersionMeta;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionSubjectKind {
     #[default]
@@ -11,7 +12,7 @@ pub enum VersionSubjectKind {
     MinecraftVersion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct VersionLoaderAttachment {
     pub component_id: LoaderComponentId,
     pub component_name: String,
@@ -21,7 +22,7 @@ pub struct VersionLoaderAttachment {
     pub build_meta: LoaderBuildMetadata,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct VersionEntry {
     #[serde(default)]
     pub subject_kind: VersionSubjectKind,
@@ -48,5 +49,6 @@ pub struct VersionEntry {
     #[serde(default)]
     pub java_major: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub loader: Option<VersionLoaderAttachment>,
 }

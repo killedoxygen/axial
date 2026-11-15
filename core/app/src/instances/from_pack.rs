@@ -16,9 +16,11 @@ use crate::content::packs::{
 };
 use crate::files::PortableName;
 use crate::install::model::{InstallQueueContentActionRequest, InstallQueueRequest};
+use crate::public::Tone;
 use crate::tasks::CancellationToken;
 use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use sha2::{Digest, Sha256, Sha512};
 use std::sync::Arc;
 
@@ -30,13 +32,14 @@ pub(super) fn stored_archive_name() -> PortableName {
     PortableName::new_exact(STORED_ARCHIVE).expect("fixed portable name")
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct ModpackTarget {
     pub canonical_id: CanonicalId,
     pub version_id: String,
     pub name: String,
     pub minecraft: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub loader: Option<String>,
     pub loader_label: String,
     pub selection_id: String,
@@ -508,7 +511,7 @@ pub(super) fn pack_setup_result(success: bool) -> CreateResultView {
     if success {
         CreateResultView {
             state_id: "setup_complete",
-            tone: "success",
+            tone: Tone::Ok,
             title: "Instance created",
             summary: "Instance created and modpack installed.",
             detail: None,
@@ -516,7 +519,7 @@ pub(super) fn pack_setup_result(success: bool) -> CreateResultView {
     } else {
         CreateResultView {
             state_id: "setup_pending",
-            tone: "warn",
+            tone: Tone::Warn,
             title: "Instance setup incomplete",
             summary: "The instance was created, but its modpack or game installation setup needs to be resumed.",
             detail: Some(

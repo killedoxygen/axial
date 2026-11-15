@@ -6,6 +6,7 @@ use axial_minecraft::{
     compare_version_entries, enrich_version_entries, scan_versions_snapshot,
 };
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 pub(crate) struct InstalledSnapshot {
     pin: GenerationPin,
@@ -66,16 +67,17 @@ pub(crate) async fn installed_snapshot(
     Ok(InstalledSnapshot { pin, snapshot })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct VersionScanViewModel {
     pub state_id: String,
     pub label: String,
     pub degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
 pub struct VersionsResponse {
     pub versions: Vec<VersionEntry>,
     pub scan_state: VersionScanViewModel,

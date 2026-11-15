@@ -2013,7 +2013,7 @@ async fn observed_settlement_survives_report_failure_and_disk_reopen() {
             && !session.process_alive
             && !session.stop_allowed
     );
-    assert_eq!(session.notice.as_ref().unwrap().tone, "warned");
+    assert_eq!(session.notice.as_ref().unwrap().tone, crate::public::Tone::Warn);
     assert!(
         session
             .notice
@@ -2228,7 +2228,7 @@ async fn observed_settlement_is_immutable_and_report_concordance_is_required() {
     let Some(LaunchIntentStatus::Accepted { session }) = intents.snapshot(key).unwrap() else {
         panic!()
     };
-    assert_ne!(session.notice.unwrap().tone, "warned");
+    assert_ne!(session.notice.unwrap().tone, crate::public::Tone::Warn);
 }
 
 #[tokio::test]

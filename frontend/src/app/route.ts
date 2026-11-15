@@ -1,0 +1,332 @@
+import { signal } from '@preact/signals';
+import type { VersionRowModel } from '../create/versions';
+import type { ContentKind } from '../generated/ContentKind';
+import type { ResolutionSelection } from '../generated/ResolutionSelection';
+import { ROUTE_PREFERENCES_KEY, parseRoutePreference } from './preferences/local';
+import { hasNativeDesktopRuntime } from '../platform/native';
+import { canEditPreferences, saveNativeRoute } from './preferences/persistence';
+
+import type { InterfaceRoute } from '../generated/InterfaceRoute';
+
+export const ROUTE_STORAGE_KEY = ROUTE_PREFERENCES_KEY;
+
+export const route = signal<InterfaceRoute>({ name: 'home' });
+
+const routeBackStack: InterfaceRoute[] = [];
+const routeForwardStack: InterfaceRoute[] = [];
+
+function sameRoute(a: InterfaceRoute, b: InterfaceRoute): boolean {
+  return routeScrollKey(a) === routeScrollKey(b);
+}
+
+export const VIEW_SCROLL_MEMORY_LIMIT = 64;
+export const VIEW_SCROLL_RESTORE_TIMEOUT_MS = 5_000;
+
+export interface ViewScrollMemory {
+  get(key: string): number | undefined;
+  set(key: string, top: number): void;
+  delete(key: string): void;
+  readonly size: number;
+}
+
+export function routeScrollKey(r: InterfaceRoute): string {
+  switch (r.name) {
+    case 'instance':
+      return JSON.stringify([r.name, r.id]);
+    case 'discover':
+      return JSON.stringify([r.name, r.target ?? null]);
+    case 'content':
+      return JSON.stringify([r.name, r.id, r.target ?? null]);
+    default:
+      return JSON.stringify([r.name]);
+  }
+}
+
+export function routeSupportsViewScroll(r: InterfaceRoute): boolean {
+  return r.name === 'home' || r.name === 'discover' || r.name === 'downloads';
+}
+
+export function createViewScrollMemory(maxEntries = VIEW_SCROLL_MEMORY_LIMIT): ViewScrollMemory {
+  const limit = Number.isFinite(maxEntries) ? Math.max(1, Math.floor(maxEntries)) : VIEW_SCROLL_MEMORY_LIMIT;
+  const positions = new Map<string, number>();
+
+  return {
+    get(key) {
+      const top = positions.get(key);
+      if (top === undefined) return undefined;
+      positions.delete(key);
+      positions.set(key, top);
+      return top;
+    },
+    set(key, top) {
+      positions.delete(key);
+      if (!Number.isFinite(top) || top <= 0) return;
+      positions.set(key, top);
+      while (positions.size > limit) {
+        const oldest = positions.keys().next().value;
+        if (oldest === undefined) break;
+        positions.delete(oldest);
+      }
+    },
+    delete(key) {
+      positions.delete(key);
+    },
+    get size() {
+      return positions.size;
+    },
+  };
+}
+
+const viewScrollMemory = createViewScrollMemory();
+
+interface PendingViewScrollRestore {
+  key: string;
+  stop: () => void;
+}
+
+let pendingViewScrollRestore: PendingViewScrollRestore | null = null;
+
+function viewElement(): HTMLElement | null {
+  if (typeof document === 'undefined') return null;
+  return document.querySelector<HTMLElement>('.cp-view');
+}
+
+function cancelViewScrollRestore(): void {
+  pendingViewScrollRestore?.stop();
+}
+
+function rememberViewScroll(): void {
+  if (!routeSupportsViewScroll(route.value)) return;
+  const key = routeScrollKey(route.value);
+  if (pendingViewScrollRestore?.key === key) return;
+  const view = viewElement();
+  if (view) viewScrollMemory.set(key, view.scrollTop);
+}
+
+/** Immediately applies a route's last position before the next browser paint. */
+export function prepareViewScroll(key: string): void {
+  if (routeScrollKey(route.value) !== key) return;
+  const view = viewElement();
+  if (view) view.scrollTop = routeSupportsViewScroll(route.value) ? (viewScrollMemory.get(key) ?? 0) : 0;
+}
+
+/**
+ * Restores a mounted route, retrying as async content grows. The returned
+ * cleanup only stops this restore, so an old route cannot cancel a newer one.
+ */
+export function restoreViewScroll(key: string, timeoutMs = VIEW_SCROLL_RESTORE_TIMEOUT_MS): () => void {
+  cancelViewScrollRestore();
+  const view = viewElement();
+  if (!view || routeScrollKey(route.value) !== key || !routeSupportsViewScroll(route.value)) return () => undefined;
+
+  const top = viewScrollMemory.get(key) ?? 0;
+  view.scrollTop = top;
+  if (top === 0 || Math.abs(view.scrollTop - top) <= 1) return () => undefined;
+
+  let stopped = false;
+  let frame: number | null = null;
+  let deadline: ReturnType<typeof setTimeout> | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+  let mutationObserver: MutationObserver | null = null;
+
+  const stopForPointer = (event: PointerEvent): void => {
+    if (event.target === view) stop();
+  };
+  const stopForKey = (event: KeyboardEvent): void => {
+    if ([' ', 'ArrowDown', 'ArrowUp', 'End', 'Home', 'PageDown', 'PageUp', 'Tab'].includes(event.key)) stop();
+  };
+
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    if (frame !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame);
+    if (deadline !== null) clearTimeout(deadline);
+    resizeObserver?.disconnect();
+    mutationObserver?.disconnect();
+    view.removeEventListener('wheel', stop);
+    view.removeEventListener('pointerdown', stopForPointer);
+    view.removeEventListener('touchmove', stop);
+    view.removeEventListener('keydown', stopForKey, true);
+    view.removeEventListener('focusin', stop);
+    if (pendingViewScrollRestore?.stop === stop) pendingViewScrollRestore = null;
+  };
+
+  const attempt = (): void => {
+    frame = null;
+    if (stopped || routeScrollKey(route.value) !== key) {
+      stop();
+      return;
+    }
+    view.scrollTop = top;
+    if (Math.abs(view.scrollTop - top) <= 1) stop();
+  };
+
+  const scheduleAttempt = (): void => {
+    if (stopped || frame !== null) return;
+    if (typeof requestAnimationFrame === 'function') {
+      frame = requestAnimationFrame(attempt);
+    } else {
+      attempt();
+    }
+  };
+
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(scheduleAttempt);
+    resizeObserver.observe(view.firstElementChild ?? view);
+  }
+  if (typeof MutationObserver !== 'undefined') {
+    mutationObserver = new MutationObserver(scheduleAttempt);
+    mutationObserver.observe(view, { childList: true, subtree: true });
+  }
+  view.addEventListener('wheel', stop, { passive: true });
+  view.addEventListener('pointerdown', stopForPointer, { passive: true });
+  view.addEventListener('touchmove', stop, { passive: true });
+  view.addEventListener('keydown', stopForKey, true);
+  view.addEventListener('focusin', stop);
+
+  pendingViewScrollRestore = { key, stop };
+  const boundedTimeout = Number.isFinite(timeoutMs) ? Math.max(0, timeoutMs) : VIEW_SCROLL_RESTORE_TIMEOUT_MS;
+  deadline = setTimeout(stop, boundedTimeout);
+  return stop;
+}
+
+export function resetViewScroll(): void {
+  cancelViewScrollRestore();
+  viewScrollMemory.delete(routeScrollKey(route.value));
+  const view = viewElement();
+  if (view) view.scrollTop = 0;
+}
+
+function setRoute(r: InterfaceRoute): void {
+  if (!canEditPreferences()) return;
+  cancelViewScrollRestore();
+  route.value = r;
+  if (hasNativeDesktopRuntime()) {
+    saveNativeRoute(r);
+    return;
+  }
+  try {
+    localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r));
+  } catch {}
+}
+
+export function navigate(r: InterfaceRoute): void {
+  if (!canEditPreferences()) return;
+  if (sameRoute(route.value, r)) return;
+  rememberViewScroll();
+  routeBackStack.push(route.value);
+  routeForwardStack.length = 0;
+  setRoute(r);
+}
+
+export function goBack(): void {
+  if (!canEditPreferences()) return;
+  const previous = routeBackStack.pop();
+  if (!previous) return;
+  rememberViewScroll();
+  routeForwardStack.push(route.value);
+  setRoute(previous);
+}
+
+export function goForward(): void {
+  if (!canEditPreferences()) return;
+  const next = routeForwardStack.pop();
+  if (!next) return;
+  rememberViewScroll();
+  routeBackStack.push(route.value);
+  setRoute(next);
+}
+
+export function restoreRoute(): void {
+  if (hasNativeDesktopRuntime()) return;
+  try {
+    const raw = localStorage.getItem(ROUTE_STORAGE_KEY);
+    if (!raw) return;
+    setRoute(parseRoutePreference(JSON.parse(raw) as unknown));
+  } catch {}
+}
+
+export const commandPaletteOpen = signal(false);
+export const showOnboardingOverlay = signal(false);
+
+export const createOpen = signal(false);
+export const accountSwitcherOpen = signal(false);
+
+export interface CreateDraftItem {
+  canonical_id: string;
+  kind: ContentKind;
+  title: string;
+  icon_url?: string;
+  version_id?: string;
+  version_label?: string;
+}
+
+export const createDraft = signal<CreateDraftItem[] | null>(null);
+
+export interface CreateModpackDraft {
+  canonical_id: string;
+  version_id: string;
+  name: string;
+  minecraft: string;
+  loader?: string;
+  loader_label: string;
+  selection_id: string;
+  icon_url?: string;
+  /** The pick it was opened from, which leaves the picks once its instance is made. */
+  pick?: ResolutionSelection;
+}
+
+export const createModpack = signal<CreateModpackDraft | null>(null);
+/** A version found elsewhere, such as the command palette, that the dialog opens on and creates. */
+export const createQuick = signal<VersionRowModel | null>(null);
+let createIntent = Symbol();
+
+export function beginCreateIntent(): () => boolean {
+  const intent = (createIntent = Symbol());
+  return () => createIntent === intent;
+}
+
+export function openCreate(): void {
+  createIntent = Symbol();
+  createDraft.value = null;
+  createModpack.value = null;
+  createQuick.value = null;
+  createOpen.value = true;
+}
+
+/** Opens the dialog on `version` and creates it. */
+export function quickCreate(version: VersionRowModel): void {
+  openCreate();
+  createQuick.value = version;
+}
+
+export function openCreateDraft(draft: CreateDraftItem[]): void {
+  createIntent = Symbol();
+  createDraft.value = draft.length > 0 ? draft : null;
+  createModpack.value = null;
+  createOpen.value = true;
+}
+
+/** `extras` install into the pack's instance once the pack has. */
+export function openCreateModpack(pack: CreateModpackDraft, extras: CreateDraftItem[] = []): void {
+  createIntent = Symbol();
+  createDraft.value = extras.length > 0 ? extras : null;
+  createModpack.value = pack;
+  createOpen.value = true;
+}
+
+export function closeCreate(): void {
+  createIntent = Symbol();
+  createOpen.value = false;
+  createDraft.value = null;
+  createModpack.value = null;
+  createQuick.value = null;
+}
+
+export function openAccountSwitcher(): void {
+  accountSwitcherOpen.value = true;
+}
+
+export function closeAccountSwitcher(): void {
+  accountSwitcherOpen.value = false;
+}

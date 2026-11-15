@@ -2,11 +2,10 @@ import type { JSX } from 'preact';
 import { useRef } from 'preact/hooks';
 import { Button, IconButton } from './Atoms';
 import { Face, type Eyes, type FaceTone } from './Face';
-import { toasts } from '../store';
-import { showOnboardingOverlay } from '../ui-state';
-import { dismissToast, holdToast } from '../toast';
-import { useLeave } from '../hooks/use-leave';
-import type { ToastItem, ToastKind } from '../types-ui';
+import { toasts, dismissToast, holdToast } from '../app/toast';
+import { showOnboardingOverlay } from '../app/route';
+import { useLeave } from './use-leave';
+import type { ToastItem, ToastKind } from '../app/toast';
 import { settleChildren } from './motion';
 
 const FACE_FOR: Record<ToastKind, { eyes: Eyes; tone?: FaceTone }> = {

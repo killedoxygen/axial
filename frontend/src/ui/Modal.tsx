@@ -4,7 +4,7 @@ import { createPortal } from 'preact/compat';
 import { useContext, useEffect, useRef } from 'preact/hooks';
 import { leaveBehind } from './motion';
 import { Icon } from './Icons';
-import { cn } from '../utils';
+import { cn } from './cn';
 import { dialogOpen } from './Dialog';
 
 interface ModalContextValue {

@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
-import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
-import type { LaunchSession } from '../types-launch';
-import type { EnrichedInstance } from '../types-instance';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch/presenters';
+import type { LaunchSession } from '../launch/state';
+import type { EnrichedInstance } from '../generated/EnrichedInstance';
 import { Chip } from './Atoms';
 
 /** What an instance is: its loader and Minecraft version. */

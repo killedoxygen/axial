@@ -5,7 +5,7 @@ use super::{
     create::{Admission, CreateInstanceRequest, CreateTarget, InstanceService, SetupIntent},
     model::{
         EnrichedInstance, Instance, InstanceError, InstanceLaunchAction, InstanceResult,
-        InstanceVersionDisplay,
+        InstanceVersionDisplay, LaunchPrimaryAction,
     },
 };
 use super::{directory::RegisteredInstance, model::InstanceId};
@@ -20,11 +20,12 @@ use crate::{
     catalog::Catalog,
     install::{
         model::{
-            InstallQueueContentActionRequest, InstallQueueInstallItemViewModel,
-            InstallQueueLoaderItemViewModel, InstallQueueRequest, InstallQueueStateResponse,
+            InstallQueueContentActionRequest, InstallItem,
+            InstallLoaderItem, InstallQueueRequest, InstallQueueStateResponse,
         },
         queue::{InstallError, InstallQueue},
     },
+    public::Tone,
     settings::SettingsStore,
     tasks::{CancellationToken, TaskHandle},
 };
@@ -33,6 +34,7 @@ use axial_minecraft::{
     loaders::{self, LoaderBuildRecord, LoaderComponentId, LoaderSelectionReason},
 };
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -58,7 +60,7 @@ pub struct SetupService {
     loader_manifest_url: Option<url::Url>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct ListResponse {
     instances: Vec<EnrichedInstance>,
     last_instance_id: Option<InstanceId>,
@@ -730,7 +732,7 @@ impl SetupService {
                         .await
                         .map_err(|_| InstanceError::Busy)?;
                 if present {
-                    verified_target = Some(InstallQueueInstallItemViewModel {
+                    verified_target = Some(InstallItem {
                         version_id: (*version).to_owned(),
                         loader: None,
                         content: None,
@@ -808,10 +810,7 @@ impl SetupService {
         let (minecraft_version, loader_key) = match resolved.loader {
             Some(loader) => (
                 loader.minecraft_version,
-                LoaderComponentId::parse(&loader.component_id)
-                    .ok_or(InstanceError::VersionUnavailable)?
-                    .short_key()
-                    .to_owned(),
+                loader.component_id.short_key().to_owned(),
             ),
             None => (resolved.version_id.clone(), "vanilla".to_owned()),
         };
@@ -863,7 +862,7 @@ impl SetupService {
                         None,
                         CreateResultView {
                             state_id: "created",
-                            tone: "success",
+                            tone: Tone::Ok,
                             title: "Instance created",
                             summary: "Instance created.",
                             detail: None,
@@ -873,7 +872,7 @@ impl SetupService {
                         Some(queue),
                         CreateResultView {
                             state_id: "created",
-                            tone: "success",
+                            tone: Tone::Ok,
                             title: "Instance created",
                             summary: "Instance created. Installation is queued.",
                             detail: None,
@@ -883,7 +882,7 @@ impl SetupService {
                         None,
                         CreateResultView {
                             state_id: "created_install_unavailable",
-                            tone: "warn",
+                            tone: Tone::Warn,
                             title: "Instance created",
                             summary: "Instance created. Installation could not be queued.",
                             detail: Some("Use Install on this instance to try again."),
@@ -1124,13 +1123,13 @@ impl SetupService {
             install_target = queued_setup_target;
         }
         let action = if !setup_available {
-            "blocked"
+            LaunchPrimaryAction::Blocked
         } else if launchable {
-            "launch"
+            LaunchPrimaryAction::Launch
         } else if setup_pending || (repair_install && install_target.is_some()) {
-            "install"
+            LaunchPrimaryAction::Install
         } else {
-            "blocked"
+            LaunchPrimaryAction::Blocked
         };
         let loader_label = match instance.loader_key.as_str() {
             "fabric" => "Fabric",
@@ -1176,26 +1175,29 @@ impl SetupService {
                     }
                 } else if launchable {
                     "ready"
+                } else if action == LaunchPrimaryAction::Install {
+                    "install"
                 } else {
-                    action
+                    "blocked"
                 }
                 .into(),
                 label: if launchable {
                     "Launch"
                 } else if setup_pending && !setup_attached {
                     "Resume setup"
-                } else if action == "blocked" {
+                } else if action == LaunchPrimaryAction::Blocked {
                     "Unavailable"
                 } else {
                     "Install"
                 }
                 .into(),
-                tone: if launchable { "ok" } else { "warn" }.into(),
+                tone: if launchable { Tone::Ok } else { Tone::Warn },
                 launchable,
-                primary_action: action.into(),
-                disabled_reason: (action == "blocked").then(|| status_detail.clone()),
+                primary_action: action,
+                disabled_reason: (action == LaunchPrimaryAction::Blocked)
+                    .then(|| status_detail.clone()),
             },
-            needs_install: if action == "install" {
+            needs_install: if action == LaunchPrimaryAction::Install {
                 instance.version_id.clone()
             } else {
                 String::new()
@@ -1570,7 +1572,7 @@ fn installed_loader_matches(
 fn loader_install_target(
     component: LoaderComponentId,
     build_id: &str,
-) -> InstanceResult<InstallQueueInstallItemViewModel> {
+) -> InstanceResult<InstallItem> {
     let (found, minecraft_version, loader_version) = loaders::parse_build_id(build_id)
         .filter(|(found, _, _)| *found == component)
         .ok_or(InstanceError::InvalidInput)?;
@@ -1579,11 +1581,11 @@ fn loader_install_target(
     }
     let version_id = loaders::installed_version_id_for(found, &minecraft_version, &loader_version)
         .map_err(|_| InstanceError::InvalidInput)?;
-    Ok(InstallQueueInstallItemViewModel {
+    Ok(InstallItem {
         version_id,
         content: None,
-        loader: Some(InstallQueueLoaderItemViewModel {
-            component_id: component.as_str().into(),
+        loader: Some(InstallLoaderItem {
+            component_id: component,
             build_id: build_id.into(),
             minecraft_version,
             loader_version,
@@ -1597,7 +1599,7 @@ fn loader_install_target(
 fn install_target_for_instance(
     instance: &Instance,
     version: Option<&VersionEntry>,
-) -> Option<InstallQueueInstallItemViewModel> {
+) -> Option<InstallItem> {
     let loader =
         if let Ok(identity) = loaders::api::decode_installed_version_id(&instance.version_id) {
             let component = identity.component_id();
@@ -1606,8 +1608,8 @@ fn install_target_for_instance(
             {
                 return None;
             }
-            Some(InstallQueueLoaderItemViewModel {
-                component_id: component.as_str().to_owned(),
+            Some(InstallLoaderItem {
+                component_id: component,
                 build_id: loaders::build_id_for(
                     component,
                     identity.minecraft_version(),
@@ -1619,8 +1621,8 @@ fn install_target_for_instance(
         } else if let Some(loader) = version.and_then(|entry| entry.loader.as_ref()) {
             // Preserve retry support for installed profiles recognized by the
             // version owner, including profiles with an older identity format.
-            Some(InstallQueueLoaderItemViewModel {
-                component_id: loader.component_id.as_str().to_owned(),
+            Some(InstallLoaderItem {
+                component_id: loader.component_id,
                 build_id: loader.build_id.clone(),
                 minecraft_version: instance.minecraft_version.clone(),
                 loader_version: loader.loader_version.clone(),
@@ -1639,7 +1641,7 @@ fn install_target_for_instance(
     } else {
         instance.version_id.clone()
     };
-    Some(InstallQueueInstallItemViewModel {
+    Some(InstallItem {
         version_id,
         loader,
         content: None,
@@ -1696,27 +1698,28 @@ fn preferred_build(builds: Vec<LoaderBuildRecord>) -> Option<LoaderBuildRecord> 
     Some(compatible.remove(index))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct SetupStatusResponse {
     pub status: &'static str,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct CreateInstanceResponse {
     #[serde(flatten)]
     pub instance: EnrichedInstance,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub install_queue: Option<InstallQueueStateResponse>,
     pub view_model: CreateResultView,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct CreateResultView {
     pub state_id: &'static str,
-    pub tone: &'static str,
+    pub tone: Tone,
     pub title: &'static str,
     pub summary: &'static str,
     pub detail: Option<&'static str>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct CreateOption {
     pub id: String,
     pub label: String,
@@ -1725,7 +1728,7 @@ pub struct CreateOption {
 #[derive(Serialize, ts_rs::TS)]
 pub struct CreateNotice {
     pub state_id: &'static str,
-    pub tone: &'static str,
+    pub tone: Tone,
     pub message: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -1735,7 +1738,7 @@ impl CreateNotice {
     fn catalog_unavailable() -> Self {
         Self {
             state_id: "catalog_unavailable",
-            tone: "warn",
+            tone: Tone::Warn,
             message: "The catalog could not be refreshed. Previously installed versions remain available.",
             detail: None,
         }
@@ -1744,7 +1747,7 @@ impl CreateNotice {
     fn library_scan_degraded() -> Self {
         Self {
             state_id: "library_scan_degraded",
-            tone: "warn",
+            tone: Tone::Warn,
             message: "Installed versions are unavailable",
             detail: Some(
                 "Could not verify installed versions. Check the library folder and try again.",
@@ -1752,7 +1755,7 @@ impl CreateNotice {
         }
     }
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct CreateVersionRow {
     pub source_id: String,
     pub selection_id: String,
@@ -1764,7 +1767,7 @@ pub struct CreateVersionRow {
     pub create_enabled: bool,
     pub disabled_reason: Option<String>,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct CreateDefaults {
     pub source_id: String,
     pub channel_id: &'static str,
@@ -1773,21 +1776,21 @@ pub struct CreateDefaults {
     pub window_width: i32,
     pub window_height: i32,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct OptimizeOption {
     pub id: &'static str,
     pub label: &'static str,
     pub detail: &'static str,
     pub default_enabled: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct PresetOption {
     pub id: &'static str,
     pub label: &'static str,
     pub detail: &'static str,
     pub default: bool,
 }
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct CreateView {
     pub sources: Vec<CreateOption>,
     pub channels: Vec<CreateOption>,
@@ -1956,7 +1959,7 @@ pub struct InstanceSetupPlanRequest {
     pub selections: Vec<ResolutionSelection>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, TS)]
 pub struct InstanceSetupPlanResponse {
     pub plan_id: Option<String>,
     pub expires_at_ms: u64,
@@ -2085,7 +2088,7 @@ fn setup_result(success: bool) -> CreateResultView {
     if success {
         CreateResultView {
             state_id: "setup_complete",
-            tone: "success",
+            tone: Tone::Ok,
             title: "Instance created",
             summary: "Instance created and selected content installed.",
             detail: None,
@@ -2093,7 +2096,7 @@ fn setup_result(success: bool) -> CreateResultView {
     } else {
         CreateResultView {
             state_id: "setup_pending",
-            tone: "warn",
+            tone: Tone::Warn,
             title: "Instance setup incomplete",
             summary: "The instance was created, but its content or installation setup needs to be resumed.",
             detail: Some("This instance stays unavailable until its accepted setup is completed."),
@@ -2104,7 +2107,7 @@ fn setup_result(success: bool) -> CreateResultView {
 fn setup_queued_result() -> CreateResultView {
     CreateResultView {
         state_id: "setup_queued",
-        tone: "success",
+        tone: Tone::Ok,
         title: "Instance created",
         summary: "Instance setup is queued. Required game files install before its content.",
         detail: None,
@@ -2114,7 +2117,7 @@ fn setup_queued_result() -> CreateResultView {
 fn setup_queue_target(
     queue: &InstallQueueStateResponse,
     instance: &Instance,
-) -> Option<InstallQueueInstallItemViewModel> {
+) -> Option<InstallItem> {
     if let Some(active) = &queue.active {
         let target = &active.install_item;
         let same_content = target
@@ -2210,13 +2213,12 @@ pub(crate) mod tests {
             assert_eq!(target.version_id, record.instance.version_id);
             assert!(target.content.is_none());
             let loader = target.loader.unwrap();
-            let component = LoaderComponentId::parse(&loader.component_id).unwrap();
-            assert_eq!(component.short_key(), record.instance.loader_key);
+            assert_eq!(loader.component_id.short_key(), record.instance.loader_key);
             assert_eq!(loader.minecraft_version, "1.21.4");
             assert_eq!(loader.loader_version, "exact-build.7");
             assert_eq!(
                 loaders::parse_build_id(&loader.build_id),
-                Some((component, "1.21.4".into(), "exact-build.7".into()))
+                Some((loader.component_id, "1.21.4".into(), "exact-build.7".into()))
             );
         }
     }

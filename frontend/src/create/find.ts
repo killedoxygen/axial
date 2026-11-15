@@ -1,9 +1,15 @@
 import { useEffect } from 'preact/hooks';
 import { cachedView, catalogRevision, listViews, viewsPending } from './catalog';
-import type { CreateSourceId, CreateVersionRow } from './contract';
+import type { CreateVersionRow } from '../generated/CreateVersionRow';
 import type { LoaderKey } from './defaults';
 import { parseVersionQuery, rankVersions } from './search';
-import { loaderKeyFromSourceId, sourceIdFromLoaderKey, versionRow, type VersionRowModel } from './versions';
+import {
+  loaderKeyFromSourceId,
+  sourceIdFromLoaderKey,
+  versionRow,
+  type CreateSourceId,
+  type VersionRowModel,
+} from './versions';
 
 /** Where a typed version is looked for. */
 export interface SearchScope {

@@ -5,12 +5,12 @@ use axial_app::{
     launch::{
         coordinator::{LaunchCoordinator, LaunchError, LaunchIntentView, LaunchRequest},
         logs::LogEntry,
-        reports::{LaunchReportStore, LaunchReportsResponse, valid_report_id},
+        reports::{LaunchReportStore, valid_report_id},
         session::{
             SessionLogsResponse, SessionManager, SessionPhase, SessionSnapshot, SessionsResponse,
         },
     },
-    performance::proofs::proof_payload,
+    performance::proofs::{LaunchProofView, LaunchReportsResponse, proof_view},
 };
 use axum::{
     Json, Router,
@@ -232,18 +232,14 @@ async fn reports_list(
     let records = reports
         .list_recent(64)
         .map_err(|_| LaunchError::PreparationFailed)?;
-    let reports = records
-        .iter()
-        .map(proof_payload)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| LaunchError::PreparationFailed)?;
+    let reports = records.into_iter().map(proof_view).collect();
     Ok(Json(LaunchReportsResponse { reports }))
 }
 
 async fn report(
     State(reports): State<LaunchReportStore>,
     Path(id): Path<String>,
-) -> ApiResult<serde_json::Value> {
+) -> ApiResult<LaunchProofView> {
     if !valid_report_id(&id) {
         return Err(LaunchError::InvalidRequest.into());
     }
@@ -251,9 +247,7 @@ async fn report(
         .get(&id)
         .map_err(|_| LaunchError::PreparationFailed)?
         .ok_or(LaunchError::InstanceNotFound)?;
-    Ok(Json(
-        proof_payload(&report).map_err(|_| LaunchError::PreparationFailed)?,
-    ))
+    Ok(Json(proof_view(report)))
 }
 
 #[cfg(test)]

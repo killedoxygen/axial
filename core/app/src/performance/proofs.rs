@@ -4,7 +4,9 @@ pub(crate) use crate::launch::reports::comparison_baseline_matches_report;
 pub use crate::launch::reports::{
     LaunchProofComparison, LaunchProofRecord, LaunchProofResourceBudget,
 };
-use serde_json::{Value, json};
+use crate::public::Tone;
+use serde::Serialize;
+use ts_rs::TS;
 
 pub fn validate_proof(report: &LaunchProofRecord) -> Result<(), super::benchmarks::BenchmarkError> {
     let encoded = crate::launch::reports::encode_report(report)
@@ -18,38 +20,87 @@ pub fn validate_proof(report: &LaunchProofRecord) -> Result<(), super::benchmark
     }
 }
 
-pub fn proof_payload(
-    report: &LaunchProofRecord,
-) -> Result<Value, super::benchmarks::BenchmarkError> {
-    let mut payload =
-        serde_json::to_value(report).map_err(|_| super::benchmarks::BenchmarkError::Unavailable)?;
+/// Recent launch proofs with their history view models.
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct LaunchReportsResponse {
+    pub reports: Vec<LaunchProofView>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct LaunchProofView {
+    #[serde(flatten)]
+    pub record: LaunchProofRecord,
+    pub view_model: LaunchProofViewModel,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct LaunchProofViewModel {
+    pub outcome_label: String,
+    pub outcome_tone: Tone,
+    pub evidence: Option<LaunchProofEvidenceView>,
+    pub comparison: LaunchProofComparisonView,
+    pub resource_budget: Option<LaunchProofResourceBudgetView>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct LaunchProofEvidenceView {
+    pub tone: Tone,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct LaunchProofComparisonView {
+    pub tone: Tone,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, TS)]
+pub struct LaunchProofResourceBudgetView {
+    pub pressure_label: String,
+    pub details: Vec<String>,
+    pub pressure: bool,
+}
+
+pub fn proof_view(report: LaunchProofRecord) -> LaunchProofView {
     let evidence = report
         .stages
         .iter()
         .flat_map(|stage| &stage.evidence)
         .last()
-        .map(|evidence| {
-            json!({
-                "tone": "info", "label": evidence.summary, "detail": evidence.details.first(),
-            })
+        .map(|evidence| LaunchProofEvidenceView {
+            tone: Tone::Info,
+            label: evidence.summary.clone(),
+            detail: evidence.details.first().cloned(),
         });
-    payload["view_model"] = json!({
-        "outcome_label": public_token_label(&report.outcome, "Unknown"),
-        "outcome_tone": match report.outcome.as_str() { "running" | "exited" | "completed" => "ok", "failed" => "err", "stopped" | "interrupted" => "warn", _ => "neutral" },
-        "evidence": evidence,
-        "comparison": launch_proof_comparison_view_model(report.comparison.as_ref()),
-        "resource_budget": launch_proof_resource_budget_view_model(report.resource_budget.as_ref()),
-    });
-    Ok(payload)
+    let view_model = LaunchProofViewModel {
+        outcome_label: public_token_label(&report.outcome, "Unknown"),
+        outcome_tone: match report.outcome.as_str() {
+            "running" | "exited" | "completed" => Tone::Ok,
+            "failed" => Tone::Err,
+            "stopped" | "interrupted" => Tone::Warn,
+            _ => Tone::Mute,
+        },
+        evidence,
+        comparison: launch_proof_comparison_view_model(report.comparison.as_ref()),
+        resource_budget: launch_proof_resource_budget_view_model(report.resource_budget.as_ref()),
+    };
+    LaunchProofView {
+        record: report,
+        view_model,
+    }
 }
 
-fn launch_proof_comparison_view_model(comparison: Option<&LaunchProofComparison>) -> Value {
+fn launch_proof_comparison_view_model(
+    comparison: Option<&LaunchProofComparison>,
+) -> LaunchProofComparisonView {
     let Some(comparison) = comparison else {
-        return json!({
-            "label": "No baseline",
-            "detail": "No comparable local proof yet",
-            "tone": "neutral",
-        });
+        return LaunchProofComparisonView {
+            label: "No baseline".into(),
+            detail: "No comparable local proof yet".into(),
+            tone: Tone::Mute,
+        };
     };
 
     let percent = launch_proof_percent_label(comparison.delta_percent);
@@ -66,30 +117,22 @@ fn launch_proof_comparison_view_model(comparison: Option<&LaunchProofComparison>
     );
     let (faster_by, slower_by, matches_baseline) = comparison_metric_copy(&comparison.metric_name);
 
-    if comparison.delta_ms < 0 {
-        json!({
-            "label": format!("{} {} ({}%)", faster_by, launch_proof_signed_duration_label(comparison.delta_ms), percent),
-            "detail": detail,
-            "tone": "ok",
-        })
-    } else if comparison.delta_ms > 0 {
-        json!({
-            "label": format!("{} {} ({}%)", slower_by, launch_proof_signed_duration_label(comparison.delta_ms), percent),
-            "detail": detail,
-            "tone": "warn",
-        })
-    } else {
-        json!({
-            "label": matches_baseline,
-            "detail": detail,
-            "tone": "neutral",
-        })
+    let delta = launch_proof_signed_duration_label(comparison.delta_ms);
+    let (label, tone) = match comparison.delta_ms.signum() {
+        -1 => (format!("{faster_by} {delta} ({percent}%)"), Tone::Ok),
+        1 => (format!("{slower_by} {delta} ({percent}%)"), Tone::Warn),
+        _ => (matches_baseline.to_owned(), Tone::Mute),
+    };
+    LaunchProofComparisonView {
+        label,
+        detail,
+        tone,
     }
 }
 
 fn launch_proof_resource_budget_view_model(
     resource_budget: Option<&LaunchProofResourceBudget>,
-) -> Option<Value> {
+) -> Option<LaunchProofResourceBudgetView> {
     let resource_budget = resource_budget?;
     let mut pressures = Vec::new();
     if resource_budget.memory_pressure {
@@ -169,15 +212,15 @@ fn launch_proof_resource_budget_view_model(
         details.push(format!("{} disk free", launch_proof_memory_label(value)));
     }
 
-    Some(json!({
-        "pressure_label": if pressures.is_empty() {
+    Some(LaunchProofResourceBudgetView {
+        pressure_label: if pressures.is_empty() {
             "Pressure clear".to_string()
         } else {
             format!("Pressure: {}", pressures.join(", "))
         },
-        "details": details,
-        "pressure": !pressures.is_empty(),
-    }))
+        details,
+        pressure: !pressures.is_empty(),
+    })
 }
 
 fn comparison_metric_copy(metric_name: &str) -> (&'static str, &'static str, &'static str) {

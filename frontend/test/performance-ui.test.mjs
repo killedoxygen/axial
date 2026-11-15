@@ -4,17 +4,18 @@ import { createRequire } from 'node:module';
 import { basename, dirname, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
+import { configView, enrichedInstance } from './wire';
 
-/** @typedef {Parameters<typeof import('../src/api').api>} ApiCall */
+/** @typedef {[method: string, path: string, body?: any]} ApiCall */
 /** @typedef {{ type: unknown, props: Record<string, unknown> }} ViewNode */
 /** @typedef {{ Button: { onClick: () => void, disabled?: boolean }, OptionTiles: { options: { value: string }[], onChange: (value: string) => void, value: string, disabled?: boolean } }} Controls */
 /**
  * @typedef {{
- *   'views/settings/PerformanceSection': typeof import('../src/views/settings/PerformanceSection'),
- *   'views/instance/performance-mode': typeof import('../src/views/instance/performance-mode'),
- *   'views/settings/PerformanceLabProofHistory': typeof import('../src/views/settings/PerformanceLabProofHistory'),
- *   'views/settings/PerformanceLabSuiteDrivers': typeof import('../src/views/settings/PerformanceLabSuiteDrivers'),
- *   'dto-performance': typeof import('../src/dto-performance'),
+ *   'settings/PerformanceSection': typeof import('../src/settings/PerformanceSection'),
+ *   'instances/detail/performance-mode': typeof import('../src/instances/detail/performance-mode'),
+ *   'performance/ProofHistory': typeof import('../src/performance/ProofHistory'),
+ *   'performance/SuiteDrivers': typeof import('../src/performance/SuiteDrivers'),
+ *   'instances/api': typeof import('../src/instances/api'),
  * }} ViewModules
  */
 
@@ -24,7 +25,7 @@ const { transformSync } = /** @type {typeof import('esbuild')} */ (dependencies(
 
 // Execute the real view functions and DTO decoders without a DOM or shared build
 // output. Hooks and primitive boundaries are modeled; this is not visual QA.
-/** @param {{ config?: { performance_mode: import('../src/types-performance').PerformanceMode }, api?: (...args: ApiCall) => Promise<unknown> }} [options] */
+/** @param {{ config?: Partial<import('../src/generated/ConfigView').ConfigView>, api?: (...args: ApiCall) => Promise<unknown> }} [options] */
 function viewHarness({ config = { performance_mode: 'managed' }, api = async () => ({}) } = {}) {
   /** @type {unknown[]} */
   const cells = [];
@@ -34,7 +35,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
   const cleanups = [];
   /** @type {ApiCall[]} */
   const calls = [];
-  /** @type {Parameters<typeof import('../src/toast').toast>[]} */
+  /** @type {Parameters<typeof import('../src/app/toast').toast>[]} */
   const notices = [];
   /** @type {string[]} */
   const clipboard = [];
@@ -43,17 +44,18 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
   /** @type {Map<string, { exports: Record<string, unknown> }>} */
   const modules = new Map();
   let cursor = 0;
+  /** @param {string} path */
+  const state = (path) => load(resolve(frontend, 'src', path));
   const store = {
-    config: { value: config },
-    devMode: { value: false },
-    instances: { value: /** @type {import('../src/types-instance').EnrichedInstance[]} */ ([]) },
-    launchSessions: { value: /** @type {Record<string, import('../src/types-launch').LaunchSession>} */ ({}) },
-    launchState: { value: /** @type {import('../src/store').LaunchState} */ ({ status: 'idle' }) },
-    logLines: { value: 0 },
-    collapsedLogSeverity: { value: null },
-    selectedInstanceId: { value: null },
-    lastInstanceId: { value: null },
-    versionById: () => null,
+    get config() {
+      return /** @type {typeof import('../src/settings/state')} */ (state('settings/state')).config;
+    },
+    get instances() {
+      return /** @type {typeof import('../src/instances/state')} */ (state('instances/state')).instances;
+    },
+    get launchSessions() {
+      return /** @type {typeof import('../src/launch/state')} */ (state('launch/state')).launchSessions;
+    },
   };
   const hooks = {
     /** @template T @param {T | (() => T)} initial @returns {[T, (next: T | ((current: T) => T)) => void]} */
@@ -100,38 +102,36 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
       jsxs: (type, props) => ({ type, props }),
       Fragment: 'Fragment',
     },
-    api: {
+    'platform/transport': {
       /** @param {ApiCall} args */
-      api: async (...args) => {
+      request: async (...args) => {
         calls.push(args);
         return api(...args);
       },
       /** @param {unknown} error */
       isApiError: (error) => error instanceof Error && error.name === 'ApiError' && 'status' in error,
     },
-    store,
-    'backend/events': {
+    'platform/events': {
       /** @param {string} path */
       subscribeApiEvents: (path) => {
         subscriptions.push(path);
         return () => {};
       },
     },
-    music: { Music: { suppress() {}, unsuppress() {} } },
-    sound: { Sound: { init() {} } },
-    toast: {
-      /** @param {Parameters<typeof import('../src/toast').toast>} args */
+    'music/music': { Music: { suppress() {}, unsuppress() {} } },
+    'app/sound': { Sound: { init() {} } },
+    'app/toast': {
+      /** @param {Parameters<typeof import('../src/app/toast').toast>} args */
       toast: (...args) => notices.push(args),
+      /** @param {string} message */
+      showError: (message) => notices.push([message, 'error']),
+      /** @param {unknown} error */
+      errMessage: (error) => (error instanceof Error && error.message ? error.message : 'Unknown error'),
     },
     'ui/Atoms': primitives(['Button', 'Pill', 'Toggle']),
     'ui/ChoicePills': primitives(['ChoicePills']),
     'ui/SettingsSheet': primitives(['SettingRow', 'SettingsSection', 'OptionTiles']),
     'ui/Select': primitives(['SelectField']),
-    // Config schema migration is shared-owner work, not mirrored in UI fixtures.
-    'dto-core': {
-      /** @param {unknown} value */
-      configResponse: (value) => value,
-    },
   };
   const context = vm.createContext({
     Error,
@@ -178,6 +178,7 @@ function viewHarness({ config = { performance_mode: 'managed' }, api = async () 
     );
     return module.exports;
   }
+  store.config.value = { ...configView(), ...config };
   return {
     store,
     calls,
@@ -245,7 +246,7 @@ test('Performance settings retain three modes, autosave and failure rollback', a
       return { performance_mode: patch.performance_mode };
     },
   });
-  const { PerformanceSection } = h.load('views/settings/PerformanceSection');
+  const { PerformanceSection } = h.load('settings/PerformanceSection');
   let view = h.render(PerformanceSection);
   const choice = control(view, 'OptionTiles');
   assert.deepEqual(
@@ -257,8 +258,11 @@ test('Performance settings retain three modes, autosave and failure rollback', a
   choice.onChange('vanilla');
   assert.equal(control(h.render(PerformanceSection), 'OptionTiles').disabled, true);
   await h.settle();
-  assert.equal(h.store.config.value.performance_mode, 'vanilla');
-  assert.equal(JSON.stringify(h.calls[0]), JSON.stringify(['PUT', '/config', { performance_mode: 'vanilla' }]));
+  assert.equal(h.store.config.value?.performance_mode, 'vanilla');
+  assert.equal(
+    JSON.stringify(h.calls[0]),
+    JSON.stringify(['PUT', '/config', { performance_mode: 'vanilla', expected_revision: 1 }]),
+  );
   view = h.render(PerformanceSection);
   await h.settle();
   fail = true;
@@ -274,17 +278,18 @@ test('instance modes preserve inheritance and health passes backend copy through
     view_model: { tone: 'warn', title: 'Review tuning', detail: 'Backend detail' },
   };
   const h = viewHarness({ config: { performance_mode: 'custom' }, api: async () => response });
-  const mode = h.load('views/instance/performance-mode');
+  const mode = h.load('instances/detail/performance-mode');
   assert.equal(mode.performanceModeFrom(''), null);
   assert.equal(mode.globalPerformanceMode(), 'custom');
   assert.equal(mode.performanceModeLabel('managed'), 'Managed');
   assert.equal(mode.performanceModeLabel('vanilla'), 'Vanilla');
   assert.equal(mode.performanceModeLabel('custom'), 'Custom');
-  assert.equal(JSON.stringify(await mode.fetchPerformanceHealth('instance /?')), JSON.stringify(response));
+  const api = h.load('instances/api');
+  assert.equal(JSON.stringify(await api.performanceHealth('instance /?')), JSON.stringify(response));
   assert.equal(h.calls[0][1], '/performance/health?instance_id=instance+%2F%3F');
 });
 
-/** @returns {import('../src/types-launch').LaunchProofRecord} */
+/** @returns {any} */
 function proofRecord() {
   return {
     schema: 'launch-proof',
@@ -315,7 +320,7 @@ function proofRecord() {
 
 test('proof history preserves neutral evidence, budget, comparison and stable copied JSON', async () => {
   const h = viewHarness({ api: async () => ({ version_id: '1.12.2', comparison: { z: 2, a: 1 } }) });
-  const { LaunchProofHistoryBlock } = h.load('views/settings/PerformanceLabProofHistory');
+  const { LaunchProofHistoryBlock } = h.load('performance/ProofHistory');
   const tree = h.render(LaunchProofHistoryBlock, { state: { status: 'ready', data: [proofRecord()] } });
   const text = visibleText(tree);
   for (const label of [
@@ -340,7 +345,7 @@ test('proof copy failures do not expose raw service details and stale history st
       throw new Error('secret-token /private/profile');
     },
   });
-  const { LaunchProofHistoryBlock } = h.load('views/settings/PerformanceLabProofHistory');
+  const { LaunchProofHistoryBlock } = h.load('performance/ProofHistory');
   const tree = h.render(LaunchProofHistoryBlock, {
     state: { status: 'error', data: [proofRecord()], error: 'Service unavailable.' },
   });
@@ -379,7 +384,7 @@ function driverResponse({ id = 'driver', state = 'stopped', pending = null, canR
   };
 }
 
-/** @type {Parameters<typeof import('../src/views/settings/PerformanceLabSuiteDrivers').BenchmarkSuiteDriversBlock>[0]} */
+/** @type {Parameters<typeof import('../src/performance/SuiteDrivers').BenchmarkSuiteDriversBlock>[0]} */
 const driverProps = {
   matrixState: {
     status: 'ready',
@@ -395,32 +400,9 @@ const driverProps = {
   },
 };
 
-/** @param {string} id @returns {import('../src/types-instance').EnrichedInstance} */
+/** @param {string} id @returns {import('../src/generated/EnrichedInstance').EnrichedInstance} */
 function driverInstance(id) {
-  return {
-    id,
-    name: id,
-    version_id: '1.21',
-    created_at: '2026-10-04T08:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
-    version_display: {
-      loader_key: 'vanilla',
-      loader_label: 'Vanilla',
-      minecraft_label: '1.21',
-      loader_version_label: '',
-      loader_detail_label: '',
-      summary_label: '1.21',
-      supports_mods: false,
-    },
-    launchable: true,
-    launch_action: { state_id: 'ready', label: 'Launch', tone: 'ok', launchable: true, primary_action: 'launch' },
-    saves_count: 0,
-    mods_count: 0,
-    resource_count: 0,
-    shader_count: 0,
-    counts_available: false,
-  };
+  return enrichedInstance({ id, name: id, version_id: '1.21' });
 }
 
 /** @param {string} id */
@@ -459,7 +441,7 @@ test('Refresh adopts every distinct active driver session through the real launc
     },
   });
   h.store.instances.value = [driverInstance('instance-1'), driverInstance('instance-2')];
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
   const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
   render();
   await h.settle();
@@ -488,7 +470,7 @@ test('an acknowledged Resume stays successful when its separate session read fai
     },
   });
   h.store.instances.value = [driverInstance('instance-1')];
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
   const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
   render();
   await h.settle();
@@ -519,7 +501,7 @@ for (const invalidation of ['Refresh', 'Stop', 'unmount']) {
       },
     });
     h.store.instances.value = [driverInstance('instance-1')];
-    const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+    const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
     const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
     render();
     await h.settle();
@@ -540,7 +522,7 @@ for (const invalidation of ['Refresh', 'Stop', 'unmount']) {
 test('benchmark driver actions follow backend permissions while ordinary resume remains available', async () => {
   const driver = driverResponse();
   const h = viewHarness({ api: async (method) => (method === 'POST' ? driver : { status: 'ok', drivers: [driver] }) });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
   h.render(BenchmarkSuiteDriversBlock, driverProps);
   await h.settle();
   const tree = h.render(BenchmarkSuiteDriversBlock, driverProps);
@@ -590,7 +572,7 @@ test('native terminal drivers retain pending evidence and follow backend qualifi
       api: async (_method, path) =>
         path.endsWith('/suite/drivers') ? { status: 'ok', drivers: [driver] } : qualification,
     });
-    const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+    const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
     h.render(BenchmarkSuiteDriversBlock, driverProps);
     await h.settle();
     const tree = h.render(BenchmarkSuiteDriversBlock, driverProps);
@@ -641,7 +623,7 @@ test('late list reads cannot overwrite an acknowledged native Resume and the sam
       return ++lists === 1 ? { status: 'ok', drivers: [stopped] } : refresh.promise;
     },
   });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
   const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
   render();
   await h.settle();
@@ -677,7 +659,7 @@ test('disposed native Resume handlers do not publish a late response', async () 
   const h = viewHarness({
     api: async (method) => (method === 'POST' ? pending.promise : { status: 'ok', drivers: [stopped] }),
   });
-  const { BenchmarkSuiteDriversBlock } = h.load('views/settings/PerformanceLabSuiteDrivers');
+  const { BenchmarkSuiteDriversBlock } = h.load('performance/SuiteDrivers');
   const render = () => h.render(BenchmarkSuiteDriversBlock, driverProps);
   render();
   await h.settle();

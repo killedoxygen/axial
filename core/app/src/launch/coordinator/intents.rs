@@ -17,8 +17,9 @@ pub const INTENT_MIGRATION: Migration = Migration {
         WHERE state IN ('accepted','interrupted');",
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(deny_unknown_fields)]
+#[ts(optional_fields)]
 pub struct LaunchRequest {
     pub instance_id: InstanceId,
     #[serde(default)]
@@ -87,7 +88,7 @@ pub enum LaunchIntentStatus {
 }
 
 /// The public form of an intent; an accepted session is its latest observation.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LaunchIntentView {
     Preparing,

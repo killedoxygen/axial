@@ -1,6 +1,6 @@
 import type { ComponentChildren, JSX } from 'preact';
 import { useRef, useState } from 'preact/hooks';
-import { playSliderSound } from '../sound';
+import { playSliderSound } from '../app/sound';
 
 export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));

@@ -1,81 +1,74 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import * as contracts from '../src/dto-contract';
-import * as core from '../src/dto-core';
-import * as installs from '../src/dto-install';
-import * as presenters from '../src/create-presenters';
+import { loadSource } from './source';
+import { enrichedInstance, queueSnapshot } from './wire';
+import * as presenters from '../src/create/presenters';
+import type { CreateInstanceResponse } from '../src/generated/CreateInstanceResponse';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const ts: typeof import('typescript') = createRequire(resolve(frontend, 'package.json'))('typescript');
-
-function response() {
+function response(): CreateInstanceResponse {
   return {
-    id: 'fixture-instance', name: 'Fixture pack', version_id: '1.21.4', created_at: '2026-09-27T00:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
-    launchable: false, install_target: null,
-    launch_action: { state_id: 'setup_pending', label: 'Resume setup', tone: 'warn', launchable: false, primary_action: 'install' },
-    version_display: { loader_key: 'vanilla', loader_label: 'Vanilla', minecraft_label: '1.21.4',
-      loader_version_label: '', loader_detail_label: '', summary_label: '1.21.4', supports_mods: false },
-    saves_count: 0, mods_count: 0, resource_count: 0, shader_count: 0,
-    view_model: { tone: 'success', summary: 'Setup queued.', detail: null },
-    install_queue: {
-      queue_epoch: 'fixture-queue', revision: 3, registry_revision: 0, active: null, items: [], failures: [],
-      view_model: { state_id: 'idle', status_label: 'Idle', title: 'Downloads', summary: 'Ready', queued_count: 0,
-        queued_count_label: 'No queued downloads', queued_item_label: 'No items queued', section_title: 'Queue',
-        empty_title: 'Nothing downloading', empty_summary: 'Ready' },
-    },
+    ...enrichedInstance({
+      name: 'Fixture pack',
+      launchable: false,
+      launch_action: {
+        state_id: 'setup_pending',
+        label: 'Resume setup',
+        tone: 'warn',
+        launchable: false,
+        primary_action: 'install',
+      },
+    }),
+    view_model: { state_id: 'setup_queued', tone: 'ok', title: 'Setup queued', summary: 'Setup queued.', detail: null },
+    install_queue: queueSnapshot({ revision: 3 }),
   };
 }
 
-function harness(options: { response?: unknown; requestError?: Error; queueError?: Error; hold?: boolean } = {}) {
-  const requests: unknown[][] = [];
+function harness(
+  options: { response?: CreateInstanceResponse; requestError?: Error; queueError?: Error; hold?: boolean } = {},
+) {
+  const requests: string[] = [];
   const notices: unknown[][] = [];
   const queues: unknown[] = [];
   const reads: unknown[][] = [];
-  const state = { instances: [core.enrichedInstanceResponse(response())] };
+  const state = { instances: [enrichedInstance({ ...response(), launchable: false })] };
   let release!: () => void;
-  const held = new Promise<void>((resolve) => { release = resolve; });
-  const dependencies: Record<string, unknown> = {
-    './api': { async api(...args: unknown[]) {
-      requests.push(args);
-      if (options.hold) await held;
-      if (options.requestError) throw options.requestError;
-      return options.response ?? response();
-    } },
-    './create-presenters': presenters,
-    './dto-contract': contracts,
-    './dto-core': core,
-    './dto-install': installs,
-    './instance-readiness': { async refreshInstanceReadiness(...args: unknown[]) { reads.push(['instance', ...args]); } },
-    './machines/downloads': {
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const setup = loadSource<typeof import('../src/instances/setup')>('instances/setup.ts', {
+    'instances/api': {
+      async resumeSetup(id: string) {
+        requests.push(id);
+        if (options.hold) await held;
+        if (options.requestError) throw options.requestError;
+        return options.response ?? response();
+      },
+    },
+    'create/presenters': presenters,
+    'instances/readiness': {
+      async refreshInstanceReadiness(...args: unknown[]) {
+        reads.push(['instance', ...args]);
+      },
+    },
+    'install/queue': {
       async applyInstallQueueResponse(value: unknown) {
         queues.push(value);
         if (options.queueError) throw options.queueError;
       },
-      async refreshInstallQueue(...args: unknown[]) { reads.push(['queue', ...args]); },
+      async refreshInstallQueue(...args: unknown[]) {
+        reads.push(['queue', ...args]);
+      },
     },
-    './toast': { toast(...args: unknown[]) { notices.push(args); } },
-    './utils': { errMessage(error: unknown) { return error instanceof Error ? error.message : String(error); } },
-  };
-  const filename = resolve(frontend, 'src/instance-setup.ts');
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+    'app/toast': {
+      toast(...args: unknown[]) {
+        notices.push(args);
+      },
+      errMessage(error: unknown) {
+        return error instanceof Error ? error.message : String(error);
+      },
+    },
   });
-  const exports = {};
-  vm.runInNewContext(compiled.outputText, {
-    exports, Error, encodeURIComponent,
-    require(id: string): unknown {
-      if (Object.prototype.hasOwnProperty.call(dependencies, id)) return dependencies[id];
-      throw new Error(`Unreviewed setup dependency: ${id}`);
-    },
-  }, { filename });
-  return { ...(exports as typeof import('../src/instance-setup')), requests, notices, queues, reads, state, release };
+  return { ...setup, requests, notices, queues, reads, state, release };
 }
 
 test('resume uses the registered identity, shares repeated clicks and preserves backend availability', async () => {
@@ -84,8 +77,7 @@ test('resume uses the registered identity, shares repeated clicks and preserves 
   const repeated = h.resumeInstanceSetup('fixture-instance');
   assert.equal(first, repeated);
   assert.equal(h.requests.length, 1);
-  assert.equal(h.requests[0][0], 'POST');
-  assert.equal(h.requests[0][1], '/instances/fixture-instance/setup/resume');
+  assert.deepEqual(h.requests, ['fixture-instance']);
   h.release();
   assert.equal(await first, true);
   assert.equal(h.state.instances.length, 1);

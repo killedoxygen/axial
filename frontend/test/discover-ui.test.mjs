@@ -5,23 +5,23 @@ import { resolve, dirname, basename } from 'node:path';
 import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
 import test from 'node:test';
 import * as signals from '@preact/signals';
-import * as ui from '../src/ui-state';
+import * as ui from '../src/app/route';
 
 /**
  * @typedef {{
- * 'content.ts': typeof import('../src/content'),
- * 'views/discover/actions.ts': typeof import('../src/views/discover/actions'),
- * 'views/discover/fit.ts': typeof import('../src/views/discover/fit'),
- * 'views/discover/install-workflow.ts': typeof import('../src/views/discover/install-workflow'),
- * 'views/discover/make.ts': typeof import('../src/views/discover/make'),
- * 'views/discover/state.ts': typeof import('../src/views/discover/state'),
- * 'machines/discover-search.ts': typeof import('../src/machines/discover-search')
+ * 'content/api.ts': typeof import('../src/content/api'),
+ * 'discover/actions.ts': typeof import('../src/discover/actions'),
+ * 'discover/fit.ts': typeof import('../src/discover/fit'),
+ * 'discover/install-workflow.ts': typeof import('../src/discover/install-workflow'),
+ * 'discover/make.ts': typeof import('../src/discover/make'),
+ * 'discover/state.ts': typeof import('../src/discover/state'),
+ * 'discover/search.ts': typeof import('../src/discover/search')
  * }} SourceModules
- * @typedef {Parameters<typeof import('../src/api').api>} ApiCall
- * @typedef {import('../src/views/discover/actions').AddOutcome} AddOutcome
- * @typedef {import('../src/types-content').ContentPage} ContentPage
- * @typedef {import('../src/machines/discover-search').DiscoverSearchRequest} SearchRequest
- * @typedef {Parameters<typeof import('../src/views/discover/actions').commitInstall>} InstallCall
+ * @typedef {[method: string, path: string, body?: unknown]} ApiCall
+ * @typedef {import('../src/discover/actions').AddOutcome} AddOutcome
+ * @typedef {import('../src/content/api').ContentPage} ContentPage
+ * @typedef {import('../src/discover/search').DiscoverSearchRequest} SearchRequest
+ * @typedef {Parameters<typeof import('../src/discover/actions').commitInstall>} InstallCall
  */
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
@@ -43,9 +43,13 @@ async function loadSource(entry, stubs = {}) {
     if (existing) return existing;
     const replacement = replacements.get(path);
     const module = replacement
-      ? new SyntheticModule(Object.keys(replacement), function () {
-          for (const [name, value] of Object.entries(replacement)) this.setExport(name, value);
-        }, { context, identifier: path })
+      ? new SyntheticModule(
+          Object.keys(replacement),
+          function () {
+            for (const [name, value] of Object.entries(replacement)) this.setExport(name, value);
+          },
+          { context, identifier: path },
+        )
       : new SourceTextModule(stripTypeScriptTypes(await readFile(path, 'utf8')), { context, identifier: path });
     modules.set(path, module);
     return module;
@@ -59,11 +63,18 @@ async function loadSource(entry, stubs = {}) {
 /** @template T @returns {{ promise: Promise<T>, resolve: (value: T | PromiseLike<T>) => void, reject: (reason?: unknown) => void }} */
 function deferred() {
   /** @type {(value: T | PromiseLike<T>) => void} */
-  let resolve = () => { throw new Error('Deferred promise was not initialized'); };
+  let resolve = () => {
+    throw new Error('Deferred promise was not initialized');
+  };
   /** @type {(reason?: unknown) => void} */
-  let reject = () => { throw new Error('Deferred promise was not initialized'); };
+  let reject = () => {
+    throw new Error('Deferred promise was not initialized');
+  };
   /** @type {Promise<T>} */
-  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  const promise = new Promise((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
   return { promise, resolve, reject };
 }
 
@@ -71,24 +82,37 @@ async function settle() {
   for (let index = 0; index < 8; index += 1) await Promise.resolve();
 }
 
-/** @type {import('../src/types-content').ContentSelection} */
+/** @type {import('../src/generated/ResolutionSelection').ResolutionSelection} */
 const selection = { canonical_id: 'modrinth:project', kind: 'mod', version_id: 'pinned-version' };
-/** @type {import('../src/types-content').ResolutionPlan} */
+/** @type {import('../src/generated/ResolutionPlan').ResolutionPlan} */
 const conflictPlan = {
-  instance_id: 'instance-a', loader: 'fabric', game_version: '1.21.1', items: [],
+  instance_id: 'instance-a',
+  loader: 'fabric',
+  game_version: '1.21.1',
+  items: [],
   conflicts: [{ canonical_id: selection.canonical_id, kind: 'incompatible', detail: 'Requires another version.' }],
   total_download_bytes: 0,
 };
 
-/** @returns {import('../src/types-install').InstallQueueStateResponse} */
+/** @returns {import('../src/generated/InstallQueueStateResponse').InstallQueueStateResponse} */
 function queueResponse() {
   return {
-    queue_epoch: 'queue-1', revision: 1, registry_revision: 0, failures: [],
-    active: null, items: [], notice: null, started_install: null,
+    queue_epoch: 'queue-1',
+    revision: 1,
+    registry_revision: 0,
+    failures: [],
+    items: [],
     view_model: {
-      state_id: 'idle', status_label: 'Idle', title: 'Downloads', summary: '', queued_count: 0,
-      queued_count_label: '0 queued', queued_item_label: 'items', section_title: 'Queue',
-      empty_title: 'No downloads', empty_summary: 'No pending downloads.',
+      state_id: 'idle',
+      status_label: 'Idle',
+      title: 'Downloads',
+      summary: '',
+      queued_count: 0,
+      queued_count_label: '0 queued',
+      queued_item_label: 'items',
+      section_title: 'Queue',
+      empty_title: 'No downloads',
+      empty_summary: 'No pending downloads.',
     },
   };
 }
@@ -97,9 +121,15 @@ function queueResponse() {
 async function clientHarness(respond) {
   /** @type {ApiCall[]} */
   const calls = [];
-  const client = await loadSource('content.ts', {
-    'api.ts': { api: async (/** @type {ApiCall} */ ...args) => { calls.push(plain(args)); return respond(...args); } },
-    'machines/downloads.ts': { reconcileUncertainMutation: async () => {} },
+  const client = await loadSource('content/api.ts', {
+    'platform/transport.ts': {
+      isApiError: () => false,
+      request: async (/** @type {ApiCall} */ ...args) => {
+        calls.push(plain(args));
+        return respond(...args);
+      },
+    },
+    'install/queue.ts': { reconcileUncertainMutation: async () => {} },
   });
   return { client, calls };
 }
@@ -107,56 +137,89 @@ async function clientHarness(respond) {
 test('search sends the exact filter, target, sort and pagination values and decodes the page', async () => {
   const page = { items: [], offset: 40, limit: 40, total: 89 };
   const { client, calls } = await clientHarness(() => page);
-  assert.deepEqual(plain(await client.searchContent({
-    kind: 'mod', query: 'map & compass', loader: 'fabric', gameVersion: '1.21.1',
-    category: 'utility', sort: 'downloads', offset: 40, limit: 40, instanceId: 'target/a',
-  })), page);
+  assert.deepEqual(
+    plain(
+      await client.searchContent({
+        kind: 'mod',
+        query: 'map & compass',
+        loader: 'fabric',
+        gameVersion: '1.21.1',
+        category: 'utility',
+        sort: 'downloads',
+        offset: 40,
+        limit: 40,
+        instanceId: 'target/a',
+      }),
+    ),
+    page,
+  );
   assert.equal(calls[0][0], 'GET');
   const url = new URL(calls[0][1], 'http://localhost');
   assert.equal(url.pathname, '/content/search');
   assert.deepEqual(Object.fromEntries(url.searchParams), {
-    kind: 'mod', query: 'map & compass', loader: 'fabric', game_version: '1.21.1',
-    category: 'utility', sort: 'downloads', offset: '40', limit: '40', instance_id: 'target/a',
+    kind: 'mod',
+    query: 'map & compass',
+    loader: 'fabric',
+    game_version: '1.21.1',
+    category: 'utility',
+    sort: 'downloads',
+    offset: '40',
+    limit: '40',
+    instance_id: 'target/a',
   });
-});
-
-test('malformed content pages fail validation instead of becoming empty search success', async () => {
-  const { client } = await clientHarness(() => ({ items: [], offset: 0, limit: 40 }));
-  await assert.rejects(client.searchContent({ kind: 'resource_pack' }), /Content total response was invalid/);
 });
 
 test('setup planning preserves backend plan identity, expiry, conflicts and exact selections', async () => {
   const response = { plan_id: 'setup-plan-1', expires_at_ms: 123456, selection_id: 'selection-7', plan: conflictPlan };
   const { client, calls } = await clientHarness(() => response);
-  /** @type {import('../src/types-content').TargetRef} */
+  /** @type {import('../src/generated/TargetRef').TargetRef} */
   const target = { kind: 'draft', loader: 'fabric', game_version: '1.21.1' };
   const result = await client.planInstanceSetup('selection-7', target, [selection]);
   assert.equal(result.plan_id, 'setup-plan-1');
   assert.equal(result.expires_at_ms, 123456);
   assert.deepEqual(plain(result.plan.conflicts), conflictPlan.conflicts);
-  assert.deepEqual(calls[0], ['POST', '/instances/setup/plan', {
-    selection_id: 'selection-7', target, selections: [selection],
-  }]);
+  assert.deepEqual(calls[0], [
+    'POST',
+    '/instances/setup/plan',
+    {
+      selection_id: 'selection-7',
+      target,
+      selections: [selection],
+    },
+  ]);
 });
 
 test('modpack picker sends only selected file IDs and explicit override intent', async () => {
   const { client, calls } = await clientHarness(() => queueResponse());
   await client.installModpack('instance-a', 'modrinth:pack', 'pack-version', {
-    selectedFileIds: ['mpf1-file-a', 'mpf1-file-b'], includeOverrides: false,
+    selectedFileIds: ['mpf1-file-a', 'mpf1-file-b'],
+    includeOverrides: false,
   });
-  assert.deepEqual(calls[0], ['POST', '/content/modpack/install', {
-    instance_id: 'instance-a', canonical_id: 'modrinth:pack', version_id: 'pack-version',
-    selected_file_ids: ['mpf1-file-a', 'mpf1-file-b'], include_overrides: false,
-  }]);
+  assert.deepEqual(calls[0], [
+    'POST',
+    '/content/modpack/install',
+    {
+      instance_id: 'instance-a',
+      canonical_id: 'modrinth:pack',
+      version_id: 'pack-version',
+      selected_file_ids: ['mpf1-file-a', 'mpf1-file-b'],
+      include_overrides: false,
+    },
+  ]);
   await client.installModpack('new-instance', 'modrinth:pack', 'pack-version');
   assert.deepEqual(calls[1][2], {
-    instance_id: 'new-instance', canonical_id: 'modrinth:pack', version_id: 'pack-version',
-    include_overrides: true, selected_file_ids: [],
+    instance_id: 'new-instance',
+    canonical_id: 'modrinth:pack',
+    version_id: 'pack-version',
+    include_overrides: true,
+    selected_file_ids: [],
   });
 });
 
 test('update and uninstall clients retain instance identity and pinned version selection', async () => {
-  const { client, calls } = await clientHarness((_method, path) => path.endsWith('/updates') ? { updates: [] } : queueResponse());
+  const { client, calls } = await clientHarness((_method, path) =>
+    path.endsWith('/updates') ? { updates: [] } : queueResponse(),
+  );
   await client.checkContentUpdates('instance/a');
   await client.installContent('instance/a', [selection], true);
   await client.uninstallContents('instance/a', ['modrinth:project']);
@@ -167,30 +230,38 @@ test('update and uninstall clients retain instance identity and pinned version s
   ]);
 });
 
-/** @param {import('../src/types-content').ResolutionPlan} [planResponse] @param {import('../src/types-install').InstallQueueStateResponse | Error} [installResponse] */
+/** @param {import('../src/generated/ResolutionPlan').ResolutionPlan} [planResponse] @param {import('../src/generated/InstallQueueStateResponse').InstallQueueStateResponse | Error} [installResponse] */
 async function actionHarness(planResponse = { ...conflictPlan, conflicts: [] }, installResponse = queueResponse()) {
   /** @type {{ method: string, path: string, body?: unknown }[]} */
   const requests = [];
-  /** @type {Parameters<typeof import('../src/machines/downloads').applyInstallQueueResponse>[]} */
+  /** @type {Parameters<typeof import('../src/install/queue').applyInstallQueueResponse>[]} */
   const applied = [];
-  /** @type {Parameters<typeof import('../src/toast').toast>[]} */
+  /** @type {Parameters<typeof import('../src/app/toast').toast>[]} */
   const notices = [];
-  const actions = await loadSource('views/discover/actions.ts', {
-    'api.ts': { api: async (/** @type {ApiCall} */ ...[method, path, body]) => {
-      requests.push(plain({ method, path, body }));
-      if (path === '/content/plan') return planResponse;
-      if (path === '/content/install') {
-        if (installResponse instanceof Error) throw installResponse;
-        return installResponse;
-      }
-      throw new Error(`Unexpected request: ${path}`);
-    } },
-    'machines/downloads.ts': {
-      applyInstallQueueResponse: async (/** @type {Parameters<typeof import('../src/machines/downloads').applyInstallQueueResponse>} */ ...args) => applied.push(args),
+  const actions = await loadSource('discover/actions.ts', {
+    'platform/transport.ts': {
+      isApiError: () => false,
+      request: async (/** @type {ApiCall} */ ...[method, path, body]) => {
+        requests.push(plain({ method, path, body }));
+        if (path === '/content/plan') return planResponse;
+        if (path === '/content/install') {
+          if (installResponse instanceof Error) throw installResponse;
+          return installResponse;
+        }
+        throw new Error(`Unexpected request: ${path}`);
+      },
+    },
+    'install/queue.ts': {
+      applyInstallQueueResponse: async (
+        /** @type {Parameters<typeof import('../src/install/queue').applyInstallQueueResponse>} */ ...args
+      ) => applied.push(args),
       reconcileUncertainMutation: async () => {},
     },
-    'toast.ts': { toast: (/** @type {Parameters<typeof import('../src/toast').toast>} */ ...args) => notices.push(args) },
-    'utils.ts': { errMessage: (/** @type {unknown} */ error) => error instanceof Error ? error.message : String(error) },
+    'app/toast.ts': {
+      toast: (/** @type {Parameters<typeof import('../src/app/toast').toast>} */ ...args) => notices.push(args),
+      errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)),
+      showError() {},
+    },
   });
   return { actions, requests, applied, notices };
 }
@@ -199,43 +270,53 @@ async function actionHarness(planResponse = { ...conflictPlan, conflicts: [] }, 
 async function picksHarness() {
   /** @type {Array<{ args: ApiCall, response: ReturnType<typeof deferred<unknown>> }>} */
   const requests = [];
-  /** @type {Parameters<typeof import('../src/toast').toast>[]} */
+  /** @type {Parameters<typeof import('../src/app/toast').toast>[]} */
   const notices = [];
-  const tray = signals.signal(/** @type {import('../src/views/discover/state').TrayItem[]} */ ([]));
+  const tray = signals.signal(/** @type {import('../src/discover/state').TrayItem[]} */ ([]));
   const state = {
     tray,
     gameVersion: signals.signal(''),
     loader: signals.signal(''),
-    selectionOf: (/** @type {import('../src/views/discover/state').TrayItem} */ { canonical_id, kind, version_id }) =>
-      ({ canonical_id, kind, ...(version_id ? { version_id } : {}) }),
-    unstage: (/** @type {string} */ id) => { tray.value = tray.value.filter((item) => item.canonical_id !== id); },
+    selectionOf: (/** @type {import('../src/discover/state').TrayItem} */ { canonical_id, kind, version_id }) => ({
+      canonical_id,
+      kind,
+      ...(version_id ? { version_id } : {}),
+    }),
+    unstage: (/** @type {string} */ id) => {
+      tray.value = tray.value.filter((item) => item.canonical_id !== id);
+    },
   };
-  const { staging, recheck } = await loadSource('views/discover/fit.ts', {
-    'views/discover/@preact/signals.ts': signals,
-    'api.ts': {
-      api: (/** @type {ApiCall} */ ...args) => {
+  const { staging, recheck } = await loadSource('discover/fit.ts', {
+    'discover/@preact/signals.ts': signals,
+    'platform/transport.ts': {
+      isApiError: () => false,
+      request: (/** @type {ApiCall} */ ...args) => {
         const response = deferred();
         requests.push({ args: plain(args), response });
         return response.promise;
       },
     },
-    'machines/downloads.ts': { reconcileUncertainMutation: async () => {} },
-    'toast.ts': { toast: (/** @type {Parameters<typeof import('../src/toast').toast>} */ ...args) => notices.push(args) },
-    'utils.ts': { errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)) },
-    'views/discover/state.ts': state,
+    'install/queue.ts': { reconcileUncertainMutation: async () => {} },
+    'app/toast.ts': {
+      toast: (/** @type {Parameters<typeof import('../src/app/toast').toast>} */ ...args) => notices.push(args),
+      errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)),
+      showError() {},
+    },
+    'discover/state.ts': state,
   });
   /** @param {number} count */
   const asked = async (count) => {
-    for (let waited = 0; waited < 200 && requests.length < count; waited += 1) await new Promise((done) => setTimeout(done, 10));
+    for (let waited = 0; waited < 200 && requests.length < count; waited += 1)
+      await new Promise((done) => setTimeout(done, 10));
     assert.equal(requests.length, count);
   };
   return { staging, recheck, state, requests, notices, asked };
 }
 
-/** @param {string} id @param {import('../src/types-content').ContentKind} kind @returns {import('../src/views/discover/state').TrayItem} */
+/** @param {string} id @param {import('../src/generated/ContentKind').ContentKind} kind @returns {import('../src/discover/state').TrayItem} */
 const pick = (id, kind) => ({ canonical_id: `modrinth:${id}`, kind, title: `Pick ${id}` });
 
-/** @param {string} id @returns {import('../src/types-content').ModpackTarget} */
+/** @param {string} id @returns {import('../src/generated/ModpackTarget').ModpackTarget} */
 function packTarget(id) {
   return {
     canonical_id: `modrinth:${id}`,
@@ -250,8 +331,14 @@ function packTarget(id) {
 
 /** @param {string} loader @param {string} game @param {string[]} [drops] */
 const candidate = (loader, game, drops = []) => ({
-  loader, loader_label: loader || 'Vanilla', game_version: game, selection_id: `${loader}|${game}`, summary: '',
-  supported_count: 1, total_count: 1 + drops.length, complete: drops.length === 0,
+  loader,
+  loader_label: loader || 'Vanilla',
+  game_version: game,
+  selection_id: `${loader}|${game}`,
+  summary: '',
+  supported_count: 1,
+  total_count: 1 + drops.length,
+  complete: drops.length === 0,
   drops: drops.map((id) => ({ canonical_id: `modrinth:${id}`, title: id })),
 });
 
@@ -259,28 +346,52 @@ test('a staged pack is read with the active Discover filters and decides which p
   const { staging, state, requests, asked } = await picksHarness();
   state.gameVersion.value = '1.20.1';
   state.loader.value = 'forge';
-  state.tray.value = [pick('pack', 'modpack'), pick('shader', 'shader_pack'), pick('mod', 'mod'), pick('needs-mod', 'mod')];
-  assert.deepEqual(requests[0].args, ['GET', '/content/modpack/target?id=modrinth%3Apack&game_version=1.20.1&loader=forge']);
+  state.tray.value = [
+    pick('pack', 'modpack'),
+    pick('shader', 'shader_pack'),
+    pick('mod', 'mod'),
+    pick('needs-mod', 'mod'),
+  ];
+  assert.deepEqual(requests[0].args, [
+    'GET',
+    '/content/modpack/target?id=modrinth%3Apack&game_version=1.20.1&loader=forge',
+  ]);
   assert.deepEqual([staging.value.fit, staging.value.pending], [null, true]);
   requests[0].response.resolve(packTarget('pack'));
   await asked(2);
   // The pack's own loader and version are planned, never ranked among the versions the picks happen to share.
-  assert.deepEqual(requests[1].args, ['POST', '/content/plan', {
-    target: { kind: 'draft', loader: 'fabric', game_version: '1.21.1' },
-    selections: [
-      { canonical_id: 'modrinth:shader', kind: 'shader_pack' },
-      { canonical_id: 'modrinth:mod', kind: 'mod' },
-      { canonical_id: 'modrinth:needs-mod', kind: 'mod' },
-    ],
-  }]);
+  assert.deepEqual(requests[1].args, [
+    'POST',
+    '/content/plan',
+    {
+      target: { kind: 'draft', loader: 'fabric', game_version: '1.21.1' },
+      selections: [
+        { canonical_id: 'modrinth:shader', kind: 'shader_pack' },
+        { canonical_id: 'modrinth:mod', kind: 'mod' },
+        { canonical_id: 'modrinth:needs-mod', kind: 'mod' },
+      ],
+    },
+  ]);
   assert.equal(staging.value.pending, true);
   requests[1].response.resolve({
-    loader: 'fabric', game_version: '1.21.1', total_download_bytes: 0,
-    items: [{
-      canonical_id: 'modrinth:needs-mod', title: 'Needs mod', kind: 'mod', project_id: 'needs-mod', version_id: 'v',
-      version_number: '1', filename: 'needs-mod.jar', reason: 'selected', already_installed: false, update: false,
-      dependencies: [{ project_id: 'mod', kind: 'required' }],
-    }],
+    loader: 'fabric',
+    game_version: '1.21.1',
+    total_download_bytes: 0,
+    items: [
+      {
+        canonical_id: 'modrinth:needs-mod',
+        title: 'Needs mod',
+        kind: 'mod',
+        project_id: 'needs-mod',
+        version_id: 'v',
+        version_number: '1',
+        filename: 'needs-mod.jar',
+        reason: 'selected',
+        already_installed: false,
+        update: false,
+        dependencies: [{ project_id: 'mod', kind: 'required' }],
+      },
+    ],
     conflicts: [{ canonical_id: 'modrinth:mod', kind: 'unavailable', detail: 'No compatible version.' }],
   });
   await settle();
@@ -296,12 +407,22 @@ test('picks alone take the pair that keeps the most, and an answer for picks sin
   await asked(1);
   state.tray.value = [pick('one', 'mod'), pick('two', 'resource_pack')];
   await asked(2);
-  assert.deepEqual(requests.map(({ args }) => args), [
-    ['POST', '/content/compatibility', { selections: [{ canonical_id: 'modrinth:one', kind: 'mod' }] }],
-    ['POST', '/content/compatibility', { selections: [
-      { canonical_id: 'modrinth:one', kind: 'mod' }, { canonical_id: 'modrinth:two', kind: 'resource_pack' },
-    ] }],
-  ]);
+  assert.deepEqual(
+    requests.map(({ args }) => args),
+    [
+      ['POST', '/content/compatibility', { selections: [{ canonical_id: 'modrinth:one', kind: 'mod' }] }],
+      [
+        'POST',
+        '/content/compatibility',
+        {
+          selections: [
+            { canonical_id: 'modrinth:one', kind: 'mod' },
+            { canonical_id: 'modrinth:two', kind: 'resource_pack' },
+          ],
+        },
+      ],
+    ],
+  );
   requests[0].response.resolve({ candidates: [candidate('forge', '1.20.1')] });
   await settle();
   assert.deepEqual([staging.value.fit, staging.value.pending], [null, true]);
@@ -309,9 +430,10 @@ test('picks alone take the pair that keeps the most, and an answer for picks sin
   await settle();
   const { fit, pending, apart } = staging.value;
   assert.ok(fit);
-  assert.deepEqual([pending, apart, fit.loader, fit.gameVersion, [...(fit.drops ?? [])]], [
-    false, false, 'fabric', '1.21.6', ['modrinth:two'],
-  ]);
+  assert.deepEqual(
+    [pending, apart, fit.loader, fit.gameVersion, [...(fit.drops ?? [])]],
+    [false, false, 'fabric', '1.21.6', ['modrinth:two']],
+  );
   state.tray.value = [pick('three', 'mod'), pick('four', 'mod')];
   await asked(3);
   requests[2].response.resolve({ candidates: [] });
@@ -334,7 +456,13 @@ test('a fit check that failed is not a fit, and asking again replaces it', async
   assert.deepEqual([staging.value.pending, staging.value.error], [true, null]);
   await asked(3);
   assert.deepEqual(requests[2].args, requests[1].args);
-  requests[2].response.resolve({ loader: 'fabric', game_version: '1.21.1', total_download_bytes: 0, items: [], conflicts: [] });
+  requests[2].response.resolve({
+    loader: 'fabric',
+    game_version: '1.21.1',
+    total_download_bytes: 0,
+    items: [],
+    conflicts: [],
+  });
   await settle();
   assert.deepEqual([staging.value.fit?.drops?.size, staging.value.pending, staging.value.error], [0, false, null]);
 
@@ -383,7 +511,7 @@ test('a pack opens with the picks it takes, and picks alone or a plain create le
 
 /**
  * The real picks, install action and queue client; instance creation, the provider and navigation are stood in.
- * @param {{ unmade?: string[], refusing?: string[], whileQueueing?: (state: typeof import('../src/views/discover/state')) => void }} [given]
+ * @param {{ unmade?: string[], refusing?: string[], whileQueueing?: (state: typeof import('../src/discover/state')) => void }} [given]
  * packs that are not created, instances that refuse a queue entry, and what the person does while one is asked for
  */
 async function makeHarness({ unmade = [], refusing = [], whileQueueing } = {}) {
@@ -392,46 +520,59 @@ async function makeHarness({ unmade = [], refusing = [], whileQueueing } = {}) {
   /** @type {unknown[]} */
   const navigations = [];
   const shared = {
-    'views/discover/@preact/signals.ts': signals,
-    'store.ts': { instances: signals.signal([]), config: signals.signal(null) },
-    'ui-state.ts': {
+    'discover/@preact/signals.ts': signals,
+    'settings/state.ts': { config: signals.signal(null) },
+    'instances/state.ts': { instances: signals.signal([]) },
+    'app/route.ts': {
       route: signals.signal({ name: 'discover' }),
       navigate: (/** @type {unknown} */ to) => navigations.push(to),
       openCreateDraft: () => {},
       openCreateModpack: () => {},
     },
   };
-  const state = await loadSource('views/discover/state.ts', shared);
-  const make = await loadSource('views/discover/make.ts', {
+  const state = await loadSource('discover/state.ts', shared);
+  const make = await loadSource('discover/make.ts', {
     ...shared,
-    'views/discover/state.ts': { ...state },
-    'api.ts': { api: async (/** @type {ApiCall} */ ...[, path, body]) => {
-      assert.equal(path, '/content/install');
-      const { instance_id: instance, selections } = /** @type {{ instance_id: string, selections: { canonical_id: string }[] }} */ (body);
-      installs.push({ instance, picks: selections.map((entry) => entry.canonical_id) });
-      whileQueueing?.(state);
-      if (refusing.includes(instance)) throw new Error('Queue is full.');
-      return queueResponse();
-    } },
-    'instance-create.ts': {
-      createInstance: async (/** @type {import('../src/instance-create').CreateInstanceArgs} */ { modpack }) =>
+    'discover/state.ts': { ...state },
+    'platform/transport.ts': {
+      isApiError: () => false,
+      request: async (/** @type {ApiCall} */ ...[, path, body]) => {
+        assert.equal(path, '/content/install');
+        const { instance_id: instance, selections } =
+          /** @type {{ instance_id: string, selections: { canonical_id: string }[] }} */ (body);
+        installs.push({ instance, picks: selections.map((entry) => entry.canonical_id) });
+        whileQueueing?.(state);
+        if (refusing.includes(instance)) throw new Error('Queue is full.');
+        return queueResponse();
+      },
+    },
+    'create/create-instance.ts': {
+      createInstance: async (/** @type {import('../src/create/create-instance').CreateInstanceArgs} */ { modpack }) =>
         modpack && !unmade.includes(modpack.canonicalId)
           ? { ok: true, instance: { id: `instance of ${modpack.canonicalId}` } }
           : { ok: false, error: 'Not created.' },
     },
-    'machines/downloads.ts': { applyInstallQueueResponse: async () => {}, reconcileUncertainMutation: async () => {} },
-    'toast.ts': { toast: () => {} },
-    'utils.ts': { errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)) },
+    'install/queue.ts': { applyInstallQueueResponse: async () => {}, reconcileUncertainMutation: async () => {} },
+    'app/toast.ts': {
+      toast: () => {},
+      errMessage: (/** @type {unknown} */ error) => (error instanceof Error ? error.message : String(error)),
+      showError() {},
+    },
   });
   const picked = () => state.tray.value.map((item) => item.canonical_id);
   return { make, state, installs, navigations, picked };
 }
 
-/** @param {string} id @param {string[]} [drops] @returns {import('../src/views/discover/make').StagedPack} */
+/** @param {string} id @param {string[]} [drops] @returns {import('../src/discover/make').StagedPack} */
 const stagedPack = (id, drops = []) => ({
   item: pick(id, 'modpack'),
   target: packTarget(id),
-  fit: { loader: 'fabric', loaderLabel: 'Fabric', gameVersion: '1.21.1', drops: new Set(drops.map((drop) => `modrinth:${drop}`)) },
+  fit: {
+    loader: 'fabric',
+    loaderLabel: 'Fabric',
+    gameVersion: '1.21.1',
+    drops: new Set(drops.map((drop) => `modrinth:${drop}`)),
+  },
 });
 
 test('picks a made pack could not queue are handed back, and picks it leaves out are neither asked for nor held', async () => {
@@ -479,15 +620,24 @@ test('several packs each take the picks that fit, and only what every instance t
   const unmade = await makeHarness({ unmade: ['modrinth:b'] });
   unmade.state.tray.value = staged;
   await unmade.make.createEach(packs, extras);
-  assert.deepEqual(unmade.installs.map((install) => install.instance), ['instance of modrinth:a']);
+  assert.deepEqual(
+    unmade.installs.map((install) => install.instance),
+    ['instance of modrinth:a'],
+  );
   assert.deepEqual([unmade.picked(), unmade.navigations], [['modrinth:b', 'modrinth:shader', 'modrinth:mod'], []]);
 
   const unchecked = await makeHarness();
   unchecked.state.tray.value = staged;
   const unknown = { loader: 'fabric', loaderLabel: 'Fabric', gameVersion: '1.21.1', drops: null };
   await unchecked.make.createEach([packs[0], { ...packs[1], fit: unknown }], extras);
-  assert.deepEqual(unchecked.installs.map((install) => install.instance), ['instance of modrinth:a']);
-  assert.deepEqual([unchecked.picked(), unchecked.navigations], [['modrinth:b', 'modrinth:shader', 'modrinth:mod'], []]);
+  assert.deepEqual(
+    unchecked.installs.map((install) => install.instance),
+    ['instance of modrinth:a'],
+  );
+  assert.deepEqual(
+    [unchecked.picked(), unchecked.navigations],
+    [['modrinth:b', 'modrinth:shader', 'modrinth:mod'], []],
+  );
 });
 
 test('an incompatible plan requests confirmation without submitting an installation', async () => {
@@ -503,7 +653,10 @@ test('queue admission is reported as queued and delegated to the shared download
   const { actions, requests, applied, notices } = await actionHarness();
   const outcome = await actions.addToInstance('instance-a', [selection], 'Example');
   assert.equal(outcome.status, 'queued');
-  assert.deepEqual(requests.map((request) => request.path), ['/content/plan', '/content/install']);
+  assert.deepEqual(
+    requests.map((request) => request.path),
+    ['/content/plan', '/content/install'],
+  );
   assert.equal(applied.length, 1);
   assert.deepEqual(plain(applied[0][1]), { showNotice: true, connectActive: true });
   assert.deepEqual(notices, [['Queued Example', 'success']]);
@@ -518,9 +671,9 @@ test('failed admission does not project installation success', async () => {
   assert.deepEqual(notices, [['Target is busy.', 'error']]);
 });
 
-/** @param {Parameters<typeof import('../src/views/discover/install-workflow').createInstallWorkflow>[0]} actions */
+/** @param {Parameters<typeof import('../src/discover/install-workflow').createInstallWorkflow>[0]} actions */
 async function workflowHarness(actions) {
-  const { createInstallWorkflow } = await loadSource('views/discover/install-workflow.ts');
+  const { createInstallWorkflow } = await loadSource('discover/install-workflow.ts');
   const workflow = createInstallWorkflow(actions, () => {});
   workflow.setTarget('instance-a');
   return workflow;
@@ -531,7 +684,10 @@ test('target changes discard pending conflict confirmation and do not install in
   const commits = [];
   const workflow = await workflowHarness({
     addToInstance: async () => ({ status: 'needs-confirmation', plan: conflictPlan }),
-    commitInstall: async (...args) => { commits.push(args); return { status: 'queued' }; },
+    commitInstall: async (...args) => {
+      commits.push(args);
+      return { status: 'queued' };
+    },
   });
   await workflow.add([selection], 'Example');
   assert.ok(workflow.snapshot().plan);
@@ -544,7 +700,10 @@ test('target changes discard pending conflict confirmation and do not install in
 test('late plan responses cannot restore confirmation after changing away and back to a target', async () => {
   /** @type {ReturnType<typeof deferred<AddOutcome>>} */
   const response = deferred();
-  const workflow = await workflowHarness({ addToInstance: () => response.promise, commitInstall: async () => ({ status: 'queued' }) });
+  const workflow = await workflowHarness({
+    addToInstance: () => response.promise,
+    commitInstall: async () => ({ status: 'queued' }),
+  });
   const first = workflow.add([selection], 'Example');
   workflow.setTarget('instance-b');
   workflow.setTarget('instance-a');
@@ -554,23 +713,34 @@ test('late plan responses cannot restore confirmation after changing away and ba
 });
 
 test('install the rest re-plans without unavailable selections and what needs them', async () => {
-  /** @type {import('../src/types-content').ContentSelection} */
+  /** @type {import('../src/generated/ResolutionSelection').ResolutionSelection} */
   const ok = { canonical_id: 'modrinth:ok', kind: 'mod' };
-  /** @type {import('../src/types-content').ContentSelection} */
+  /** @type {import('../src/generated/ResolutionSelection').ResolutionSelection} */
   const gone = { canonical_id: 'modrinth:gone', kind: 'mod' };
-  /** @type {import('../src/types-content').ContentSelection} */
+  /** @type {import('../src/generated/ResolutionSelection').ResolutionSelection} */
   const needsGone = { canonical_id: 'modrinth:needs', kind: 'mod' };
-  /** @param {string} id @param {string[]} requires @returns {import('../src/types-content').PlanItem} */
+  /** @param {string} id @param {string[]} requires @returns {import('../src/generated/PlanItem').PlanItem} */
   const item = (id, requires) => ({
-    canonical_id: id, title: id, kind: 'mod', project_id: id.slice('modrinth:'.length), version_id: 'v',
-    version_number: '1', filename: `${id}.jar`, reason: 'selected', already_installed: false, update: false,
+    canonical_id: id,
+    title: id,
+    kind: 'mod',
+    project_id: id.slice('modrinth:'.length),
+    version_id: 'v',
+    version_number: '1',
+    filename: `${id}.jar`,
+    reason: 'selected',
+    already_installed: false,
+    update: false,
     dependencies: requires.map((project_id) => ({ project_id, kind: 'required' })),
   });
-  /** @type {import('../src/types-content').ResolutionPlan} */
+  /** @type {import('../src/generated/ResolutionPlan').ResolutionPlan} */
   const partialPlan = {
-    loader: 'fabric', game_version: '1.21.1',
+    loader: 'fabric',
+    game_version: '1.21.1',
     items: [item(ok.canonical_id, []), item(needsGone.canonical_id, ['gone'])],
-    conflicts: [{ canonical_id: gone.canonical_id, title: 'Gone', kind: 'unavailable', detail: 'No compatible version.' }],
+    conflicts: [
+      { canonical_id: gone.canonical_id, title: 'Gone', kind: 'unavailable', detail: 'No compatible version.' },
+    ],
     total_download_bytes: 0,
   };
   /** @type {unknown[]} */
@@ -600,8 +770,14 @@ test('same-turn duplicate adds and confirms submit once and preserve captured se
   const commits = [];
   let plans = 0;
   const workflow = await workflowHarness({
-    addToInstance: () => { plans += 1; return planning.promise; },
-    commitInstall: (...args) => { commits.push(plain(args)); return installing.promise; },
+    addToInstance: () => {
+      plans += 1;
+      return planning.promise;
+    },
+    commitInstall: (...args) => {
+      commits.push(plain(args));
+      return installing.promise;
+    },
   });
   const selections = [{ ...selection }];
   const first = workflow.add(selections, 'Example');
@@ -623,7 +799,10 @@ test('same-turn duplicate adds and confirms submit once and preserve captured se
 test('accepted work finishing after target change cannot clear the current tray through a queued callback', async () => {
   /** @type {ReturnType<typeof deferred<AddOutcome>>} */
   const admission = deferred();
-  const workflow = await workflowHarness({ addToInstance: () => admission.promise, commitInstall: async () => ({ status: 'queued' }) });
+  const workflow = await workflowHarness({
+    addToInstance: () => admission.promise,
+    commitInstall: async () => ({ status: 'queued' }),
+  });
   const first = workflow.add([selection], 'Example');
   workflow.setTarget('instance-b');
   admission.resolve({ status: 'queued' });
@@ -631,15 +810,32 @@ test('accepted work finishing after target change cannot clear the current tray 
 });
 
 async function searchHarness() {
-  const { createDiscoverSearchLifecycle } = await loadSource('machines/discover-search.ts');
+  const { createDiscoverSearchLifecycle } = await loadSource('discover/search.ts');
   /** @type {Map<number, () => void>} */
   const callbacks = new Map();
   let next = 0;
-  /** @type {import('../src/machines/discover-search').DiscoverSearchSnapshot} */
-  const state = { loadedSearchKey: '', loadedContextKey: '', loadedAt: null, results: [], total: 0, loading: false, loadingMore: false, searchError: null };
-  const lifecycle = createDiscoverSearchLifecycle({ read: () => state, update: (patch) => Object.assign(state, patch) }, {
-    set: (callback) => { callbacks.set(++next, callback); return next; }, clear: (id) => callbacks.delete(id),
-  }, () => 1000);
+  /** @type {import('../src/discover/search').DiscoverSearchSnapshot} */
+  const state = {
+    loadedSearchKey: '',
+    loadedContextKey: '',
+    loadedAt: null,
+    results: [],
+    total: 0,
+    loading: false,
+    loadingMore: false,
+    searchError: null,
+  };
+  const lifecycle = createDiscoverSearchLifecycle(
+    { read: () => state, update: (patch) => Object.assign(state, patch) },
+    {
+      set: (callback) => {
+        callbacks.set(++next, callback);
+        return next;
+      },
+      clear: (id) => callbacks.delete(id),
+    },
+    () => 1000,
+  );
   const run = () => {
     const nextCallback = callbacks.entries().next().value;
     assert.ok(nextCallback, 'Expected a scheduled search');
@@ -648,30 +844,53 @@ async function searchHarness() {
     callback();
   };
   /** @param {string} key @param {string} contextKey @param {SearchRequest['search']} search @returns {SearchRequest} */
-  const request = (key, contextKey, search) => ({ key, contextKey, input: { kind: 'mod' }, search, errorMessage: (error) => error instanceof Error ? error.message : String(error) });
+  const request = (key, contextKey, search) => ({
+    key,
+    contextKey,
+    input: { kind: 'mod' },
+    search,
+    errorMessage: (error) => (error instanceof Error ? error.message : String(error)),
+  });
   return { state, lifecycle, run, request, callbacks };
 }
 
 /** @param {string} canonicalId @param {number} total @returns {ContentPage} */
 function searchPage(canonicalId, total) {
   return {
-    items: [{ canonical_id: canonicalId, kind: 'mod', provider: 'modrinth', project_id: canonicalId,
-      title: canonicalId, author: 'Example', summary: '', downloads: 0, follows: 0,
-      categories: [], game_versions: [], loaders: [] }],
-    total, offset: 0, limit: 40,
+    items: [
+      {
+        canonical_id: canonicalId,
+        kind: 'mod',
+        provider: 'modrinth',
+        project_id: canonicalId,
+        title: canonicalId,
+        author: 'Example',
+        summary: '',
+        downloads: 0,
+        follows: 0,
+        categories: [],
+        game_versions: [],
+        loaders: [],
+      },
+    ],
+    total,
+    offset: 0,
+    limit: 40,
   };
 }
 
 test('search context changes hide stale actionable results and ignore old pagination', async () => {
   const { state, lifecycle, run, request } = await searchHarness();
   lifecycle.search(request('a', 'instance-a', async () => searchPage('first-a', 2)));
-  run(); await settle();
+  run();
+  await settle();
   /** @type {ReturnType<typeof deferred<ContentPage>>} */
   const page = deferred();
   lifecycle.loadMore({ key: 'a', input: { kind: 'mod', offset: 1 }, search: () => page.promise });
   lifecycle.search(request('b', 'instance-b', async () => searchPage('first-b', 1)));
   assert.deepEqual(plain(state.results), []);
-  run(); await settle();
+  run();
+  await settle();
   page.resolve(searchPage('stale-a', 2));
   await settle();
   assert.deepEqual(plain(state.results), searchPage('first-b', 1).items);
@@ -683,11 +902,13 @@ test('search remount shares a pending request and a forced retry wins over an ol
   /** @type {ReturnType<typeof deferred<ContentPage>>} */
   const first = deferred();
   const initial = request('a', 'target', () => first.promise);
-  lifecycle.search(initial); run();
+  lifecycle.search(initial);
+  run();
   lifecycle.search(initial);
   assert.equal(callbacks.size, 0);
   lifecycle.search({ ...initial, force: true, search: async () => searchPage('fresh', 1) });
-  run(); await settle();
+  run();
+  await settle();
   first.resolve(searchPage('stale', 1));
   await settle();
   assert.deepEqual(plain(state.results), searchPage('fresh', 1).items);

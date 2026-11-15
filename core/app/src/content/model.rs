@@ -1,8 +1,9 @@
 //! Provider-neutral catalog records. Raw file references confer no filesystem authority.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
     Mod,
@@ -47,7 +48,7 @@ impl ContentKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Modrinth,
@@ -115,7 +116,7 @@ pub struct LoaderGameFilter {
     pub game_version: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct Page<T> {
     pub items: Vec<T>,
     pub offset: u32,
@@ -125,7 +126,7 @@ pub struct Page<T> {
 
 /// Stable identity for a piece of content across the app, namespaced by its
 /// authoritative service (`modrinth:AABBCC`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 pub struct CanonicalId(pub String);
 
 impl CanonicalId {
@@ -152,21 +153,24 @@ impl CanonicalId {
 }
 
 /// A downloadable file with the integrity facts needed to verify it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct FileRef {
     pub url: String,
     pub filename: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub sha1: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub sha512: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub size: Option<u64>,
     #[serde(default)]
     pub primary: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyKind {
     Required,
@@ -175,11 +179,13 @@ pub enum DependencyKind {
     Embedded,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ContentDependency {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub version_id: Option<String>,
     pub kind: DependencyKind,
 }
@@ -214,7 +220,7 @@ impl ContentDependency {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseChannel {
     Release,
@@ -222,7 +228,7 @@ pub enum ReleaseChannel {
     Alpha,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ContentVersion {
     pub id: String,
     pub name: String,
@@ -233,6 +239,7 @@ pub struct ContentVersion {
     pub loaders: Vec<String>,
     pub channel: ReleaseChannel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub published: Option<String>,
     #[serde(default)]
     pub downloads: u64,
@@ -257,13 +264,14 @@ impl ContentVersion {
 }
 
 /// Search/listing summary of a canonical piece of content.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CanonicalContent {
     pub canonical_id: CanonicalId,
     pub kind: ContentKind,
     pub provider: ProviderId,
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub slug: Option<String>,
     pub title: String,
     #[serde(default)]
@@ -271,9 +279,11 @@ pub struct CanonicalContent {
     #[serde(default)]
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub icon_url: Option<String>,
     /// The screenshot its author chose to represent it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub cover_url: Option<String>,
     #[serde(default)]
     pub downloads: u64,
@@ -286,6 +296,7 @@ pub struct CanonicalContent {
     #[serde(default)]
     pub loaders: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub updated: Option<String>,
 }
 
@@ -297,14 +308,15 @@ pub struct ProjectMetadata {
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct GalleryImage {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub title: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ContentDetail {
     #[serde(flatten)]
     pub content: CanonicalContent,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import * as ui from '../src/ui-state';
+import * as ui from '../src/app/route';
 
 class FakeView {
   /** @type {Map<string, Set<() => void>>} */
@@ -150,7 +150,7 @@ test('restoration retries after mounted async content becomes tall enough', () =
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
-  /** @type {ui.Route} */
+  /** @type {import('../src/generated/InterfaceRoute').InterfaceRoute} */
   const savedRoute = { name: 'discover', target: 'restore-after-load' };
 
   try {
@@ -178,7 +178,7 @@ test('explicit reset cancels a pending restore and forgets its position', () => 
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
-  /** @type {ui.Route} */
+  /** @type {import('../src/generated/InterfaceRoute').InterfaceRoute} */
   const savedRoute = { name: 'discover', target: 'reset-instance' };
 
   try {
@@ -204,11 +204,14 @@ test('explicit reset cancels a pending restore and forgets its position', () => 
 });
 
 test('manual scrolling and focus movement cancel a pending async restore', () => {
-  for (const [event, target] of [['wheel', 'manual-scroll'], ['focusin', 'keyboard-focus']]) {
+  for (const [event, target] of [
+    ['wheel', 'manual-scroll'],
+    ['focusin', 'keyboard-focus'],
+  ]) {
     const view = new FakeView();
     view.scrollHeight = 1_400;
     const dom = installDom(view);
-    /** @type {ui.Route} */
+    /** @type {import('../src/generated/InterfaceRoute').InterfaceRoute} */
     const savedRoute = { name: 'discover', target };
 
     try {
@@ -234,7 +237,7 @@ test('restoration deadline releases observers for permanently short content', as
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
-  /** @type {ui.Route} */
+  /** @type {import('../src/generated/InterfaceRoute').InterfaceRoute} */
   const savedRoute = { name: 'discover', target: 'short-content' };
 
   try {
@@ -259,7 +262,7 @@ test('views with remount-local tabs and filters do not retain scroll', () => {
   const view = new FakeView();
   view.scrollHeight = 1_400;
   const dom = installDom(view);
-  /** @type {ui.Route} */
+  /** @type {import('../src/generated/InterfaceRoute').InterfaceRoute} */
   const settingsRoute = { name: 'settings' };
 
   try {

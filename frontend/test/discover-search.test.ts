@@ -1,24 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { ContentPage, SearchHit } from '../src/types-content';
+import type { ContentPage } from '../src/content/api';
+import type { SearchItem } from '../src/generated/SearchItem';
 import {
   createDiscoverSearchLifecycle,
   type DiscoverLoadMoreRequest,
   type DiscoverSearchRequest,
-} from '../src/machines/discover-search';
+} from '../src/discover/search';
 
 interface TestState {
   loadedSearchKey: string;
   loadedContextKey: string;
   loadedAt: number | null;
-  results: SearchHit[];
+  results: SearchItem[];
   total: number;
   loading: boolean;
   loadingMore: boolean;
   searchError: string | null;
 }
 
-function hit(id: string): SearchHit {
+function hit(id: string): SearchItem {
   return {
     canonical_id: id,
     kind: 'mod',

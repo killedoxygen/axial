@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { comboMatches, effectiveCombos, shortcutById, shortcutHint } from '../src/shortcuts';
+import { comboMatches, effectiveCombos, shortcutById, shortcutHint } from '../src/app/shortcuts';
 
 function onPlatform(platform: string, run: () => void): void {
   const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');

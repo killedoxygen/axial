@@ -6,10 +6,10 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const source = await readFile(resolve(frontend, 'src/error-reporting.ts'), 'utf8');
+const source = await readFile(resolve(frontend, 'src/app/error-reporting.ts'), 'utf8');
 const executable = stripTypeScriptTypes(source)
-  .replace("import { api } from './api';", '')
-  .replace("import { config } from './store';", '')
+  .replace("import { request } from '../platform/transport';", '')
+  .replace("import { config } from '../settings/state';", '')
   .replace(/export function /g, 'function ');
 
 /**
@@ -30,7 +30,7 @@ function reporter(consent = true, send = async () => {}) {
     window,
     config: { peek: () => settings.value },
     /** @param {ReportCall} args */
-    api: (...args) => {
+    request: (...args) => {
       calls.push(args);
       return send(...args);
     },
@@ -43,7 +43,7 @@ function reporter(consent = true, send = async () => {}) {
     EvalError,
   });
   vm.runInContext(`${executable}\nglobalThis.reporter = { initErrorReporting, reportRenderError };`, context);
-  /** @type {typeof import('../src/error-reporting')} */
+  /** @type {typeof import('../src/app/error-reporting')} */
   const exported = context.reporter;
   return { ...exported, calls, events, window, settings };
 }
@@ -147,13 +147,17 @@ test('deduplication and five-report session cap bound the error storm', async ()
 
 test('in-flight reporting suppresses recursion and consent is rechecked for every event', async () => {
   /** @type {() => void} */
-  let finish = () => { throw new Error('Reporting request did not start'); };
+  let finish = () => {
+    throw new Error('Reporting request did not start');
+  };
   const app = reporter(
     true,
     () =>
-      new Promise(/** @param {(value?: void) => void} resolve */ (resolve) => {
-        finish = resolve;
-      }),
+      new Promise(
+        /** @param {(value?: void) => void} resolve */ (resolve) => {
+          finish = resolve;
+        },
+      ),
   );
   app.reportRenderError(new TypeError('one'));
   app.reportRenderError(new RangeError('two'));

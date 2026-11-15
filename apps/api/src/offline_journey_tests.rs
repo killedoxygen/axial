@@ -1223,21 +1223,13 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
         started.expect("startup must return while resumed provider I/O is still held");
     let services = services.unwrap();
     let api = Api::new(&services);
-    let operation_path = format!("/api/v1/performance/instances/{instance}/operation");
     tokio::time::timeout(Duration::from_secs(3), async {
         api.get("/api/v1/config").await;
-        let operation = api.get(&operation_path).await["operation"].clone();
+        let operation = performance_operation(&services, &command);
         assert_eq!(operation["id"], command);
         assert_eq!(operation["instance_id"], instance);
         assert_eq!(operation["action"], action);
-        assert_eq!(operation["view_model"]["is_terminal"], false, "{operation}");
-        assert_eq!(
-            api.get(&format!(
-                "/api/v1/performance/instances/{instance}/operation"
-            ))
-            .await["operation"],
-            operation
-        );
+        assert!(!operation_terminal(&operation), "{operation}");
         for (method, path, body) in [
             (
                 reqwest::Method::PUT,
@@ -1270,8 +1262,8 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     provider.hold.send_replace(false);
     let completed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let operation = api.get(&operation_path).await["operation"].clone();
-            if operation["view_model"]["is_terminal"] == true && services.tasks.status().is_idle() {
+            let operation = performance_operation(&services, &command);
+            if operation_terminal(&operation) && services.tasks.status().is_idle() {
                 break operation;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1349,10 +1341,7 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     .await
     .unwrap();
     let api = Api::new(&services);
-    assert_eq!(
-        api.get(&operation_path).await["operation"].clone(),
-        completed
-    );
+    assert_eq!(performance_operation(&services, &command), completed);
     assert_eq!(
         api.get(&format!(
             "/api/v1/performance/health?instance_id={instance}"
@@ -1394,6 +1383,35 @@ async fn prepared_performance_restart_journey(queued: bool, action: &str, change
     assert_eq!(std::fs::read(mods.join("user.jar")).unwrap(), canary);
 }
 
+fn latest_performance_command(services: &DesktopServices, instance: &str) -> Option<String> {
+    services
+        .instances
+        .registry()
+        .storage()
+        .read(|db| -> Result<Option<String>, axial_app::storage::StorageError> {
+            use axial_app::storage::rusqlite::OptionalExtension;
+            Ok(db
+                .query_row(
+                    "SELECT id FROM performance_commands WHERE instance_id=?1 ORDER BY rowid DESC LIMIT 1",
+                    [instance],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+        .unwrap()
+}
+
+fn performance_operation(services: &DesktopServices, command: &str) -> Value {
+    serde_json::to_value(services.performance.operation(command).unwrap().unwrap()).unwrap()
+}
+
+fn operation_terminal(operation: &Value) -> bool {
+    matches!(
+        operation["state"].as_str(),
+        Some("complete" | "failed" | "interrupted")
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "subprocess helper for the actual Prepared Performance boundary"]
 async fn prepared_performance_crash_helper() {
@@ -1415,7 +1433,6 @@ async fn prepared_performance_crash_helper() {
     )
     .await
     .unwrap();
-    let api = Api::new(&services);
     let id = instance.parse().unwrap();
     let record = services.instances.registry().get_live(&id).unwrap();
     let request = services.performance.resolution_request(
@@ -1433,16 +1450,14 @@ async fn prepared_performance_crash_helper() {
     }
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let operation = api
-                .get(&format!(
-                    "/api/v1/performance/instances/{instance}/operation"
-                ))
-                .await["operation"]
-                .clone();
-            assert_ne!(
-                operation["view_model"]["is_terminal"], true,
-                "Apply did not reach Prepared: {operation}"
-            );
+            let command = latest_performance_command(&services, &instance);
+            if let Some(command) = command {
+                let operation = performance_operation(&services, &command);
+                assert!(
+                    !operation_terminal(&operation),
+                    "Apply did not reach Prepared: {operation}"
+                );
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -2505,7 +2520,7 @@ fn assert_observed_terminal(status: &Value, instance: &str, session: &str) {
     assert_eq!(snapshot["view_model"]["terminal"], true);
     assert_eq!(snapshot["outcome"]["kind"], "stopped");
     assert_eq!(snapshot["outcome"]["reason"], "launcher_stopped");
-    assert_eq!(snapshot["notice"]["tone"], "warned");
+    assert_eq!(snapshot["notice"]["tone"], "warn");
     assert!(
         snapshot["notice"]["message"]
             .as_str()

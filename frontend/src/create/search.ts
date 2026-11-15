@@ -41,7 +41,7 @@ function closeness(row: VersionRowModel, version: string): number | null {
   if (typed !== null && undotted(id) === typed) return 1;
   if (id.startsWith(version) || name.startsWith(version)) return 2;
   if (typed !== null && undotted(id).startsWith(typed)) return 3;
-  const rest = [row.hint ?? '', ...row.tags.map((tag) => tag.label)].join(' ').toLowerCase();
+  const rest = (row.hint ?? '').toLowerCase();
   return id.includes(version) || name.includes(version) || rest.includes(version) ? 4 : null;
 }
 

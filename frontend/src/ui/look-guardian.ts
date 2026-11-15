@@ -1,4 +1,4 @@
-import type { Theme } from '../tokens';
+import type { Theme } from '../app/tokens';
 
 const BLEND_LIMIT = 25;
 const ANALOGOUS_LIMIT = 80;

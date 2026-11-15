@@ -1,0 +1,129 @@
+import { computed, signal } from '@preact/signals';
+import { profileSkinFileUrl, savedSkinFileUrl } from './api';
+import { DEFAULT_SKINS } from './default-skins';
+import { accountsSnapshot, activeAccount } from './snapshot';
+import { local, saveLocalState, canEditPreferences } from '../app/local-state';
+import { config } from '../settings/state';
+import type { AccountView } from '../generated/AccountView';
+import type { MinecraftCape } from '../generated/MinecraftCape';
+
+/** Bumped whenever a skin chosen in Axial changes; `local` itself is not observable. */
+const skinChoices = signal(0);
+
+/** Who is playing, as the shell shows them. Derived, so it can never fall behind the accounts or the choices. */
+const player = computed(() => {
+  skinChoices.value;
+  const fallbackName = config.value?.username?.trim() || 'Player';
+  const account = activeAccount(accountsSnapshot.value);
+  const profile = account?.kind === 'microsoft' ? account.minecraft_profile : null;
+  if (!account || (account.kind === 'microsoft' && !profile)) {
+    return { name: fallbackName, skin: selectedSkinTextureSrc(selectedSkinForAccount(FALLBACK_SKIN_ACCOUNT_KEY)) };
+  }
+  return {
+    name: profile?.name.trim() || account.display_name.trim() || fallbackName,
+    skin: accountSkinTextureSrc(account),
+  };
+});
+export const accountSkinSrc = computed(() => player.value.skin);
+export const accountDisplayName = computed(() => player.value.name);
+
+const DEFAULT_SELECTED_SKIN = 'default:steve';
+export const FALLBACK_SKIN_ACCOUNT_KEY = 'account:fallback';
+
+export function launcherSkinAccountKey(accountId: string): string {
+  const normalized = accountId.trim();
+  return `account:${normalized || 'unknown'}`;
+}
+
+export function selectedSkinForAccount(accountKey?: string): string {
+  if (!accountKey) return validSelectedSkin(local.selectedSkin);
+  return validSelectedSkin(local.selectedSkinsByAccount[accountKey] ?? local.selectedSkin);
+}
+
+export function hasSelectedSkinForAccount(accountKey: string): boolean {
+  return (
+    typeof local.selectedSkinsByAccount[accountKey] === 'string' &&
+    local.selectedSkinsByAccount[accountKey].trim().length > 0
+  );
+}
+
+export function selectedSkinTextureSrc(value = selectedSkinForAccount()): string | null {
+  if (value.startsWith('default:')) {
+    const id = value.slice('default:'.length);
+    return DEFAULT_SKINS.find((skin) => skin.id === id)?.src ?? null;
+  }
+  if (value.startsWith('saved:')) {
+    const textureKey = value.slice('saved:'.length);
+    return textureKey ? savedSkinFileUrl({ texture_key: textureKey }) : null;
+  }
+  return null;
+}
+
+/** The texture of the skin a Microsoft account's Minecraft profile wears. */
+export function profileSkinTextureSrc(account: AccountView): string | null {
+  const profile = account.minecraft_profile;
+  const skin = account.profile_skin;
+  if (!profile || !skin) return null;
+  const params = new URLSearchParams({ profile: profile.id, skin: skin.id, texture: skin.url });
+  return profileSkinFileUrl(params);
+}
+
+/** The cape a Microsoft account's Minecraft profile wears. */
+export function profileCape(account: AccountView | null | undefined): MinecraftCape | null {
+  return account?.minecraft_profile?.capes.find((cape) => cape.id === account.profile_cape_id) ?? null;
+}
+
+export function setSelectedSkin(value: string, accountKey?: string): void {
+  if (!canEditPreferences()) return;
+  const next = validSelectedSkin(value);
+  if (accountKey) {
+    if (local.selectedSkinsByAccount[accountKey] !== next) {
+      local.selectedSkinsByAccount = {
+        ...local.selectedSkinsByAccount,
+        [accountKey]: next,
+      };
+    }
+  } else {
+    local.selectedSkin = next;
+  }
+  saveLocalState();
+  skinChoices.value += 1;
+}
+
+export function resetSelectedSkin(accountKey?: string): void {
+  setSelectedSkin(DEFAULT_SELECTED_SKIN, accountKey);
+}
+
+/** Carries an account's chosen skin to the id it has after a rename. */
+export function moveAccountSkin(fromAccountId: string, toAccountId: string): void {
+  const from = launcherSkinAccountKey(fromAccountId);
+  const to = launcherSkinAccountKey(toAccountId);
+  if (from === to || !canEditPreferences()) return;
+  const { [from]: chosen, ...rest } = local.selectedSkinsByAccount;
+  if (chosen === undefined) return;
+  local.selectedSkinsByAccount = { ...rest, [to]: chosen };
+  saveLocalState();
+  skinChoices.value += 1;
+}
+
+/** Drops the skin chosen for an account that no longer exists. */
+export function forgetAccountSkin(accountId: string): void {
+  const key = launcherSkinAccountKey(accountId);
+  if (!(key in local.selectedSkinsByAccount) || !canEditPreferences()) return;
+  const { [key]: _removed, ...rest } = local.selectedSkinsByAccount;
+  local.selectedSkinsByAccount = rest;
+  saveLocalState();
+  skinChoices.value += 1;
+}
+
+/** The skin texture an account shows: its Minecraft profile skin, or the look chosen for it in Axial. */
+export function accountSkinTextureSrc(account: AccountView): string | null {
+  return account.kind === 'microsoft'
+    ? profileSkinTextureSrc(account)
+    : selectedSkinTextureSrc(selectedSkinForAccount(launcherSkinAccountKey(account.account_id)));
+}
+
+function validSelectedSkin(value: string | undefined): string {
+  const selected = value?.trim();
+  return selected || DEFAULT_SELECTED_SKIN;
+}

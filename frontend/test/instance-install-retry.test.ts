@@ -1,24 +1,15 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import * as core from '../src/dto-core';
-import * as installItems from '../src/install-item';
-import * as launchPresenters from '../src/launch-presenters';
-import { minecraftVersionLabel } from '../src/version-display';
-import type { EnrichedInstance } from '../src/types-instance';
-import type { LaunchSession } from '../src/types-launch';
-import type { LaunchState } from '../src/store';
-import type { ActiveDownload, DownloadFailure } from '../src/machines/downloads';
-import type { InstallQueueInstallItemViewModel, InstallQueuedItemViewModel } from '../src/types-install';
-import type { LoaderComponentId } from '../src/types-loader';
-
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
-const { enrichedInstanceResponse } = core;
+import { apiModule, loadSource, requireDependency } from './source';
+import { enrichedInstance } from './wire';
+import * as installItems from '../src/install/item';
+import * as launchPresenters from '../src/launch/presenters';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
+import type { LaunchSession, LaunchState } from '../src/launch/state';
+import type { ActiveDownload, DownloadFailure } from '../src/install/queue';
+import type { InstallItem } from '../src/generated/InstallItem';
+import type { InstallQueuedItemViewModel } from '../src/generated/InstallQueuedItemViewModel';
+import type { LoaderComponentId } from '../src/generated/LoaderComponentId';
 
 function harness() {
   const downloads = {
@@ -27,29 +18,14 @@ function harness() {
     downloadQueue: { value: { items: [] as InstallQueuedItemViewModel[] } },
     installedStateSettling: { value: false },
   };
-  const filename = resolve(frontend, 'src/instance-install-status.ts');
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
+  const status = loadSource<typeof import('../src/install/status')>('install/status.ts', {
+    'install/queue': downloads,
+    'install/item': installItems,
   });
-  const exports = {};
-  vm.runInNewContext(
-    compiled.outputText,
-    {
-      exports,
-      require(id: string): unknown {
-        if (id === './machines/downloads') return downloads;
-        if (id === './install-item') return installItems;
-        if (id === './version-display') return { minecraftVersionLabel };
-        throw new Error(`Unreviewed instance install dependency: ${id}`);
-      },
-    },
-    { filename },
-  );
-  return { downloads, ...(exports as typeof import('../src/instance-install-status')) };
+  return { downloads, ...status };
 }
 
-function target(component: LoaderComponentId): InstallQueueInstallItemViewModel {
+function target(component: LoaderComponentId): InstallItem {
   return {
     version_id: `opaque-installed-${component}`,
     loader: {
@@ -61,14 +37,11 @@ function target(component: LoaderComponentId): InstallQueueInstallItemViewModel 
   };
 }
 
-function instance(installTarget: InstallQueueInstallItemViewModel | null) {
-  return {
+function instance(installTarget: InstallItem | null): EnrichedInstance {
+  return enrichedInstance({
     id: 'registered-instance',
     name: 'Survival',
     version_id: installTarget?.version_id ?? 'unavailable-loader',
-    created_at: '2026-09-27T09:00:00Z',
-    java_selection: { kind: 'inherited' as const },
-    revision: 1,
     version_display: {
       loader_key: 'fabric',
       loader_label: 'Fabric',
@@ -88,14 +61,10 @@ function instance(installTarget: InstallQueueInstallItemViewModel | null) {
     },
     needs_install: installTarget?.version_id ?? 'unavailable-loader',
     install_target: installTarget,
-    saves_count: 0,
-    mods_count: 0,
-    resource_count: 0,
-    shader_count: 0,
-  };
+  });
 }
 
-function queued(installTarget: InstallQueueInstallItemViewModel): InstallQueuedItemViewModel {
+function queued(installTarget: InstallItem): InstallQueuedItemViewModel {
   return {
     queue_id: 'queued-loader',
     state_id: 'queued',
@@ -111,10 +80,10 @@ function queued(installTarget: InstallQueueInstallItemViewModel): InstallQueuedI
   };
 }
 
-function failed(installTarget: InstallQueueInstallItemViewModel): DownloadFailure {
+function failed(installTarget: InstallItem): DownloadFailure {
   return {
     operationId: 'failed-operation',
-    item: installItems.installItemFromQueueInstallItem(installTarget),
+    item: installTarget,
     displayName: 'Loader',
     failedAt: 1,
     viewModel: {
@@ -140,26 +109,26 @@ for (const component of [
       const installTarget = target(component);
       const wire = instance(installTarget);
       const h = harness();
-      const parsed = enrichedInstanceResponse(wire);
+      const parsed = wire;
       if (outcome === 'failed') {
         h.downloads.downloadFailures.value = [failed(installTarget)];
-        assert.equal(h.instanceInstallStatus(parsed, undefined).state, 'failed');
+        assert.equal(h.instanceInstallStatus(parsed).state, 'failed');
         h.downloads.downloadFailures.value = [];
       } else {
         h.downloads.downloadQueue.value.items = [queued(installTarget)];
-        assert.equal(h.instanceInstallStatus(parsed, undefined).state, 'queued');
+        assert.equal(h.instanceInstallStatus(parsed).state, 'queued');
         h.downloads.downloadQueue.value.items = [];
       }
       // Reloaded registry response and an empty queue are sufficient. The
       // frontend never decodes the opaque installed/build identities.
       const restarted = harness();
-      const refreshed = enrichedInstanceResponse(JSON.parse(JSON.stringify(wire)));
-      const status = restarted.instanceInstallStatus(refreshed, undefined);
+      const refreshed: EnrichedInstance = JSON.parse(JSON.stringify(wire));
+      const status = restarted.instanceInstallStatus(refreshed);
       assert.equal(status.state, 'idle');
       assert.equal(status.installing, false);
       assert.ok(status.item?.loader);
-      assert.equal(status.item.loader.minecraftVersion, '1.21.4');
-      assert.deepEqual(installItems.installQueueRequestFromItem(status.item), {
+      assert.equal(status.item.loader.minecraft_version, '1.21.4');
+      assert.deepEqual(installItems.installQueueRequest(status.item), {
         kind: 'loader',
         component_id: component,
         build_id: `opaque-build-${component}`,
@@ -175,11 +144,10 @@ test('an explicit unavailable target cannot become a vanilla install or inherit 
   stale.version_id = wire.version_id;
   h.downloads.downloadFailures.value = [failed(stale)];
   h.downloads.downloadQueue.value.items = [queued(stale)];
-  const parsed = enrichedInstanceResponse(wire);
+  const parsed = wire;
   assert.equal(parsed.install_target, null);
   assert.equal(parsed.launch_action.primary_action, 'blocked');
-  assert.equal(h.installItemForInstance(parsed, undefined), null);
-  const status = h.instanceInstallStatus(parsed, undefined);
+  const status = h.instanceInstallStatus(parsed);
   assert.equal(status.item, null);
   assert.equal(status.target, '');
   assert.equal(status.failure, null);
@@ -193,45 +161,23 @@ test('an authoritative loader target does not match another build with the same 
   other.loader!.build_id = 'different-build';
   h.downloads.downloadFailures.value = [failed(other)];
   h.downloads.downloadQueue.value.items = [queued(other)];
-  const status = h.instanceInstallStatus(enrichedInstanceResponse(instance(expected)), undefined);
+  const status = h.instanceInstallStatus(instance(expected));
   assert.equal(status.state, 'idle');
   assert.ok(status.item);
-  assert.deepEqual(installItems.installQueueRequestFromItem(status.item), {
+  assert.deepEqual(installItems.installQueueRequest(status.item), {
     kind: 'loader',
     component_id: 'net.fabricmc.fabric-loader',
     build_id: expected.loader!.build_id,
   });
 });
 
-test('the instance boundary validates install targets and preserves absent compatibility fields', () => {
-  const wire = instance(target('net.fabricmc.fabric-loader'));
-  assert.throws(() => enrichedInstanceResponse({ ...wire, install_target: { version_id: 42 } }), /Install version/);
-  assert.throws(
-    () =>
-      enrichedInstanceResponse({
-        ...wire,
-        install_target: { ...wire.install_target, loader: { ...wire.install_target?.loader, build_id: 42 } },
-      }),
-    /Loader build/,
-  );
-  const { install_target: _omitted, ...oldWire } = wire;
-  const parsed = enrichedInstanceResponse(oldWire);
-  assert.equal(parsed.install_target, undefined);
-  const h = harness();
-  const item = h.installItemForInstance({ version_id: '1.21.4' }, undefined);
-  assert.ok(item);
-  assert.deepEqual(installItems.installQueueRequestFromItem(item), { kind: 'vanilla', version_id: '1.21.4' });
-});
-
 function detailHarness(inst: EnrichedInstance) {
   const h = harness();
   const store = {
-    config: { value: null },
     instances: { value: [inst] as EnrichedInstance[] },
     launchSessions: { value: {} as Record<string, LaunchSession> },
     launchNotices: { value: {} },
     launchState: { value: { status: 'idle' } as LaunchState },
-    versionById: () => undefined,
   };
   const reads: string[] = [];
   let read = async (): Promise<unknown> => inst;
@@ -241,133 +187,110 @@ function detailHarness(inst: EnrichedInstance) {
   let mountedDeps: Array<unknown[] | undefined> = [];
   const cleanups: Array<() => void> = [];
   let resourceReads = 0;
-  const readinessFile = resolve(frontend, 'src/instance-readiness.ts');
-  const readinessExports = {};
-  vm.runInNewContext(ts.transpileModule(readFileSync(readinessFile, 'utf8'), {
-    compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.CommonJS },
-  }).outputText, {
-    exports: readinessExports,
-    require(id: string): unknown {
-      if (id === './api') return { api: async (_method: string, path: string) => { reads.push(path); return read(); } };
-      if (id === './dto-core') return core;
-      if (id === './store') return store;
-      if (id === './utils') return { showError: assert.fail };
-      throw new Error(`Unreviewed readiness dependency: ${id}`);
-    },
-  }, { filename: readinessFile });
-  const imports: Record<string, unknown> = {
-    'preact/hooks': {
-      useState: <T>(initial: T | (() => T)) => {
-        const index = cursor++;
-        if (!(index in values)) values[index] = typeof initial === 'function' ? (initial as () => T)() : initial;
-        return [values[index], (next: T | ((current: T) => T)) => {
-          values[index] = typeof next === 'function' ? (next as (current: T) => T)(values[index] as T) : next;
-        }];
-      },
-      useRef: <T>(value: T) => { const index = cursor++; return values[index] ??= { current: value }; },
-      useEffect(run: () => void | (() => void), deps?: unknown[]) { effects.push({ run, deps }); },
-    },
-    'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
-    '../../ui/Icons': { Icon: 'Icon' },
-    '../../vista/Vista': { Vista: () => null },
-    '../../ui/Face': { Face: 'Face' },
-    '../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Chip: 'Chip', Empty: 'Empty', Status: 'Status' },
-    '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile', guardedInstanceHue: () => 140, artSeedFor: () => 0 },
-    '../../ui/ContextMenu': {},
-    '../../store': store,
-    '../../ui-state': {},
-    '../../actions': {},
-    '../../launch': {},
-    '../../machines/downloads': h.downloads,
-    '../../utils': { errMessage: (error: Error) => error.message },
-    '../../format': { formatDate: () => 'Today', fmtRelative: () => 'Never' },
-    '../../instance-install-status': h,
-    '../../instance-setup': {},
-    '../../instance-readiness': readinessExports,
-    '../../launch-presenters': launchPresenters,
-    './mod-provenance-cache': { cachedModProvenance: () => null },
-    './listing-cache': { lastListing: () => null, readListing: () => () => undefined },
-    '../../content-activity': { contentRevision: { value: 0 } },
-    './components/pack-origin': { PackChips: 'PackChips' },
-    './resources': {
-      fetchInstanceResources: async () => {
-        resourceReads += 1;
-        throw new Error('Resources unavailable');
-      },
-    },
-    './logs': {},
-    './instance-actions': {},
-    '../../hooks/use-theme': { useTheme: () => ({}) },
-    './components/launch': {
-      LaunchSplitButton: 'LaunchSplitButton',
-      InstallBarrierPane: 'InstallBarrierPane',
-      LaunchOutcomeNotice: 'LaunchOutcomeNotice',
-    },
-    ...Object.fromEntries(
-      ['Mods', 'Packs', 'Worlds', 'Screenshots', 'Logs', 'Settings'].map((name) => [
-        `./tabs/${name}Pane`,
-        { [`${name}Pane`]: `${name}Pane` },
-      ]),
-    ),
-  };
-  const filename = resolve(frontend, 'src/views/instance/InstanceDetailView.tsx');
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.CommonJS,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
+  const instanceApi = apiModule<typeof import('../src/instances/api')>('instances/api.ts', async (_method, path) => {
+    if (path.endsWith('/resources')) {
+      resourceReads += 1;
+      throw new Error('Resources unavailable');
+    }
+    reads.push(path);
+    return read();
   });
-  const exports = {};
-  vm.runInNewContext(
-    compiled.outputText,
+  const instanceState = { instances: store.instances, selectInstance: () => {} };
+  const launchState = { ...store, clearLaunchNotice: () => {} };
+  const readiness = loadSource<typeof import('../src/instances/readiness')>(
+    'instances/readiness.ts',
     {
-      exports,
-      require(id: string) {
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed instance view dependency: ${id}`);
-      },
+      'instances/api': instanceApi,
+      'settings/state': { config: { value: null } },
+      'instances/state': instanceState,
+      'launch/state': launchState,
+      'app/toast': { showError: assert.fail },
     },
-    { filename },
+    { window: { setTimeout } },
   );
-  const launchFile = resolve(frontend, 'src/views/instance/components/launch.tsx');
-  const launchExports = {};
-  const launchImports: Record<string, unknown> = {
-    'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
-    '../../../ui/Icons': { Icon: 'Icon' },
-    '../../../ui/Atoms': { Button: 'Button', IconButton: 'IconButton', Meter: 'Meter', SplitButton: 'SplitButton' },
-    '../../../ui/Face': { Face: 'Face' },
-    '../../../ui/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
-    '../../../ui/ContextMenu': {},
-    '../../../ui-state': {},
-    '../../../actions': {},
-    '../../../toast': {},
-    '../../../launch-presenters': launchPresenters,
-    '../instance-actions': {},
-  };
-  vm.runInNewContext(
-    ts.transpileModule(readFileSync(launchFile, 'utf8'), {
-      fileName: launchFile,
-      compilerOptions: {
-        target: ts.ScriptTarget.ES2020,
-        module: ts.ModuleKind.CommonJS,
-        jsx: ts.JsxEmit.ReactJSX,
-        jsxImportSource: 'preact',
-      },
-    }).outputText,
+  const jsx = requireDependency('preact/jsx-runtime');
+  const launchControls = loadSource<typeof import('../src/instances/detail/components/launch')>(
+    'instances/detail/components/launch.tsx',
     {
-      exports: launchExports,
-      require(id: string): unknown {
-        if (Object.prototype.hasOwnProperty.call(launchImports, id)) return launchImports[id];
-        throw new Error(`Unreviewed launch control dependency: ${id}`);
-      },
+      'preact/jsx-runtime': jsx,
+      'ui/Atoms': { Button: 'Button', Meter: 'Meter', Notice: 'Notice', SplitButton: 'SplitButton' },
+      'install/DownloadFailureNotice': { DownloadFailureNotice: 'DownloadFailureNotice' },
+      'ui/ContextMenu': {},
+      'app/route': {},
+      'launch/state': launchState,
+      'app/toast': {},
+      'launch/presenters': launchPresenters,
+      'instances/detail/instance-actions': {},
     },
-    { filename: launchFile },
   );
-  const { LaunchSplitButton } = launchExports as typeof import('../src/views/instance/components/launch');
-  const { InstanceDetailView } = exports as typeof import('../src/views/instance/InstanceDetailView');
+  const view = loadSource<typeof import('../src/instances/detail/InstanceDetailView')>(
+    'instances/detail/InstanceDetailView.tsx',
+    {
+      'preact/hooks': {
+        useState: <T>(initial: T | (() => T)) => {
+          const index = cursor++;
+          if (!(index in values)) values[index] = typeof initial === 'function' ? (initial as () => T)() : initial;
+          return [
+            values[index],
+            (next: T | ((current: T) => T)) => {
+              values[index] = typeof next === 'function' ? (next as (current: T) => T)(values[index] as T) : next;
+            },
+          ];
+        },
+        useRef: <T>(value: T) => {
+          const index = cursor++;
+          return (values[index] ??= { current: value });
+        },
+        useEffect(run: () => void | (() => void), deps?: unknown[]) {
+          effects.push({ run, deps });
+        },
+      },
+      'preact/jsx-runtime': jsx,
+      'ui/Atoms': {
+        Button: 'Button',
+        Chip: 'Chip',
+        Empty: 'Empty',
+        IconButton: 'IconButton',
+        Status: 'Status',
+        Tabs: 'Tabs',
+      },
+      'ui/InstanceVisual': { artSeedFor: () => 0 },
+      'vista/Vista': { Vista: () => null },
+      'ui/ContextMenu': {},
+      'content/activity': { contentRevision: { value: 0 } },
+      'instances/state': instanceState,
+      'launch/state': launchState,
+      'app/route': { navigate: () => {}, resetViewScroll: () => {} },
+      'launch/controller': {},
+      'install/queue': {},
+      'app/toast': { errMessage: (error: Error) => error.message },
+      'ui/format': { fmtRelative: () => 'Never' },
+      'install/status': h,
+      'instances/readiness': readiness,
+      'instances/setup': {},
+      'launch/presenters': launchPresenters,
+      'instances/api': instanceApi,
+      'instances/detail/listing-cache': { lastListing: () => null, readListing: () => () => undefined },
+      'instances/detail/logs': { LOG_RESOURCE_POLL_MS: 2500 },
+      'instances/detail/instance-actions': {},
+      ...Object.fromEntries(
+        ['Mods', 'Packs', 'Worlds', 'Screenshots', 'Logs', 'Settings'].map((name) => [
+          `instances/detail/tabs/${name}Pane`,
+          { [`${name}Pane`]: `${name}Pane` },
+        ]),
+      ),
+      'instances/detail/components/launch': {
+        LaunchSplitButton: 'LaunchSplitButton',
+        InstallBarrierPane: 'InstallBarrierPane',
+        LaunchOutcomeNotice: 'LaunchOutcomeNotice',
+      },
+      'instances/detail/components/pack-origin': { PackChips: 'PackChips' },
+      'instances/detail/mod-provenance-cache': { cachedModProvenance: () => null },
+    },
+    { window: { setInterval, clearInterval } },
+  );
+  const { LaunchSplitButton } = launchControls;
+  const { InstanceDetailView } = view;
   type Node = { type: unknown; props: Record<string, unknown> };
   function nodes(value: unknown): Node[] {
     if (Array.isArray(value)) return value.flatMap(nodes);
@@ -398,15 +321,23 @@ function detailHarness(inst: EnrichedInstance) {
     return Array.isArray(children) ? children[0] : children;
   }
   return {
-    ...h, store, reads, render, status,
+    ...h,
+    store,
+    reads,
+    render,
+    status,
     primaryLabel,
-    respond(next: typeof read) { read = next;
+    respond(next: typeof read) {
+      read = next;
     },
     resourceReads: () => resourceReads,
     mount() {
       render();
       mountedDeps = effects.map(({ deps }) => deps);
-      for (const { run } of effects) { const cleanup = run(); if (cleanup) cleanups.push(cleanup); }
+      for (const { run } of effects) {
+        const cleanup = run();
+        if (cleanup) cleanups.push(cleanup);
+      }
     },
     update() {
       render();
@@ -418,13 +349,15 @@ function detailHarness(inst: EnrichedInstance) {
         if (cleanup) cleanups.push(cleanup);
       });
     },
-    unmount() { for (const cleanup of cleanups) cleanup(); },
+    unmount() {
+      for (const cleanup of cleanups) cleanup();
+    },
   };
 }
 
 test('the real instance header follows installation and backend readiness instead of assuming Ready', () => {
   const installTarget = target('net.fabricmc.fabric-loader');
-  const inst = enrichedInstanceResponse(instance(installTarget));
+  const inst = instance(installTarget);
   const h = detailHarness(inst);
   const { status, store } = h;
   assert.equal(status(), undefined);
@@ -432,7 +365,7 @@ test('the real instance header follows installation and backend readiness instea
   h.downloads.activeDownload.value = {
     queueId: 'queue-1',
     kind: 'loader',
-    item: installItems.installItemFromQueueInstallItem(installTarget),
+    item: installTarget,
     displayName: 'Minecraft',
     pct: 0,
     ringPct: 0,
@@ -486,9 +419,12 @@ test('the real instance header follows installation and backend readiness instea
 });
 
 test('entering instance details and refreshing Mods recover stale availability while retaining resource errors', async () => {
-  const busy = enrichedInstanceResponse(instance(null));
-  const ready: EnrichedInstance = { ...busy, launchable: true,
-    launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' } };
+  const busy = instance(null);
+  const ready: EnrichedInstance = {
+    ...busy,
+    launchable: true,
+    launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' },
+  };
   const h = detailHarness(busy);
   h.respond(async () => ready);
   h.mount();
@@ -504,7 +440,8 @@ test('entering instance details and refreshing Mods recover stale availability w
   assert.equal(h.status(), undefined);
   assert.equal(h.primaryLabel(), 'Launch');
   assert.deepEqual(h.reads, [`/instances/${busy.id}`, `/instances/${busy.id}`]);
-  const resources = h.render().find((node) => node.type === 'ModsPane')?.props.resources as { status: string;
+  const resources = h.render().find((node) => node.type === 'ModsPane')?.props.resources as {
+    status: string;
     data: unknown;
     error: string;
   };
@@ -515,11 +452,16 @@ test('entering instance details and refreshing Mods recover stale availability w
 });
 
 test('instance details reread resources once setup releases the instance', async () => {
-  const pending = enrichedInstanceResponse(instance(null));
-  const settling: EnrichedInstance = { ...pending,
-    launch_action: { ...pending.launch_action, state_id: 'setup_queued' } };
-  const ready: EnrichedInstance = { ...pending, launchable: true,
-    launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' } };
+  const pending = instance(null);
+  const settling: EnrichedInstance = {
+    ...pending,
+    launch_action: { ...pending.launch_action, state_id: 'setup_queued' },
+  };
+  const ready: EnrichedInstance = {
+    ...pending,
+    launchable: true,
+    launch_action: { state_id: 'ready', primary_action: 'launch', label: 'Launch', launchable: true, tone: 'ok' },
+  };
   const h = detailHarness(settling);
   h.respond(async () => h.store.instances.value[0]);
   h.mount();
@@ -537,13 +479,13 @@ test('instance details reread resources once setup releases the instance', async
 
 test('idle instance readiness stays settling until the installed-state refresh completes', () => {
   const h = harness();
-  const inst = enrichedInstanceResponse(instance(null));
-  assert.equal(h.instanceInstallStatus(inst, undefined).settling, false);
+  const inst = instance(null);
+  assert.equal(h.instanceInstallStatus(inst).settling, false);
   h.downloads.installedStateSettling.value = true;
-  const pending = h.instanceInstallStatus(inst, undefined);
+  const pending = h.instanceInstallStatus(inst);
   assert.equal(pending.settling, true);
   assert.equal(pending.installing, false);
   assert.equal(pending.state, 'idle');
   h.downloads.installedStateSettling.value = false;
-  assert.equal(h.instanceInstallStatus(inst, undefined).settling, false);
+  assert.equal(h.instanceInstallStatus(inst).settling, false);
 });

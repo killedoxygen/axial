@@ -15,7 +15,7 @@ use crate::{
     },
     instances::{model::InstanceId, setup::SetupWork},
     library::{GenerationPin, LibraryLifecycle},
-    public::OperationId,
+    public::{OperationId, Tone},
     storage::{
         MetadataStore, Migration, StorageError,
         rusqlite::{self, OptionalExtension, params},
@@ -212,7 +212,7 @@ struct State {
 }
 struct Entry {
     request: InstallQueueRequest,
-    item: InstallQueueInstallItemViewModel,
+    item: InstallItem,
     status: Status,
     pin: Option<GenerationPin>,
     started_at: Option<u64>,
@@ -775,7 +775,7 @@ impl InstallQueue {
     pub async fn resolve_target(
         &self,
         request: &InstallQueueRequest,
-    ) -> Result<InstallQueueInstallItemViewModel, InstallError> {
+    ) -> Result<InstallItem, InstallError> {
         self.resolve_target_cancellable(request, std::future::pending())
             .await
     }
@@ -831,12 +831,12 @@ impl InstallQueue {
         &self,
         request: &InstallQueueRequest,
         cancelled: impl std::future::Future<Output = ()>,
-    ) -> Result<InstallQueueInstallItemViewModel, InstallError> {
+    ) -> Result<InstallItem, InstallError> {
         match request {
             InstallQueueRequest::Vanilla { version_id } => {
                 axial_minecraft::portable_path::PortableFileName::new_exact(version_id)
                     .map_err(|_| InstallError::InvalidRequest)?;
-                Ok(InstallQueueInstallItemViewModel {
+                Ok(InstallItem {
                     version_id: version_id.clone(),
                     loader: None,
                     content: None,
@@ -869,10 +869,10 @@ impl InstallQueue {
                     .registry()
                     .get_live(&id)
                     .map_err(|_| InstallError::NotFound)?;
-                Ok(InstallQueueInstallItemViewModel {
+                Ok(InstallItem {
                     version_id: record.instance.version_id,
                     loader: None,
-                    content: Some(InstallQueueContentItemViewModel {
+                    content: Some(InstallContentItem {
                         instance_id: instance_id.clone(),
                         label: label.clone(),
                         action: action.clone(),
@@ -1173,7 +1173,7 @@ impl InstallQueue {
     fn enqueue_resolved(
         &self,
         request: InstallQueueRequest,
-        item: InstallQueueInstallItemViewModel,
+        item: InstallItem,
         pin: GenerationPin,
         setup: Option<SetupWork>,
         front: bool,
@@ -1196,7 +1196,7 @@ impl InstallQueue {
         &self,
         state: &mut State,
         request: InstallQueueRequest,
-        item: InstallQueueInstallItemViewModel,
+        item: InstallItem,
         pin: GenerationPin,
         setup: Option<SetupWork>,
         front: bool,
@@ -1339,7 +1339,7 @@ impl InstallQueue {
                     Err(_) => {
                         response.notice = Some(InstallQueueNoticeViewModel {
                             state_id: "removed_cleanup_pending".into(),
-                            tone: "warn".into(),
+                            tone: Tone::Warn,
                             message: "Removed from queue. Instance cleanup is incomplete.".into(),
                             detail: Some("The instance may need deletion to be resumed.".into()),
                         })
@@ -1651,7 +1651,7 @@ impl InstallQueue {
         id: &str,
         pin: &GenerationPin,
         operation: &axial_minecraft::managed_path::ManagedLibraryOperation,
-        item: &InstallQueueInstallItemViewModel,
+        item: &InstallItem,
         retained: Option<RetainedInstall>,
         reconstruct: Reconstruct,
     ) -> Result<RecoveryAction, WorkFailure>
@@ -3356,7 +3356,7 @@ impl PublicationCheckpoint {
     fn verify(
         &self,
         operation: &axial_minecraft::managed_path::ManagedLibraryOperation,
-        item: &InstallQueueInstallItemViewModel,
+        item: &InstallItem,
     ) -> Result<(), InstallError> {
         let evidence =
             axial_minecraft::ManagedInstallPublicationEvidenceId::parse(&self.evidence_id)
@@ -3443,15 +3443,12 @@ async fn persist_activation(
     })?.map_err(|_| KnownGoodActivationRejected)
 }
 
-fn item_for_loader(record: &LoaderBuildRecord) -> InstallQueueInstallItemViewModel {
-    InstallQueueInstallItemViewModel {
+fn item_for_loader(record: &LoaderBuildRecord) -> InstallItem {
+    InstallItem {
         version_id: record.version_id.clone(),
         content: None,
-        loader: Some(InstallQueueLoaderItemViewModel {
-            component_id: serde_json::to_value(record.component_id)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_default(),
+        loader: Some(InstallLoaderItem {
+            component_id: record.component_id,
             build_id: record.build_id.clone(),
             minecraft_version: record.minecraft_version.clone(),
             loader_version: record.loader_version.clone(),
@@ -3551,15 +3548,12 @@ fn validate_content_request(
         Err(InstallError::InvalidRequest)
     }
 }
-fn item_label(item: &InstallQueueInstallItemViewModel) -> String {
+fn item_label(item: &InstallItem) -> String {
     if let Some(content) = &item.content {
         return content.label.clone();
     }
     if let Some(loader) = &item.loader {
-        let Some(component) = LoaderComponentId::parse(&loader.component_id) else {
-            return "Unknown loader".into();
-        };
-        let name = component.display_name();
+        let name = loader.component_id.display_name();
         let version = loader.loader_version.trim();
         let label = if version.is_empty() {
             format!("{name} loader")
@@ -3661,7 +3655,7 @@ fn failure_view(error: InstallError, detail: Option<String>) -> InstallFailureVi
     InstallFailureViewModel {
         state_id: "failed".into(),
         title: "Installation failed".into(),
-        tone: "danger".into(),
+        tone: Tone::Err,
         summary: error.to_string(),
         detail,
         details: Vec::new(),
@@ -3700,7 +3694,7 @@ fn project(state: &State) -> InstallQueueStateResponse {
             install_id: Some(id.clone()),
             operation_id: Some(entry.status.operation_id.clone()),
             install_started_at_ms: entry.started_at,
-            kind: kind(&entry.request).into(),
+            kind: (&entry.request).into(),
             title: item_label(&entry.item),
             label: item_label(&entry.item),
             summary: progress.label.clone(),
@@ -3722,7 +3716,7 @@ fn project(state: &State) -> InstallQueueStateResponse {
                 .map(|entry| InstallQueuedItemViewModel {
                     queue_id: id.clone(),
                     state_id: "queued".into(),
-                    kind: kind(&entry.request).into(),
+                    kind: (&entry.request).into(),
                     title: item_label(&entry.item),
                     label: item_label(&entry.item),
                     summary: "Waiting to install".into(),
@@ -3775,14 +3769,6 @@ fn project(state: &State) -> InstallQueueStateResponse {
         removed_instance_id: None,
     }
 }
-fn kind(request: &InstallQueueRequest) -> &'static str {
-    match request {
-        InstallQueueRequest::Vanilla { .. } => "vanilla",
-        InstallQueueRequest::Loader { .. } => "loader",
-        InstallQueueRequest::Content { .. } => "content",
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -4864,10 +4850,10 @@ pub(crate) mod tests {
         use axial_minecraft::loaders::{build_id_for, installed_version_id_for};
 
         let (_root, _storage, library, _exclusions, _owner, queue) = fixture();
-        let item = |component: LoaderComponentId| InstallQueueInstallItemViewModel {
+        let item = |component: LoaderComponentId| InstallItem {
             version_id: installed_version_id_for(component, "1.20.1", "0.19.5").unwrap(),
-            loader: Some(InstallQueueLoaderItemViewModel {
-                component_id: component.as_str().into(),
+            loader: Some(InstallLoaderItem {
+                component_id: component,
                 build_id: build_id_for(component, "1.20.1", "0.19.5"),
                 minecraft_version: "1.20.1".into(),
                 loader_version: "0.19.5".into(),
@@ -4946,10 +4932,10 @@ pub(crate) mod tests {
             (LoaderComponentId::Forge, "Forge"),
             (LoaderComponentId::NeoForge, "NeoForge"),
         ] {
-            let item = InstallQueueInstallItemViewModel {
+            let item = InstallItem {
                 version_id: installed_version_id_for(component, "1.20.1", "0.19.5").unwrap(),
-                loader: Some(InstallQueueLoaderItemViewModel {
-                    component_id: component.as_str().into(),
+                loader: Some(InstallLoaderItem {
+                    component_id: component,
                     build_id: build_id_for(component, "1.20.1", "0.19.5"),
                     minecraft_version: "1.20.1".into(),
                     loader_version: "0.19.5".into(),
@@ -4994,7 +4980,7 @@ pub(crate) mod tests {
 
     #[test]
     fn install_labels_preserve_vanilla_and_content_wording() {
-        let mut item = InstallQueueInstallItemViewModel {
+        let mut item = InstallItem {
             version_id: " 1.20.1 ".into(),
             loader: None,
             content: None,
@@ -5002,14 +4988,14 @@ pub(crate) mod tests {
         assert_eq!(item_label(&item), "Minecraft 1.20.1");
         item.version_id = " ".into();
         assert_eq!(item_label(&item), "Minecraft");
-        item.loader = Some(InstallQueueLoaderItemViewModel {
-            component_id: LoaderComponentId::Fabric.as_str().into(),
+        item.loader = Some(InstallLoaderItem {
+            component_id: LoaderComponentId::Fabric,
             build_id: "opaque-build".into(),
             minecraft_version: " ".into(),
             loader_version: " ".into(),
         });
         assert_eq!(item_label(&item), "Fabric loader");
-        item.content = Some(InstallQueueContentItemViewModel {
+        item.content = Some(InstallContentItem {
             instance_id: "instance".into(),
             label: "Install selected resource packs".into(),
             action: InstallQueueContentActionRequest::Uninstall {
@@ -5316,7 +5302,7 @@ pub(crate) mod tests {
 
     fn retained_request_fixture(
         loader: bool,
-    ) -> (InstallQueueRequest, InstallQueueInstallItemViewModel) {
+    ) -> (InstallQueueRequest, InstallItem) {
         if loader {
             let component = LoaderComponentId::Quilt;
             let build_id = axial_minecraft::loaders::build_id_for(component, "1.20.1", "0.30.1");
@@ -5325,13 +5311,13 @@ pub(crate) mod tests {
                     component_id: component,
                     build_id: build_id.clone(),
                 },
-                InstallQueueInstallItemViewModel {
+                InstallItem {
                     version_id: axial_minecraft::loaders::installed_version_id_for(
                         component, "1.20.1", "0.30.1",
                     )
                     .unwrap(),
-                    loader: Some(InstallQueueLoaderItemViewModel {
-                        component_id: component.as_str().into(),
+                    loader: Some(InstallLoaderItem {
+                        component_id: component,
                         build_id,
                         minecraft_version: "1.20.1".into(),
                         loader_version: "0.30.1".into(),
@@ -5344,7 +5330,7 @@ pub(crate) mod tests {
                 InstallQueueRequest::Vanilla {
                     version_id: "retained-native-fixture".into(),
                 },
-                InstallQueueInstallItemViewModel {
+                InstallItem {
                     version_id: "retained-native-fixture".into(),
                     loader: None,
                     content: None,
@@ -5356,7 +5342,7 @@ pub(crate) mod tests {
     fn retain_fixture(
         queue: &InstallQueue,
         request: InstallQueueRequest,
-        item: InstallQueueInstallItemViewModel,
+        item: InstallItem,
     ) -> String {
         let pin = queue.inner.library.admit().unwrap();
         let lease = queue
@@ -5668,7 +5654,7 @@ pub(crate) mod tests {
             let runtime_id = accepted
                 .items
                 .iter()
-                .find(|item| item.kind == "vanilla")
+                .find(|item| item.kind == InstallKind::Vanilla)
                 .unwrap()
                 .queue_id
                 .clone();
@@ -5699,9 +5685,9 @@ pub(crate) mod tests {
                 resumed
                     .items
                     .iter()
-                    .map(|item| item.kind.as_str())
+                    .map(|item| item.kind)
                     .collect::<Vec<_>>(),
-                ["vanilla", "content", "vanilla"]
+                [InstallKind::Vanilla, InstallKind::Content, InstallKind::Vanilla]
             );
             assert_eq!(resumed.items[0].install_item.version_id, "1.21.4");
             assert_eq!(resumed.items[2].install_item.version_id, "unrelated");
@@ -5777,10 +5763,10 @@ pub(crate) mod tests {
             label: "Remove fixture".into(),
             action: action.clone(),
         };
-        let item = InstallQueueInstallItemViewModel {
+        let item = InstallItem {
             version_id: "content-target".into(),
             loader: None,
-            content: Some(InstallQueueContentItemViewModel {
+            content: Some(InstallContentItem {
                 instance_id,
                 label: "Remove fixture".into(),
                 action,
@@ -6870,11 +6856,11 @@ pub(crate) mod tests {
                 .items[0]
                 .queue_id
                 .clone();
-            let item = InstallQueueInstallItemViewModel {
+            let item = InstallItem {
                 version_id: target.clone(),
                 content: None,
-                loader: Some(InstallQueueLoaderItemViewModel {
-                    component_id: "fabric".into(),
+                loader: Some(InstallLoaderItem {
+                    component_id: LoaderComponentId::Fabric,
                     build_id: "fixture".into(),
                     minecraft_version: base.into(),
                     loader_version: "0.16.0".into(),

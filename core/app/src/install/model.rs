@@ -1,16 +1,17 @@
 pub use crate::content::resolve::ResolutionSelection as InstallQueueContentSelection;
-use crate::public::OperationId;
+use crate::public::{OperationId, Tone};
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallStartResponse {
     pub install_id: String,
     pub operation_id: OperationId,
     pub view_model: InstallProgressViewModel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallProgressStepViewModel {
     pub phase_id: String,
     pub label: String,
@@ -19,7 +20,7 @@ pub struct InstallProgressStepViewModel {
     pub total: i32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallProgressViewModel {
     pub phase_id: String,
     pub label: String,
@@ -27,6 +28,7 @@ pub struct InstallProgressViewModel {
     pub terminal: bool,
     pub failed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub active_step: Option<InstallProgressStepViewModel>,
 }
 
@@ -47,30 +49,32 @@ pub struct InstallStatusResponse {
     pub failure_point: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallActionViewModel {
     pub action: String,
     pub label: String,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub disabled_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallFailureViewModel {
     pub state_id: String,
     pub title: String,
-    pub tone: String,
+    pub tone: Tone,
     pub summary: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub details: Vec<String>,
     pub retry_action: InstallActionViewModel,
     pub dismiss_action: InstallActionViewModel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 pub enum InstallQueueRequest {
@@ -88,7 +92,7 @@ pub enum InstallQueueRequest {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(deny_unknown_fields)]
 pub enum InstallQueueContentActionRequest {
@@ -98,6 +102,7 @@ pub enum InstallQueueContentActionRequest {
         allow_incompatible: bool,
         /// Untracked destination files the person chose to replace.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[ts(optional = nullable)]
         replace_files: Vec<String>,
     },
     Uninstall {
@@ -113,67 +118,73 @@ pub enum InstallQueueContentActionRequest {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallQueueInstallItemViewModel {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+pub struct InstallItem {
     pub version_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loader: Option<InstallQueueLoaderItemViewModel>,
+    #[ts(optional)]
+    pub loader: Option<InstallLoaderItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<InstallQueueContentItemViewModel>,
+    #[ts(optional)]
+    pub content: Option<InstallContentItem>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallQueueContentItemViewModel {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+pub struct InstallContentItem {
     pub instance_id: String,
     pub label: String,
     pub action: InstallQueueContentActionRequest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallQueueLoaderItemViewModel {
-    pub component_id: String,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+pub struct InstallLoaderItem {
+    pub component_id: LoaderComponentId,
     pub build_id: String,
     pub minecraft_version: String,
     pub loader_version: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallQueuedItemViewModel {
     pub queue_id: String,
     pub state_id: String,
-    pub kind: String,
+    pub kind: InstallKind,
     pub title: String,
     pub label: String,
     pub summary: String,
     pub detail: String,
     pub position: usize,
     pub total: usize,
-    pub install_item: InstallQueueInstallItemViewModel,
+    pub install_item: InstallItem,
     pub remove_action: InstallActionViewModel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallQueueActiveViewModel {
     pub queue_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub retry_action: Option<InstallActionViewModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub install_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub operation_id: Option<OperationId>,
     /// Unix epoch milliseconds for when the install session began running.
     /// Omitted while the queue entry is only reserved in the active lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub install_started_at_ms: Option<u64>,
-    pub kind: String,
+    pub kind: InstallKind,
     pub title: String,
     pub label: String,
     pub summary: String,
-    pub install_item: InstallQueueInstallItemViewModel,
+    pub install_item: InstallItem,
     pub progress: InstallProgressViewModel,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallQueueViewModel {
     pub state_id: String,
     pub status_label: String,
@@ -183,24 +194,27 @@ pub struct InstallQueueViewModel {
     pub queued_count_label: String,
     pub queued_item_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub next_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub active_queued_count_label: Option<String>,
     pub section_title: String,
     pub empty_title: String,
     pub empty_summary: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallQueueNoticeViewModel {
     pub state_id: String,
-    pub tone: String,
+    pub tone: Tone,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallQueueStateResponse {
     /// A fresh queue incarnation permits clients to rebase after process restart.
     pub queue_epoch: String,
@@ -209,17 +223,40 @@ pub struct InstallQueueStateResponse {
     pub registry_revision: u64,
     /// Undismissed failures, newest first. A later success for the same item clears its failure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional = nullable)]
     pub failures: Vec<InstallQueueFailureViewModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub active: Option<InstallQueueActiveViewModel>,
     pub items: Vec<InstallQueuedItemViewModel>,
     pub view_model: InstallQueueViewModel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub notice: Option<InstallQueueNoticeViewModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub started_install: Option<InstallStartResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub removed_instance_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallKind {
+    Vanilla,
+    Loader,
+    Content,
+}
+
+impl From<&InstallQueueRequest> for InstallKind {
+    fn from(request: &InstallQueueRequest) -> Self {
+        match request {
+            InstallQueueRequest::Vanilla { .. } => Self::Vanilla,
+            InstallQueueRequest::Loader { .. } => Self::Loader,
+            InstallQueueRequest::Content { .. } => Self::Content,
+        }
+    }
 }
 
 /// A terminal result is emitted only after file and metadata effects settle.
@@ -232,14 +269,14 @@ pub enum InstallOutcome {
     Removed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 pub struct InstallQueueFailureViewModel {
     pub failed_at_ms: u64,
     pub queue_id: String,
     pub install_id: String,
     pub operation_id: OperationId,
     pub label: String,
-    pub install_item: InstallQueueInstallItemViewModel,
+    pub install_item: InstallItem,
     pub failure_view_model: InstallFailureViewModel,
 }
 

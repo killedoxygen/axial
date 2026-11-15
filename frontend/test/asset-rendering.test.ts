@@ -7,13 +7,13 @@ import vm from 'node:vm';
 import { toChildArray, type VNode } from 'preact';
 
 import brandMark from '../../assets/brand-mark.json';
-import { Sound } from '../src/sound';
+import { Sound } from '../src/app/sound';
 import { InstanceGlyph, type VisualInstance } from '../src/ui/InstanceVisual';
 import { Logo } from '../src/ui/Logo';
 import { MicrosoftMark } from '../src/ui/MicrosoftMark';
-import * as skinThree from '../src/views/accounts/three';
+import * as skinThree from '../src/accounts/three';
 import { LOADER_LABELS, type LoaderKey } from '../src/create/defaults';
-import { LoaderLogo, loaderLogoSrc } from '../src/views/create/loader-logos';
+import { LoaderLogo, loaderLogoSrc } from '../src/create/loader-logos';
 
 type LooseProps = Record<string, any>;
 
@@ -23,13 +23,13 @@ function functionalResult(vnode: VNode): VNode<LooseProps> {
 }
 
 test('concurrent skin renderer loads share one promise and a failed load permits retry', async () => {
-  const filename = resolve('src/views/accounts/skin-three-loader.ts');
+  const filename = resolve('src/accounts/skin-three-loader.ts');
   const ts: typeof import('typescript') = createRequire(resolve('package.json'))('typescript');
   const output = ts.transpileModule(await readFile(filename, 'utf8'), {
     fileName: filename,
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
   });
-  const exports = {} as typeof import('../src/views/accounts/skin-three-loader');
+  const exports = {} as typeof import('../src/accounts/skin-three-loader');
   const failure = new Error('Skin renderer chunk unavailable');
   let attempts = 0;
   vm.runInNewContext(

@@ -5,7 +5,7 @@ use axial_app::{
     content::{
         catalog::{ContentError, ContentService},
         compatibility,
-        install::{ContentMutations, MutationError, MutationReceipt},
+        install::{ContentMutations, MutationError},
         model::*,
         packs::{ModpackFilesPlan, PackError, PackVersion},
         resolve::{self, ResolutionSelection},
@@ -50,7 +50,6 @@ pub fn router(state: Arc<ContentRoutes>) -> Router {
         .route("/api/v1/instances/{id}/content", get(installed))
         .route("/api/v1/instances/{id}/content/updates", get(updates))
         .route("/api/v1/instances/{id}/content/uninstall", post(uninstall))
-        .route("/api/v1/instances/{id}/content/settle", post(settle))
         .layer(DefaultBodyLimit::max(256 * 1024))
         // The archive body is bounded by the handler's own read limit.
         .route("/api/v1/content/modpack/file", post(modpack_file))
@@ -388,17 +387,6 @@ async fn uninstall(
         .uninstall_request(&instance, request.canonical_ids)
         .map_err(|refusal| ApiError::body(StatusCode::CONFLICT, refusal))?;
     Ok(Json(state.queue.enqueue(queued).await?))
-}
-
-async fn settle(State(state): Content, Path(raw): Path<String>) -> ApiResult<MutationReceipt> {
-    let work = state.mutations.resume(&id(&raw)?)?;
-    let receipt = work.join().await.map_err(|_| {
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "Content operation requires settlement.",
-        )
-    })??;
-    Ok(Json(receipt))
 }
 
 #[cfg(test)]

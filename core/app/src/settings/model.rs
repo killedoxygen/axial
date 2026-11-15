@@ -109,8 +109,9 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(de: D) -> Result<Opti
     T::deserialize(de).map(Some)
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
+#[ts(optional_fields)]
 pub struct ConfigPatch {
     pub expected_revision: u64,
     #[serde(default, deserialize_with = "present")]
@@ -132,10 +133,13 @@ pub struct ConfigPatch {
     #[serde(default, deserialize_with = "present")]
     pub theme: Option<ConfigTheme>,
     #[serde(default)]
+    #[ts(as = "Option<i32>", optional = nullable)]
     pub custom_hue: NullablePatch<i32>,
     #[serde(default)]
+    #[ts(as = "Option<i32>", optional = nullable)]
     pub custom_vibrancy: NullablePatch<i32>,
     #[serde(default)]
+    #[ts(as = "Option<i32>", optional = nullable)]
     pub lightness: NullablePatch<i32>,
     #[serde(default, deserialize_with = "present")]
     pub telemetry_enabled: Option<bool>,
@@ -144,8 +148,10 @@ pub struct ConfigPatch {
     #[serde(default, deserialize_with = "present")]
     pub discord_rpc_onboarding_seen: Option<bool>,
     #[serde(default)]
+    #[ts(as = "Option<bool>", optional = nullable)]
     pub music_enabled: NullablePatch<bool>,
     #[serde(default)]
+    #[ts(as = "Option<i32>", optional = nullable)]
     pub music_volume: NullablePatch<i32>,
     #[serde(default, deserialize_with = "present")]
     pub music_track: Option<i32>,

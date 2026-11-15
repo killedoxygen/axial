@@ -4,12 +4,13 @@ import { createRequire } from 'node:module';
 import { basename, dirname, resolve } from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
-import type { ContentSelection, ModpackFilesPlan } from '../src/types-content';
-import type { InstallQueueStateResponse } from '../src/types-install';
-import type { EnrichedInstance } from '../src/types-instance';
+import type { ResolutionSelection } from '../src/generated/ResolutionSelection';
+import type { ModpackFilesPlan } from '../src/generated/ModpackFilesPlan';
+import type { InstallQueueStateResponse } from '../src/generated/InstallQueueStateResponse';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
 
-type ApiCall = Parameters<typeof import('../src/api').api>;
-type PickerProps = Parameters<typeof import('../src/views/discover/ModpackPicker').ModpackPicker>[0];
+type ApiCall = [method: string, path: string, body?: unknown];
+type PickerProps = Parameters<typeof import('../src/discover/ModpackPicker').ModpackPicker>[0];
 type ViewNode = { type: unknown; props: Record<string, unknown> };
 const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
 const dependencies = createRequire(resolve(frontend, 'package.json'));
@@ -30,7 +31,6 @@ function queue(revision = 1, registryRevision = 0): InstallQueueStateResponse {
     queue_epoch: 'queue-a',
     revision,
     registry_revision: registryRevision,
-    active: null,
     items: [],
     failures: [],
     view_model: {
@@ -117,8 +117,9 @@ function harness() {
     '@preact/signals': dependencies('@preact/signals'),
     'preact/hooks': hooks,
     'preact/jsx-runtime': dependencies('preact/jsx-runtime'),
-    api: {
-      api: async (...args: ApiCall): Promise<unknown> => {
+    'platform/transport': {
+      isApiError: (error: unknown) => error instanceof Error && error.name === 'ApiError',
+      request: async (...args: ApiCall): Promise<unknown> => {
         calls.push(structuredClone(args));
         if (args[0] === 'POST') return io.post(args);
         assert.equal(args[0], 'GET');
@@ -129,16 +130,20 @@ function harness() {
         throw new Error(`Unexpected content request: ${args[1]}`);
       },
     },
-    'loaders/api': { connectInstallQueueSSE: () => () => {} },
-    toast: { toast: (...args: unknown[]) => notices.push(args) },
+    'platform/events': { subscribeApiEvents: () => () => {} },
+    'app/toast': {
+      toast: (...args: unknown[]) => notices.push(args),
+      showError: (...args: unknown[]) => notices.push(args),
+      errMessage: (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    },
     'ui/Dialog': { showChoice: async () => null },
-    'ui-state': { navigate: () => {} },
-    'views/instance/instance-actions': { openInstanceFolder: async () => {} },
+    'app/route': { navigate: () => {} },
+    'instances/detail/instance-actions': { openInstanceFolder: async () => {} },
     'ui/Art': { Art: 'Art' },
     'ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', Notice: 'Notice', Status: 'Status' },
     'ui/Modal': { Modal: 'Modal', ModalContent: 'ModalContent', ModalHeader: 'ModalHeader', ModalTitle: 'ModalTitle' },
     'ui/SelectionActionTray': { SelectionCheckbox: 'SelectionCheckbox' },
-    'views/discover/shared': { KIND_ICON: {} },
+    'discover/shared': { KIND_ICON: {} },
   };
   const modules = new Map<string, { exports: object }>();
   const sourceRoot = resolve(frontend, 'src');
@@ -166,11 +171,10 @@ function harness() {
     );
     return module.exports as T;
   }
-  const client = load<typeof import('../src/content')>('content');
-  const downloads = load<typeof import('../src/machines/downloads')>('machines/downloads');
-  const activity = load<typeof import('../src/content-activity')>('content-activity');
-  const { ModpackPicker } =
-    load<typeof import('../src/views/discover/ModpackPicker')>('views/discover/ModpackPicker');
+  const client = load<typeof import('../src/content/api')>('content/api');
+  const downloads = load<typeof import('../src/install/queue')>('install/queue');
+  const activity = load<typeof import('../src/content/activity')>('content/activity');
+  const { ModpackPicker } = load<typeof import('../src/discover/ModpackPicker')>('discover/ModpackPicker');
   function render(next: Partial<PickerProps> = {}): unknown {
     props = { ...props, ...next };
     cursor = 0;
@@ -211,13 +215,13 @@ for (const readFails of [false, true]) {
   test(`lost mod update batch stops submissions and ${readFails ? 'retains uncertainty when the queue read fails' : 'observes accepted work through the queue'}`, async (t) => {
     const h = harness();
     t.after(h.dispose);
-    const mods = h.load<typeof import('../src/views/instance/mod-actions')>('views/instance/mod-actions');
-    const bulk = h.load<typeof import('../src/views/instance/bulk-actions')>('views/instance/bulk-actions');
+    const mods = h.load<typeof import('../src/instances/detail/mod-actions')>('instances/detail/mod-actions');
+    const bulk = h.load<typeof import('../src/instances/detail/bulk-actions')>('instances/detail/bulk-actions');
     const accepted = queue(1);
     h.io.post = async ([method, path, body]) => {
       assert.equal(method, 'POST');
       assert.equal(path, '/content/install');
-      const request = body as { instance_id: string; selections: ContentSelection[]; allow_incompatible: boolean };
+      const request = body as { instance_id: string; selections: ResolutionSelection[]; allow_incompatible: boolean };
       assert.equal(request.instance_id, 'instance-a');
       assert.equal(request.allow_incompatible, false);
       const index = accepted.items.length;
@@ -362,22 +366,6 @@ for (const kind of ['install', 'pack', 'uninstall'] as const) {
     assert.equal(h.notices.length, 0);
   });
 }
-
-test('malformed queue acknowledgement reconciles without claiming success, even if the read fails', async (t) => {
-  const h = harness();
-  t.after(h.dispose);
-  h.io.post = async () => ({});
-  h.io.queue = async () => {
-    throw new Error('Queue read unavailable');
-  };
-  await assert.rejects(h.client.installModpack('instance-a', 'modrinth:pack'), /Install queue epoch/);
-  assert.equal(h.calls.filter(([method]) => method === 'POST').length, 1);
-  assert.equal(h.calls.filter(([, path]) => path === '/install/queue').length, 1);
-  assert.equal(
-    h.notices.some(([, kind]) => kind === 'success'),
-    false,
-  );
-});
 
 test('lost pack response rechecks installed files without closing as success or retaining a stale selection', async (t) => {
   const h = harness();

@@ -627,7 +627,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             ).await.unwrap();
             let started = accepted.started_install.unwrap();
             assert_eq!(accepted.items.len(), 1);
-            assert_eq!(accepted.items[0].kind, "content");
+            assert_eq!(accepted.items[0].kind, crate::install::model::InstallKind::Content);
             assert!(accepted.active.is_none());
             let (_, mut updates) = queue.subscribe();
             let workers = work.admit(PhysicalWorkRequest::foreground_parallel(
@@ -3762,7 +3762,7 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
     let versions = service.installed().await.unwrap();
     select_unowned_microsoft_account(&accounts);
     let account_block = service.enrich(instance.clone(), &versions).await;
-    assert_eq!(account_block.launch_action.primary_action, "blocked");
+    assert_eq!(account_block.launch_action.primary_action, LaunchPrimaryAction::Blocked);
     assert!(account_block.status_detail.contains("account"));
     accounts.create_offline_account("FixturePlayer").unwrap();
     let pin = service.instances.directories().library().admit().unwrap();
@@ -3772,12 +3772,12 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
     let busy = service.launch.preflight(instance.id.clone()).await;
     assert_eq!(busy.error.unwrap().code, LaunchError::InstanceBusy);
     let blocked = service.enrich(instance.clone(), &versions).await;
-    assert_eq!(blocked.launch_action.primary_action, "blocked");
+    assert_eq!(blocked.launch_action.primary_action, LaunchPrimaryAction::Blocked);
     assert_eq!(blocked.launch_action.label, "Unavailable");
     assert!(blocked.needs_install.is_empty());
     drop(publication);
     let runtime_block = service.enrich(instance.clone(), &versions).await;
-    assert_eq!(runtime_block.launch_action.primary_action, "blocked");
+    assert_eq!(runtime_block.launch_action.primary_action, LaunchPrimaryAction::Blocked);
     assert_eq!(
         runtime_block.status_detail,
         "The selected Java executable is missing."
@@ -3799,7 +3799,7 @@ async fn scanner_ready_artifact_drift_offers_install_without_masking_transient_b
         LaunchError::InstallUnavailable
     );
     let drifted = service.enrich(instance, &scanned).await;
-    assert_eq!(drifted.launch_action.primary_action, "install");
+    assert_eq!(drifted.launch_action.primary_action, LaunchPrimaryAction::Install);
     assert_eq!(drifted.launch_action.label, "Install");
     assert_eq!(drifted.needs_install, "1.21.4");
     assert!(!drifted.launchable);
@@ -3856,7 +3856,11 @@ fn list_summary_leaves_content_integrity_to_strict_preflight() {
                 assert_eq!(row.launchable, summary_ready, "{case}: {row:?}");
                 assert_eq!(
                     row.launch_action.primary_action,
-                    if summary_ready { "launch" } else { "install" },
+                    if summary_ready {
+                        LaunchPrimaryAction::Launch
+                    } else {
+                        LaunchPrimaryAction::Install
+                    },
                     "{case}"
                 );
                 assert!(!strict.launchable, "{case}: {strict:?}");
@@ -3920,7 +3924,7 @@ async fn absent_or_unready_catalog_does_not_turn_launch_blocks_into_install_perm
     );
     for catalog in unready_catalogs(&versions) {
         let blocked = service.enrich(instance.clone(), &catalog).await;
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
+        assert_eq!(blocked.launch_action.primary_action, LaunchPrimaryAction::Blocked);
         assert_eq!(blocked.launch_action.label, "Unavailable");
         assert!(blocked.status_detail.contains("account"));
         assert!(blocked.needs_install.is_empty());
@@ -3936,7 +3940,7 @@ async fn absent_or_unready_catalog_does_not_turn_launch_blocks_into_install_perm
     assert_eq!(busy.error.unwrap().code, LaunchError::InstanceBusy);
     for catalog in unready_catalogs(&versions) {
         let blocked = service.enrich(instance.clone(), &catalog).await;
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
+        assert_eq!(blocked.launch_action.primary_action, LaunchPrimaryAction::Blocked);
         assert_eq!(blocked.launch_action.label, "Unavailable");
         assert_eq!(blocked.status_detail, LaunchError::InstanceBusy.to_string());
         assert!(blocked.needs_install.is_empty());
@@ -3950,7 +3954,7 @@ async fn absent_or_unready_catalog_does_not_turn_launch_blocks_into_install_perm
     );
     for catalog in unready_catalogs(&versions) {
         let blocked = service.enrich(instance.clone(), &catalog).await;
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
+        assert_eq!(blocked.launch_action.primary_action, LaunchPrimaryAction::Blocked);
         assert_eq!(
             blocked.status_detail,
             "The selected Java executable is missing."
@@ -3993,7 +3997,7 @@ async fn guarded_missing_install_evidence_offers_install_without_a_selected_acco
         );
         for catalog in std::iter::once(versions.clone()).chain(unready_catalogs(&versions)) {
             let missing = service.enrich(instance.clone(), &catalog).await;
-            assert_eq!(missing.launch_action.primary_action, "install");
+            assert_eq!(missing.launch_action.primary_action, LaunchPrimaryAction::Install);
             assert_eq!(missing.launch_action.label, "Install");
             assert_eq!(missing.needs_install, instance.version_id);
             assert!(!missing.launchable);
@@ -4028,7 +4032,7 @@ async fn unavailable_install_metadata_does_not_offer_reinstall() {
     );
     for catalog in std::iter::once(versions.clone()).chain(unready_catalogs(&versions)) {
         let blocked = service.enrich(instance.clone(), &catalog).await;
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
+        assert_eq!(blocked.launch_action.primary_action, LaunchPrimaryAction::Blocked);
         assert_eq!(blocked.launch_action.label, "Unavailable");
         assert!(blocked.needs_install.is_empty());
     }
@@ -4048,7 +4052,7 @@ async fn assert_setup_unreadable(
         assert!(!blocked.launchable);
         assert!(!blocked.launch_action.launchable);
         assert_eq!(blocked.launch_action.state_id, "blocked");
-        assert_eq!(blocked.launch_action.primary_action, "blocked");
+        assert_eq!(blocked.launch_action.primary_action, LaunchPrimaryAction::Blocked);
         assert_eq!(blocked.launch_action.label, "Unavailable");
         assert!(blocked.needs_install.is_empty());
         assert_eq!(
@@ -4193,7 +4197,7 @@ async fn resumed_setup_response_is_ready_after_accepted_admission_releases() {
         "{}",
         response.instance.status_detail
     );
-    assert_eq!(response.instance.launch_action.primary_action, "launch");
+    assert_eq!(response.instance.launch_action.primary_action, LaunchPrimaryAction::Launch);
 }
 
 #[tokio::test]
@@ -4687,7 +4691,7 @@ async fn unavailable_setup_metadata_blocks_an_otherwise_launchable_instance() {
     use_probe_java(root.path(), &service, "");
     let ready = service.enrich(instance.clone(), &versions).await;
     assert!(ready.launchable, "{}", ready.status_detail);
-    assert_eq!(ready.launch_action.primary_action, "launch");
+    assert_eq!(ready.launch_action.primary_action, LaunchPrimaryAction::Launch);
     service
         .instances
         .registry()
@@ -4761,9 +4765,9 @@ async fn grouped_readiness_preserves_row_results_order_and_waiter_scope() {
         input.iter().map(|row| &row.id).collect::<Vec<_>>()
     );
     assert!(rows[0].launchable && rows[3].launchable);
-    assert_eq!(rows[1].launch_action.primary_action, "install");
+    assert_eq!(rows[1].launch_action.primary_action, LaunchPrimaryAction::Install);
     assert_eq!(rows[1].needs_install, "1.20.1");
-    assert_eq!(rows[2].launch_action.primary_action, "blocked");
+    assert_eq!(rows[2].launch_action.primary_action, LaunchPrimaryAction::Blocked);
     assert_eq!(
         rows[2].status_detail,
         "The selected Java executable is missing."
@@ -4895,7 +4899,7 @@ async fn grouped_readiness_scans_empty_and_busy_lists_without_erasing_rows() {
     assert_eq!(rows[0].instance.id, instance.id);
     assert_eq!(rows[0].version_display.minecraft_label, "1.21.4");
     assert!(!rows[0].launchable);
-    assert_eq!(rows[0].launch_action.primary_action, "blocked");
+    assert_eq!(rows[0].launch_action.primary_action, LaunchPrimaryAction::Blocked);
     assert!(rows[0].needs_install.is_empty());
     assert!(unavailable.unwrap().is_empty());
 }
@@ -5124,7 +5128,7 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
                     assert_eq!(row.instance.id, instance.id);
                     assert!(row.launchable, "{}", row.status_detail);
                     assert!(row.launch_action.launchable);
-                    assert_eq!(row.launch_action.primary_action, "launch");
+                    assert_eq!(row.launch_action.primary_action, LaunchPrimaryAction::Launch);
                     assert!(row.needs_install.is_empty());
                 }
             }
@@ -5133,7 +5137,7 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
                 assert_eq!(row.instance.id, instance.id);
                 assert_eq!(row.version_display.minecraft_label, "1.21.4");
                 assert!(!row.launchable);
-                assert_eq!(row.launch_action.primary_action, "blocked");
+                assert_eq!(row.launch_action.primary_action, LaunchPrimaryAction::Blocked);
                 assert!(row.needs_install.is_empty());
             }
             assert_eq!(degraded["status"], "ready", "{degraded}");
@@ -5153,7 +5157,7 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
                 assert_eq!(row.instance.id, instance.id);
                 assert!(!row.launchable, "{} retained stale Launch", instance.name);
                 assert!(!row.launch_action.launchable);
-                assert_eq!(row.launch_action.primary_action, "blocked");
+                assert_eq!(row.launch_action.primary_action, LaunchPrimaryAction::Blocked);
                 assert!(row.needs_install.is_empty());
             }
         }
@@ -5440,7 +5444,7 @@ async fn first_instance_still_queues_uninstalled_runtime() {
     assert!(queue.active.is_none());
     assert_eq!(queue.items.len(), 1);
     assert_eq!(queue.items[0].install_item.version_id, "1.21.4");
-    assert_eq!(created.instance.launch_action.primary_action, "install");
+    assert_eq!(created.instance.launch_action.primary_action, LaunchPrimaryAction::Install);
     service.installs.shutdown_queued().unwrap();
     drop(blocker);
 }

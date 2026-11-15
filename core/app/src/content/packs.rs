@@ -21,6 +21,7 @@ use crate::network::{
 use crate::tasks::CancellationToken;
 use axial_minecraft::loaders::LoaderComponentId;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -482,12 +483,13 @@ pub async fn resolve_pack(
     })
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct ModpackFileOption {
     pub selection_id: String,
     pub filename: String,
     pub kind: ContentKind,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub size: Option<u64>,
     pub title: String,
     pub identified: bool,
@@ -497,16 +499,18 @@ pub struct ModpackFileOption {
     /// The managed version of the same project when it differs from the pack's.
     /// Choosing the file then updates that project deliberately.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub installed_version_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
 pub struct ModpackFilesPlan {
     pub canonical_id: CanonicalId,
     pub version_id: String,
     pub name: String,
     pub minecraft: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub loader: Option<String>,
     pub files: Vec<ModpackFileOption>,
 }

@@ -28,6 +28,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+ts-rs.workspace = true
 unicode-casefold.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true

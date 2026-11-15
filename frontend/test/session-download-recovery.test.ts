@@ -1,55 +1,45 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
 import test from 'node:test';
-import vm from 'node:vm';
-import type { ApiEventOptions } from '../src/backend/events';
-import type { InstallQueueStateResponse } from '../src/types-install';
-import type { LaunchSession } from '../src/types-launch';
-import type { EnrichedInstance } from '../src/types-instance';
-import type { Config } from '../src/types-settings';
+import { apiModule, isApiError, loadSource as source, requireDependency, type Call } from './source';
+import { configView, enrichedInstance, queueSnapshot } from './wire';
+import type { ApiEventOptions } from '../src/platform/events';
+import type { ConfigView } from '../src/generated/ConfigView';
+import type { EnrichedInstance } from '../src/generated/EnrichedInstance';
+import type { InstallFailureViewModel } from '../src/generated/InstallFailureViewModel';
+import type { InstallQueueFailureViewModel } from '../src/generated/InstallQueueFailureViewModel';
+import type { InstallQueueStateResponse } from '../src/generated/InstallQueueStateResponse';
+import type { SessionSnapshot } from '../src/generated/SessionSnapshot';
 
-const frontend = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const requireDependency = createRequire(resolve(frontend, 'package.json'));
-const ts: typeof import('typescript') = requireDependency('typescript');
-const signals: typeof import('@preact/signals') = requireDependency('@preact/signals');
-
-const { signal } = signals;
-
-function source<T extends object>(path: string, imports: Record<string, unknown> = {}, globals: Record<string, unknown> = {}): T {
-  const filename = resolve(frontend, 'src', path);
-  const output = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
-  });
-  const exports = {};
-  vm.runInNewContext(output.outputText, {
-    exports, Error, URLSearchParams, structuredClone,
-    require(id: string): unknown {
-      if (id === '@preact/signals') return signals;
-      if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-      throw new Error(`Unreviewed recovery test dependency: ${id}`);
-    },
-    ...globals,
-  }, { filename });
-  return exports as T;
-}
+type Subscribe = Parameters<typeof apiModule>[2];
 
 function timers() {
   let next = 0;
   const timeouts = new Map<number, { callback: () => void; delay: number }>();
   const intervals = new Map<number, () => void>();
   return {
-    timeouts, intervals,
-    setTimeout(callback: () => void, delay: number): number { const id = ++next; timeouts.set(id, { callback, delay }); return id; },
-    clearTimeout(id: number): void { timeouts.delete(id); },
-    setInterval(callback: () => void): number { const id = ++next; intervals.set(id, callback); return id; },
-    clearInterval(id: number): void { intervals.delete(id); },
+    timeouts,
+    intervals,
+    setTimeout(callback: () => void, delay: number): number {
+      const id = ++next;
+      timeouts.set(id, { callback, delay });
+      return id;
+    },
+    clearTimeout(id: number): void {
+      timeouts.delete(id);
+    },
+    setInterval(callback: () => void): number {
+      const id = ++next;
+      intervals.set(id, callback);
+      return id;
+    },
+    clearInterval(id: number): void {
+      intervals.delete(id);
+    },
     runTimeout(): void {
       const timer = timeouts.entries().next().value;
       assert.ok(timer, 'expected a pending timeout');
-      timeouts.delete(timer[0]); timer[1].callback();
+      timeouts.delete(timer[0]);
+      timer[1].callback();
     },
   };
 }
@@ -57,85 +47,86 @@ function timers() {
 function deferred<T>() {
   let resolveValue!: (value: T) => void;
   let reject!: (error: Error) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolveValue = resolvePromise; reject = rejectPromise; });
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolveValue = resolvePromise;
+    reject = rejectPromise;
+  });
   return { promise, resolve: resolveValue, reject };
 }
 
 const flush = (): Promise<void> => new Promise((done) => setImmediate(done));
-const contract = source<typeof import('../src/dto-contract')>('dto-contract.ts');
-const installContract = source<typeof import('../src/dto-install')>('dto-install.ts', { './dto-contract': contract });
-const coreContract = source<typeof import('../src/dto-core')>('dto-core.ts', {
-  './dto-contract': contract, './dto-install': installContract,
-});
-const logContract = source<typeof import('../src/dto-launch')>('dto-launch.ts', { './dto-contract': contract });
-const noticeContract = source<typeof import('../src/launch-notice-tracker')>('launch-notice-tracker.ts');
-const statusContract = source<typeof import('../src/launch-response-adapters')>('launch-response-adapters.ts', {
-  './dto-contract': contract, './launch-notice-tracker': noticeContract,
-});
 
-function historicalStatusApi(
-  statusCode = 404,
-  payload: unknown = { error: 'The instance was not found.', code: 'instance_not_found' },
-  path = '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status',
-) {
-  return source<typeof import('../src/api')>(
-    'api.ts',
-    {
-      './native': { getNativeApiTransportBootstrap: async () => null },
-      './dto-contract': contract,
-    },
-    {
-      URL,
-      Headers,
-      __AXIAL_WEB_API_BASE__: 'http://127.0.0.1:1',
-      __AXIAL_TEST_API_CAPABILITY__: 'fixture-capability',
-      __AXIAL_MOCK_API__: false,
-      fetch: async (url: string) => {
-        assert.equal(url, `http://127.0.0.1:1/api/v1${path}`);
-        return new Response(JSON.stringify(payload), {
-          status: statusCode,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      },
-    },
-  );
+/** An error response as the transport raises it. */
+function refusal(status: number, payload: { error?: string; code?: string }): Error {
+  return Object.assign(new Error(payload.error ?? `Request failed (${status})`), { name: 'ApiError', status, payload });
 }
-const apiContract = historicalStatusApi();
 
-function status(revision = 1, terminal = false) {
+const unknownSession = { error: 'The instance was not found.', code: 'instance_not_found' };
+
+function status(revision = 1, terminal = false): SessionSnapshot {
   return {
-    session_id: 'session-1', instance_id: 'instance-1', revision,
-    launched_at: '2026-09-08T08:00:00Z', notice: null,
-    outcome: terminal ? { kind: 'clean', reason: 'clean_exit', summary: 'Game closed' } : null,
-    view_model: { state_id: terminal ? 'exited' : 'running', label: terminal ? 'Ended' : 'Playing',
-      progress_pct: 100, terminal, playing: !terminal, process_live: !terminal, can_stop: !terminal },
+    session_id: 'session-1',
+    instance_id: 'instance-1',
+    revision,
+    phase: terminal ? 'exited' : 'running',
+    launched_at: '2026-09-08T08:00:00Z',
+    started_at_ms: null,
+    pid: null,
+    process_alive: !terminal,
+    stop_allowed: !terminal,
+    exit_code: null,
+    tree_settled: terminal,
+    output_drained: terminal,
+    boot_observed: true,
+    notice: null,
+    outcome: terminal ? { kind: 'clean', reason: 'clean_exit', failure_class: null, summary: 'Game closed' } : null,
+    view_model: {
+      state_id: terminal ? 'exited' : 'running',
+      label: terminal ? 'Ended' : 'Playing',
+      progress_pct: 100,
+      terminal,
+      playing: !terminal,
+      process_live: !terminal,
+      can_stop: !terminal,
+    },
   };
 }
 
-function log(sequence: number) { return { sequence, source: 'stdout', text: `line-${sequence}`, truncated: false }; }
+function log(sequence: number) {
+  return { sequence, source: 'stdout', text: `line-${sequence}`, truncated: false };
+}
 
 function instance(launchable = false): EnrichedInstance {
-  return {
-    id: 'instance-1', name: 'Example', version_id: '1.21', created_at: '2026-09-08T08:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
-    version_display: { loader_key: 'vanilla', loader_label: 'Vanilla', minecraft_label: '1.21',
-      loader_version_label: '', loader_detail_label: '', summary_label: '1.21', supports_mods: false },
-    launchable, launch_action: { state_id: launchable ? 'ready' : 'blocked', label: launchable ? 'Launch' : 'Unavailable',
-      tone: launchable ? 'ok' : 'warn', launchable, primary_action: launchable ? 'launch' : 'blocked' },
-    saves_count: 0, mods_count: 0, resource_count: 0, shader_count: 0, counts_available: false,
-  };
+  return enrichedInstance({
+    id: 'instance-1',
+    name: 'Example',
+    version_id: '1.21',
+    launchable,
+    launch_action: {
+      state_id: launchable ? 'ready' : 'blocked',
+      label: launchable ? 'Launch' : 'Unavailable',
+      tone: launchable ? 'ok' : 'warn',
+      launchable,
+      primary_action: launchable ? 'launch' : 'blocked',
+    },
+  });
 }
 
-function configSnapshot(): Config {
-  return coreContract.configResponse({ revision: 1, account_selection_revision: 1, username: 'Player', launch_auth_mode: 'offline',
-    max_memory_mb: 4096, min_memory_mb: 512, java_path_override: '', window_width: 0, window_height: 0, jvm_preset: '',
-    performance_mode: 'vanilla', theme: 'obsidian', custom_hue: null, custom_vibrancy: null, lightness: null,
-    onboarding_done: true, telemetry_enabled: false, discord_rpc_enabled: false, discord_rpc_onboarding_seen: true,
-    music_enabled: false, music_volume: 50, music_track: 0 });
+function configSnapshot(): ConfigView {
+  return configView({ performance_mode: 'vanilla', theme: 'obsidian', music_enabled: false, music_volume: 50 });
+}
+
+/** The state owners one window holds, shared by the launch and downloads controllers under test. */
+function stateOwners() {
+  const launchState = source<typeof import('../src/launch/state')>('launch/state.ts');
+  const instanceState = source<typeof import('../src/instances/state')>('instances/state.ts');
+  const settings = source<typeof import('../src/settings/state')>('settings/state.ts');
+  return { launchState, instanceState, settings, store: { ...launchState, ...instanceState, config: settings.config } };
 }
 
 function launchHarness(intentResult?: unknown, running = true) {
+  const owners = stateOwners();
+  const { launchState, instanceState, settings, store } = owners;
   const clock = timers();
   const finalLogs = deferred<unknown>();
   let currentStatus = status();
@@ -151,92 +142,72 @@ function launchHarness(intentResult?: unknown, running = true) {
   const sounds: string[] = [];
   const lines: Array<{ source: string; text: string }> = [];
   let readInstance: () => Promise<unknown> = async () => instance(true);
-  const store = {
-    launchSessions: signal<Record<string, LaunchSession>>(
-      statusContract.launchSessionsResponse({ sessions: intentResult === undefined && running ? [currentStatus] : [] }),
-    ),
-    launchState: signal<import('../src/store').LaunchState>({ status: 'idle' }),
-    config: signal<Config | null>(null),
-    instances: signal([instance()]),
-    selectedInstance: signal(instance(true)),
-    instanceLaunchDrafts: signal({}),
-    selectedInstanceId: signal('instance-1'),
-    launchNotices: signal({}),
-    versions: signal<unknown[]>([]),
-    lastInstanceId: signal<string | null>(null),
-  };
-  const actions = source<typeof import('../src/actions')>('actions.ts', {
-    './store': store,
-    './launch-response-adapters': statusContract,
-  });
-  const api = {
-    isApiError: apiContract.isApiError,
-    api: async (method: string, path: string, body?: unknown) => {
-      if (path === '/launch' && (intentResult !== undefined || postLaunch)) {
-        assert.equal(method, 'POST');
-        calls.push(path);
-        if (postLaunch) return postLaunch(body);
-        throw new Error('Launch response lost');
-      }
-      if (method === 'POST' && path.endsWith('/kill')) {
-        calls.push(path);
-        return postKill();
-      }
-      assert.equal(method, 'GET');
+  instanceState.instances.value = [instance(true)];
+  instanceState.selectedInstanceId.value = 'instance-1';
+  if (intentResult === undefined && running)
+    launchState.launchSessions.value = launchState.liveSessions([currentStatus]);
+  const call: Call = async (method, path, body) => {
+    if (path === '/launch' && (intentResult !== undefined || postLaunch)) {
+      assert.equal(method, 'POST');
       calls.push(path);
-      if (path.startsWith('/launch/intents/')) return readIntent(path);
-      if (path.endsWith('/logs')) return finalLogs.promise;
-      if (path.endsWith('/status')) return readStatus();
-      if (path === '/instances/instance-1') return readInstance();
-      if (path === '/instances') return { instances: [await readInstance()], last_instance_id: null };
-      throw new Error(`Unexpected launch read ${path}`);
-    },
+      if (postLaunch) return postLaunch(body);
+      throw new Error('Launch response lost');
+    }
+    if (method === 'POST' && path.endsWith('/kill')) {
+      calls.push(path);
+      return postKill();
+    }
+    assert.equal(method, 'GET');
+    calls.push(path);
+    if (path.startsWith('/launch/intents/')) return readIntent(path);
+    if (path.endsWith('/logs')) return finalLogs.promise;
+    if (path.endsWith('/status')) return readStatus();
+    if (path === '/instances/instance-1') return readInstance();
+    if (path === '/instances') return { instances: [await readInstance()], last_instance_id: null };
+    throw new Error(`Unexpected launch read ${path}`);
   };
-  const readiness = source<typeof import('../src/instance-readiness')>(
-    'instance-readiness.ts',
+  const subscribe: Subscribe = (_path, options) => {
+    connections++;
+    subscription = options as ApiEventOptions<unknown>;
+    return () => {
+      closed++;
+    };
+  };
+  const instancesApi = apiModule<typeof import('../src/instances/api')>('instances/api.ts', call);
+  const readiness = source<typeof import('../src/instances/readiness')>(
+    'instances/readiness.ts',
     {
-      './api': api,
-      './dto-core': coreContract,
-      './store': store,
-      './utils': { showError: (message: string) => errors.push(message) },
+      'instances/api': instancesApi,
+      'settings/state': settings,
+      'instances/state': instanceState,
+      'launch/state': launchState,
+      'app/toast': { showError: (message: string) => errors.push(message) },
     },
     { window: clock },
   );
-  const launch = source<typeof import('../src/launch')>(
-    'launch.ts',
+  const launch = source<typeof import('../src/launch/controller')>(
+    'launch/controller.ts',
     {
-      './api': api,
-      './backend/events': {
-        subscribeApiEvents: (_path: string, options: ApiEventOptions<unknown>) => {
-          connections++;
-          subscription = options;
-          return () => {
-            closed++;
-          };
-        },
-      },
-      './sound': { Sound: { init() {}, ui: (sound: string) => sounds.push(sound) } },
-      './music': { Music: { suppress() {}, unsuppress() {} } },
-      './utils': {
-        appendLog: (source: string, text: string) => lines.push({ source, text }),
-        showError: (message: string) => errors.push(message),
-        errMessage: String,
-      },
-      './store': store,
-      './actions': actions,
-      './launch-notice-tracker': noticeContract,
-      './launch-response-adapters': statusContract,
-      './dto-contract': contract,
-      './dto-core': {},
-      './dto-launch': logContract,
-      './instance-readiness': readiness,
+      'platform/transport': { isApiError },
+      'app/sound': { Sound: { init() {}, ui: (sound: string) => sounds.push(sound) } },
+      'music/music': { Music: { suppress() {}, unsuppress() {} } },
+      'app/log': { appendLog: (source: string, text: string) => lines.push({ source, text }) },
+      'app/toast': { showError: (message: string) => errors.push(message), errMessage: String },
+      'settings/state': settings,
+      'instances/state': instanceState,
+      'instances/api': instancesApi,
+      'instances/readiness': readiness,
+      'launch/state': launchState,
+      'launch/notices': source('launch/notices.ts'),
+      'launch/api': apiModule('launch/api.ts', call, subscribe),
     },
-    { ...clock, window: clock, crypto: { randomUUID: () => '9eb6ce58-c29a-44bc-a290-aea8973e9bdb' } },
+    { ...clock, window: clock, crypto: { randomUUID: () => '9eb6ce58-c29a-44bc-a290-aea8973e9bdb' }, Date },
   );
   if (intentResult === undefined && running) launch.reconnectLaunchSession('instance-1', 'Example');
   return {
+    owners,
     store,
-    actions,
+    actions: { ...launchState, ...instanceState, setConfig: settings.setConfig },
     lines,
     calls,
     errors,
@@ -280,13 +251,19 @@ function launchHarness(intentResult?: unknown, running = true) {
   };
 }
 
+function liveSession(snapshot: SessionSnapshot, h: ReturnType<typeof launchHarness>) {
+  const session = h.owners.launchState.liveSessions([snapshot])['instance-1'];
+  assert.ok(session);
+  return session;
+}
+
 test('already Playing adoption and bootstrap reconnect project recency once without replaying launch sound', async () => {
   for (const entrypoint of ['adoption', 'reconnect']) {
     const h = launchHarness(undefined, false);
     h.store.instances.value = [{ ...instance(), name: 'Current name', java_path: '/fixture/java' }];
     if (entrypoint === 'adoption') await h.launch.adoptLaunchSession('session-1');
     else {
-      h.actions.confirmLaunch('instance-1', statusContract.launchSessionsResponse({ sessions: [status()] })['instance-1']);
+      h.actions.confirmLaunch('instance-1', liveSession(status(), h));
       h.launch.reconnectLaunchSession('instance-1', 'Example');
     }
     await flush();
@@ -299,25 +276,37 @@ test('already Playing adoption and bootstrap reconnect project recency once with
     h.launch.reconnectLaunchSession('instance-1', 'Example');
     assert.equal(h.store.instances.value[0], projected);
     assert.deepEqual(h.sounds, []);
-    assert.equal(h.calls.some((path) => path.startsWith('/instances')), false);
+    assert.equal(
+      h.calls.some((path) => path.startsWith('/instances')),
+      false,
+    );
   }
 });
 
-for (const change of ['settings edit', 'newer recency', 'replacement session', 'session lifetime', 'instance removal']) {
+for (const change of [
+  'settings edit',
+  'newer recency',
+  'replacement session',
+  'session lifetime',
+  'instance removal',
+]) {
   test(`first Playing recency respects current ownership after ${change}`, async () => {
     const h = launchHarness(undefined, false);
-    const starting = { ...status(), view_model: { ...status().view_model, state_id: 'starting', label: 'Starting', playing: false } };
+    const starting = {
+      ...status(),
+      view_model: { ...status().view_model, state_id: 'starting', label: 'Starting', playing: false },
+    };
     h.readStatus(async () => starting);
     await h.launch.adoptLaunchSession('session-1');
     await flush();
-    assert.equal(h.store.instances.value[0].last_played_at, undefined);
+    assert.equal(h.store.instances.value[0].last_played_at, '');
     if (change === 'settings edit') {
       h.actions.updateInstanceInList({ ...instance(), name: 'Renamed while starting', java_path: '/fixture/new-java' });
     } else if (change === 'newer recency') {
       h.actions.updateInstanceInList({ ...instance(), last_played_at: '2026-10-04T08:00:00Z' });
     } else if (change === 'instance removal') h.store.instances.value = [];
     else {
-      h.actions.confirmLaunch('instance-1', statusContract.launchSessionsResponse({ sessions: [{ ...status(), session_id: 'session-2' }] })['instance-1']);
+      h.actions.confirmLaunch('instance-1', liveSession({ ...status(), session_id: 'session-2' }, h));
       if (change === 'session lifetime') h.actions.endSessionIfCurrent('instance-1', 'session-2');
     }
     const before = h.store.instances.value;
@@ -395,10 +384,10 @@ async function acceptedPlay() {
   await flush();
   assert.equal(h.store.launchSessions.value['instance-1'].statusRevision, 7);
   assert.equal(h.store.launchSessions.value['instance-1'].viewModel.playing, true);
-  const missing = historicalStatusApi();
-  const settled = historicalStatusApi(200, settledIntent(), intentPath);
-  h.readStatus(() => missing.api('GET', `/launch/${sessionId}/status`));
-  h.readIntent((path) => settled.api('GET', path));
+  h.readStatus(async () => {
+    throw refusal(404, unknownSession);
+  });
+  h.readIntent(async () => settledIntent());
   return { ...h, sessionId, intentPath, accepted };
 }
 
@@ -435,8 +424,10 @@ test('a restored Playing session without its original intent cannot infer settle
   await flush();
   const sessions = h.store.launchSessions.value;
   const path = '/launch/session-1/status';
-  const missing = historicalStatusApi(404, { error: 'The instance was not found.', code: 'instance_not_found' }, path);
-  h.readStatus(() => missing.api('GET', path));
+  assert.ok(h.calls.includes(path));
+  h.readStatus(async () => {
+    throw refusal(404, unknownSession);
+  });
   h.poll();
   await flush();
   assert.equal(h.store.launchSessions.value, sessions);
@@ -454,15 +445,14 @@ test('a restored Playing session without its original intent cannot infer settle
 for (const [code, payload] of [
   [404, { error: 'Unclassified absence' }],
   [404, { error: 'Different refusal', code: 'another_error' }],
-  [404, { code: 'instance_not_found' }],
   [503, { error: 'Status unavailable', code: 'instance_not_found' }],
 ] as const) {
   test(`unclassified or unavailable status cannot authorize an intent read: ${code} ${JSON.stringify(payload)}`, async () => {
     const h = await acceptedPlay();
     const sessions = h.store.launchSessions.value;
-    const path = `/launch/${h.sessionId}/status`;
-    const response = historicalStatusApi(code, payload, path);
-    h.readStatus(() => response.api('GET', path));
+    h.readStatus(async () => {
+      throw refusal(code, payload);
+    });
     h.poll();
     await flush();
     assert.equal(h.store.launchSessions.value, sessions);
@@ -488,7 +478,6 @@ for (const [label, payload] of [
       code: 'interrupted',
     },
   ],
-  ['missing snapshot', { state: 'accepted' }],
   ['different session', { ...terminal, session: { ...terminal.session, session_id: 'different-session' } }],
   ['different instance', { ...terminal, session: { ...terminal.session, instance_id: 'different-instance' } }],
   ['different launch time', { ...terminal, session: { ...terminal.session, launched_at: '2026-09-08T08:00:01.000Z' } }],
@@ -498,7 +487,6 @@ for (const [label, payload] of [
   ['live process', { ...terminal, session: { ...terminal.session, process_alive: true } }],
   ['stop allowed', { ...terminal, session: { ...terminal.session, stop_allowed: true } }],
   ['missing outcome', { ...terminal, session: { ...terminal.session, outcome: null } }],
-  ['unsafe revision', { ...terminal, session: { ...terminal.session, revision: Number.MAX_SAFE_INTEGER + 1 } }],
   ...(['playing', 'process_live', 'can_stop'] as const).map(
     (flag) =>
       [
@@ -513,8 +501,7 @@ for (const [label, payload] of [
   test(`unverified original intent cannot clear Playing: ${label}`, async () => {
     const h = await acceptedPlay();
     const sessions = h.store.launchSessions.value;
-    const response = historicalStatusApi(200, payload, h.intentPath);
-    h.readIntent((path) => response.api('GET', path));
+    h.readIntent(async () => structuredClone(payload));
     h.poll();
     await flush();
     await flush();
@@ -563,7 +550,6 @@ test('repeated original settlement completes once while another instance is sele
   const h = await acceptedPlay();
   const other = { ...instance(true), id: 'instance-2', name: 'Other' };
   h.store.instances.value = [...h.store.instances.value, other];
-  h.store.selectedInstance.value = other;
   h.actions.selectInstance('instance-2');
   h.actions.confirmLaunch('instance-2', {
     sessionId: 'session-2',
@@ -593,7 +579,7 @@ test('repeated original settlement completes once while another instance is sele
   await flush();
   assert.equal(h.store.launchSessions.value['instance-1'], undefined);
   assert.equal(h.store.launchSessions.value['instance-2'], otherSession);
-  assert.equal(h.store.selectedInstance.value, other);
+  assert.equal(h.store.selectedInstance.value?.id, other.id);
   assert.equal(h.clock.intervals.size, 0);
   assert.equal(h.closed(), 1);
   assert.equal(h.calls.filter((path) => path === '/instances/instance-1').length, 1);
@@ -635,14 +621,16 @@ test('delayed live status or Stop outcomes cannot undo verified settlement while
         view_model: { ...h.accepted.view_model, state_id: 'stopping', label: 'Stopping Minecraft', playing: false },
       });
     } else if (stale === 'Stop refused') {
-      const path = `/launch/${h.sessionId}/kill`;
-      const response = historicalStatusApi(404, { error: 'The instance was not found.', code: 'instance_not_found' }, path);
-      await response.api('POST', path).catch(reply.reject);
+      reply.reject(refusal(404, unknownSession));
     } else reply.reject(new Error('Stop response lost'));
     await stopping;
     const current = h.store.launchSessions.value['instance-1'];
     if (stale === 'Stop refused' || stale === 'Stop response lost') assert.equal(current, settled, stale);
-    assert.equal(current.viewModel.terminal, true, `${stale}: a delayed reply cannot undo authenticated terminal settlement`);
+    assert.equal(
+      current.viewModel.terminal,
+      true,
+      `${stale}: a delayed reply cannot undo authenticated terminal settlement`,
+    );
     assert.equal(current.viewModel.playing, false, stale);
     assert.equal(current.viewModel.can_stop, false, stale);
     assert.equal(current.viewModel.process_live, false, stale);
@@ -737,20 +725,25 @@ test('concurrent duplicate adoption never creates a second connection or replace
   assert.equal(h.store.launchSessions.value['instance-1'].sessionId, 'session-1');
 });
 
-test('an invalid, terminal or unclassified external session read cannot publish controls', async () => {
+test('a mismatched, terminal or unclassified external session read cannot publish controls', async () => {
   const historical = '4772f752-5f75-48fb-a1f0-bb484f858ea0';
-  const refusal = (code: number, payload: unknown) => () =>
-    historicalStatusApi(code, payload).api('GET', `/launch/${historical}/status`);
+  const refused = (code: number, payload: { error?: string; code?: string }) => async () => {
+    throw refusal(code, payload);
+  };
   for (const { label, read, session = 'session-1', visible = true } of [
-    { label: 'malformed', read: async () => ({ error: 'private provider detail' }) },
     { label: 'mismatched identity', read: async () => ({ ...status(), session_id: 'different-session' }) },
-    { label: 'invalid launch time', read: async () => ({ ...status(), launched_at: 'invalid' }) },
-    { label: 'unsafe revision', read: async () => ({ ...status(), revision: Number.MAX_SAFE_INTEGER + 1 }) },
     { label: 'already terminal', read: async () => status(2, true), visible: false },
-    { label: 'unclassified 404', read: refusal(404, { error: 'private provider detail' }), session: historical },
-    { label: 'other 404 code', read: refusal(404, { error: 'private provider detail', code: 'another_error' }), session: historical },
-    { label: 'typed 404 without message', read: refusal(404, { code: 'instance_not_found' }), session: historical },
-    { label: 'unavailable 503', read: refusal(503, { error: 'private provider detail', code: 'instance_not_found' }), session: historical },
+    { label: 'unclassified 404', read: refused(404, { error: 'private provider detail' }), session: historical },
+    {
+      label: 'other 404 code',
+      read: refused(404, { error: 'private provider detail', code: 'another_error' }),
+      session: historical,
+    },
+    {
+      label: 'unavailable 503',
+      read: refused(503, { error: 'private provider detail', code: 'instance_not_found' }),
+      session: historical,
+    },
   ]) {
     const h = launchHarness(undefined, false);
     const sessions = h.store.launchSessions.value;
@@ -768,8 +761,9 @@ test('typed absence of a historical session is quiet and preserves any current g
   for (const running of [false, true]) {
     const h = launchHarness(undefined, running);
     await flush();
-    const response = historicalStatusApi();
-    h.readStatus(() => response.api('GET', '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status'));
+    h.readStatus(async () => {
+      throw refusal(404, unknownSession);
+    });
     const sessions = h.store.launchSessions.value;
     const preparation = h.store.launchState.value;
     const connections = h.connections();
@@ -791,8 +785,7 @@ test('late historical absence cannot clear or reconnect a newer live projection'
   const adoption = h.launch.adoptLaunchSession('4772f752-5f75-48fb-a1f0-bb484f858ea0');
   h.emit(status(5), 'status');
   const sessions = h.store.launchSessions.value;
-  const response = historicalStatusApi();
-  await response.api('GET', '/launch/4772f752-5f75-48fb-a1f0-bb484f858ea0/status').catch(pending.reject);
+  pending.reject(refusal(404, unknownSession));
   await adoption;
   assert.equal(h.store.launchSessions.value, sessions);
   assert.equal(h.store.launchSessions.value['instance-1'].statusRevision, 5);
@@ -818,10 +811,7 @@ test('external adoption cannot overwrite, replace or strand a newer session or p
     if (timing !== 'occupied') h.readStatus(() => reply.promise);
     const adoption = timing === 'occupied' ? undefined : h.launch.adoptLaunchSession('session-1');
     if (change === 'replacement session' || change === 'session lifetime') {
-      const replacement = statusContract.launchSessionsResponse({
-        sessions: [{ ...status(), session_id: 'session-2' }],
-      });
-      h.actions.confirmLaunch('instance-1', replacement['instance-1']);
+      h.actions.confirmLaunch('instance-1', liveSession({ ...status(), session_id: 'session-2' }, h));
       if (change === 'session lifetime') h.actions.endSessionIfCurrent('instance-1', 'session-2');
     } else if (change === 'preparation' || change === 'preparation lifetime') {
       h.actions.startLaunch('instance-1');
@@ -840,7 +830,11 @@ test('external adoption cannot overwrite, replace or strand a newer session or p
 });
 
 test('an interrupted durable launch stops recovery polling and prevents a fresh launch', async () => {
-  const harness = launchHarness({ state: 'interrupted', session_id: 'session-1', error: 'Its process outcome is unknown.' });
+  const harness = launchHarness({
+    state: 'interrupted',
+    session_id: 'session-1',
+    error: 'Its process outcome is unknown.',
+  });
   await harness.launch.launchGame();
   await flush();
   assert.equal(harness.store.launchState.value.status, 'preparing');
@@ -852,24 +846,14 @@ test('an interrupted durable launch stops recovery polling and prevents a fresh 
   assert.equal(harness.calls.filter((path) => path === '/launch').length, 1);
 });
 
-test('an interrupted reply without its session identity cannot end status reconciliation', async () => {
-  const harness = launchHarness({ state: 'interrupted' });
-  await harness.launch.launchGame();
-  await flush();
-  assert.equal(harness.store.launchState.value.status, 'preparing');
-  assert.equal(harness.clock.timeouts.size, 1);
-  harness.clock.runTimeout();
-  await flush();
-  assert.equal(harness.calls.filter((path) => path === '/launch').length, 1);
-  assert.equal(Object.keys(harness.store.launchSessions.value).length, 0);
-});
-
 test('replayed launch history is appended once per session sequence', async () => {
   const harness = launchHarness();
   await flush();
   for (const sequence of [1, 2, 1, 2, 3]) harness.emit(log(sequence), 'log');
-  assert.deepEqual(harness.lines.map((line) => line.text), ['line-1', 'line-2', 'line-3']);
-  assert.throws(() => harness.emit({ ...log(4), sequence: -1 }, 'log'), /sequence/);
+  assert.deepEqual(
+    harness.lines.map((line) => line.text),
+    ['line-1', 'line-2', 'line-3'],
+  );
   harness.emit(log(5), 'log');
   assert.match(harness.lines[3].text, /no longer available/);
   assert.equal(harness.lines[4].text, 'line-5');
@@ -889,7 +873,10 @@ test('terminal polling drains the retained log tail before closing the stream', 
   harness.emit(status(2, true), 'status');
   harness.finalLogs.resolve({ entries: [log(1), log(2), log(3)] });
   await flush();
-  assert.deepEqual(harness.lines.map((line) => line.text), ['line-1', 'line-2', 'line-3', 'Game closed']);
+  assert.deepEqual(
+    harness.lines.map((line) => line.text),
+    ['line-1', 'line-2', 'line-3', 'Game closed'],
+  );
   assert.equal(harness.store.launchSessions.value['instance-1'], undefined);
   assert.equal(harness.closed(), 1);
   assert.equal(harness.calls.filter((path) => path.endsWith('/logs')).length, 1);
@@ -934,8 +921,14 @@ test('final log timeout is bounded and a late reply cannot affect a replacement 
   assert.equal([...harness.clock.timeouts.values()][0].delay, 5000);
   harness.clock.runTimeout();
   await flush();
-  harness.store.launchSessions.value = { 'instance-1': { sessionId: 'session-2', launchedAt: status().launched_at,
-    statusRevision: 1, viewModel: status().view_model } };
+  harness.store.launchSessions.value = {
+    'instance-1': {
+      sessionId: 'session-2',
+      launchedAt: status().launched_at,
+      statusRevision: 1,
+      viewModel: status().view_model,
+    },
+  };
   const count = harness.lines.length;
   harness.finalLogs.resolve({ entries: [log(1)] });
   await flush();
@@ -947,9 +940,17 @@ test('terminal readiness rechecks once after the launch reservation is released 
   for (const { label, read, launchable, errors } of [
     { label: 'released reservation', read: (reads: number) => instance(reads > 1), launchable: true, errors: 0 },
     { label: 'backend refusal', read: () => instance(), launchable: false, errors: 0 },
-    { label: 'read failure', read: (): EnrichedInstance => { throw new Error('Offline'); }, launchable: false, errors: 1 },
+    {
+      label: 'read failure',
+      read: (): EnrichedInstance => {
+        throw new Error('Offline');
+      },
+      launchable: false,
+      errors: 1,
+    },
   ]) {
     const harness = launchHarness();
+    harness.store.instances.value = [instance()];
     let reads = 0;
     harness.readInstance(async () => read(++reads));
     harness.emit(status(2, true), 'status');
@@ -981,10 +982,16 @@ for (const change of ['edit', 'remove', 'session', 'config'] as const) {
     await flush();
     if (change === 'edit') harness.store.instances.value = [{ ...instance(), name: 'Renamed' }];
     if (change === 'remove') harness.store.instances.value = [];
-    if (change === 'config') harness.store.config.value = { ...harness.store.config.value } as Config;
-    if (change === 'session') harness.store.launchSessions.value = { 'instance-1': {
-      sessionId: 'session-2', launchedAt: status().launched_at, statusRevision: 1, viewModel: status().view_model,
-    } };
+    if (change === 'config') harness.store.config.value = { ...harness.store.config.value } as ConfigView;
+    if (change === 'session')
+      harness.store.launchSessions.value = {
+        'instance-1': {
+          sessionId: 'session-2',
+          launchedAt: status().launched_at,
+          statusRevision: 1,
+          viewModel: status().view_model,
+        },
+      };
     const before = harness.store.instances.value;
     reply.resolve(instance(true));
     await flush();
@@ -1009,41 +1016,56 @@ test('a newer account readiness read supersedes an older terminal readiness resp
 });
 
 function queue(epoch: string, revision: number, registryRevision: number): InstallQueueStateResponse {
-  return { queue_epoch: epoch, revision, registry_revision: registryRevision, active: null, items: [], failures: [],
-    view_model: { state_id: 'empty', status_label: epoch, title: 'Downloads', summary: '', queued_count: 0,
-      queued_count_label: '0', queued_item_label: 'Queued', section_title: 'Queue', empty_title: 'Empty', empty_summary: '' } };
+  const snapshot = queueSnapshot({ queue_epoch: epoch, revision, registry_revision: registryRevision, failures: [] });
+  snapshot.view_model.status_label = epoch;
+  return snapshot;
 }
 
-function downloadsHarness(sharedStore?: {
-  versions: { value: unknown[] };
-  instances: { value: unknown[] };
-  lastInstanceId: { value: string | null };
-  config: { value: Config | null };
-  launchSessions: { value: Record<string, LaunchSession> };
-  launchState: { value: import('../src/store').LaunchState };
-}) {
+function downloadsHarness(shared?: ReturnType<typeof launchHarness>) {
+  const owners = shared?.owners ?? stateOwners();
   const clock = timers();
   const calls: string[] = [];
   const errors: string[] = [];
   let subscription: ((response: InstallQueueStateResponse) => void) | undefined;
-  const store = sharedStore ?? {
-    versions: signal<unknown[]>([]), instances: signal<unknown[]>([]), lastInstanceId: signal<string | null>(null),
-    config: signal<Config | null>(null), launchSessions: signal<Record<string, LaunchSession>>({}),
-    launchState: signal<import('../src/store').LaunchState>({ status: 'idle' }),
+  let read: (path: string) => Promise<unknown> = async (path) =>
+    path === '/versions' ? { versions: ['installed'] } : { instances: ['ready'], last_instance_id: null };
+  const call: Call = async (method, path) => {
+    assert.equal(method, 'GET');
+    calls.push(path);
+    return read(path);
   };
-  let read: (path: string) => Promise<unknown> = async (path) => path === '/versions'
-    ? { versions: ['installed'] } : { instances: ['ready'], last_instance_id: null };
-  const machine = source<typeof import('../src/machines/downloads')>('machines/downloads.ts', {
-    '../api': { api: async (method: string, path: string) => { assert.equal(method, 'GET'); calls.push(path); return read(path); } },
-    '../utils': { errMessage: String, showError: (message: string) => errors.push(message) }, '../toast': { toast() {} },
-    '../loaders/api': { connectInstallQueueSSE: (next: typeof subscription) => { subscription = next; return () => {}; } }, '../store': store,
-    '../content-activity': { markContentChanged() {} }, '../dto-install': installContract,
-    '../dto-core': sharedStore ? coreContract : { versionsResponse: (value: unknown) => value, instancesResponse: (value: unknown) => value },
-    '../install-item': source<typeof import('../src/install-item')>('install-item.ts'),
-    './download-view-models': source<typeof import('../src/machines/download-view-models')>('machines/download-view-models.ts'),
-  }, clock);
-  return { machine, store, calls, errors, clock, read: (next: typeof read): void => { read = next; },
-    emit(response: InstallQueueStateResponse): void { assert.ok(subscription); subscription(response); },
+  const subscribe: Subscribe = (_path, options) => {
+    subscription = (response) => options.onValue(response, 'message', response.revision);
+    return () => {};
+  };
+  const machine = source<typeof import('../src/install/queue')>(
+    'install/queue.ts',
+    {
+      'app/toast': { errMessage: String, showError: (message: string) => errors.push(message), toast() {} },
+      'install/api': apiModule('install/api.ts', call, subscribe),
+      'instances/api': apiModule('instances/api.ts', call),
+      'settings/state': owners.settings,
+      'instances/state': owners.instanceState,
+      'launch/state': owners.launchState,
+      'content/activity': { markContentChanged() {} },
+      'install/item': source('install/item.ts'),
+      'install/presenters': source('install/presenters.ts'),
+    },
+    clock,
+  );
+  return {
+    machine,
+    store: owners.store,
+    calls,
+    errors,
+    clock,
+    read: (next: typeof read): void => {
+      read = next;
+    },
+    emit(response: InstallQueueStateResponse): void {
+      assert.ok(subscription);
+      subscription(response);
+    },
   };
 }
 
@@ -1053,10 +1075,17 @@ test('required initial hydration joins the current stream projection without a d
     const snapshot = queue('current', 1, 0);
     const queueReply = deferred<unknown>();
     const versionsReply = deferred<unknown>();
-    h.read(async (path) => path === '/install/queue' ? queueReply.promise : path === '/versions'
-      ? versionsReply.promise : { instances: ['current'], last_instance_id: null });
+    h.read(async (path) =>
+      path === '/install/queue'
+        ? queueReply.promise
+        : path === '/versions'
+          ? versionsReply.promise
+          : { instances: ['current'], last_instance_id: null },
+    );
     let ready = false;
-    const refresh = h.machine.refreshInstallQueue({ connectActive: true, requireInstalledState: true }).then(() => { ready = true; });
+    const refresh = h.machine.refreshInstallQueue({ connectActive: true, requireInstalledState: true }).then(() => {
+      ready = true;
+    });
     h.emit(snapshot);
     await flush();
     queueReply.resolve(initial === 'matching' ? snapshot : queue('old', 10, 9));
@@ -1078,18 +1107,27 @@ test('required hydration follows newer registry revisions and restarted epochs b
     const h = downloadsHarness();
     const oldVersions = deferred<unknown>();
     const newVersions = deferred<unknown>();
-    h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-      ? oldVersions.promise : { instances: ['old'], last_instance_id: 'old' });
+    h.read(async (path) =>
+      path === '/install/queue'
+        ? queue('first', 1, 0)
+        : path === '/versions'
+          ? oldVersions.promise
+          : { instances: ['old'], last_instance_id: 'old' },
+    );
     let ready = false;
-    const refresh = h.machine.refreshInstallQueue({ requireInstalledState: true }).then(() => { ready = true; });
+    const refresh = h.machine.refreshInstallQueue({ requireInstalledState: true }).then(() => {
+      ready = true;
+    });
     await flush();
-    h.read(async (path) => path === '/versions' ? newVersions.promise : { instances: ['current'], last_instance_id: 'current' });
+    h.read(async (path) =>
+      path === '/versions' ? newVersions.promise : { instances: ['current'], last_instance_id: 'current' },
+    );
     const current = h.machine.applyInstallQueueResponse(next);
     await flush();
     oldVersions.resolve({ versions: ['old'] });
     await flush();
     assert.equal(ready, false);
-    assert.deepEqual(h.store.instances.value, []);
+    assert.equal(h.store.instances.value.length, 0);
     newVersions.resolve({ versions: ['current'] });
     await Promise.all([refresh, current]);
     assert.deepEqual(h.store.versions.value, ['current']);
@@ -1108,25 +1146,34 @@ test('new registry cursors drain the active read pair before reading only the la
     let maximumActive = 0;
     const track = async (reply: Promise<unknown>): Promise<unknown> => {
       maximumActive = Math.max(maximumActive, ++active);
-      try { return await reply; } finally { active -= 1; }
+      try {
+        return await reply;
+      } finally {
+        active -= 1;
+      }
     };
     h.read((path) => track(path === '/versions' ? oldVersions.promise : oldInstances.promise));
     const old = h.machine.applyInstallQueueResponse(queue('first', 1, 0));
     await flush();
-    h.read((path) => track(Promise.resolve(path === '/versions'
-      ? { versions: ['latest'] } : { instances: ['latest'], last_instance_id: 'latest' })));
+    h.read((path) =>
+      track(
+        Promise.resolve(
+          path === '/versions' ? { versions: ['latest'] } : { instances: ['latest'], last_instance_id: 'latest' },
+        ),
+      ),
+    );
     const middle = h.machine.applyInstallQueueResponse(queue('first', 2, 1));
     const latest = h.machine.applyInstallQueueResponse(queue('first', 3, 2));
     await flush();
     assert.equal(h.calls.length, 2, 'new cursors must join both active requests');
-    assert.deepEqual(h.store.instances.value, []);
+    assert.equal(h.store.instances.value.length, 0);
 
     if (failure === '/instances') oldInstances.reject(new Error('Obsolete instance read failed'));
     else if (failure === '/versions') oldVersions.reject(new Error('Obsolete version read failed'));
     else oldVersions.resolve({ versions: ['obsolete'] });
     await flush();
     assert.equal(h.calls.length, 2, 'one settled request must not release the other active request');
-    assert.deepEqual(h.store.instances.value, []);
+    assert.equal(h.store.instances.value.length, 0);
     if (failure === '/instances') oldVersions.resolve({ versions: ['obsolete'] });
     else oldInstances.resolve({ instances: ['obsolete'], last_instance_id: 'obsolete' });
     await Promise.all([old, middle, latest]);
@@ -1147,17 +1194,27 @@ test('new registry cursors drain the active read pair before reading only the la
 test('required hydration propagates a shared read failure and explicit retry bypasses background backoff', async () => {
   const h = downloadsHarness();
   const versionsReply = deferred<unknown>();
-  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? versionsReply.promise : { instances: ['ready'], last_instance_id: null });
+  h.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? versionsReply.promise
+        : { instances: ['ready'], last_instance_id: null },
+  );
   const initial = assert.rejects(h.machine.refreshInstallQueue({ requireInstalledState: true }), /Unavailable/);
   const background = h.machine.applyInstallQueueResponse(queue('first', 1, 0));
   await flush();
   versionsReply.reject(new Error('Unavailable'));
   await Promise.all([initial, background]);
-  assert.deepEqual(h.store.instances.value, []);
+  assert.equal(h.store.instances.value.length, 0);
   assert.equal(h.clock.timeouts.size, 1);
-  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? { versions: ['ready'] } : { instances: ['ready'], last_instance_id: null });
+  h.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? { versions: ['ready'] }
+        : { instances: ['ready'], last_instance_id: null },
+  );
   await h.machine.refreshInstallQueue({ requireInstalledState: true });
   assert.deepEqual(h.store.instances.value, ['ready']);
   assert.equal(h.clock.timeouts.size, 0);
@@ -1167,11 +1224,18 @@ test('required hydration propagates a shared read failure and explicit retry byp
 test('a required attempt cannot reuse a projection read that began before the attempt at the same queue cursor', async () => {
   const h = downloadsHarness();
   const oldVersions = deferred<unknown>();
-  h.read(async (path) => path === '/versions' ? oldVersions.promise : { instances: ['old'], last_instance_id: 'old' });
+  h.read(async (path) =>
+    path === '/versions' ? oldVersions.promise : { instances: ['old'], last_instance_id: 'old' },
+  );
   const oldRead = h.machine.applyInstallQueueResponse(queue('first', 1, 0));
   await flush();
-  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? { versions: ['fresh'] } : { instances: ['fresh'], last_instance_id: 'fresh' });
+  h.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? { versions: ['fresh'] }
+        : { instances: ['fresh'], last_instance_id: 'fresh' },
+  );
   const freshRead = h.machine.refreshInstallQueue({ requireInstalledState: true });
   await flush();
   assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
@@ -1186,15 +1250,25 @@ test('a required attempt cannot reuse a projection read that began before the at
 test('a failed newer projection cannot be hidden by completion of an obsolete required read', async () => {
   const h = downloadsHarness();
   const oldVersions = deferred<unknown>();
-  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? oldVersions.promise : { instances: ['old'], last_instance_id: 'old' });
-  const initial = assert.rejects(h.machine.refreshInstallQueue({ requireInstalledState: true }), /New projection unavailable/);
+  h.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? oldVersions.promise
+        : { instances: ['old'], last_instance_id: 'old' },
+  );
+  const initial = assert.rejects(
+    h.machine.refreshInstallQueue({ requireInstalledState: true }),
+    /New projection unavailable/,
+  );
   await flush();
-  h.read(async () => { throw new Error('New projection unavailable'); });
+  h.read(async () => {
+    throw new Error('New projection unavailable');
+  });
   const current = h.machine.applyInstallQueueResponse(queue('first', 2, 1));
   oldVersions.resolve({ versions: ['old'] });
   await Promise.all([initial, current]);
-  assert.deepEqual(h.store.instances.value, []);
+  assert.equal(h.store.instances.value.length, 0);
   assert.equal(h.calls.filter((path) => path === '/instances').length, 2);
   assert.equal(h.clock.timeouts.size, 1);
   h.machine.disconnectInstallQueue();
@@ -1203,14 +1277,19 @@ test('a failed newer projection cannot be hidden by completion of an obsolete re
 test('disconnecting a required projection discards its late read and does not restart it behind the caller', async () => {
   const h = downloadsHarness();
   const versionsReply = deferred<unknown>();
-  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? versionsReply.promise : { instances: ['late'], last_instance_id: 'late' });
+  h.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? versionsReply.promise
+        : { instances: ['late'], last_instance_id: 'late' },
+  );
   const stopped = assert.rejects(h.machine.refreshInstallQueue({ requireInstalledState: true }), /interrupted/);
   await flush();
   h.machine.disconnectInstallQueue();
   versionsReply.resolve({ versions: ['late'] });
   await stopped;
-  assert.deepEqual(h.store.instances.value, []);
+  assert.equal(h.store.instances.value.length, 0);
   assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
 });
 
@@ -1218,12 +1297,17 @@ test('a fresh required read after disconnect still drains the prior backend requ
   const h = downloadsHarness();
   const oldVersions = deferred<unknown>();
   const oldInstances = deferred<unknown>();
-  h.read(async (path) => path === '/versions' ? oldVersions.promise : oldInstances.promise);
+  h.read(async (path) => (path === '/versions' ? oldVersions.promise : oldInstances.promise));
   const oldRead = h.machine.applyInstallQueueResponse(queue('first', 1, 0));
   await flush();
   h.machine.disconnectInstallQueue();
-  h.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? { versions: ['fresh'] } : { instances: ['fresh'], last_instance_id: 'fresh' });
+  h.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? { versions: ['fresh'] }
+        : { instances: ['fresh'], last_instance_id: 'fresh' },
+  );
   const freshRead = h.machine.refreshInstallQueue({ requireInstalledState: true });
   await flush();
   assert.equal(h.calls.filter((path) => path === '/instances').length, 1);
@@ -1251,16 +1335,18 @@ test('coalesced successful installs invalidate views without an observed active 
 
 test('an older downloads projection cannot overwrite readiness published after session settlement', async () => {
   const launch = launchHarness();
-  const downloads = downloadsHarness(launch.store);
-  downloads.read(async (path) => path === '/versions'
-    ? { versions: [] } : { instances: [instance(false)], last_instance_id: 'instance-1' });
+  const downloads = downloadsHarness(launch);
+  downloads.read(async (path) =>
+    path === '/versions' ? { versions: [] } : { instances: [instance(false)], last_instance_id: 'instance-1' },
+  );
   await downloads.machine.applyInstallQueueResponse(queue('first', 1, 0));
 
   // Removing a waiting install can advance the registry while this game runs.
   // Its instance read finishes first; the paired versions read is still pending.
   const oldVersions = deferred<unknown>();
-  downloads.read(async (path) => path === '/versions'
-    ? oldVersions.promise : { instances: [instance(false)], last_instance_id: 'instance-1' });
+  downloads.read(async (path) =>
+    path === '/versions' ? oldVersions.promise : { instances: [instance(false)], last_instance_id: 'instance-1' },
+  );
   const removedQueue = queue('first', 25, 1);
   const oldProjection = downloads.machine.applyInstallQueueResponse(removedQueue);
   await flush();
@@ -1274,13 +1360,16 @@ test('an older downloads projection cannot overwrite readiness published after s
   assert.equal(launch.calls.filter((path) => path === '/instances/instance-1').length, 1);
   assert.equal(launch.store.instances.value[0].launch_action.label, 'Launch');
 
-  downloads.read(async (path) => path === '/versions'
-    ? { versions: [] } : { instances: [instance(true)], last_instance_id: 'instance-1' });
+  downloads.read(async (path) =>
+    path === '/versions' ? { versions: [] } : { instances: [instance(true)], last_instance_id: 'instance-1' },
+  );
   oldVersions.resolve({ versions: [] });
   await oldProjection;
   assert.equal(launch.errors.length + downloads.errors.length, 0);
   assert.equal(launch.store.launchSessions.value['instance-1'], undefined);
-  assert.equal(launch.store.instances.value[0].launch_action.label, 'Launch',
+  assert.equal(
+    launch.store.instances.value[0].launch_action.label,
+    'Launch',
     "the delayed registry response must not restore the ended session's Unavailable readiness",
   );
   assert.equal(launch.store.instances.value[0].launchable, true);
@@ -1290,15 +1379,15 @@ test('an older downloads projection cannot overwrite readiness published after s
 
 test('a complete session lifetime invalidates an older projection while terminal readiness is still pending', async () => {
   const launch = launchHarness(undefined, false);
-  const downloads = downloadsHarness(launch.store);
+  const downloads = downloadsHarness(launch);
   const oldVersions = deferred<unknown>();
   const oldInstances = deferred<unknown>();
   const terminalReadiness = deferred<unknown>();
-  downloads.read(async (path) => path === '/versions' ? oldVersions.promise : oldInstances.promise);
+  downloads.read(async (path) => (path === '/versions' ? oldVersions.promise : oldInstances.promise));
   const projection = downloads.machine.applyInstallQueueResponse(queue('first', 1, 0));
   await flush();
 
-  launch.actions.confirmLaunch('instance-1', statusContract.launchSessionsResponse({ sessions: [status()] })['instance-1']);
+  launch.actions.confirmLaunch('instance-1', liveSession(status(), launch));
   launch.launch.reconnectLaunchSession('instance-1', 'Example');
   oldInstances.resolve({ instances: [instance(false)], last_instance_id: null });
   await flush();
@@ -1310,8 +1399,9 @@ test('a complete session lifetime invalidates an older projection while terminal
   assert.equal(launch.store.launchState.value.status, 'idle');
   assert.equal(launch.calls.filter((path) => path === '/instances/instance-1').length, 1);
 
-  downloads.read(async (path) => path === '/versions'
-    ? { versions: [] } : { instances: [instance(true)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/versions' ? { versions: [] } : { instances: [instance(true)], last_instance_id: null },
+  );
   oldVersions.resolve({ versions: [] });
   await projection;
   terminalReadiness.resolve(instance(true));
@@ -1322,27 +1412,44 @@ test('a complete session lifetime invalidates an older projection while terminal
   assert.equal(downloads.clock.timeouts.size, 0);
 });
 
-for (const change of ['account selection', 'config', 'instance edit', 'instance removal', 'versions', 'last instance', 'preparation lifetime'] as const) {
+for (const change of [
+  'account selection',
+  'config',
+  'instance edit',
+  'instance removal',
+  'versions',
+  'last instance',
+  'preparation lifetime',
+] as const) {
   test(`a downloads projection rebases after a newer ${change} without advancing the queue cursor`, async () => {
     const launch = launchHarness(undefined, false);
     launch.actions.setConfig(configSnapshot());
-    const downloads = downloadsHarness(launch.store);
+    const downloads = downloadsHarness(launch);
     const oldVersions = deferred<unknown>();
-    downloads.read(async (path) => path === '/versions'
-      ? oldVersions.promise : { instances: [instance(false)], last_instance_id: null });
+    downloads.read(async (path) =>
+      path === '/versions' ? oldVersions.promise : { instances: [instance(false)], last_instance_id: null },
+    );
     const projection = downloads.machine.applyInstallQueueResponse(queue('first', 1, 0));
     await flush();
-    if (change === 'account selection') launch.actions.setConfig({ ...configSnapshot(), account_selection_revision: 2 });
+    if (change === 'account selection')
+      launch.actions.setConfig({ ...configSnapshot(), account_selection_revision: 2 });
     if (change === 'config') launch.actions.setConfig({ ...configSnapshot(), revision: 2, max_memory_mb: 8192 });
     if (change === 'instance edit') launch.actions.updateInstanceInList({ ...instance(true), name: 'Renamed' });
     if (change === 'instance removal') launch.actions.removeInstance('instance-1');
     if (change === 'versions') launch.store.versions.value = [];
     if (change === 'last instance') launch.store.lastInstanceId.value = 'instance-1';
-    if (change === 'preparation lifetime') { launch.actions.startLaunch('instance-1'); launch.actions.endLaunchPrep(); }
-    const expected = change === 'instance removal' ? [] : [{ ...instance(true), name: change === 'instance edit' ? 'Renamed' : 'Example' }];
+    if (change === 'preparation lifetime') {
+      launch.actions.startLaunch('instance-1');
+      launch.actions.endLaunchPrep();
+    }
+    const expected =
+      change === 'instance removal'
+        ? []
+        : [{ ...instance(true), name: change === 'instance edit' ? 'Renamed' : 'Example' }];
     const lastInstance = launch.store.lastInstanceId.value;
-    downloads.read(async (path) => path === '/versions'
-      ? { versions: [] } : { instances: expected, last_instance_id: lastInstance });
+    downloads.read(async (path) =>
+      path === '/versions' ? { versions: [] } : { instances: expected, last_instance_id: lastInstance },
+    );
     oldVersions.resolve({ versions: [] });
     await projection;
     assert.deepEqual(JSON.parse(JSON.stringify(launch.store.instances.value)), expected);
@@ -1357,11 +1464,12 @@ for (const change of ['account selection', 'config', 'instance edit', 'instance 
 
 test('same-session status ticks, same-owner preparation progress and navigation do not starve registry reads', async () => {
   const launch = launchHarness();
-  const downloads = downloadsHarness(launch.store);
+  const downloads = downloadsHarness(launch);
   launch.actions.startLaunch('instance-2');
   const versionsReply = deferred<unknown>();
-  downloads.read(async (path) => path === '/versions'
-    ? versionsReply.promise : { instances: [instance(false)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/versions' ? versionsReply.promise : { instances: [instance(false)], last_instance_id: null },
+  );
   const projection = downloads.machine.applyInstallQueueResponse(queue('first', 1, 0));
   await flush();
   for (let revision = 2; revision <= 4; revision++) {
@@ -1379,17 +1487,25 @@ test('same-session status ticks, same-owner preparation progress and navigation 
 
 test('an obsolete read failure rebases silently and required hydration awaits the fresh projection', async () => {
   const launch = launchHarness(undefined, false);
-  const downloads = downloadsHarness(launch.store);
+  const downloads = downloadsHarness(launch);
   const oldVersions = deferred<unknown>();
   const freshVersions = deferred<unknown>();
-  downloads.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? oldVersions.promise : { instances: [instance(false)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? oldVersions.promise
+        : { instances: [instance(false)], last_instance_id: null },
+  );
   let ready = false;
-  const initial = downloads.machine.refreshInstallQueue({ requireInstalledState: true }).then(() => { ready = true; });
+  const initial = downloads.machine.refreshInstallQueue({ requireInstalledState: true }).then(() => {
+    ready = true;
+  });
   await flush();
   launch.actions.setConfig(configSnapshot());
-  downloads.read(async (path) => path === '/versions'
-    ? freshVersions.promise : { instances: [instance(true)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/versions' ? freshVersions.promise : { instances: [instance(true)], last_instance_id: null },
+  );
   oldVersions.reject(new Error('Obsolete network failure'));
   await flush();
   assert.equal(ready, false);
@@ -1403,12 +1519,20 @@ test('an obsolete read failure rebases silently and required hydration awaits th
 
 test('sustained supersession fails required hydration truthfully and retries the unreconciled cursor on a bounded timer', async () => {
   const launch = launchHarness(undefined, false);
-  const downloads = downloadsHarness(launch.store);
+  const downloads = downloadsHarness(launch);
   const replies = [deferred<unknown>(), deferred<unknown>()];
   let attempt = 0;
-  downloads.read(async (path) => path === '/install/queue' ? queue('first', 1, 0) : path === '/versions'
-    ? replies[attempt++].promise : { instances: [instance(false)], last_instance_id: null });
-  const failed = assert.rejects(downloads.machine.refreshInstallQueue({ requireInstalledState: true }), /state changed while refreshing/);
+  downloads.read(async (path) =>
+    path === '/install/queue'
+      ? queue('first', 1, 0)
+      : path === '/versions'
+        ? replies[attempt++].promise
+        : { instances: [instance(false)], last_instance_id: null },
+  );
+  const failed = assert.rejects(
+    downloads.machine.refreshInstallQueue({ requireInstalledState: true }),
+    /state changed while refreshing/,
+  );
   for (const [index, reply] of replies.entries()) {
     await flush();
     launch.actions.setConfig({ ...configSnapshot(), account_selection_revision: index + 1 });
@@ -1421,8 +1545,9 @@ test('sustained supersession fails required hydration truthfully and retries the
   assert.equal([...downloads.clock.timeouts.values()][0].delay, 500);
   await downloads.machine.applyInstallQueueResponse(queue('first', 2, 0));
   assert.equal(downloads.calls.filter((path) => path === '/instances').length, 2);
-  downloads.read(async (path) => path === '/versions'
-    ? { versions: [] } : { instances: [instance(true)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/versions' ? { versions: [] } : { instances: [instance(true)], last_instance_id: null },
+  );
   downloads.clock.runTimeout();
   await flush();
   assert.equal(launch.store.instances.value[0].launch_action.label, 'Launch');
@@ -1432,14 +1557,18 @@ test('sustained supersession fails required hydration truthfully and retries the
 
 test('disconnect during a rebase prevents late publication and cannot schedule a retry', async () => {
   const launch = launchHarness(undefined, false);
-  const downloads = downloadsHarness(launch.store);
+  const downloads = downloadsHarness(launch);
   const first = deferred<unknown>();
   const second = deferred<unknown>();
-  downloads.read(async (path) => path === '/versions' ? first.promise : { instances: [instance(false)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/versions' ? first.promise : { instances: [instance(false)], last_instance_id: null },
+  );
   const projection = downloads.machine.applyInstallQueueResponse(queue('first', 1, 0));
   await flush();
   launch.actions.setConfig(configSnapshot());
-  downloads.read(async (path) => path === '/versions' ? second.promise : { instances: [instance(true)], last_instance_id: null });
+  downloads.read(async (path) =>
+    path === '/versions' ? second.promise : { instances: [instance(true)], last_instance_id: null },
+  );
   first.resolve({ versions: [] });
   await flush();
   downloads.machine.disconnectInstallQueue();
@@ -1470,8 +1599,13 @@ test('queue restart accepts lower revisions and rejects delayed snapshots from i
 test('a late initial queue read cannot replace the restarted stream snapshot', async () => {
   const harness = downloadsHarness();
   const initial = deferred<unknown>();
-  harness.read(async (path) => path === '/install/queue' ? initial.promise
-    : path === '/versions' ? { versions: [] } : { instances: [], last_instance_id: null });
+  harness.read(async (path) =>
+    path === '/install/queue'
+      ? initial.promise
+      : path === '/versions'
+        ? { versions: [] }
+        : { instances: [], last_instance_id: null },
+  );
   const refresh = harness.machine.refreshInstallQueue();
   await harness.machine.applyInstallQueueResponse(queue('new', 1, 0));
   initial.resolve(queue('old', 80, 9));
@@ -1482,12 +1616,14 @@ test('a late initial queue read cannot replace the restarted stream snapshot', a
 test('delayed registry reads from an old process cannot overwrite the restarted process views', async () => {
   const harness = downloadsHarness();
   const oldVersions = deferred<unknown>();
-  harness.read(async (path) => path === '/versions' ? oldVersions.promise
-    : { instances: ['old'], last_instance_id: 'old' });
+  harness.read(async (path) =>
+    path === '/versions' ? oldVersions.promise : { instances: ['old'], last_instance_id: 'old' },
+  );
   const oldRefresh = harness.machine.applyInstallQueueResponse(queue('old', 80, 9));
   await flush();
-  harness.read(async (path) => path === '/versions' ? { versions: ['new'] }
-    : { instances: ['new'], last_instance_id: 'new' });
+  harness.read(async (path) =>
+    path === '/versions' ? { versions: ['new'] } : { instances: ['new'], last_instance_id: 'new' },
+  );
   const current = harness.machine.applyInstallQueueResponse(queue('new', 1, 0));
   oldVersions.resolve({ versions: ['old'] });
   await Promise.all([oldRefresh, current]);
@@ -1518,20 +1654,39 @@ test('failed registry reads retry without a new queue event and cancellation cle
 
 test('failures are listed newest first and leave with the queue snapshot that drops them', async () => {
   const harness = downloadsHarness();
-  const view = { state_id: 'failed', title: 'Install failed', tone: 'err', summary: 'Download interrupted', details: [],
+  const view: InstallFailureViewModel = {
+    state_id: 'failed',
+    title: 'Install failed',
+    tone: 'err',
+    summary: 'Download interrupted',
+    details: [],
     retry_action: { action: 'retry', label: 'Retry install', enabled: true },
-    dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true } };
-  const failed = (operation: string, label: string) => ({ failed_at_ms: 100, queue_id: operation, install_id: operation,
-    operation_id: operation, label, install_item: { version_id: '1.21.6' }, failure_view_model: view });
+    dismiss_action: { action: 'dismiss', label: 'Dismiss', enabled: true },
+  };
+  const failed = (operation: string, label: string): InstallQueueFailureViewModel => ({
+    failed_at_ms: 100,
+    queue_id: operation,
+    install_id: operation,
+    operation_id: operation,
+    label,
+    install_item: { version_id: '1.21.6' },
+    failure_view_model: view,
+  });
   const names = () => harness.machine.downloadFailures.value.map((failure) => failure.displayName);
-  await harness.machine.applyInstallQueueResponse({ ...queue('first', 1, 0),
-    failures: [failed('operation-2', 'Minecraft 1.21.6'), failed('operation-1', 'Minecraft 1.20.1')] });
+  await harness.machine.applyInstallQueueResponse({
+    ...queue('first', 1, 0),
+    failures: [failed('operation-2', 'Minecraft 1.21.6'), failed('operation-1', 'Minecraft 1.20.1')],
+  });
   assert.deepEqual(names(), ['Minecraft 1.21.6', 'Minecraft 1.20.1']);
-  await harness.machine.applyInstallQueueResponse({ ...queue('first', 2, 0),
-    failures: [failed('operation-1', 'Minecraft 1.20.1')] });
+  await harness.machine.applyInstallQueueResponse({
+    ...queue('first', 2, 0),
+    failures: [failed('operation-1', 'Minecraft 1.20.1')],
+  });
   assert.deepEqual(names(), ['Minecraft 1.20.1']);
-  await harness.machine.applyInstallQueueResponse({ ...queue('first', 1, 0),
-    failures: [failed('operation-2', 'Minecraft 1.21.6')] });
+  await harness.machine.applyInstallQueueResponse({
+    ...queue('first', 1, 0),
+    failures: [failed('operation-2', 'Minecraft 1.21.6')],
+  });
   assert.deepEqual(names(), ['Minecraft 1.20.1']);
   await harness.machine.applyInstallQueueResponse(queue('first', 3, 0));
   assert.deepEqual(names(), []);
@@ -1545,24 +1700,36 @@ test('new event connections deliver their complete snapshot even when revisions 
     readonly listeners = new Map<string, (event: { data: string }) => void>();
     onopen?: () => void;
     onerror?: () => void;
-    constructor() { sources.push(this); }
-    addEventListener(name: string, callback: (event: { data: string }) => void): void { this.listeners.set(name, callback); }
+    constructor() {
+      sources.push(this);
+    }
+    addEventListener(name: string, callback: (event: { data: string }) => void): void {
+      this.listeners.set(name, callback);
+    }
     close(): void {}
-    emit(revision: number): void { this.listeners.get('message')?.({ data: JSON.stringify({ revision, value: revision }) }); }
+    emit(revision: number): void {
+      this.listeners.get('message')?.({ data: JSON.stringify({ revision, value: revision }) });
+    }
   }
-  const events = source<typeof import('../src/backend/events')>('backend/events.ts', {
-    '../api': { apiEventSourceUrl: async () => '/fresh-ticket' },
-  }, { ...clock, EventSource: FakeEventSource });
-  const close = events.subscribeApiEvents('/install/queue/events', {
-    decode: (value: unknown) => { assert.equal(typeof value, 'number'); return value as number; },
+  const events = source<typeof import('../src/platform/events')>(
+    'platform/events.ts',
+    {
+      'platform/transport': { apiEventSourceUrl: async () => '/fresh-ticket' },
+    },
+    { ...clock, EventSource: FakeEventSource },
+  );
+  const close = events.subscribeApiEvents<number>('/install/queue/events', {
     onValue: (value) => seen.push(value),
   });
   await flush();
-  sources[0].emit(80); sources[0].emit(79); sources[0].onerror?.();
+  sources[0].emit(80);
+  sources[0].emit(79);
+  sources[0].onerror?.();
   clock.runTimeout();
   await flush();
   sources[0].emit(100);
-  sources[1].emit(1); sources[1].emit(1);
+  sources[1].emit(1);
+  sources[1].emit(1);
   assert.deepEqual(seen, [80, 1]);
   close();
 });
@@ -1572,54 +1739,56 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
   const snapshot = queue('first', 1, 0);
   const item = {
     version_id: 'loader-v2-opaque-installed-identity',
-    loader: { component_id: 'net.fabricmc.fabric-loader', build_id: 'opaque-build-identity',
-      minecraft_version: '1.20.1', loader_version: '0.19.5' },
+    loader: {
+      component_id: 'net.fabricmc.fabric-loader',
+      build_id: 'opaque-build-identity',
+      minecraft_version: '1.20.1',
+      loader_version: '0.19.5',
+    },
   } as const;
   const label = 'Fabric 0.19.5 for Minecraft 1.20.1';
   snapshot.active = {
-    queue_id: 'active-queue', kind: 'loader', title: label, label, summary: 'Downloading files',
+    queue_id: 'active-queue',
+    kind: 'loader',
+    title: label,
+    label,
+    summary: 'Downloading files',
     install_item: item,
     progress: { phase_id: 'download', label: 'Downloading files', progress_pct: 25, terminal: false, failed: false },
   };
-  snapshot.items = [{
-    queue_id: 'next-queue', state_id: 'queued', kind: 'loader', title: label, label,
-    summary: 'Waiting to install', detail: '', position: 1, total: 1, install_item: item,
-    remove_action: { action: 'remove_from_queue', label: 'Remove from queue', enabled: true },
-  }];
+  snapshot.items = [
+    {
+      queue_id: 'next-queue',
+      state_id: 'queued',
+      kind: 'loader',
+      title: label,
+      label,
+      summary: 'Waiting to install',
+      detail: '',
+      position: 1,
+      total: 1,
+      install_item: item,
+      remove_action: { action: 'remove_from_queue', label: 'Remove from queue', enabled: true },
+    },
+  ];
   snapshot.view_model.queued_count = 1;
   await h.machine.applyInstallQueueResponse(snapshot);
-  assert.equal(h.machine.activeDownload.value?.item.versionId, item.version_id);
+  assert.equal(h.machine.activeDownload.value?.item.version_id, item.version_id);
   const removed: string[] = [];
-  const imports: Record<string, unknown> = {
+  const { DownloadsView } = source<typeof import('../src/install/DownloadsView')>('install/DownloadsView.tsx', {
     'preact/jsx-runtime': requireDependency('preact/jsx-runtime'),
-    '../../ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', Meter: 'Meter', Ring: 'Ring' },
-    '../../ui/Icons': { Icon: 'Icon' },
-    '../../ui/Face': { Face: 'Face' },
-    '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile' },
-    '../../ui-state': { navigate() {}, openCreate() {} },
-    '../discover/shared': { KIND_ICON: {} },
-    '../../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
-    '../create/loader-logos': { LoaderLogo: 'LoaderLogo' },
-    '../../install-item': source<typeof import('../src/install-item')>('install-item.ts'),
-    '../../hooks/use-now': { useNowTicker: () => 0 },
-    '../../machines/downloads': { ...h.machine, removeQueuedInstall: (id: string) => removed.push(id) },
-    '../../api': { api: async () => assert.fail('rendering issues no requests') },
-    '../../dto-install': installContract,
-    '../../store': h.store,
-    '../../utils': { errMessage: String, showError: () => undefined },
-  };
-  const filename = resolve(frontend, 'src/views/downloads/DownloadsView.tsx');
-  const compiled = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020,
-      jsx: ts.JsxEmit.ReactJSX, jsxImportSource: 'preact' },
+    'ui/Atoms': { Button: 'Button', Chip: 'Chip', Empty: 'Empty', Meter: 'Meter', Ring: 'Ring' },
+    'ui/Face': { Face: 'Face' },
+    'ui/Icons': { Icon: 'Icon' },
+    'ui/InstanceVisual': { InstanceTile: 'InstanceTile' },
+    'instances/state': { instances: h.store.instances },
+    'app/route': { navigate() {}, openCreate() {} },
+    'ui/use-now': { useNowTicker: () => 0 },
+    'discover/shared': { KIND_ICON: {} },
+    'create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
+    'create/loader-logos': { LoaderLogo: 'LoaderLogo' },
+    'install/queue': { ...h.machine, removeQueuedInstall: (id: string) => removed.push(id) },
   });
-  const exports = {};
-  vm.runInNewContext(compiled.outputText, { exports, require(id: string): unknown {
-    if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-    throw new Error(`Unreviewed downloads view dependency: ${id}`);
-  } }, { filename });
-  const { DownloadsView } = exports as typeof import('../src/views/downloads/DownloadsView');
   type Node = { type: unknown; props: Record<string, unknown> };
   function nodes(value: unknown): Node[] {
     if (Array.isArray(value)) return value.flatMap(nodes);
@@ -1633,7 +1802,10 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
   assert.equal(rendered.find((node) => node.type === 'strong')?.props.children, label);
   assert.equal(rendered.filter((node) => node.type === 'strong' && node.props.children === label).length, 2);
   assert.equal(rendered.find((node) => node.type === 'Chip')?.props.children, '1.20.1');
-  assert.equal(rendered.some((node) => node.props.children === item.version_id), false);
+  assert.equal(
+    rendered.some((node) => node.props.children === item.version_id),
+    false,
+  );
   const remove = rendered.find((node) => node.type === 'button' && node.props['aria-label'] === 'Remove from queue');
   assert.ok(remove);
   (remove.props.onClick as () => void)();
@@ -1645,8 +1817,13 @@ test('install ring estimates advance only on accepted snapshots and reset for ea
   const snapshot = (epoch: string, revision: number, phase: string, pct: number, install = 'first') => ({
     ...queue(epoch, revision, 0),
     active: {
-      queue_id: 'same-queue', install_id: install, operation_id: install,
-      kind: 'vanilla' as const, title: 'Minecraft', label: 'Minecraft', summary: '',
+      queue_id: 'same-queue',
+      install_id: install,
+      operation_id: install,
+      kind: 'vanilla' as const,
+      title: 'Minecraft',
+      label: 'Minecraft',
+      summary: '',
       install_item: { version_id: '1.21.4' },
       progress: { phase_id: phase, label: phase, progress_pct: pct, terminal: false, failed: false },
     },

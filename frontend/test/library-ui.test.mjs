@@ -1,12 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { basename, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import vm from 'node:vm';
 import test from 'node:test';
 
-/** @typedef {import('../src/types-instance').EnrichedInstance} LibraryInstance */
+/** @typedef {import('../src/generated/EnrichedInstance').EnrichedInstance} LibraryInstance */
 /** @typedef {ReturnType<typeof event>} TestEvent */
 /** @template [P = Record<string, unknown>] @typedef {{ type: unknown, props: P }} ViewNode */
 /** @typedef {{ onClick: (event?: TestEvent) => void, children?: unknown, icon?: string, title?: string, disabled?: boolean, tooltip?: string }} ActionProps */
@@ -32,49 +27,17 @@ import test from 'node:test';
 /** @typedef {{ label: string, onSelect?: () => void }} MenuItem */
 /** @typedef {{ e: TestEvent, menu: MenuItem[] } | { e: TestEvent, inst: LibraryInstance }} MenuCall */
 
-const frontendPath = basename(process.cwd()) === 'frontend' ? process.cwd() : resolve(process.cwd(), 'frontend');
-const frontendRoot = pathToFileURL(`${frontendPath}/`);
-const dependencyRequire = createRequire(new URL('package.json', frontendRoot));
-const ts = /** @type {typeof import('typescript')} */ (dependencyRequire('typescript'));
-const jsxRuntime = /** @type {typeof import('preact/jsx-runtime')} */ (dependencyRequire('preact/jsx-runtime'));
+import { loadSource as load, requireDependency } from './source';
+import { enrichedInstance } from './wire';
 
-/** @param {string} path @param {Record<string, unknown>} [imports] @returns {Record<string, unknown>} */
-function loadSource(path, imports = {}) {
-  const filename = fileURLToPath(new URL(path, frontendRoot));
-  const { outputText } = ts.transpileModule(readFileSync(filename, 'utf8'), {
-    fileName: filename,
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-      jsx: ts.JsxEmit.ReactJSX,
-      jsxImportSource: 'preact',
-    },
-  });
-  /** @type {Record<string, unknown>} */
-  const exports = {};
-  vm.runInNewContext(
-    outputText,
-    {
-      exports,
-      /** @param {string} id */
-      require(id) {
-        if (id === 'preact/jsx-runtime') return jsxRuntime;
-        if (Object.prototype.hasOwnProperty.call(imports, id)) return imports[id];
-        throw new Error(`Unreviewed library UI dependency: ${id}`);
-      },
-      Date,
-    },
-    { filename },
-  );
-  return exports;
+const jsxRuntime = /** @type {typeof import('preact/jsx-runtime')} */ (requireDependency('preact/jsx-runtime'));
+
+/** @param {string} path @param {Record<string, unknown>} [stubs] @returns {Record<string, unknown>} */
+function loadSource(path, stubs = {}) {
+  return load(path.replace(/^src\//, ''), { 'preact/jsx-runtime': jsxRuntime, ...stubs }, { Date });
 }
 
-const presenters = loadSource('src/launch-presenters.ts');
-const contracts = loadSource('src/dto-contract.ts');
-const installDtos = loadSource('src/dto-install.ts', { './dto-contract': contracts });
-const { enrichedInstanceResponse } = /** @type {typeof import('../src/dto-core')} */ (
-  loadSource('src/dto-core.ts', { './dto-contract': contracts, './dto-install': installDtos })
-);
+const presenters = loadSource('src/launch/presenters.ts');
 const parts = /** @type {Parts} */ (
   /** @type {unknown} */ (
     Object.fromEntries(
@@ -96,12 +59,12 @@ const parts = /** @type {Parts} */ (
   )
 );
 
-const facts = loadSource('src/ui/InstanceFacts.tsx', { './Atoms': parts, '../launch-presenters': presenters });
+const facts = loadSource('src/ui/InstanceFacts.tsx', { 'ui/Atoms': parts, 'launch/presenters': presenters });
 const rows = /** @type {{ RowLead: (props: object) => unknown, RowMenu: (props: object) => unknown }} */ (
   loadSource('src/ui/Rows.tsx', {
-    './Atoms': parts,
-    './SelectionActionTray': parts,
-    './selection': {
+    'ui/Atoms': parts,
+    'ui/SelectionActionTray': parts,
+    'ui/selection': {
       /** @param {boolean} selected @param {string} name */
       selectionToggleLabel: (selected, name) => `${selected ? 'Deselect' : 'Select'} ${name}`,
     },
@@ -165,21 +128,15 @@ function event(key = '', nested = false) {
 
 /** @param {string} id @param {Partial<Omit<LibraryInstance, 'launch_action'>> & { launch_action?: Partial<LibraryInstance['launch_action']> }} [overrides] @returns {LibraryInstance} */
 function instance(id, overrides = {}) {
-  return {
+  return enrichedInstance({
     id,
     name: `Instance ${id}`,
     version_id: `version-${id}`,
     created_at: '2026-01-01T00:00:00Z',
-    java_selection: { kind: 'inherited' },
-    revision: 1,
     last_played_at: '2026-01-01T00:00:00Z',
     art_seed: 40,
     mods_count: 3,
     counts_available: true,
-    launchable: true,
-    saves_count: 0,
-    resource_count: 0,
-    shader_count: 0,
     version_display: {
       loader_key: 'fixture-loader',
       loader_label: 'Backend loader',
@@ -198,7 +155,7 @@ function instance(id, overrides = {}) {
       label: 'Launch game',
       ...overrides.launch_action,
     },
-  };
+  });
 }
 
 /** @param {LibraryInstance[]} [initialInstances] */
@@ -240,47 +197,47 @@ function libraryHarness(initialInstances = []) {
         ];
       },
     },
-    '../../ui/Atoms': parts,
-    '../../ui/Face': { Face: 'Face' },
-    '../../vista/Vista': { Vista: () => null },
-    '../../actions': {
+    'ui/Atoms': parts,
+    'ui/Face': { Face: 'Face' },
+    'vista/Vista': { Vista: () => null, warmVistas() {} },
+    'instances/state': {
+      ...store,
       /** @param {string} id */
       selectInstance(id) {
         launches.selected = id;
       },
     },
-    '../../launch': {
+    'launch/controller': {
       launchGame() {
         launches.count++;
       },
     },
-    '../../ui/Icons': parts,
-    '../../ui/InstanceCard': {
+    'ui/Icons': parts,
+    'ui/InstanceCard': {
       ...loadSource('src/ui/InstanceCard.tsx', {
-        './InstanceVisual': parts,
-        './InstanceFacts': facts,
-        './Atoms': parts,
-        './Icons': parts,
-        './SelectionActionTray': parts,
-        './selection': {},
-        '../ui-state': {},
-        '../store': {},
-        '../instance-install-status': {},
-        '../launch-presenters': presenters,
+        'ui/InstanceVisual': parts,
+        'ui/InstanceFacts': facts,
+        'ui/Atoms': parts,
+        'ui/Icons': parts,
+        'ui/SelectionActionTray': parts,
+        'ui/selection': {},
+        'app/route': {},
+        'launch/state': {},
+        'install/status': {},
       }),
       InstanceCard: parts.InstanceCard,
     },
-    '../../ui/InstanceFacts': facts,
-    '../../ui/InstanceVisual': { ...parts, guardedInstanceHue: () => 40, artSeedFor: () => 0 },
-    '../../ui/Rows': rows,
-    '../../ui/Segmented': parts,
-    '../../ui/motion': { settleChildren() {} },
-    '../../ui/SelectionActionTray': parts,
-    '../../ui/ContextMenu': {
+    'ui/InstanceFacts': facts,
+    'ui/InstanceVisual': { ...parts, guardedInstanceHue: () => 40, artSeedFor: () => 0 },
+    'ui/Rows': rows,
+    'ui/Segmented': parts,
+    'ui/motion': { settleChildren() {} },
+    'ui/SelectionActionTray': parts,
+    'ui/ContextMenu': {
       /** @param {TestEvent} e @param {MenuItem[]} menu */
       openContextMenu: (e, menu) => calls.menus.push({ e, menu }),
     },
-    '../../ui/selection': {
+    'ui/selection': {
       /** @param {boolean} selected @param {string} name */
       selectionToggleLabel: (selected, name) => `${selected ? 'Deselect' : 'Select'} ${name}`,
       /** @param {{ toggle: (id: string) => unknown }} selection @param {string} id */
@@ -299,40 +256,39 @@ function libraryHarness(initialInstances = []) {
         };
       },
     },
-    '../../hooks/use-theme': { useTheme: () => ({ r: { sm: 12 } }) },
-    '../../store': store,
-    '../../instance-install-status': {
+    'settings/state': store,
+    'launch/state': store,
+    'install/status': {
       /** @param {LibraryInstance} inst */
       instanceInstallStatus: (inst) => installs.get(inst.id) ?? { state: 'idle', installing: false },
     },
-    '../../launch-presenters': presenters,
-    '../../ui-state': {
+    'app/route': {
       /** @param {{ name: string, id?: string }} route */
       navigate: (route) => calls.navigations.push(route),
       openCreate: () => {
         calls.create += 1;
       },
     },
-    '../instance/instance-menu': {
+    'instances/detail/instance-menu': {
       /** @param {LibraryInstance} inst */
       instanceMenuItems: (inst) => [{ label: `Backend menu for ${inst.id}` }],
       /** @param {TestEvent} e @param {LibraryInstance} inst */
       openInstanceContextMenu: (e, inst) => calls.menus.push({ e, inst }),
     },
-    '../instance/instance-actions': {
+    'instances/detail/instance-actions': {
       deleteInstancesFlow: async () => {},
     },
-    './PendingRemovalsNotice': { PendingRemovalsNotice: () => null },
-    '../../format': {
+    'instances/PendingRemovalsNotice': { PendingRemovalsNotice: () => null },
+    'ui/format': {
       /** @param {string | undefined} iso */
       fmtRelative: (iso) => iso ?? 'Never',
     },
   };
-  const { HomeView } = /** @type {typeof import('../src/views/home/HomeView')} */ (
-    loadSource('src/views/home/HomeView.tsx', imports)
+  const { HomeView } = /** @type {typeof import('../src/home/HomeView')} */ (
+    loadSource('src/home/HomeView.tsx', imports)
   );
-  const { InstancesView } = /** @type {typeof import('../src/views/instances/InstancesView')} */ (
-    loadSource('src/views/instances/InstancesView.tsx', imports)
+  const { InstancesView } = /** @type {typeof import('../src/instances/InstancesView')} */ (
+    loadSource('src/instances/InstancesView.tsx', imports)
   );
   return {
     store,
@@ -371,8 +327,8 @@ test('home retains newest lead, six recent covers and See all without mutating t
 });
 
 test('unavailable or omitted count availability hides row counts without suppressing known zero', () => {
-  for (const available of [false, undefined]) {
-    const unknown = enrichedInstanceResponse(instance('unknown', { counts_available: available }));
+  {
+    const unknown = instance('unknown', { counts_available: false });
     assert.equal(unknown.counts_available, false);
     const h = libraryHarness([unknown]);
     const library = h.library();
@@ -384,7 +340,7 @@ test('unavailable or omitted count availability hides row counts without suppres
     assert.equal(nodes(row, (n) => n.props.class === 'cp-library-cell')[1].props.children, null);
     assert.match(textOf(row), /Backend Minecraft/);
   }
-  const known = enrichedInstanceResponse(instance('known', { mods_count: 0 }));
+  const known = instance('known', { mods_count: 0 });
   assert.equal(known.counts_available, true);
   const h = libraryHarness([known]);
   const library = h.library();
@@ -395,11 +351,8 @@ test('unavailable or omitted count availability hides row counts without suppres
   );
 });
 
-test('partial count snapshots retain each row availability and reject malformed availability', () => {
-  const records = [
-    enrichedInstanceResponse(instance('known')),
-    enrichedInstanceResponse(instance('unknown', { counts_available: false, mods_count: 99 })),
-  ];
+test('partial count snapshots retain each row availability', () => {
+  const records = [instance('known'), instance('unknown', { counts_available: false, mods_count: 99 })];
   const h = libraryHarness(records);
   ofType(h.library(), parts.Segmented)[0].props.onChange('list');
   const rows = nodes(h.library(), (n) => typeof n.type === 'function' && n.type.name === 'ListRow');
@@ -409,12 +362,6 @@ test('partial count snapshots retain each row availability and reject malformed 
     return nodes(component(node.props), (n) => n.props.class === 'cp-library-cell')[1].props.children;
   });
   assert.deepEqual(counts, [3, null]);
-  for (const invalid of [null, 'false', 0, {}]) {
-    assert.throws(
-      () => enrichedInstanceResponse({ ...instance('invalid'), counts_available: invalid }),
-      /Instance count availability/,
-    );
-  }
 });
 
 test('empty home keeps its create entrypoint and no lead', () => {
