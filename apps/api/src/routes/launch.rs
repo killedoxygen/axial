@@ -10,7 +10,7 @@ use axial_app::{
             SessionLogsResponse, SessionManager, SessionPhase, SessionSnapshot, SessionsResponse,
         },
     },
-    performance::proofs::{LaunchProofView, LaunchReportsResponse, proof_view},
+    launch::reports::{LaunchProofView, LaunchReportsResponse, proof_view},
 };
 use axum::{
     Json, Router,

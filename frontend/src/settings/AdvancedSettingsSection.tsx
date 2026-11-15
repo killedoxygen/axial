@@ -10,40 +10,6 @@ import { devMode } from '../app/store';
 import { toast, errMessage } from '../app/toast';
 import { reloadApplication } from '../app/preferences/persistence';
 
-type PerformanceLabCardComponent = (typeof import('../performance/PerformanceLabCard'))['PerformanceLabCard'];
-
-const loadPerformanceLabCard = __AXIAL_ENABLE_DEV_LAB__
-  ? async (): Promise<PerformanceLabCardComponent> =>
-      (await import('../performance/PerformanceLabCard')).PerformanceLabCard
-  : null;
-
-function PerformanceLabSlot(): JSX.Element | null {
-  const isDev = devMode.value;
-  const [Lab, setLab] = useState<PerformanceLabCardComponent | null>(null);
-
-  useEffect(() => {
-    if (!isDev || !loadPerformanceLabCard) {
-      setLab(null);
-      return;
-    }
-
-    let alive = true;
-    void loadPerformanceLabCard()
-      .then((component) => {
-        if (alive) setLab(() => component);
-      })
-      .catch((err: unknown) => {
-        if (alive) toast(`Could not load Performance Lab: ${errMessage(err)}`, 'error');
-      });
-    return () => {
-      alive = false;
-    };
-  }, [isDev]);
-
-  if (!loadPerformanceLabCard || !isDev || !Lab) return null;
-  return <Lab />;
-}
-
 export function AdvancedSettingsSection(): JSX.Element {
   const cfg = config.value;
   const isDev = devMode.value;
@@ -131,7 +97,6 @@ export function AdvancedSettingsSection(): JSX.Element {
           }
         />
       )}
-      {__AXIAL_ENABLE_DEV_LAB__ && isDev && <PerformanceLabSlot />}
       {isDev && hasNativeDesktopRuntime() && (
         <SettingRow
           title="Reset launcher"

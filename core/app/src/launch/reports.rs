@@ -1,11 +1,12 @@
 //! Sanitized launch proof reports, their durable store and comparison baselines.
 
 mod comparison;
+mod views;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use comparison::comparison_baseline_matches_report;
 use comparison::*;
+pub use views::{LaunchProofView, LaunchReportsResponse, proof_view};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;

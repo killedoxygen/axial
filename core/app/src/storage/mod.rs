@@ -42,7 +42,7 @@ pub const SCHEMA: &[Migration] = &[
     crate::content::install::MIGRATION,
     crate::performance::rules::MIGRATION,
     crate::performance::mutation::MIGRATION,
-    crate::performance::benchmarks::MIGRATION,
+    RETIRED_BENCHMARK_MIGRATION,
     crate::skins::store::MIGRATION,
     crate::launch::coordinator::INTENT_MIGRATION,
     crate::launch::reports::REPORT_MIGRATION,
@@ -114,6 +114,15 @@ pub struct MetadataStore {
 }
 
 const APPLICATION_ID: i64 = 0x4158_4952; // AXIR.
+/// Recorded schema of the retired benchmark driver. Profiles created by this
+/// application carry these tables; the migration stays so they reopen with
+/// their recorded schema history intact.
+const RETIRED_BENCHMARK_MIGRATION: Migration = Migration {
+    id: "performance_benchmarks.v1",
+    sql: "CREATE TABLE benchmark_suites (suite_id TEXT PRIMARY KEY NOT NULL, payload BLOB NOT NULL CHECK(length(payload)<=262144)) STRICT;
+    CREATE TABLE benchmark_drivers (driver_id TEXT PRIMARY KEY NOT NULL, payload BLOB NOT NULL CHECK(length(payload)<=16384), request BLOB CHECK(length(request)<=8192)) STRICT;",
+};
+
 const MIGRATION_TABLE: &str = "CREATE TABLE IF NOT EXISTS _axial_schema_migrations (
     id TEXT PRIMARY KEY NOT NULL CHECK(length(id) BETWEEN 1 AND 128),
     sql TEXT NOT NULL CHECK(length(sql) BETWEEN 1 AND 1048576)

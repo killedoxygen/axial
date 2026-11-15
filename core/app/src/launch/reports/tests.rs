@@ -223,10 +223,7 @@ fn session_report_reopen_preserves_its_committed_comparison() {
 
 #[test]
 fn release_managed_report_compares_to_planned_vanilla_baseline_after_reopen() {
-    use crate::performance::benchmarks::{
-        benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
-    };
-
+    // Recorded history from the retired benchmark driver still compares.
     let temporary_parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
     let root = tempfile::tempdir_in(temporary_parent).unwrap();
     let path = root.path().join("metadata.sqlite");
@@ -234,10 +231,16 @@ fn release_managed_report_compares_to_planned_vanilla_baseline_after_reopen() {
     let store = LaunchReportStore::new(metadata.clone()).unwrap();
     let redactor = Redactor::new(vec![]);
     let mode = "release_validation";
-    let plan = benchmark_suite_plan(mode).unwrap();
-    let runs = benchmark_suite_manifest_run_inputs(mode, &plan);
-    assert_eq!(runs[0].profile, "vanilla_baseline");
-    assert_eq!(runs[1].profile, "managed_default");
+    struct Run {
+        profile: String,
+        run_type: String,
+        benchmark_id: String,
+    }
+    let runs = ["vanilla_baseline", "managed_default"].map(|profile| Run {
+        profile: profile.into(),
+        run_type: "coldish".into(),
+        benchmark_id: format!("benchmark-{}", profile.len()),
+    });
     let version = axial_minecraft::loaders::installed_version_id_for(
         axial_minecraft::loaders::LoaderComponentId::Forge,
         "1.12.2",

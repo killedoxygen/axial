@@ -898,6 +898,7 @@ impl LaunchIntents {
         Ok(self.load(key)?.map(|entry| entry.status.borrow().clone()))
     }
 
+    #[cfg(test)]
     pub(super) fn record(&self, key: &str) -> Result<Option<IntentRecord>, LaunchError> {
         validate_intent_key(key)?;
         let entries = self.entries.lock().map_err(|_| LaunchError::Closed)?;

@@ -34,7 +34,6 @@ const PLAYER: &str = "FixturePlayer";
 const INTERRUPTED_CHILD_PROFILE: &str = "AXIAL_TEST_INTERRUPTED_GAME_PROFILE";
 const INTERRUPTED_CHILD_INSTANCE: &str = "AXIAL_TEST_INTERRUPTED_GAME_INSTANCE";
 const INTERRUPTED_CHILD_INTENT: &str = "AXIAL_TEST_INTERRUPTED_GAME_INTENT";
-const INTERRUPTED_CHILD_BENCHMARK: &str = "AXIAL_TEST_INTERRUPTED_GAME_BENCHMARK";
 const INTERRUPTED_CLEANUP_PORT: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_PORT";
 const INTERRUPTED_CLEANUP_TOKEN: &str = "AXIAL_TEST_INTERRUPTED_GAME_CLEANUP_TOKEN";
 const INTERRUPTED_CHILD_EXIT: i32 = 75;
@@ -989,10 +988,6 @@ const SETTLED_CHILD_PROFILE: &str = "AXIAL_TEST_SETTLED_REPORT_PROFILE";
 const SETTLED_CHILD_INSTANCE: &str = "AXIAL_TEST_SETTLED_REPORT_INSTANCE";
 const SETTLED_CHILD_INTENT: &str = "AXIAL_TEST_SETTLED_REPORT_INTENT";
 const SETTLED_CHILD_EXIT: i32 = 74;
-const DRIVER_CHILD_PROFILE: &str = "AXIAL_TEST_DRIVER_RESTART_PROFILE";
-const DRIVER_CHILD_INSTANCE: &str = "AXIAL_TEST_DRIVER_RESTART_INSTANCE";
-const DRIVER_CHILD_EXIT: i32 = 76;
-const RESTART_SUITE: &str = "automatic-restart-suite";
 
 fn fixture_child_log_tail(output: &mut std::fs::File) -> String {
     use std::io::{Read, Seek, SeekFrom};
@@ -1496,17 +1491,16 @@ async fn ping_fixture_channels(channels: &mut [tokio::net::TcpStream]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_interrupted_launch_preserves_quit_and_does_not_repeat_unknown_session() {
     let _process_work = PROCESS_WORK.lock().await;
-    for (case, benchmark, existing) in [
-        ("managed library launch", false, false),
-        ("external library launch", false, true),
-        ("benchmark driver", true, false),
+    for (case, existing) in [
+        ("managed library launch", false),
+        ("external library launch", true),
     ] {
         eprintln!("interrupted launch case: {case}");
-        interrupted_launch_preservation_journey(benchmark, existing).await;
+        interrupted_launch_preservation_journey(existing).await;
     }
 }
 
-async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool) {
+async fn interrupted_launch_preservation_journey(existing: bool) {
     use std::process::Stdio;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1568,10 +1562,6 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
         .env(INTERRUPTED_CHILD_INSTANCE, &instance)
         .env(INTERRUPTED_CHILD_INTENT, &intent)
         .env(
-            INTERRUPTED_CHILD_BENCHMARK,
-            if benchmark { "1" } else { "0" },
-        )
-        .env(
             INTERRUPTED_CLEANUP_PORT,
             cleanup.local_addr().unwrap().port().to_string(),
         )
@@ -1612,41 +1602,15 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
     }
     assert_fixture_child_exit(child, &mut output, INTERRUPTED_CHILD_EXIT).await;
     ping_fixture_channels(&mut channels).await;
-    let (payload, original_instance, interrupted_driver) = {
+    let (payload, original_instance) = {
         let storage = Arc::new(
             axial_app::storage::MetadataStore::open(profile.join("metadata.sqlite")).unwrap(),
         );
-        let interrupted_driver = benchmark.then(|| {
-            storage
-                .read(
-                    |db| -> Result<(Value, Value), axial_app::storage::StorageError> {
-                        let driver: Vec<u8> =
-                            db.query_row("SELECT payload FROM benchmark_drivers", [], |row| {
-                                row.get(0)
-                            })?;
-                        let suite: Vec<u8> =
-                            db.query_row("SELECT payload FROM benchmark_suites", [], |row| {
-                                row.get(0)
-                            })?;
-                        Ok((
-                            serde_json::from_slice(&driver).unwrap(),
-                            serde_json::from_slice(&suite).unwrap(),
-                        ))
-                    },
-                )
-                .unwrap()
-        });
-        let effective_intent = interrupted_driver
-            .as_ref()
-            .map_or(intent.as_str(), |(_, suite)| {
-                suite["runs"][0]["launch_intent"].as_str().unwrap()
-            });
-        let payload = unobserved_intent_payload(&storage, effective_intent);
+        let payload = unobserved_intent_payload(&storage, &intent);
         let registry = axial_app::instances::directory::Registry::new(storage);
         (
             payload,
             registry.get_live(&instance.parse().unwrap()).unwrap(),
-            interrupted_driver,
         )
     };
     let accepted: Value = serde_json::from_slice(&payload).unwrap();
@@ -1657,9 +1621,7 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
             accepted["binding"]["application_root"]
         );
     }
-    if !benchmark {
-        assert_eq!(accepted["request"]["intent_key"], intent);
-    }
+    assert_eq!(accepted["request"]["intent_key"], intent);
     let intent = accepted["request"]["intent_key"].as_str().unwrap();
     let session = accepted["session_id"].as_str().unwrap();
     assert_eq!(accepted["request"]["instance_id"], instance);
@@ -1687,42 +1649,7 @@ async fn interrupted_launch_preservation_journey(benchmark: bool, existing: bool
         assert_eq!(status["state"], "interrupted");
         assert_eq!(status["code"], "interrupted");
         assert_eq!(status["session_id"], session);
-        if let Some((driver, suite)) = &interrupted_driver {
-            assert_eq!(driver["state"], "waiting");
-            let driver_path = format!(
-                "/api/v1/launch/benchmark/suite/drivers/{}",
-                driver["id"].as_str().unwrap()
-            );
-            let restored = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let restored = api.driver(&driver_path).await;
-                    if restored["driver"]["state"] == "interrupted" {
-                        break restored;
-                    }
-                    assert_ne!(restored["driver"]["state"], "failed", "{restored}");
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            })
-            .await
-            .expect("automatic startup must refuse the unknown accepted mapping");
-            assert_eq!(restored["driver"]["active_session_id"], session);
-            assert_eq!(restored["driver"]["launched_run_count"], 1);
-            assert_eq!(restored["driver"]["pending_run_index"], 1);
-            assert_eq!(
-                api.get("/api/v1/launch/benchmark/suite/drivers").await["drivers"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                1
-            );
-            let retained = api
-                .suite(&format!("{}", suite["suite_id"].as_str().unwrap()))
-                .await;
-            assert_eq!(retained["runs"][0]["state"], "interrupted");
-            assert_eq!(retained["runs"][0]["session_id"], session);
-            assert_eq!(retained["runs"][0]["launch_intent"], intent);
-            assert_eq!(retained["runs"][1], suite["runs"][1]);
-        } else {
+        {
             let (status, replay) = api
                 .response(
                     reqwest::Method::POST,
@@ -1825,27 +1752,7 @@ async fn interrupted_launch_crash_helper() {
     let services = start_in_profile(profile, None).await.unwrap();
     let api = Api::new(&services);
     wait_launchable(&api, &instance).await;
-    let (session, intent) = if std::env::var(INTERRUPTED_CHILD_BENCHMARK).as_deref() == Ok("1") {
-        let driver = api.post("/api/v1/launch/benchmark/suite/driver", json!({
-            "instance_id":instance,"suite_id":"interrupted-driver-suite","suite_mode":"development","interval_ms":30000
-        })).await;
-        let run = wait_benchmark_run(&api, "interrupted-driver-suite", 0).await;
-        let path = format!(
-            "/api/v1/launch/benchmark/suite/drivers/{}",
-            driver["driver"]["id"].as_str().unwrap()
-        );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while api.driver(&path).await["driver"]["state"] != "waiting" {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("accepted driver must checkpoint its first mapping");
-        (
-            run["session_id"].as_str().unwrap().to_owned(),
-            run["launch_intent"].as_str().unwrap().to_owned(),
-        )
-    } else {
+    let (session, intent) = {
         let accepted = api
             .post(
                 "/api/v1/launch",
@@ -1867,19 +1774,6 @@ async fn interrupted_launch_crash_helper() {
     std::process::exit(INTERRUPTED_CHILD_EXIT);
 }
 
-async fn wait_benchmark_run(api: &Api, suite: &str, index: usize) -> Value {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let suite = api.suite(&format!("{suite}")).await;
-            if suite["runs"][index]["state"] == "running" {
-                break suite["runs"][index].clone();
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("automatic driver must accept the expected real session")
-}
 
 async fn assert_fixture_processes_gone(processes: &BTreeSet<u64>) {
     let gone = tokio::time::timeout(Duration::from_secs(5), tokio::process::Command::new("python3")
@@ -1893,594 +1787,9 @@ async fn assert_fixture_processes_gone(processes: &BTreeSet<u64>) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_benchmark_driver_stop_resume_preserves_live_run_and_continues_once() {
-    use axial_app::storage::StorageError;
-    use futures_util::FutureExt;
 
-    let _process_work = PROCESS_WORK.lock().await;
-    const SUITE: &str = "live-stop-resume-suite";
-    let mut temporary =
-        Some(tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap());
-    let profile = temporary.as_ref().unwrap().path().join("profile");
-    let mut preserve = || {
-        if let Some(temporary) = temporary.take() {
-            eprintln!(
-                "Retained benchmark fixture after failure: {}",
-                temporary.keep().display()
-            );
-        }
-    };
-    let provider = Provider::start(false).await;
-    let services =
-        match start_profile_with_test_endpoints(profile.clone(), provider.endpoints()).await {
-            Ok(services) => services,
-            Err(error) => {
-                preserve();
-                provider.shutdown().await;
-                panic!("benchmark fixture startup failed: {error}");
-            }
-        };
-    let mut processes = BTreeSet::new();
-    let journey = std::panic::AssertUnwindSafe(async {
-        let api = Api::new(&services);
-        configure_offline(
-            &api,
-            json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
-        )
-        .await;
-        install_vanilla(&api).await;
-        let created = api
-            .post(
-                "/api/v1/instances",
-                json!({"name":"Live scheduler continuation","selection_id":format!("vanilla|{VERSION}")}),
-            )
-            .await;
-        assert!(created["install_queue"].is_null(), "{created}");
-        let instance = created["id"].as_str().unwrap();
-        let started = api
-            .post(
-                "/api/v1/launch/benchmark/suite/driver",
-                json!({"instance_id":instance,"suite_id":SUITE,"suite_mode":"development","interval_ms":5000}),
-            )
-            .await;
-        let driver_id = started["driver"]["id"].as_str().unwrap();
-        let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{driver_id}");
-        let suite_path = format!("{SUITE}");
-        let first = wait_benchmark_run(&api, SUITE, 0).await;
-        let first_session = first["session_id"].as_str().unwrap();
-        let (_, first_processes) = observe_running_session(&api, first_session).await;
-        processes.extend(first_processes.iter().copied());
-        let live = api
-            .get(&format!("/api/v1/launch/{first_session}/status"))
-            .await;
-        assert!(first_processes.contains(&live["pid"].as_u64().unwrap()));
-        let original_suite = api.suite(&suite_path).await;
-        assert_eq!(original_suite["runs"].as_array().unwrap().len(), 2);
-        let first_intent = first["launch_intent"].as_str().unwrap();
-        let second_intent = original_suite["runs"][1]["launch_intent"]
-            .as_str()
-            .unwrap();
-        assert_ne!(first_intent, second_intent);
-        for (index, profile, run_type) in [
-            (0, "vanilla_baseline", "coldish"),
-            (1, "managed_default", "repeat"),
-        ] {
-            assert_eq!(original_suite["runs"][index]["profile"], profile);
-            assert_eq!(original_suite["runs"][index]["run_type"], run_type);
-        }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let status = api.driver(&driver_path).await;
-                if status["driver"]["state"] == "waiting" {
-                    break;
-                }
-                assert_eq!(status["driver"]["state"], "running", "{status}");
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("first accepted run must reach its public driver checkpoint");
-        let request = services.instances.registry().storage().read(|db| -> Result<Vec<u8>, StorageError> {
-            Ok(db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver_id], |row| row.get(0))?)
-        }).unwrap();
 
-        // No task-owner idle wait or mutation retry separates Stop from Resume.
-        for (action, state) in [("stop", "stopped"), ("resume", "running")] {
-            let (status, body) = api
-                .response(
-                    reqwest::Method::POST,
-                    &format!("{driver_path}/{action}"),
-                    Some(json!({})),
-                )
-                .await;
-            let checkpoint = api.driver(&driver_path).await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "{action}: {body}; driver: {checkpoint}"
-            );
-            if action == "resume" {
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let status = api.driver(&driver_path).await;
-                        if status["driver"]["state"] == "waiting" {
-                            assert_eq!(status["driver"]["active_session_id"], first_session);
-                            break;
-                        }
-                        assert_eq!(status["driver"]["state"], "running", "{status}");
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                })
-                .await
-                .expect("resumed scheduler must observe the original still-running session");
-            }
-            let suite = api.suite(&suite_path).await;
-            let session = api
-                .get(&format!("/api/v1/launch/{first_session}/status"))
-                .await;
-            assert_eq!(body["driver"]["id"], driver_id);
-            assert_eq!(body["driver"]["suite_id"], SUITE);
-            assert_eq!(body["driver"]["state"], state);
-            assert_eq!(body["driver"]["interval_ms"], 5000);
-            assert_eq!(body["driver"]["launched_run_count"], 1);
-            assert_eq!(body["driver"]["pending_run_index"], 1);
-            assert_eq!(body["driver"]["active_session_id"], first_session);
-            assert_eq!(body["driver"]["last_session_id"], first_session);
-            assert_eq!(body["view_model"]["can_stop"], action == "resume");
-            assert_eq!(body["view_model"]["can_resume"], action == "stop");
-            assert_eq!(suite["runs"], original_suite["runs"]);
-            assert_eq!(suite["runs"][1]["state"], "pending");
-            assert!(suite["runs"][1]["session_id"].is_null());
-            assert_eq!(session["phase"], "running");
-            assert_eq!(session["process_alive"], true);
-            assert_eq!(session["pid"], live["pid"]);
-            let sessions = api.get("/api/v1/launch/sessions").await;
-            assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
-            assert_eq!(sessions["sessions"][0]["session_id"], first_session);
-            let unreserved = api
-                .client
-                .get(format!("{}/api/v1/launch/intents/{second_intent}", api.base))
-                .header(transport::CAPABILITY_HEADER, &api.capability)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(unreserved.status(), StatusCode::NOT_FOUND);
-        }
 
-        assert_eq!(
-            observe_and_stop_session(&api, first_session).await,
-            first_processes
-        );
-        services.instances.registry().storage().read(|db| -> Result<(), StorageError> {
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE intent_key=?1 AND state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [first_intent], |row| row.get::<_, i64>(0))?, 1);
-            Ok(())
-        }).unwrap();
-        let second = wait_benchmark_run(&api, SUITE, 1).await;
-        let second_session = second["session_id"].as_str().unwrap();
-        assert_ne!(second_session, first_session);
-        assert_eq!(second["launch_intent"], second_intent);
-        let (_, second_processes) = observe_running_session(&api, second_session).await;
-        processes.extend(second_processes.iter().copied());
-        assert_eq!(
-            observe_and_stop_session(&api, second_session).await,
-            second_processes
-        );
-        let complete_driver = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                let status = api.driver(&driver_path).await;
-                if status["driver"]["state"] == "complete" {
-                    break status;
-                }
-                assert!(matches!(status["driver"]["state"].as_str(), Some("running" | "waiting")), "{status}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("resumed driver must complete its original two-run plan");
-        assert_eq!(complete_driver["driver"]["id"], driver_id);
-        assert_eq!(complete_driver["driver"]["run_count"], 2);
-        assert_eq!(complete_driver["driver"]["launched_run_count"], 2);
-        assert!(complete_driver["driver"]["pending_run_index"].is_null());
-        assert!(complete_driver["driver"]["active_session_id"].is_null());
-        assert!(!complete_driver["view_model"]["can_resume"].as_bool().unwrap());
-        let complete_suite = api.suite(&suite_path).await;
-        assert_eq!(complete_suite["runs"].as_array().unwrap().len(), 2);
-        let mut reports = Vec::new();
-        for (index, session, intent) in [
-            (0, first_session, first_intent),
-            (1, second_session, second_intent),
-        ] {
-            let run = &complete_suite["runs"][index];
-            assert_eq!(run["session_id"], session);
-            assert_eq!(run["launch_intent"], intent);
-            assert_eq!(run["state"], "stopped");
-            for field in ["benchmark_id", "profile", "run_type", "target_id"] {
-                assert_eq!(run[field], original_suite["runs"][index][field]);
-            }
-            let accepted = api.get(&format!("/api/v1/launch/intents/{intent}")).await;
-            assert_eq!(accepted["state"], "accepted");
-            assert_eq!(accepted["session"]["session_id"], session);
-            assert_eq!(accepted["session"]["phase"], "exited");
-            assert_eq!(accepted["session"]["tree_settled"], true);
-            assert_eq!(accepted["session"]["output_drained"], true);
-            let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
-            assert_eq!(report["instance_id"], instance);
-            assert_eq!(report["scenario"]["benchmark_id"], run["benchmark_id"]);
-            assert_eq!(report["scenario"]["benchmark_profile"], run["profile"]);
-            assert_eq!(report["scenario"]["benchmark_run_type"], run["run_type"]);
-            assert_eq!(report["scenario"]["benchmark_mode"], "development");
-            assert_eq!(report["session_outcome"]["kind"], "stopped");
-            reports.push((session.to_owned(), report));
-        }
-        (driver_path, suite_path, complete_driver, complete_suite, reports, request)
-    })
-    .catch_unwind()
-    .await;
-    let shutdown = std::panic::AssertUnwindSafe(services.server.shutdown())
-        .catch_unwind()
-        .await;
-    let settled = services.server.is_shutdown_settled();
-    drop(services);
-    let provider_shutdown = std::panic::AssertUnwindSafe(provider.shutdown())
-        .catch_unwind()
-        .await;
-    let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
-        .catch_unwind()
-        .await;
-    if !matches!(&shutdown, Ok(Ok(())))
-        || !settled
-        || provider_shutdown.is_err()
-        || absent.is_err()
-        || journey.is_err()
-    {
-        preserve();
-    }
-    shutdown
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        .unwrap();
-    assert!(settled);
-    provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    absent.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    let (driver_path, suite_path, driver, suite, reports, request) =
-        journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-
-    let reopened = match start_in_profile(profile, None).await {
-        Ok(services) => services,
-        Err(error) => {
-            preserve();
-            panic!("benchmark fixture reopen failed: {error}");
-        }
-    };
-    let persisted = std::panic::AssertUnwindSafe(async {
-        let api = Api::new(&reopened);
-        assert_eq!(api.driver(&driver_path).await, driver);
-        assert_eq!(api.suite(&suite_path).await, suite);
-        assert_eq!(api.get("/api/v1/launch/sessions").await, json!({"sessions":[]}));
-        for (session, report) in reports {
-            assert_eq!(api.get(&format!("/api/v1/launch/reports/{session}")).await, report);
-        }
-        reopened.instances.registry().storage().read(|db| -> Result<(), StorageError> {
-            let saved: Vec<u8> = db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver["driver"]["id"].as_str().unwrap()], |row| row.get(0))?;
-            assert!(saved == request, "resumption must preserve the captured driver request");
-            assert_eq!(db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row.get::<_, i64>(0))?, 1);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 2);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 2);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get::<_, i64>(0))?, 2);
-            Ok(())
-        }).unwrap();
-    })
-    .catch_unwind()
-    .await;
-    let shutdown = std::panic::AssertUnwindSafe(reopened.server.shutdown())
-        .catch_unwind()
-        .await;
-    let settled = reopened.server.is_shutdown_settled();
-    drop(reopened);
-    let absent = std::panic::AssertUnwindSafe(assert_fixture_processes_gone(&processes))
-        .catch_unwind()
-        .await;
-    if !matches!(&shutdown, Ok(Ok(()))) || !settled || absent.is_err() || persisted.is_err() {
-        preserve();
-    }
-    shutdown
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        .unwrap();
-    assert!(settled);
-    absent.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    persisted.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-}
-
-#[test]
-fn real_benchmark_driver_automatically_resumes_remaining_run_once() {
-    let _process_work = PROCESS_WORK.blocking_lock();
-    let (runtime, _diagnostics) = diagnostic_runtime();
-    runtime.block_on(benchmark_driver_automatically_resumes_remaining_run_once());
-}
-
-async fn benchmark_driver_automatically_resumes_remaining_run_once() {
-    use axial_app::storage::StorageError;
-    use futures_util::FutureExt;
-    use std::process::Stdio;
-
-    let temporary =
-        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-    let profile = temporary.path().join("profile");
-    let mut provider = None;
-    let mut services = None;
-    let journey = std::panic::AssertUnwindSafe(async {
-        provider = Some(Provider::start(false).await);
-        services = Some(
-            start_profile_with_test_endpoints(
-                profile.clone(),
-                provider.as_ref().unwrap().endpoints(),
-            )
-            .await
-            .unwrap(),
-        );
-        let api = Api::new(services.as_ref().unwrap());
-        configure_offline(
-            &api,
-            json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
-        )
-        .await;
-        install_vanilla(&api).await;
-        let created = api
-            .post(
-                "/api/v1/instances",
-                json!({
-                    "name":"Automatic driver restart","selection_id":format!("vanilla|{VERSION}")
-                }),
-            )
-            .await;
-        let instance = created["id"].as_str().unwrap().to_owned();
-        assert!(created["install_queue"].is_null(), "{created}");
-        services.as_ref().unwrap().server.shutdown().await.unwrap();
-        assert!(services.as_ref().unwrap().server.is_shutdown_settled());
-        drop(services.take());
-        provider.take().unwrap().shutdown().await;
-
-        let mut output = std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(temporary.path().join("driver-child.log"))
-            .unwrap();
-        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "offline_journey_tests::benchmark_pending_boundary_crash_helper",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(DRIVER_CHILD_PROFILE, &profile)
-            .env(DRIVER_CHILD_INSTANCE, &instance)
-            .stdout(Stdio::from(output.try_clone().unwrap()))
-            .stderr(Stdio::from(output.try_clone().unwrap()))
-            .kill_on_drop(false)
-            .spawn()
-            .unwrap();
-        let helper_pid = child.id();
-        let exit = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
-        if !matches!(&exit, Ok(Ok(status)) if status.code() == Some(DRIVER_CHILD_EXIT)) {
-            let tail = fixture_child_log_tail(&mut output);
-            panic!(
-                "driver boundary helper did not settle safely: {exit:?}; helper {helper_pid:?}; retained {}\n{tail}",
-                temporary.path().display()
-            );
-        }
-        let (driver_bytes, request, suite_bytes, first_intent_bytes, first_report_bytes) = {
-            let storage =
-                axial_app::storage::MetadataStore::open(profile.join("metadata.sqlite")).unwrap();
-            storage.read(|db| -> Result<_, StorageError> {
-                let (driver, request): (Vec<u8>, Vec<u8>) = db.query_row("SELECT payload,request FROM benchmark_drivers", [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                let suite: Vec<u8> = db.query_row("SELECT payload FROM benchmark_suites WHERE suite_id=?1", [RESTART_SUITE], |row| row.get(0))?;
-                let intent: Vec<u8> = db.query_row("SELECT payload FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get(0))?;
-                let report: Vec<u8> = db.query_row("SELECT payload FROM launch_reports", [], |row| row.get(0))?;
-                assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 1);
-                Ok((driver, request, suite, intent, report))
-            }).unwrap()
-        };
-        let driver: Value = serde_json::from_slice(&driver_bytes).unwrap();
-        let original_suite: Value = serde_json::from_slice(&suite_bytes).unwrap();
-        assert_eq!(driver["state"], "waiting");
-        assert_eq!(driver["launched_run_count"], 1);
-        assert_eq!(driver["pending_run_index"], 1);
-        assert_eq!(original_suite["runs"][1]["state"], "pending");
-        assert!(original_suite["runs"][1]["session_id"].is_null());
-        let driver_id = driver["id"].as_str().unwrap();
-        let driver_path = format!("/api/v1/launch/benchmark/suite/drivers/{driver_id}");
-        let first = original_suite["runs"][0]["session_id"].as_str().unwrap();
-        let first_intent = original_suite["runs"][0]["launch_intent"].as_str().unwrap();
-
-        services = Some(start_in_profile(profile.clone(), None).await.unwrap());
-        let reopened = services.as_ref().unwrap();
-        let api = Api::new(reopened);
-        // Startup itself owns this continuation; no Resume or Tick request follows.
-        let second = wait_benchmark_run(&api, RESTART_SUITE, 1).await;
-        let second_session = second["session_id"].as_str().unwrap();
-        assert_ne!(second_session, first);
-        assert_ne!(second["launch_intent"], first_intent);
-        let processes = observe_and_stop_session(&api, second_session).await;
-        assert_fixture_processes_gone(&processes).await;
-        let complete_driver = tokio::time::timeout(Duration::from_secs(40), async {
-            loop {
-                let status = api.driver(&driver_path).await;
-                if status["driver"]["state"] == "complete" {
-                    break status;
-                }
-                assert!(
-                    matches!(
-                        status["driver"]["state"].as_str(),
-                        Some("running" | "waiting")
-                    ),
-                    "{status}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("automatic driver must complete after the remaining real run");
-        assert_eq!(complete_driver["driver"]["launched_run_count"], 2);
-        assert!(complete_driver["driver"]["pending_run_index"].is_null());
-        let complete_suite = api
-            .suite(&format!("{RESTART_SUITE}"))
-            .await;
-        assert_eq!(complete_suite["runs"][0]["session_id"], first);
-        assert_eq!(complete_suite["runs"][0]["launch_intent"], first_intent);
-        assert_eq!(complete_suite["runs"][1]["session_id"], second_session);
-        assert!(
-            complete_suite["runs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|run| run["state"] == "stopped")
-        );
-        for (index, session) in [first, second_session].into_iter().enumerate() {
-            let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
-            assert_eq!(
-                report["scenario"]["benchmark_id"],
-                complete_suite["runs"][index]["benchmark_id"]
-            );
-            assert_eq!(report["session_outcome"]["kind"], "stopped");
-        }
-        reopened.server.shutdown().await.unwrap();
-        assert!(reopened.server.is_shutdown_settled());
-        drop(services.take());
-
-        services = Some(start_in_profile(profile.clone(), None).await.unwrap());
-        let reopened = services.as_ref().unwrap();
-        let api = Api::new(reopened);
-        assert_eq!(api.driver(&driver_path).await, complete_driver);
-        assert_eq!(
-            api.suite(&format!("{RESTART_SUITE}"))
-                .await,
-            complete_suite
-        );
-        assert_eq!(
-            api.get("/api/v1/launch/sessions").await,
-            json!({"sessions":[]})
-        );
-        reopened.instances.registry().storage().read(|db| -> Result<(), StorageError> {
-            assert_eq!(db.query_row("SELECT count(*) FROM benchmark_drivers", [], |row| row.get::<_, i64>(0))?, 1);
-            assert_eq!(db.query_row("SELECT request FROM benchmark_drivers WHERE driver_id=?1", [driver_id], |row| row.get::<_, Vec<u8>>(0))?, request);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 2);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 2);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_reports", [], |row| row.get::<_, i64>(0))?, 2);
-            assert_eq!(db.query_row("SELECT payload FROM launch_intents WHERE intent_key=?1", [first_intent], |row| row.get::<_, Vec<u8>>(0))?, first_intent_bytes);
-            assert_eq!(db.query_row("SELECT payload FROM launch_reports WHERE session_id=?1", [first], |row| row.get::<_, Vec<u8>>(0))?, first_report_bytes);
-            Ok(())
-        }).unwrap();
-        reopened.server.shutdown().await.unwrap();
-        assert!(reopened.server.is_shutdown_settled());
-        drop(services.take());
-    })
-    .catch_unwind()
-    .await;
-    let shutdown = match services.as_ref() {
-        Some(services) => {
-            std::panic::AssertUnwindSafe(services.server.shutdown())
-                .catch_unwind()
-                .await
-        }
-        None => Ok(Ok(())),
-    };
-    let settled = services
-        .as_ref()
-        .is_none_or(|services| services.server.is_shutdown_settled());
-    drop(services);
-    let provider_shutdown = match provider {
-        Some(provider) => {
-            std::panic::AssertUnwindSafe(provider.shutdown())
-                .catch_unwind()
-                .await
-        }
-        None => Ok(()),
-    };
-    if journey.is_err()
-        || !matches!(&shutdown, Ok(Ok(())))
-        || !settled
-        || provider_shutdown.is_err()
-    {
-        eprintln!(
-            "Retained automatic benchmark fixture after failure: {}",
-            temporary.keep().display()
-        );
-    }
-    shutdown
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-        .unwrap();
-    assert!(settled);
-    provider_shutdown.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    journey.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "subprocess helper that exits only between fully settled benchmark runs"]
-async fn benchmark_pending_boundary_crash_helper() {
-    use futures_util::FutureExt;
-    use tracing_subscriber::prelude::*;
-
-    let profile =
-        PathBuf::from(std::env::var_os(DRIVER_CHILD_PROFILE).expect("isolated driver profile"));
-    assert_eq!(std::fs::canonicalize(&profile).unwrap(), profile);
-    let instance = std::env::var(DRIVER_CHILD_INSTANCE).unwrap();
-    tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_ansi(false)
-        .without_time()
-        .finish()
-        .with(
-            tracing_subscriber::filter::Targets::new()
-                .with_target("axial_app::launch::session", tracing::Level::WARN)
-                .with_target("axial_app::launch::prepare", tracing::Level::WARN),
-        )
-        .try_init()
-        .unwrap();
-    let services = start_in_profile(profile, None).await.unwrap();
-    let api = Api::new(&services);
-    let boundary = std::panic::AssertUnwindSafe(async {
-        let started = std::time::Instant::now();
-        let driver = api.post("/api/v1/launch/benchmark/suite/driver", json!({
-            "instance_id":instance,"suite_id":RESTART_SUITE,"suite_mode":"development","interval_ms":30000
-        })).await;
-        let run = wait_benchmark_run(&api, RESTART_SUITE, 0).await;
-        let session = run["session_id"].as_str().unwrap();
-        let processes = observe_and_stop_session(&api, session).await;
-        assert_fixture_processes_gone(&processes).await;
-        let native_root = services.library.admit().unwrap().read_projection().unwrap().join("cache/natives");
-        assert_eq!(std::fs::read_dir(&native_root).unwrap().count(), 0);
-        assert!(services.sessions.snapshots().iter().all(|session| session.phase == axial_app::launch::session::SessionPhase::Exited));
-        let report = api.get(&format!("/api/v1/launch/reports/{session}")).await;
-        assert_eq!(report["session_outcome"]["kind"], "stopped");
-        services.instances.registry().storage().read(|db| -> Result<(), axial_app::storage::StorageError> {
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents WHERE state='accepted' AND terminal_ack=1 AND settlement IS NOT NULL", [], |row| row.get::<_, i64>(0))?, 1);
-            assert_eq!(db.query_row("SELECT count(*) FROM launch_intents", [], |row| row.get::<_, i64>(0))?, 1);
-            Ok(())
-        }).unwrap();
-        let path = format!("/api/v1/launch/benchmark/suite/drivers/{}", driver["driver"]["id"].as_str().unwrap());
-        let current = api.driver(&path).await;
-        assert_eq!(current["driver"]["state"], "waiting");
-        assert_eq!(current["driver"]["pending_run_index"], 1);
-        let suite = api.suite(&format!("{RESTART_SUITE}")).await;
-        assert_eq!(suite["runs"][0]["session_id"], session);
-        assert_eq!(suite["runs"][1]["state"], "pending");
-        assert!(suite["runs"][1]["session_id"].is_null());
-        started.elapsed() < Duration::from_secs(15)
-    }).catch_unwind().await;
-    if matches!(&boundary, Ok(true)) {
-        std::process::exit(DRIVER_CHILD_EXIT);
-    }
-    // A missed safe boundary is a failed test, never permission to kill a game.
-    if let Err(error) = services.server.shutdown().await {
-        eprintln!("driver fixture cleanup requires inspection: {error}");
-        std::future::pending::<()>().await;
-    }
-    match boundary {
-        Err(panic) => std::panic::resume_unwind(panic),
-        _ => panic!("settled pending boundary exceeded its safe pre-tick deadline"),
-    }
-}
 
 fn settlement_evidence(
     storage: &axial_app::storage::MetadataStore,
@@ -5832,7 +5141,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
         );
         observe_and_stop_session(&api, first).await;
         assert_fixture_processes_gone(&processes).await;
-        let original = initial.benchmarks.reports().get(first).unwrap().unwrap();
+        let original = initial.reports.get(first).unwrap().unwrap();
         assert_eq!(original.scenario.requested_memory_mb, Some(768));
         assert!(
             original
@@ -5875,7 +5184,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
         assert_eq!(restored["max_memory_mb"], 1024);
         assert_eq!(restored["revision"], edited["revision"]);
         let second = launch_and_stop(&api, instance).await;
-        let next = reopened.benchmarks.reports().get(&second).unwrap().unwrap();
+        let next = reopened.reports.get(&second).unwrap().unwrap();
         assert_eq!(next.scenario.requested_memory_mb, Some(1024));
         assert!(
             next.logs
@@ -5883,7 +5192,7 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
                 .any(|line| line.text == "Fixture heap MiB 1024")
         );
         assert_eq!(
-            reopened.benchmarks.reports().get(first).unwrap().unwrap(),
+            reopened.reports.get(first).unwrap().unwrap(),
             original
         );
         reopened.server.shutdown().await.unwrap();
@@ -5987,12 +5296,6 @@ async fn playing_instance_edits() -> Result<(), RetainedKillJourney> {
     Ok(())
 }
 
-#[test]
-fn real_benchmark_mapping_survives_response_loss_and_restart() {
-    let _process_work = PROCESS_WORK.blocking_lock();
-    let (runtime, _diagnostics) = diagnostic_runtime();
-    runtime.block_on(benchmark_mapping_survives_response_loss_and_restart());
-}
 
 fn diagnostic_runtime() -> (tokio::runtime::Runtime, tracing::dispatcher::DefaultGuard) {
     use tracing_subscriber::prelude::*;
@@ -6045,290 +5348,6 @@ fn runtime_with_diagnostics(
     (runtime, current_thread)
 }
 
-async fn benchmark_mapping_survives_response_loss_and_restart() {
-    use axial_app::storage::StorageError;
-    use axial_app::{
-        launch::reports::LaunchProofScenario, performance::benchmarks::BenchmarkLaunchRequest,
-    };
-    let temporary =
-        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-    let profile = temporary.path().join("profile");
-    let provider = Provider::start(false).await;
-    let services = start_profile_with_test_endpoints(profile.clone(), provider.endpoints())
-        .await
-        .unwrap();
-    let api = Api::new(&services);
-    configure_offline(
-        &api,
-        json!({"expected_revision":0,"performance_mode":"vanilla","java_path_override":""}),
-    )
-    .await;
-    install_vanilla(&api).await;
-    let created = api
-        .post(
-            "/api/v1/instances",
-            json!({
-                "name":"Benchmark recovery","selection_id":format!("vanilla|{VERSION}")
-            }),
-        )
-        .await;
-    let instance = created["id"].as_str().unwrap().to_owned();
-    assert!(created["install_queue"].is_null(), "{created}");
-    assert_eq!(created["view_model"]["summary"], "Instance created.");
-    wait_launchable(&api, &instance).await;
-
-    // Refuse only the response-side update after a real session was accepted.
-    // The pre-spawn mapping must already be durable when this write fails.
-    services.instances.registry().storage().transaction(|tx| -> Result<(), StorageError> {
-        tx.execute_batch("CREATE TRIGGER refuse_benchmark_response BEFORE UPDATE ON benchmark_suites WHEN instr(CAST(NEW.payload AS TEXT),'\"state\":\"running\"')>0 BEGIN SELECT RAISE(ABORT,'response write unavailable'); END;")?;
-        Ok(())
-    }).unwrap();
-    let request =
-        json!({"instance_id":instance,"suite_id":"recovery-suite","suite_mode":"development"});
-    let response = api
-        .benchmarks
-        .upgrade()
-        .unwrap()
-        .tick(serde_json::from_value(request.clone()).unwrap())
-        .await;
-    assert!(matches!(
-        response,
-        Err(axial_app::performance::benchmarks::BenchmarkError::Storage(_))
-    ), "{response:?}");
-    let suite = api.suite("recovery-suite").await;
-    assert_eq!(suite["runs"][0]["state"], "launching", "{suite}");
-    let first = suite["runs"][0]["session_id"]
-        .as_str()
-        .expect("mapping precedes accepted process")
-        .to_owned();
-    let first_intent = suite["runs"][0]["launch_intent"].as_str().unwrap();
-    let accepted = api
-        .get(&format!("/api/v1/launch/intents/{first_intent}"))
-        .await;
-    assert_eq!(accepted["state"], "accepted");
-    assert_eq!(accepted["session"]["session_id"], first);
-    assert_eq!(accepted["session"]["instance_id"], instance);
-    let retried = api.tick(request.clone()).await;
-    assert_eq!(retried["state"], "active");
-    assert_eq!(retried["active_session_id"], first);
-    services
-        .instances
-        .registry()
-        .storage()
-        .transaction(|tx| -> Result<(), StorageError> {
-            tx.execute_batch("DROP TRIGGER refuse_benchmark_response")?;
-            Ok(())
-        })
-        .unwrap();
-    observe_and_stop_session(&api, &first).await;
-    let proof = services.benchmarks.reports().get(&first).unwrap().unwrap();
-    assert_eq!(proof.instance_id, instance);
-    assert_eq!(
-        proof.scenario.benchmark_profile.as_deref(),
-        Some("vanilla_baseline")
-    );
-    let other = api
-        .post(
-            "/api/v1/instances",
-            json!({
-                "name":"Other selected instance","selection_id":format!("vanilla|{VERSION}")
-            }),
-        )
-        .await;
-    assert!(other["install_queue"].is_null(), "{other}");
-    assert_eq!(other["view_model"]["summary"], "Instance created.");
-    let other_instance = other["id"].as_str().unwrap();
-    let pending_input: BenchmarkLaunchRequest = serde_json::from_value(json!({
-        "instance_id":instance,"suite_id":"pending-suite","suite_mode":"development"
-    }))
-    .unwrap();
-    let mut pending_suite = services.benchmarks.ensure_suite(&pending_input).unwrap();
-    let pending_session = uuid::Uuid::new_v4().to_string();
-    let pending_run = &mut pending_suite.runs[0];
-    pending_run.state = "launching".into();
-    pending_run.session_id = Some(pending_session.clone());
-    let context = serde_json::to_string(&LaunchProofScenario {
-        benchmark_id: Some(pending_run.benchmark_id.clone()),
-        benchmark_profile: Some(pending_run.profile.clone()),
-        benchmark_run_type: Some(pending_run.run_type.clone()),
-        benchmark_mode: Some("development".into()),
-        ..LaunchProofScenario::default()
-    })
-    .unwrap();
-    let intent = json!({"request": {
-        "instance_id":instance,"version_id":null,"username":PLAYER,
-        "max_memory_mb":768,"min_memory_mb":256,"client_started_at_ms":null,
-        "intent_key":pending_run.launch_intent
-    }, "context":context,"session_id":pending_session});
-    // Durable fixture at the mapping-before-preparation crash boundary. There
-    // is deliberately no accepted process or terminal report for this identity.
-    services
-        .instances
-        .registry()
-        .storage()
-        .transaction(|tx| -> Result<(), StorageError> {
-            tx.execute(
-                "INSERT INTO launch_intents(intent_key,payload,state) VALUES(?1,?2,'pending')",
-                axial_app::storage::rusqlite::params![
-                    pending_suite.runs[0].launch_intent,
-                    serde_json::to_vec(&intent).unwrap()
-                ],
-            )?;
-            tx.execute(
-                "UPDATE benchmark_suites SET payload=?1 WHERE suite_id='pending-suite'",
-                [serde_json::to_vec(&pending_suite).unwrap()],
-            )?;
-            tx.execute(
-                "UPDATE instance_selection SET instance_id=?1 WHERE singleton=1",
-                [other_instance],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    services.server.shutdown().await.unwrap();
-    assert!(services.server.is_shutdown_settled());
-    drop(services);
-    provider.shutdown().await;
-
-    let reopened = start_in_profile(profile.clone(), None).await.unwrap();
-    let api = Api::new(&reopened);
-    assert_eq!(
-        reopened
-            .instances
-            .registry()
-            .last_instance_id()
-            .unwrap()
-            .unwrap()
-            .as_str(),
-        other_instance
-    );
-    let historical = api
-        .get(&format!("/api/v1/launch/intents/{first_intent}"))
-        .await;
-    assert_eq!(historical["state"], "accepted");
-    assert_eq!(historical["session"]["phase"], "exited");
-    assert_eq!(historical["session"]["outcome"]["kind"], "stopped");
-    assert_eq!(historical["session"]["session_id"], first);
-    let pending = api.benchmarks.upgrade().unwrap().tick(serde_json::from_value(json!({
-        "suite_id":"pending-suite","username":"ChangedPlayer","max_memory_mb":2048,"min_memory_mb":512
-    })).unwrap()).await.unwrap();
-    assert_eq!(pending["state"], "launched", "{pending}");
-    assert_eq!(pending["session"]["session_id"], pending_session);
-    assert_eq!(pending["session"]["instance_id"], instance);
-    assert_eq!(
-        pending["suite"]["runs"][0]["launch_intent"],
-        pending_suite.runs[0].launch_intent.as_deref().unwrap()
-    );
-    observe_and_stop_session(&api, &pending_session).await;
-    let pending_proof = reopened
-        .benchmarks
-        .reports()
-        .get(&pending_session)
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending_proof.scenario.requested_memory_mb, Some(768));
-    wait_launchable(&api, &instance).await;
-    let next = api.tick(json!({"suite_id":"recovery-suite"})).await;
-    assert_eq!(next["state"], "launched", "{next}");
-    assert_eq!(next["run_index"], 1);
-    assert_eq!(next["suite"]["runs"][0]["state"], "stopped");
-    assert_eq!(next["suite"]["runs"][0]["session_id"], first);
-    assert_eq!(next["suite"]["runs"][0]["launched_at"], proof.launched_at);
-    let second = next["session"]["session_id"].as_str().unwrap();
-    assert_ne!(second, first);
-    assert_eq!(next["suite"]["runs"][1]["session_id"], second);
-    assert_eq!(next["session"]["instance_id"], instance);
-    observe_and_stop_session(&api, second).await;
-    let complete = api.tick(json!({"suite_id":"recovery-suite"})).await;
-    assert_eq!(complete["state"], "complete");
-
-    wait_launchable(&api, &instance).await;
-    let observed = api
-        .tick(json!({
-            "instance_id":instance,"suite_id":"report-loss-suite","suite_mode":"development"
-        }))
-        .await;
-    let settled_session = observed["session"]["session_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let settled_intent = observed["suite"]["runs"][0]["launch_intent"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    observe_and_stop_session(&api, &settled_session).await;
-    let settled = api
-        .get(&format!("/api/v1/launch/intents/{settled_intent}"))
-        .await;
-    let saved_suite = api.suite("report-loss-suite").await;
-    // Loss of a diagnostic report does not erase the owner's actual settlement
-    // observation or grant permission to repeat the benchmark run.
-    reopened
-        .instances
-        .registry()
-        .storage()
-        .transaction(|tx| -> Result<(), StorageError> {
-            assert_eq!(
-                tx.execute(
-                    "DELETE FROM launch_reports WHERE session_id=?1",
-                    [&settled_session]
-                )?,
-                1
-            );
-            Ok(())
-        })
-        .unwrap();
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
-    drop(reopened);
-
-    let reopened = start_in_profile(profile, None).await.unwrap();
-    let api = Api::new(&reopened);
-    let status = api
-        .get(&format!("/api/v1/launch/intents/{settled_intent}"))
-        .await;
-    assert_observed_terminal(&status, &instance, &settled_session);
-    assert_eq!(
-        status["session"]["launched_at"],
-        settled["session"]["launched_at"]
-    );
-    assert_eq!(
-        status["session"]["exit_code"],
-        settled["session"]["exit_code"]
-    );
-    for run_index in [Value::Null, json!(0)] {
-        let result = api
-            .benchmarks
-            .upgrade()
-            .unwrap()
-            .tick(
-                serde_json::from_value(
-                    json!({"suite_id":"report-loss-suite","run_index":run_index}),
-                )
-                .unwrap(),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(axial_app::performance::benchmarks::BenchmarkError::Unavailable)
-        ));
-        let retained = api.suite("report-loss-suite").await;
-        assert_eq!(retained, saved_suite);
-        assert_eq!(retained["runs"][0]["session_id"], settled_session);
-        assert_eq!(retained["runs"][1]["state"], "pending");
-    }
-    assert!(reopened.sessions.snapshots().is_empty());
-    assert!(
-        reopened
-            .benchmarks
-            .reports()
-            .get(&settled_session)
-            .unwrap()
-            .is_none()
-    );
-    reopened.server.shutdown().await.unwrap();
-    assert!(reopened.server.is_shutdown_settled());
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_refuses_held_materialization_then_installation_survives_reopen() {

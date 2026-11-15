@@ -1,6 +1,5 @@
 pub mod accounts;
 pub mod auth;
-pub mod benchmarks;
 pub mod content;
 pub(crate) mod error;
 pub mod install;
@@ -8,7 +7,6 @@ pub mod instances;
 pub mod java;
 pub mod launch;
 pub mod music;
-pub mod performance;
 pub mod resources;
 pub mod settings;
 pub mod skin;

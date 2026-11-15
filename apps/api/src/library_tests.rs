@@ -961,9 +961,6 @@ async fn cleanup_refused_content_exit(services: DesktopServices) {
     ServerHandle::join_owned(&services.server.telemetry_worker, "fixture telemetry join")
         .await
         .unwrap();
-    ServerHandle::join_owned(&services.server.rules_worker, "fixture rules join")
-        .await
-        .unwrap();
     services.server.runtime_cache.settle().unwrap();
     services.music.settle().unwrap();
     let library = services.library.clone();

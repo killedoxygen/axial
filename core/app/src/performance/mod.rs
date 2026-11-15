@@ -1,15 +1,11 @@
 //! User-selected Performance behavior and exact managed-file transactions.
 
-pub mod benchmarks;
 pub mod composition;
 pub(crate) mod duplicate;
 pub mod effective;
-pub mod health;
 pub mod model;
 pub mod mutation;
 pub mod plan;
-pub mod proofs;
-pub mod qualification;
 pub mod resolve;
 pub mod rollback;
 pub mod rules;

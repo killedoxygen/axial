@@ -11,7 +11,7 @@ use axial_app::{
     media::MediaError,
     music::MusicError,
     performance::{
-        PerformanceMutationError, benchmarks::BenchmarkError, rules::RulesWorkflowError,
+        PerformanceMutationError,
     },
     public::ErrorResponse,
     resources::{ResourceError, folders::FolderError, mods::ModImportError},
@@ -342,27 +342,6 @@ impl PublicError for PerformanceMutationError {
             Self::InstanceNotFound | Self::SnapshotNotFound => StatusCode::NOT_FOUND,
             Self::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::CONFLICT,
-        }
-    }
-}
-
-impl PublicError for RulesWorkflowError {
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::Unconfigured => StatusCode::BAD_REQUEST,
-            Self::ProviderFailed => StatusCode::BAD_GATEWAY,
-            _ => StatusCode::CONFLICT,
-        }
-    }
-}
-
-impl PublicError for BenchmarkError {
-    fn status(&self) -> StatusCode {
-        match self {
-            Self::Invalid => StatusCode::BAD_REQUEST,
-            Self::NotFound => StatusCode::NOT_FOUND,
-            Self::Busy | Self::Complete => StatusCode::CONFLICT,
-            _ => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }

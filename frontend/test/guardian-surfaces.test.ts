@@ -20,9 +20,7 @@ import {
   launchSessionHasLiveProcess,
   launchSessionIsPlaying,
 } from '../src/launch/presenters';
-import { performanceHealthNotice } from '../src/performance/presenters';
 import type { InstallQueueNoticeViewModel } from '../src/generated/InstallQueueNoticeViewModel';
-import type { PerformanceHealthResponse } from '../src/generated/PerformanceHealthResponse';
 import type { SessionNotice } from '../src/generated/SessionNotice';
 import type { SessionOutcome } from '../src/generated/SessionOutcome';
 import type { SessionSnapshot } from '../src/generated/SessionSnapshot';
@@ -372,26 +370,4 @@ test('create surfaces preserve backend display copy', () => {
   assert.equal(createToastKind('err'), 'error');
   assert.equal(createToastKind('warn'), 'info');
   assert.equal(createToastKind('ok'), 'success');
-});
-
-test('performance health raises only warning and error summaries as notices', () => {
-  const health = (tone: SessionNotice['tone']): PerformanceHealthResponse => ({
-    state: null,
-    health: 'healthy',
-    warnings: [],
-    managed_artifacts: [],
-    rollback_available: false,
-    view_model: {
-      state_id: 'performance_summary',
-      title: 'Backend performance warning',
-      detail: 'Backend performance detail',
-      tone,
-      managed_artifact_count: 0,
-      actions: [],
-    },
-  });
-  assert.equal(performanceHealthNotice(health('warn'))?.title, 'Backend performance warning');
-  assert.equal(performanceHealthNotice(health('err'))?.tone, 'err');
-  assert.equal(performanceHealthNotice(health('ok')), null);
-  assert.equal(performanceHealthNotice(null), null);
 });

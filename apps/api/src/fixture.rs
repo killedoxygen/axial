@@ -12,7 +12,7 @@ use std::{path::PathBuf, sync::Weak, time::Duration};
 pub(crate) struct Profile {
     pub(crate) services: DesktopServices,
     pub(crate) api: Api,
-    pub(crate) temporary: tempfile::TempDir,
+    _temporary: tempfile::TempDir,
 }
 
 impl Profile {
@@ -29,7 +29,7 @@ impl Profile {
         Self {
             services,
             api,
-            temporary,
+            _temporary: temporary,
         }
     }
 
@@ -83,7 +83,6 @@ pub(crate) struct Api {
     pub(crate) capability: String,
     pub(crate) installs: Weak<axial_app::install::queue::InstallQueue>,
     launch: Weak<axial_app::launch::coordinator::LaunchCoordinator>,
-    pub(crate) benchmarks: Weak<axial_app::performance::benchmarks::BenchmarkService>,
 }
 
 impl Api {
@@ -99,7 +98,6 @@ impl Api {
             capability: bootstrap.capability,
             installs: std::sync::Arc::downgrade(&services.installs),
             launch: std::sync::Arc::downgrade(&services.launch),
-            benchmarks: std::sync::Arc::downgrade(&services.benchmarks),
         }
     }
 
@@ -116,38 +114,6 @@ impl Api {
 
     pub(crate) async fn preflight_response(&self, id: &str) -> (StatusCode, Value) {
         (StatusCode::OK, self.preflight(id).await)
-    }
-
-    pub(crate) async fn driver(&self, path: &str) -> Value {
-        let id = path.rsplit('/').next().unwrap();
-        self.get("/api/v1/launch/benchmark/suite/drivers").await["drivers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|view| view["driver"]["id"] == id)
-            .unwrap()
-            .clone()
-    }
-
-    pub(crate) async fn tick(&self, input: Value) -> Value {
-        self.benchmarks
-            .upgrade()
-            .unwrap()
-            .tick(serde_json::from_value(input).unwrap())
-            .await
-            .unwrap()
-    }
-
-    pub(crate) async fn suite(&self, path: &str) -> Value {
-        serde_json::to_value(
-            self.benchmarks
-                .upgrade()
-                .unwrap()
-                .suite(path.rsplit('/').next().unwrap())
-                .unwrap()
-                .unwrap(),
-        )
-        .unwrap()
     }
 
     pub(crate) async fn install_status(&self, path: &str) -> Value {

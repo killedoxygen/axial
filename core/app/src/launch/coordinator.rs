@@ -126,38 +126,6 @@ impl LaunchCoordinator {
         self
     }
 
-    /// Reserve the exact session identity before the benchmark commits its run
-    /// mapping. This grants no process authority; launch still rechecks fences.
-    pub(crate) fn reserve_benchmark(
-        &self,
-        request: &LaunchRequest,
-        scenario: &super::reports::LaunchProofScenario,
-    ) -> Result<String, LaunchError> {
-        let context = serde_json::to_string(scenario).map_err(|_| LaunchError::InvalidRequest)?;
-        self.intents.reserve_identity(request, Some(context))
-    }
-
-    pub(crate) fn benchmark_request(
-        &self,
-        key: &str,
-        session_id: &str,
-        instance_id: &InstanceId,
-        scenario: &super::reports::LaunchProofScenario,
-    ) -> Result<LaunchRequest, LaunchError> {
-        let context = serde_json::to_string(scenario).map_err(|_| LaunchError::InvalidRequest)?;
-        let record = self
-            .intents
-            .record(key)?
-            .ok_or(LaunchError::IntentUnavailable)?;
-        if record.session_id != session_id
-            || &record.request.instance_id != instance_id
-            || record.context.as_deref() != Some(context.as_str())
-        {
-            return Err(LaunchError::IntentConflict);
-        }
-        Ok(record.request)
-    }
-
     pub fn intent(&self, key: &str) -> Result<Option<LaunchIntentStatus>, LaunchError> {
         self.intents.snapshot(key)
     }
@@ -183,51 +151,6 @@ impl LaunchCoordinator {
         }))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn observe_unstarted_benchmark_for_test(
-        &self,
-        request: LaunchRequest,
-        scenario: super::reports::LaunchProofScenario,
-    ) -> SessionSnapshot {
-        let context = serde_json::to_string(&scenario).unwrap();
-        let ReservedIntent::New {
-            key, session_id, ..
-        } = self
-            .intents
-            .reserve_context(&request, Some(context))
-            .unwrap()
-        else {
-            panic!("fixture launch already accepted")
-        };
-        let instance = self.admit(&request.instance_id).unwrap();
-        let application = self.instances.library().admit_application_root().unwrap();
-        let acceptance = self
-            .intents
-            .accept(
-                &key,
-                IntentBinding::capture(&instance, &application).unwrap(),
-            )
-            .unwrap();
-        let version_id = request
-            .version_id
-            .clone()
-            .unwrap_or_else(|| instance.record().instance.version_id.clone());
-        super::session::finish_unstarted_for_test(
-            acceptance,
-            session_id,
-            request.instance_id,
-            version_id,
-            self.intents.reports.clone().unwrap(),
-            false,
-        )
-        .await;
-        let Some(LaunchIntentStatus::Accepted { session }) = self.intents.snapshot(&key).unwrap()
-        else {
-            panic!("fixture did not settle")
-        };
-        session
-    }
-
     fn admit(&self, id: &InstanceId) -> Result<RegisteredInstance, LaunchError> {
         let pin = self
             .instances
@@ -249,27 +172,7 @@ impl LaunchCoordinator {
     }
 
     pub async fn launch(&self, request: LaunchRequest) -> Result<SessionSnapshot, LaunchError> {
-        self.launch_with_context(request, None).await
-    }
-
-    pub async fn launch_benchmark_configured(
-        &self,
-        request: LaunchRequest,
-        scenario: super::reports::LaunchProofScenario,
-    ) -> Result<SessionSnapshot, LaunchError> {
-        self.launch_with_context(request, Some(scenario)).await
-    }
-
-    async fn launch_with_context(
-        &self,
-        request: LaunchRequest,
-        context: Option<super::reports::LaunchProofScenario>,
-    ) -> Result<SessionSnapshot, LaunchError> {
-        let fingerprint = context
-            .as_ref()
-            .map(|value| serde_json::to_string(value).map_err(|_| LaunchError::InvalidRequest))
-            .transpose()?;
-        let reservation = self.intents.reserve_context(&request, fingerprint)?;
+        let reservation = self.intents.reserve_context(&request, None)?;
         let mut receiver = match reservation {
             ReservedIntent::Existing(receiver) => receiver,
             ReservedIntent::New {
@@ -313,7 +216,6 @@ impl LaunchCoordinator {
                             admitted,
                             &request,
                             &cancel,
-                            context,
                             &native_retention,
                             library_retention.clone(),
                             telemetry.clone(),
@@ -441,7 +343,6 @@ impl LaunchCoordinator {
         admitted: RegisteredInstance,
         request: &LaunchRequest,
         cancellation: &CancellationToken,
-        context: Option<super::reports::LaunchProofScenario>,
         native_retention: &Mutex<Option<Arc<crate::install::vanilla::PreparedNatives>>>,
         library_retention: Arc<super::libraries::Retention>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
@@ -451,7 +352,6 @@ impl LaunchCoordinator {
                 admitted,
                 request,
                 cancellation,
-                context,
                 native_retention,
                 library_retention,
                 telemetry,
@@ -473,7 +373,6 @@ impl LaunchCoordinator {
         admitted: RegisteredInstance,
         request: &LaunchRequest,
         cancellation: &CancellationToken,
-        context: Option<super::reports::LaunchProofScenario>,
         native_retention: &Mutex<Option<Arc<crate::install::vanilla::PreparedNatives>>>,
         library_retention: Arc<super::libraries::Retention>,
         telemetry: Arc<super::session::LaunchAttemptTelemetry>,
@@ -670,7 +569,7 @@ impl LaunchCoordinator {
         if cancellation.is_cancelled() {
             return Err(LaunchError::Cancelled);
         }
-        let mut scenario = context.unwrap_or_default();
+        let mut scenario = super::reports::LaunchProofScenario::default();
         scenario.performance_mode = effective.performance_mode.as_str().into();
         scenario.version_id = Some(instance.version_id.clone());
         scenario.requested_memory_mb = Some(effective.max_memory_mb);

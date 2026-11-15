@@ -1,24 +1,9 @@
-//! Performance presentation over the launch owner's canonical proof schema.
+//! Presentation of recorded launch proofs and their history.
 
-pub(crate) use crate::launch::reports::comparison_baseline_matches_report;
-pub use crate::launch::reports::{
-    LaunchProofComparison, LaunchProofRecord, LaunchProofResourceBudget,
-};
+use super::{LaunchProofComparison, LaunchProofRecord, LaunchProofResourceBudget};
 use crate::public::Tone;
 use serde::Serialize;
 use ts_rs::TS;
-
-pub fn validate_proof(report: &LaunchProofRecord) -> Result<(), super::benchmarks::BenchmarkError> {
-    let encoded = crate::launch::reports::encode_report(report)
-        .map_err(|_| super::benchmarks::BenchmarkError::Unavailable)?;
-    let canonical = crate::launch::reports::decode_report(&encoded)
-        .map_err(|_| super::benchmarks::BenchmarkError::Unavailable)?;
-    if canonical == *report {
-        Ok(())
-    } else {
-        Err(super::benchmarks::BenchmarkError::Unavailable)
-    }
-}
 
 /// Recent launch proofs with their history view models.
 #[derive(Clone, Debug, Serialize, TS)]

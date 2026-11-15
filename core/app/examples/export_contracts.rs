@@ -27,17 +27,10 @@ use axial_app::{
     },
     launch::{
         coordinator::{LaunchErrorResponse, LaunchIntentView, LaunchRequest, PreflightDiagnostics},
+        reports::{LaunchProofView, LaunchReportsResponse},
         session::{SessionLogsResponse, SessionSnapshot, SessionsResponse},
     },
     music::MusicStatusResponse,
-    performance::{
-        benchmarks::{
-            BenchmarkDriverView, BenchmarkDriversResponse, BenchmarkLaunchRequest, BenchmarkMatrix,
-        },
-        health::PerformanceHealthResponse,
-        proofs::{LaunchProofView, LaunchReportsResponse},
-        qualification::QualificationResponse,
-    },
     public::{ApplicationStatus, ErrorResponse, OperationId, StatusResponse, Tone},
     resources::{
         InstanceLogTailResponse, InstanceResourcesResponse, ResourceCommand,
@@ -126,9 +119,6 @@ fn export(destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
         LaunchRequest, LaunchErrorResponse, SessionSnapshot, SessionsResponse, SessionLogsResponse,
         LaunchIntentView,
         PreflightDiagnostics, LaunchReportsResponse, LaunchProofView,
-        // Performance
-        PerformanceHealthResponse, BenchmarkLaunchRequest, BenchmarkMatrix, BenchmarkDriverView, BenchmarkDriversResponse,
-        QualificationResponse,
         // Accounts and skins
         AccountListResponse, AccountCommandResponse, AccountRemovedResponse,
         ProfileRefreshResponse, SavedSkinsResponse, SkinNormalizeResponse, SkinApplyResponse,

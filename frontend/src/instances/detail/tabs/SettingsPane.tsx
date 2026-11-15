@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Chip, Notice } from '../../../ui/Atoms';
+import { Chip } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { ChoicePills, type ChoicePillOption } from '../../../ui/ChoicePills';
 import { OverrideChip, SettingRow, SettingsSection } from '../../../ui/SettingsSheet';
@@ -9,7 +9,7 @@ import { WindowField } from '../../../ui/WindowField';
 import { JavaPathField, JvmArgsInput } from '../../../launch/RuntimeFields';
 import { canAutoSave, useAutoSave } from '../../../settings/autosave';
 import { normalizeJvmPreset, useJvmPresets } from '../../../launch/jvm-presets';
-import { performanceHealth, updateInstance } from '../../api';
+import { updateInstance } from '../../api';
 import { explicitMaxMemoryMb, isAutomaticMemory } from '../../../settings/memory';
 import { refreshInstanceReadiness } from '../../readiness';
 import { config, systemInfo } from '../../../settings/state';
@@ -18,7 +18,6 @@ import { fmtMem, memoryGb } from '../../../ui/format';
 import type { ConfigPerformanceMode } from '../../../generated/ConfigPerformanceMode';
 import type { EnrichedInstance } from '../../../generated/EnrichedInstance';
 import type { JavaSelection } from '../../../generated/JavaSelection';
-import { performanceHealthNotice } from '../../../performance/presenters';
 import {
   globalPerformanceMode,
   performanceModeFrom,
@@ -58,8 +57,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
     instance: { id: inst.id, revision: inst.revision },
     flushPending: () => flushArgs.current(),
   });
-
-  const [healthNotice, setHealthNotice] = useState<ReturnType<typeof performanceHealthNotice>>(null);
 
   const memoryOverridden = (inst.max_memory_mb ?? 0) > 0 || (inst.min_memory_mb ?? 0) > 0;
   const savedMaxGb = memoryGb(inst.max_memory_mb, explicitMaxMemoryMb(cfg));
@@ -116,21 +113,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
     };
   }, [inst.id]);
 
-  useEffect(() => {
-    let cancelled = false;
-    void performanceHealth(inst.id)
-      .then((health) => {
-        if (cancelled) return;
-        setHealthNotice(performanceHealthNotice(health));
-      })
-      .catch(() => {
-        if (!cancelled) setHealthNotice(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [inst.id, inst.performance_mode, globalMode]);
-
   const commitArgs = (next: string): void => {
     if (!canAutoSave()) return;
     pendingArgs.current = null;
@@ -184,12 +166,6 @@ function InstanceSettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element
 
   return (
     <div class="cp-pane cp-settings-pane">
-      {healthNotice && (
-        <Notice tone={healthNotice.tone} title={healthNotice.title}>
-          {healthNotice.detail && <p>{healthNotice.detail}</p>}
-        </Notice>
-      )}
-
       <SettingsSection>
         <SettingRow
           title="Memory"

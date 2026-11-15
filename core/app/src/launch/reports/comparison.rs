@@ -80,21 +80,6 @@ pub(super) fn comparison_baseline_snapshot(
     })
 }
 
-pub(crate) fn comparison_baseline_matches_report(
-    comparison: &LaunchProofComparison,
-    baseline: &LaunchProofRecord,
-) -> bool {
-    let metric_value = match comparison.metric_name.as_str() {
-        LAUNCH_STAGE_COMPARISON_METRIC_NAME => launch_total_completed_stage_duration_ms(baseline),
-        LAUNCH_BOOT_COMPARISON_METRIC_NAME => baseline.boot_duration_ms,
-        _ => None,
-    };
-    launch_proof_outcome_is_comparable(&baseline.outcome)
-        && comparison.baseline_session_id == baseline.session_id
-        && comparison.baseline_recorded_at == baseline.recorded_at
-        && comparison_baseline_snapshot(baseline).as_ref() == Some(&comparison.baseline)
-        && metric_value == Some(comparison.baseline_value_ms)
-}
 
 pub(super) fn comparison_baseline_mode_rank(
     current: &LaunchProofRecord,

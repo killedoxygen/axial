@@ -1368,7 +1368,6 @@ const handlers: Record<string, Handler> = {
       { path: '/mock/java/17/bin/java', component: 'java-runtime-gamma-17', source: 'system' },
     ],
   }),
-  'GET /performance/health': () => ({ health: null }),
   'GET /update': () => mockUpdateInfo(),
   'GET /update/snapshot': (): UpdateSnapshot => ({ info: mockUpdateInfo(), flow: mockUpdateFlow() }),
   'GET /update/flow': () => mockUpdateFlow(),

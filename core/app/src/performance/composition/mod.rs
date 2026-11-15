@@ -1,6 +1,7 @@
 //! Managed composition files: exact install, removal, rollback and recovery
 //! under one bound instance authority.
 
+mod health;
 mod artifact;
 pub(crate) mod plan;
 pub(crate) mod state;
@@ -438,7 +439,7 @@ impl ManagedCompositionAuthority {
             move || -> Result<_, ManagedMutationError> {
                 let (state, mutation_permit) = admitted_inspection_state(&mods, admit_mutation)?;
                 let (health, warnings) =
-                    super::health::derive_health(state.as_ref(), plan.as_ref(), None, Some(&mods));
+                    health::derive_health(state.as_ref(), plan.as_ref(), None, Some(&mods));
                 let installed_mod_evidence = installed_mod_evidence(&mods, state.as_ref())
                     .map_err(ManagedMutationError::definite)?;
                 let rollback_snapshots = state::list_rollback_snapshots_admitted(&mods)
@@ -493,7 +494,7 @@ impl ManagedCompositionAuthority {
                 request.installed_mods = installed_mod_evidence.clone();
                 let expected_game_version = request.game_version.clone();
                 let plan = resolve(request);
-                let (health, warnings) = super::health::derive_health(
+                let (health, warnings) = health::derive_health(
                     state.as_ref(),
                     Some(&plan),
                     Some(&expected_game_version),
@@ -597,7 +598,7 @@ fn absent_inspection(
     plan: Option<&CompositionPlan>,
     expected_game_version: Option<&str>,
 ) -> ManagedCompositionInspection {
-    let (health, warnings) = super::health::derive_health(None, plan, expected_game_version, None);
+    let (health, warnings) = health::derive_health(None, plan, expected_game_version, None);
     ManagedCompositionInspection {
         state: None,
         health,
@@ -615,7 +616,7 @@ fn recovered_inspection(
     state::prove_managed_storage_recovered(&instance_mods, state.as_ref())
         .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
     let (health, warnings) =
-        super::health::derive_health(state.as_ref(), None, None, Some(&instance_mods));
+        health::derive_health(state.as_ref(), None, None, Some(&instance_mods));
     let installed_mod_evidence = installed_mod_evidence(&instance_mods, state.as_ref())
         .map_err(ManagedMutationError::definite)?;
     let rollback_snapshots = state::list_rollback_snapshots_admitted(&instance_mods)

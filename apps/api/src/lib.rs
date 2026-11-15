@@ -34,7 +34,7 @@ use axial_app::{
     library::{LibraryId, LibraryLifecycle, LibraryOpenOutcome},
     music::MusicService,
     network::{ClientConfig, ProviderClient},
-    performance::{PerformanceService, benchmarks::BenchmarkService, rules::RulesSettings},
+    performance::{PerformanceService, rules::RulesSettings},
     profile::{Profile, Recovery},
     public::APPLICATION_ID,
     resources::{ResourceService, folders::FolderService},
@@ -176,7 +176,7 @@ pub struct DesktopServices {
     pub skins: Arc<ProfileMedia>,
     pub performance: PerformanceService,
     pub launch: Arc<LaunchCoordinator>,
-    pub benchmarks: Arc<BenchmarkService>,
+    pub reports: LaunchReportStore,
     pub content_mutations: Arc<ContentMutations>,
     pub music: Arc<MusicService>,
 }
@@ -204,7 +204,6 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     serving: Mutex<ServerTask>,
     telemetry_worker: Mutex<ServerTask>,
-    rules_worker: Mutex<ServerTask>,
     file_settlement: Mutex<Option<JoinHandle<Result<(), String>>>>,
     shutdown_settled: AtomicBool,
 }
@@ -291,13 +290,8 @@ impl ServerHandle {
             "The telemetry worker did not stop cleanly.",
         )
         .await;
-        let rules = Self::join_owned(
-            &self.rules_worker,
-            "The performance rules worker did not stop cleanly.",
-        )
-        .await;
         self.shutdown_settled.store(true, Ordering::Release);
-        http.and(telemetry).and(rules)
+        http.and(telemetry)
     }
 
     /// Retain owned work until shutdown settles. An error returned after
@@ -384,7 +378,7 @@ pub async fn start_desktop(extra_origin: Option<&str>) -> Result<DesktopServices
         extra_origin,
         true,
         configured_telemetry(),
-        configured_rules(),
+        RulesSettings::default(),
     )
     .await
 }
@@ -395,7 +389,7 @@ pub async fn start_browser(extra_origin: Option<&str>) -> Result<DesktopServices
         extra_origin,
         false,
         configured_telemetry(),
-        configured_rules(),
+        RulesSettings::default(),
     )
     .await
 }
@@ -426,14 +420,6 @@ fn configured_telemetry() -> Option<CollectorConfig> {
     }
 }
 
-fn configured_rules() -> RulesSettings {
-    let value = |name| std::env::var(name).ok();
-    RulesSettings::new(
-        value("AXIAL_PERFORMANCE_RULES_URL").as_deref(),
-        value("AXIAL_PERFORMANCE_RULES_ED25519_PUBLIC_KEY").as_deref(),
-        value("AXIAL_PERFORMANCE_RULES_REFRESH_INTERVAL_SECONDS").as_deref(),
-    )
-}
 
 /// Explicit profile injection keeps browser, desktop, and acceptance tests on
 /// the same composition without reading process-global configuration.
@@ -651,7 +637,6 @@ async fn start_profile_inner(
         sessions,
         launch,
         setup,
-        benchmarks,
         content_mutations,
         content_routes,
         resources,
@@ -790,17 +775,6 @@ async fn start_profile_inner(
                     .with_intents(intents)
                     .with_telemetry(telemetry.clone()),
                 );
-                let benchmarks = Arc::new(
-                    BenchmarkService::new(
-                        metadata,
-                        instances.registry().clone(),
-                        Arc::new(reports.clone()),
-                        launch.as_ref().clone(),
-                        sessions.clone(),
-                        tasks.clone(),
-                    )
-                    .map_err(|error| error.to_string())?,
-                );
                 let setup = Arc::new(
                     SetupService::new(
                         instances.clone(),
@@ -822,7 +796,6 @@ async fn start_profile_inner(
                     sessions,
                     launch,
                     setup,
-                    benchmarks,
                     content_mutations,
                     content_routes,
                     resources,
@@ -906,16 +879,8 @@ async fn start_profile_inner(
             launch.as_ref().clone(),
             sessions.clone(),
         ))
-        .merge(routes::launch::reports_router(reports))
+        .merge(routes::launch::reports_router(reports.clone()))
         .merge(routes::skin::router(skins.clone()))
-        .merge(routes::performance::router(
-            Arc::new(performance.clone()),
-            settings.clone(),
-        ))
-        .merge(routes::benchmarks::router(
-            benchmarks.clone(),
-            Arc::new(performance.clone()),
-        ))
         .merge(routes::content::router(content_routes))
         .merge(routes::resources::router(resources.clone()))
         .merge(routes::resources::folders_router(folders))
@@ -938,15 +903,6 @@ async fn start_profile_inner(
         let receiver = receiver.clone();
         tokio::spawn(async move {
             telemetry.run(receiver).await;
-            Ok(())
-        })
-    };
-    let rules_worker = {
-        let rules = performance.rules().clone();
-        let tasks = tasks.clone();
-        let receiver = receiver.clone();
-        tokio::spawn(async move {
-            rules.run(tasks, receiver).await;
             Ok(())
         })
     };
@@ -981,19 +937,10 @@ async fn start_profile_inner(
             join: Some(telemetry_worker),
             result: None,
         }),
-        rules_worker: Mutex::new(ServerTask {
-            join: Some(rules_worker),
-            result: None,
-        }),
         shutdown_settled: AtomicBool::new(false),
         file_settlement: Mutex::new(None),
     });
     installs.resume_queued();
-    if benchmarks.resume_interrupted_drivers().is_err() {
-        tracing::warn!(
-            "benchmark restart remains unresolved; driver status retains the interrupted run"
-        );
-    }
     Ok(DesktopServices {
         server,
         tasks,
@@ -1010,7 +957,7 @@ async fn start_profile_inner(
         skins,
         performance,
         launch,
-        benchmarks,
+        reports,
         content_mutations,
         music,
     })

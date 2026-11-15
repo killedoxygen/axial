@@ -12,7 +12,6 @@ import type { ModImportResponse } from '../generated/ModImportResponse';
 import type { ListResponse } from '../generated/ListResponse';
 import type { CreateInstanceResponse } from '../generated/CreateInstanceResponse';
 import type { PendingInstancesResponse } from '../generated/PendingInstancesResponse';
-import type { PerformanceHealthResponse } from '../generated/PerformanceHealthResponse';
 import type { ResourceCommand } from '../generated/ResourceCommand';
 import type { StatusResponse } from '../generated/StatusResponse';
 import type { VersionsResponse } from '../generated/VersionsResponse';
@@ -65,10 +64,6 @@ export function listVersions(): Promise<VersionsResponse> {
 
 export function listJavaRuntimes(): Promise<JavaRuntimesResponse> {
   return request('GET', '/java');
-}
-
-export function performanceHealth(id: string): Promise<PerformanceHealthResponse> {
-  return request('GET', `/performance/health?${new URLSearchParams({ instance_id: id })}`);
 }
 
 export function resources(id: string): Promise<InstanceResourcesResponse> {
