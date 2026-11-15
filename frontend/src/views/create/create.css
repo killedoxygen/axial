@@ -55,9 +55,8 @@
 .cp-cr-form .cp-select-trigger {
   width: 100%;
 }
-.cp-cr-mono {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
+.cp-cr-version {
+  font-size: 13px;
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
@@ -166,10 +165,36 @@
   cursor: default;
 }
 
-/* Versions: one select; open, the list unfolds under it and the dialog grows to hold it. */
-.cp-cr-versions .cp-chips {
-  flex-wrap: nowrap;
+/* Versions: one field that is its own search; open, the list floats under it. */
+.cp-cr-combo {
   --chip-bg: var(--fill-2);
+  cursor: text;
+}
+.cp-cr-combo:focus-within {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.cp-cr-combo input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: none;
+  color: inherit;
+}
+/* The chosen version stands in the empty field, and steps back once the list is open to be searched. */
+.cp-cr-combo input::placeholder {
+  color: var(--text-mute);
+  transition: color var(--t-quick) var(--ease-out);
+}
+.cp-cr-combo[data-state='closed'] input[data-chosen]::placeholder {
+  color: var(--text);
+}
+.cp-cr-combo .cp-select-caret {
+  padding: 0;
+  border: 0;
+  cursor: pointer;
 }
 .cp-cr-versions-menu {
   --raise: oklch(from var(--pop) calc(l + 0.045) c h);
@@ -179,17 +204,7 @@
   gap: 6px;
   padding: 5px;
 }
-.cp-cr-versions-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.cp-cr-versions-bar .cp-field {
-  flex: 1;
-  height: var(--h-sm);
-  background: var(--raise);
-}
-.cp-cr-versions-bar .cp-seg {
+.cp-cr-versions-menu .cp-seg {
   flex: none;
   background: var(--raise);
 }
@@ -214,11 +229,11 @@
   border-radius: var(--rad-ctl);
   cursor: pointer;
 }
-.cp-cr-vrow:is(:hover, [aria-selected='true']) {
+.cp-cr-vrow[data-hand] {
   --chip-bg: oklch(from var(--pop) calc(l + 0.11) c h);
   background: var(--raise);
 }
-.cp-cr-vrow[aria-selected='true'] .cp-cr-mono {
+.cp-cr-vrow[aria-selected='true'] .cp-cr-version {
   font-weight: 600;
 }
 .cp-cr-vrow[aria-disabled='true'] {
@@ -228,6 +243,23 @@
 .cp-cr-vrow-hint {
   color: var(--text-mute);
   font-size: 12px;
+}
+.cp-cr-vrow-loader {
+  flex: none;
+  color: var(--text-dim);
+}
+/* The match in hand offers its creation; the others hold the place. */
+.cp-cr-vrow-act {
+  display: flex;
+  flex: none;
+  margin-right: -4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-quick) var(--ease-out);
+}
+.cp-cr-vrow[data-hand] .cp-cr-vrow-act {
+  opacity: 1;
+  pointer-events: auto;
 }
 .cp-cr-vrow-mark {
   display: grid;

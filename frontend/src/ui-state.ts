@@ -1,4 +1,5 @@
 import { signal } from '@preact/signals';
+import type { VersionRowModel } from './create/versions';
 import type { ContentKind, ContentSelection } from './types-content';
 import { ROUTE_PREFERENCES_KEY, parseRoutePreference } from './preferences/local';
 import { hasNativeDesktopRuntime } from './native';
@@ -200,7 +201,10 @@ function setRoute(r: Route): void {
   if (!canEditPreferences()) return;
   cancelViewScrollRestore();
   route.value = r;
-  if (hasNativeDesktopRuntime()) { saveNativeRoute(r); return; }
+  if (hasNativeDesktopRuntime()) {
+    saveNativeRoute(r);
+    return;
+  }
   try {
     localStorage.setItem(ROUTE_STORAGE_KEY, JSON.stringify(r));
   } catch {}
@@ -273,6 +277,8 @@ export interface CreateModpackDraft {
 }
 
 export const createModpack = signal<CreateModpackDraft | null>(null);
+/** A version found elsewhere, such as the command palette, that the dialog opens on and creates. */
+export const createQuick = signal<VersionRowModel | null>(null);
 let createIntent = Symbol();
 
 export function beginCreateIntent(): () => boolean {
@@ -284,7 +290,14 @@ export function openCreate(): void {
   createIntent = Symbol();
   createDraft.value = null;
   createModpack.value = null;
+  createQuick.value = null;
   createOpen.value = true;
+}
+
+/** Opens the dialog on `version` and creates it. */
+export function quickCreate(version: VersionRowModel): void {
+  openCreate();
+  createQuick.value = version;
 }
 
 export function openCreateDraft(draft: CreateDraftItem[]): void {
@@ -307,6 +320,7 @@ export function closeCreate(): void {
   createOpen.value = false;
   createDraft.value = null;
   createModpack.value = null;
+  createQuick.value = null;
 }
 
 export function openAccountSwitcher(): void {

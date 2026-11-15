@@ -1,12 +1,12 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { Button, IconButton, Input, Kbd, Notice, Ring, type NoticeTone } from '../../ui/Atoms';
+import { Button, IconButton, Input, Notice, Ring, type NoticeTone } from '../../ui/Atoms';
 import { Face } from '../../ui/Face';
 import { InstanceTile } from '../../ui/InstanceVisual';
 import { Icon } from '../../ui/Icons';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { SelectField } from '../../ui/Select';
-import { closeCreate, createModpack, createOpen } from '../../ui-state';
+import { closeCreate, createModpack, createOpen, createQuick } from '../../ui-state';
 import { createNoticePresentation } from '../../create-presenters';
 import { LoaderTiles } from './LoaderTiles';
 import { Options } from './Options';
@@ -14,7 +14,7 @@ import { StagedPicks } from './StagedPicks';
 import { VersionPicker } from './VersionPicker';
 import { useModpackFileImport } from './modpack-file';
 import { useCreateForm, type CreateForm } from './use-create-form';
-export { createBackendViewResponse, createLoaderBuildsResponse } from './contract';
+export { createBackendViewResponse, createLoaderBuildsResponse } from '../../create/contract';
 
 export function CreateView(): JSX.Element {
   return (
@@ -32,7 +32,11 @@ export function CreateView(): JSX.Element {
       >
         {/* An identified modpack file reopens the card in its setup mode. */}
         <CreateCard
-          key={createModpack.value ? `${createModpack.value.canonical_id}:${createModpack.value.version_id}` : 'new'}
+          key={
+            createModpack.value
+              ? `${createModpack.value.canonical_id}:${createModpack.value.version_id}`
+              : (createQuick.value?.selectionId ?? 'new')
+          }
         />
       </ModalContent>
     </Modal>
@@ -105,7 +109,7 @@ function CreateCard(): JSX.Element {
   const { pack, draft, identity, versions } = form;
   const [versionsOpen, setVersionsOpen] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
-  const filterRef = useRef<HTMLInputElement | null>(null);
+  const versionRef = useRef<HTMLInputElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const packFile = useModpackFileImport(rootRef, !pack);
 
@@ -124,7 +128,7 @@ function CreateCard(): JSX.Element {
       if (e.key === '/' && !inField && !pack) {
         e.preventDefault();
         setVersionsOpen(true);
-        requestAnimationFrame(() => filterRef.current?.focus());
+        versionRef.current?.focus();
       }
     };
     window.addEventListener('keydown', handler);
@@ -162,16 +166,16 @@ function CreateCard(): JSX.Element {
         <span class="cp-cr-key cp-cr-key--top">Minecraft</span>
         {pack ? (
           <div class="cp-select-trigger cp-cr-locked">
-            <span class="cp-cr-mono">{pack.minecraft}</span>
+            <span class="cp-cr-version">{pack.minecraft}</span>
           </div>
         ) : (
           <VersionPicker
             versions={versions}
-            sourceKey={form.source.key}
             draft={draft}
             open={versionsOpen}
             onOpenChange={setVersionsOpen}
-            filterRef={filterRef}
+            inputRef={versionRef}
+            onCreate={() => void form.submit()}
           />
         )}
 
@@ -213,7 +217,6 @@ function CreateCard(): JSX.Element {
           busy={form.submitting}
           disabled={!form.canCreate}
           sound="affirm"
-          trailing={<Kbd>↵</Kbd>}
           onClick={() => void form.submit()}
         >
           {pack ? 'Create and install' : 'Create instance'}

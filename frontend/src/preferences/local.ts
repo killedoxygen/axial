@@ -9,6 +9,7 @@ export function defaultLocalPreferences(): LocalPrefs {
     theme: 'obsidian', customHue: 140, customVibrancy: 100, lightness: 0,
     sounds: true, hideSkinNametag: false, selectedSkin: '', selectedSkinsByAccount: {},
     shortcuts: {}, overlayPositions: {}, lastUpdateCheckAt: '', dismissedUpdateVersion: '',
+    habits: {}, quietCautions: [],
   };
 }
 
@@ -90,6 +91,16 @@ export function parseLocalPreferences(value: unknown): LocalPrefs {
   if (data.selectedSkinsByAccount !== undefined) result.selectedSkinsByAccount = mapped(data.selectedSkinsByAccount, (entry) => text(entry));
   if (data.shortcuts !== undefined) result.shortcuts = mapped(data.shortcuts, shortcut);
   if (data.overlayPositions !== undefined) result.overlayPositions = mapped(data.overlayPositions, position);
+  if (data.habits !== undefined) {
+    result.habits = mapped(data.habits, (entry) => {
+      const count = number(entry, 0, 0xffff_ffff);
+      return Number.isInteger(count) ? count : invalid();
+    });
+  }
+  if (data.quietCautions !== undefined) {
+    if (!Array.isArray(data.quietCautions) || data.quietCautions.length > 4096) invalid();
+    result.quietCautions = [...new Set(data.quietCautions.map((entry: unknown) => text(entry, 128)))].sort();
+  }
   return result;
 }
 

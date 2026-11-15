@@ -1,7 +1,10 @@
 //! Profile-scoped interface preferences. Their revision is independent of the
 //! launch/configuration fence, and their payload never enters ConfigView's watch.
 
-use std::{collections::BTreeMap, io};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use ts_rs::TS;
@@ -94,6 +97,10 @@ pub struct LocalPreferences {
     pub overlay_positions: BTreeMap<String, OverlayPosition>,
     pub last_update_check_at: String,
     pub dismissed_update_version: String,
+    /// How often the user has done each counted thing.
+    pub habits: BTreeMap<String, u32>,
+    /// Cautions the user asked not to be shown again.
+    pub quiet_cautions: BTreeSet<String>,
 }
 
 impl Default for LocalPreferences {
@@ -111,6 +118,8 @@ impl Default for LocalPreferences {
             overlay_positions: BTreeMap::new(),
             last_update_check_at: String::new(),
             dismissed_update_version: String::new(),
+            habits: BTreeMap::new(),
+            quiet_cautions: BTreeSet::new(),
         }
     }
 }
@@ -316,6 +325,13 @@ impl LocalPreferences {
                 number(scale, 0.0, 1.0)?;
             }
         }
+        keys(&self.habits)?;
+        if self.quiet_cautions.len() > MAX_ENTRIES {
+            return Err(invalid());
+        }
+        for id in &self.quiet_cautions {
+            text(id, 128)?;
+        }
         Ok(())
     }
 }
@@ -406,7 +422,8 @@ mod tests {
                 "selectedSkinsByAccount":{"account:fallback":"default:alex"},
                 "shortcuts":{"launch":{"key":"K","ctrl":true,"shift":false}},
                 "overlayPositions":{"music":{"x":-12.5,"y":16.25,"scaleX":0.125,"scaleY":1.0}},
-                "lastUpdateCheckAt":"2026-09-27T00:00:00Z", "dismissedUpdateVersion":"1.2.3"
+                "lastUpdateCheckAt":"2026-09-27T00:00:00Z", "dismissedUpdateVersion":"1.2.3",
+                "habits":{"create.quick":3}, "quietCautions":["create.enter-creates"]
             },
             "route":{"name":"content","id":"project","target":"instance"}
         }))
@@ -655,7 +672,12 @@ mod tests {
         let value = envelope();
         value.validate().unwrap();
         let encoded = serde_json::to_value(&value).unwrap();
-        assert_eq!(encoded["preferences"].as_object().unwrap().len(), 12);
+        assert_eq!(encoded["preferences"].as_object().unwrap().len(), 14);
+        assert_eq!(encoded["preferences"]["habits"], json!({"create.quick":3}));
+        assert_eq!(
+            encoded["preferences"]["quietCautions"],
+            json!(["create.enter-creates"])
+        );
         assert_eq!(encoded["preferences"]["customHue"], json!(215.125));
         assert_eq!(
             encoded["preferences"]["overlayPositions"]["music"]["scaleX"],

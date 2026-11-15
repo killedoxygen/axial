@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
-import { LOADER_LABELS, LOADER_TAGLINES } from './defaults';
+import { LOADER_LABELS, LOADER_TAGLINES } from '../../create/defaults';
 import { LoaderLogo } from './loader-logos';
-import { loaderKeyFromSourceId, type CreateForm } from './use-create-form';
+import { loaderKeyFromSourceId } from '../../create/versions';
+import type { CreateForm } from './use-create-form';
 
 /** One logo tile per loader, the chosen one named once beside them. A modpack fixes the loader, so its tiles stand down. */
 export function LoaderTiles({ form }: { form: CreateForm }): JSX.Element {

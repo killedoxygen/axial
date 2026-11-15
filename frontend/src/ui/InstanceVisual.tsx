@@ -3,7 +3,7 @@ import { versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
 import { hashStr } from '../tokens';
 import { useTheme } from '../hooks/use-theme';
-import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../views/create/defaults';
+import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../create/defaults';
 import { loaderLogoSrc } from '../views/create/loader-logos';
 import { resolveTileHue } from './look-guardian';
 import type { Theme } from '../tokens';

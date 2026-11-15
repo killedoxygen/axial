@@ -1,8 +1,8 @@
-import type { LoaderComponentId } from '../../types-loader';
-import type { CreateNotice } from '../../create-presenters';
-import type { CreateLoaderBuildsView as CreateLoaderBuildsResponse } from '../../generated/CreateLoaderBuildsView';
+import type { LoaderComponentId } from '../types-loader';
+import type { CreateNotice } from '../create-presenters';
+import type { CreateLoaderBuildsView as CreateLoaderBuildsResponse } from '../generated/CreateLoaderBuildsView';
 import type { Channel } from './defaults';
-import { dtoArray, dtoBoolean, dtoEnum, dtoNumber, dtoOptionalString, dtoRecord, dtoString } from '../../dto-contract';
+import { dtoArray, dtoBoolean, dtoEnum, dtoNumber, dtoOptionalString, dtoRecord, dtoString } from '../dto-contract';
 
 export type CreateSourceId = 'vanilla' | LoaderComponentId;
 export type { CreateLoaderBuildsResponse };

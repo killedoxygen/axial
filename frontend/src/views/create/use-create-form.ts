@@ -3,7 +3,8 @@ import { nextArtSeed } from '../../ui/InstanceVisual';
 import { harmoniousTilePalette, seedForTileHue } from '../../ui/look-guardian';
 import { useTheme } from '../../hooks/use-theme';
 import { config, systemInfo } from '../../store';
-import { closeCreate, createDraft, createModpack, type CreateDraftItem } from '../../ui-state';
+import { closeCreate, createDraft, createModpack, createQuick, type CreateDraftItem } from '../../ui-state';
+import { firstTime, habit, noteHabit } from '../../habits';
 import { api } from '../../api';
 import { contentCompatibility, planInstanceSetup } from '../../content';
 import { toast } from '../../toast';
@@ -22,16 +23,17 @@ import {
   type ScreenSize,
   type WindowPresetSpec,
 } from '../../ui/screen-presets';
+import { defaultIconFor, defaultNameFor, LOADER_LABELS, type Channel, type LoaderKey } from '../../create/defaults';
+import { cachedView, fetchView, storeView } from '../../create/catalog';
+import { useVersionSearch } from '../../create/find';
 import {
-  defaultIconFor,
-  defaultNameFor,
-  LOADER_COMPONENT_IDS,
-  LOADER_LABELS,
-  loaderKeyFromComponentId,
-  type Channel,
-  type LoaderKey,
-} from './defaults';
-import { CHANNEL_ORDER, type VersionDownloadState, type VersionRowModel } from './view-model';
+  CHANNEL_ORDER,
+  loaderKeyFromSourceId,
+  normalizeChannel,
+  sourceIdFromLoaderKey,
+  versionRow,
+  type VersionRowModel,
+} from '../../create/versions';
 import {
   createBackendViewResponse,
   createLoaderBuildsResponse,
@@ -42,37 +44,15 @@ import {
   type CreatePresetOption,
   type CreateSourceId,
   type CreateVersionRow,
-} from './contract';
+} from '../../create/contract';
 
-/* Last good create-view response per source, kept across dialog opens so the
-   version list renders immediately while a fresh copy loads in the background. */
-const createViewCache = new Map<CreateSourceId, CreateBackendViewResponse>();
-
-export function loaderKeyFromSourceId(sourceId: CreateSourceId): LoaderKey {
-  if (sourceId === 'vanilla') return 'vanilla';
-  return loaderKeyFromComponentId(sourceId);
-}
-
-function sourceIdFromLoaderKey(loader: LoaderKey): CreateSourceId {
-  return loader === 'vanilla' ? 'vanilla' : LOADER_COMPONENT_IDS[loader];
-}
+/* A search lists its closest matches, not every version that contains a digit. */
+const SEARCH_LIMIT = 40;
 
 function loaderKeyFromWire(value: string | null | undefined): LoaderKey {
   if (!value || value === 'vanilla') return 'vanilla';
   if (value === 'fabric' || value === 'quilt' || value === 'forge' || value === 'neoforge') return value;
   throw new Error('Create loader response was invalid.');
-}
-
-function normalizeChannel(value: string | undefined): Channel {
-  return CHANNEL_ORDER.includes(value as Channel) ? (value as Channel) : 'unknown';
-}
-
-function normalizeDownloadState(value: string | undefined): VersionDownloadState {
-  return value === 'base' || value === 'full' ? value : 'none';
-}
-
-function rowSearchText(row: VersionRowModel): string {
-  return [row.id, row.displayName, row.hint ?? '', row.tags.map((tag) => tag.label).join(' ')].join(' ').toLowerCase();
 }
 
 /** The create form's one state owner: source, version, identity, options, staged picks and submission. */
@@ -82,18 +62,26 @@ export function useCreateForm() {
   // Picks alone choose their loader and version; with a pack they follow the pack's.
   const openDraft = pack ? null : draft;
   const theme = useTheme();
-  const [sourceId, setSourceId] = useState<CreateSourceId>('vanilla');
-  const [selectedSelectionId, setSelectedSelectionId] = useState<string | null>(null);
-  const [channel, setChannel] = useState<Channel>('release');
+  // Opened on a version found elsewhere: the form starts on it and creates it once its defaults are in.
+  const [quick] = useState(() => (pack || draft ? null : createQuick.value));
+  const [sourceId, setSourceId] = useState<CreateSourceId>(quick?.sourceId ?? 'vanilla');
+  const [selectedSelectionId, setSelectedSelectionId] = useState<string | null>(quick?.selectionId ?? null);
+  const [channel, setChannel] = useState<Channel>(quick?.channel ?? 'release');
   const [query, setQuery] = useState('');
   const [nameOverride, setNameOverride] = useState<string | null>(null);
   const [viewError, setViewError] = useState<string | null>(null);
   const [viewLoading, setViewLoading] = useState(Boolean(openDraft));
-  const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(null);
+  const [backendView, setBackendView] = useState<CreateBackendViewResponse | null>(() =>
+    openDraft ? null : cachedView(sourceId),
+  );
+  // The loader whose view's defaults the form now holds.
+  const [appliedSource, setAppliedSource] = useState<CreateSourceId | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // The selection Enter asked to create, held until its loader builds arrive.
+  const [queuedCreate, setQueuedCreate] = useState<string | null>(quick?.selectionId ?? null);
   const submittingRef = useRef(false);
   const loadRequestRef = useRef(0);
-  const loadedCreateViewSourceRef = useRef<string | null>(null);
+  const loadedCreateViewSourceRef = useRef<CreateSourceId | null>(null);
   const sourceKey = loaderKeyFromSourceId(sourceId);
 
   const totalGB = systemInfo.value?.total_memory_mb ? Math.floor(systemInfo.value.total_memory_mb / 1024) : 16;
@@ -176,8 +164,13 @@ export function useCreateForm() {
     }
   }, [windowPresets, windowPresetId]);
 
-  const applyCreateView = (source: string, res: CreateBackendViewResponse, applyMutableDefaults = true): void => {
+  const applyCreateView = (
+    source: CreateSourceId,
+    res: CreateBackendViewResponse,
+    applyMutableDefaults = true,
+  ): void => {
     loadedCreateViewSourceRef.current = source;
+    setAppliedSource(source);
     setBackendView(res);
     const options = res.preset_options;
     setPresetOptions(options);
@@ -229,22 +222,19 @@ export function useCreateForm() {
     const requestId = loadRequestRef.current + 1;
     loadRequestRef.current = requestId;
     if (providedView) {
-      createViewCache.set(source, providedView);
+      storeView(source, providedView);
       applyCreateView(source, providedView);
       setViewLoading(false);
       setViewError(null);
       return;
     }
-    const cached = createViewCache.get(source);
+    const cached = cachedView(source);
     if (cached) applyCreateView(source, cached);
     setViewLoading(!cached);
     setViewError(null);
     try {
-      const res = createBackendViewResponse(
-        await api('GET', `/instances/create-view?source=${encodeURIComponent(source)}`),
-      );
+      const res = await fetchView(source);
       if (requestId !== loadRequestRef.current) return;
-      createViewCache.set(source, res);
       applyCreateView(source, res, !cached);
     } catch (err: unknown) {
       if (requestId !== loadRequestRef.current) return;
@@ -285,21 +275,27 @@ export function useCreateForm() {
     [backendRows, sourceId],
   );
 
-  const compatibleForSource = useMemo(() => {
-    if (!openDraft || !draftCandidates) return availableForSource;
-    return availableForSource.filter((row) =>
-      draftCandidates.some(
+  // Staged picks narrow every loader's versions to the ones they all support.
+  const draftAllows = useMemo(() => {
+    if (!openDraft || !draftCandidates) return () => true;
+    return (row: CreateVersionRow) => {
+      const loader = loaderKeyFromSourceId(row.source_id);
+      return draftCandidates.some(
         (candidate) =>
-          loaderKeyFromWire(candidate.loader) === sourceKey && candidate.game_version === row.minecraft_version_id,
-      ),
-    );
-  }, [availableForSource, openDraft, draftCandidates, sourceKey]);
+          loaderKeyFromWire(candidate.loader) === loader && candidate.game_version === row.minecraft_version_id,
+      );
+    };
+  }, [openDraft, draftCandidates]);
 
-  const availableChannels = useMemo<Channel[]>(() => {
-    const has: Record<Channel, boolean> = { release: false, snapshot: false, legacy: false, unknown: false };
-    for (const row of compatibleForSource) has[normalizeChannel(row.channel)] = true;
-    return CHANNEL_ORDER.filter((c) => has[c]);
-  }, [compatibleForSource]);
+  const sourceRows = useMemo<VersionRowModel[]>(
+    () => availableForSource.filter(draftAllows).map(versionRow),
+    [availableForSource, draftAllows],
+  );
+
+  const availableChannels = useMemo<Channel[]>(
+    () => CHANNEL_ORDER.filter((channel) => sourceRows.some((row) => row.channel === channel)),
+    [sourceRows],
+  );
 
   useEffect(() => {
     if (availableChannels.length === 0) return;
@@ -307,25 +303,16 @@ export function useCreateForm() {
     setChannel(availableChannels[0]!);
   }, [availableChannels, channel]);
 
-  const versionRows: VersionRowModel[] = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return compatibleForSource
-      .map((row) => ({
-        id: row.minecraft_version_id,
-        selectionId: row.selection_id,
-        displayName: row.display_name,
-        hint: row.hint ?? null,
-        channel: normalizeChannel(row.channel),
-        tags: row.tags,
-        downloadState: normalizeDownloadState(row.download_state),
-        createEnabled: row.create_enabled,
-        disabledReason: row.disabled_reason ?? null,
-      }))
-      .filter((row) => row.channel === channel)
-      .filter((row) => !q || rowSearchText(row).includes(q));
-  }, [channel, query, compatibleForSource]);
+  // A search reaches every channel, and the loader its letters name.
+  const found = useVersionSearch(query, {
+    source: sourceId,
+    allows: draftAllows,
+    offers: (loader) => !draftLoaders || draftLoaders.has(loader),
+    limit: SEARCH_LIMIT,
+  });
+  const versionRows = found ? found.rows : sourceRows.filter((row) => row.channel === channel);
   const selectedVersionRow = selectedSelectionId
-    ? (versionRows.find((row) => row.selectionId === selectedSelectionId) ?? null)
+    ? (sourceRows.find((row) => row.selectionId === selectedSelectionId) ?? null)
     : null;
   const mcVersionId = pack ? pack.minecraft : (selectedVersionRow?.id ?? null);
   const identityKey = pack ? loaderKeyFromWire(pack.loader) : sourceKey;
@@ -337,7 +324,11 @@ export function useCreateForm() {
       backendTabs.length > 0
         ? [...backendTabs, ...availableChannels.filter((c) => !backendTabs.includes(c))]
         : availableChannels;
-    return tabs.filter((value, index, values) => values.indexOf(value) === index);
+    // Unclassified versions get a tab only where there are some.
+    return tabs.filter(
+      (value, index, values) =>
+        values.indexOf(value) === index && (value !== 'unknown' || availableChannels.includes(value)),
+    );
   }, [channelOptions, availableChannels]);
 
   useEffect(() => {
@@ -346,12 +337,13 @@ export function useCreateForm() {
     if (!best) return;
     const bestKey = loaderKeyFromWire(best.loader);
     if (sourceKey !== bestKey) return;
-    const row = versionRows.find((entry) => entry.id === best.game_version && entry.createEnabled);
+    const row = sourceRows.find((entry) => entry.id === best.game_version && entry.createEnabled);
     if (row) {
       setSelectedSelectionId(row.selectionId);
+      setChannel(row.channel);
       setDraftAutoPicked(true);
     }
-  }, [openDraft, draftCandidates, draftAutoPicked, sourceKey, versionRows]);
+  }, [openDraft, draftCandidates, draftAutoPicked, sourceKey, sourceRows]);
 
   const draftCandidate = openDraft && selectedVersionRow ? draftCandidateFor(sourceKey, selectedVersionRow.id) : null;
   // With a pack the picks were already checked against its loader and version, where they were staged.
@@ -398,9 +390,9 @@ export function useCreateForm() {
 
   useEffect(() => {
     if (!selectedSelectionId) return;
-    if (versionRows.some((row) => row.selectionId === selectedSelectionId)) return;
+    if (sourceRows.some((row) => row.selectionId === selectedSelectionId)) return;
     setSelectedSelectionId(null);
-  }, [versionRows, selectedSelectionId]);
+  }, [sourceRows, selectedSelectionId]);
 
   const draftReady = picked ? Boolean(packDrops) : !openDraft || draftCandidates !== null;
   const versionReady = (pack ? true : Boolean(selectionId && selectedVersionRow?.createEnabled === true)) && draftReady;
@@ -464,7 +456,7 @@ export function useCreateForm() {
   const presetOption =
     presetOptions.find((option) => option.id === jvmPreset) ?? presetOptions.find((option) => option.default) ?? null;
 
-  const submit = async (): Promise<void> => {
+  const submit = async (quickly = false): Promise<void> => {
     if (submittingRef.current || !canCreate) return;
     const trimmed = name.trim();
     if (!trimmed || !createSelectionId) return;
@@ -517,6 +509,18 @@ export function useCreateForm() {
         },
       });
       if (!result.ok) return;
+      if (!pack && !draft) {
+        if (quickly) noteHabit('create.quick');
+        else {
+          noteHabit('create.by-hand');
+          // Said once, to someone who keeps making instances the long way.
+          if (habit('create.by-hand') >= 3 && habit('create.quick') === 0 && firstTime('tip.quick-create')) {
+            toast('Tip: type "forge 1.13.1" in the Minecraft field and press Enter to create it.', 'info', {
+              duration: 12_000,
+            });
+          }
+        }
+      }
       if (result.instance) {
         const held = pack && draft ? await addPicksTo(result.instance.id, draft, draftDropped) : [];
         unstageAll([
@@ -530,6 +534,35 @@ export function useCreateForm() {
       setSubmitting(false);
     }
   };
+
+  const chooseVersion = (row: VersionRowModel): void => {
+    if (row.sourceId !== sourceId) {
+      // Found through search, so its view is cached: apply it with the switch, leaving no render without rows.
+      const view = cachedView(row.sourceId);
+      if (view) applyCreateView(row.sourceId, view, false);
+      setSourceId(row.sourceId);
+    }
+    // Another version's builds are fetched afresh; their failure no longer speaks for this one.
+    if (row.sourceId !== sourceId || row.id !== mcVersionId) setLoaderBuildsError(null);
+    setSelectedSelectionId(row.selectionId);
+    setChannel(row.channel);
+    setQuery('');
+  };
+
+  const awaitingCreate =
+    viewLoading ||
+    !draftReady ||
+    (sourceKey !== 'vanilla' && mcVersionId != null && !currentLoaderBuilds && !loaderBuildsError);
+  useEffect(() => {
+    if (!queuedCreate) return;
+    if (queuedCreate !== selectedSelectionId) setQueuedCreate(null);
+    else if (appliedSource !== sourceId) return;
+    else if (canCreate) {
+      setQueuedCreate(null);
+      void submit(true);
+    } else if (!awaitingCreate) setQueuedCreate(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queuedCreate, selectedSelectionId, appliedSource, canCreate, awaitingCreate]);
 
   return {
     pack,
@@ -551,9 +584,21 @@ export function useCreateForm() {
     versions: {
       rows: versionRows,
       selected: selectedVersionRow,
-      choose: setSelectedSelectionId,
+      choose: chooseVersion,
+      /** Choose it and create as soon as it can be. */
+      create: (row: VersionRowModel) => {
+        chooseVersion(row);
+        setQueuedCreate(row.selectionId);
+      },
       query,
       setQuery,
+      searching: found !== null,
+      /** The loaders named are still being listed, so the top match may yet change. */
+      searchPending: found?.pending ?? false,
+      /** The search named a loader, which nobody types by accident. */
+      loaderNamed: found?.loader != null,
+      /** Rows come from more than the chosen loader and say which one they are. */
+      acrossLoaders: versionRows.some((row) => row.sourceId !== sourceId),
       channel,
       setChannel,
       channelTabs,
@@ -562,7 +607,7 @@ export function useCreateForm() {
       error: viewError,
       reload: () => void loadCreateView(),
       compatibility: (row: VersionRowModel) =>
-        openDraft && draftCandidates ? draftCandidateFor(sourceKey, row.id) : null,
+        openDraft && draftCandidates ? draftCandidateFor(loaderKeyFromSourceId(row.sourceId), row.id) : null,
     },
     loaderBuild: {
       shown: !pack && sourceKey !== 'vanilla' && mcVersionId != null,
@@ -609,7 +654,7 @@ export function useCreateForm() {
     },
     notices,
     canCreate,
-    submitting,
+    submitting: submitting || queuedCreate !== null,
     submit,
   };
 }

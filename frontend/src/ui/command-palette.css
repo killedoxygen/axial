@@ -170,3 +170,8 @@
   width: 18px;
   padding: 0;
 }
+/* A loader's mark leads the instance it would make. */
+.cp-cmd-loader {
+  background-color: currentColor;
+  mask: var(--cp-loader-src) center / contain no-repeat;
+}

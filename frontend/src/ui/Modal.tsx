@@ -46,7 +46,8 @@ function ModalContent({
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const panel = panelRef.current;
-    const autofocus = panel?.querySelector<HTMLElement>('[data-autofocus], input, button');
+    const autofocus =
+      panel?.querySelector<HTMLElement>('[data-autofocus]') ?? panel?.querySelector<HTMLElement>('input, button');
     if (!dialogOpen.value) (autofocus ?? panel)?.focus();
 
     const onKeyDown = (e: KeyboardEvent): void => {
@@ -57,20 +58,26 @@ function ModalContent({
         return;
       }
       if (e.key === 'Tab' && panel) {
-        const focusable = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-          (el) => el.offsetParent !== null || el === document.activeElement,
-        );
-        if (focusable.length === 0) return;
-        const first = focusable[0]!;
-        const last = focusable[focusable.length - 1]!;
+        // Notices offering an action stay reachable from the dialog: the panel and they take turns in one cycle.
+        const groups = [panel, ...document.querySelectorAll<HTMLElement>('[data-modal-reachable]')]
+          .map((scope) => ({
+            scope,
+            items: Array.from(scope.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+              (el) => !el.closest('[data-leaving]') && (el.offsetParent !== null || el === document.activeElement),
+            ),
+          }))
+          .filter((group) => group.items.length > 0);
+        if (groups.length === 0) return;
         const active = document.activeElement;
-        if (e.shiftKey && (active === first || active === panel)) {
+        const at = groups.findIndex((group) => group.scope.contains(active));
+        const step = (to: number): void => {
           e.preventDefault();
-          last.focus();
-        } else if (!e.shiftKey && active === last) {
-          e.preventDefault();
-          first.focus();
-        }
+          const { items } = groups[(to + groups.length) % groups.length]!;
+          (e.shiftKey ? items[items.length - 1]! : items[0]!).focus();
+        };
+        if (at === -1) step(e.shiftKey ? -1 : 0);
+        else if (e.shiftKey && (active === panel || active === groups[at]!.items[0])) step(at - 1);
+        else if (!e.shiftKey && active === groups[at]!.items[groups[at]!.items.length - 1]) step(at + 1);
       }
     };
     document.addEventListener('keydown', onKeyDown);

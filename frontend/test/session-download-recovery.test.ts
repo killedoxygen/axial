@@ -1598,7 +1598,7 @@ test('Downloads renders loader labels and Minecraft versions while retaining que
     '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile' },
     '../../ui-state': { navigate() {}, openCreate() {} },
     '../discover/shared': { KIND_ICON: {} },
-    '../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
+    '../../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
     '../create/loader-logos': { LoaderLogo: 'LoaderLogo' },
     '../../install-item': source<typeof import('../src/install-item')>('install-item.ts'),
     '../../hooks/use-now': { useNowTicker: () => 0 },

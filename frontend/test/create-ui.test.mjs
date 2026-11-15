@@ -37,8 +37,9 @@ const bundled = await build({
     contents: `
       export * from './src/instance-create';
       export * from './src/create-presenters';
-      export * from './src/views/create/contract';
-      export * from './src/views/create/view-model';
+      export * from './src/create/contract';
+      export * from './src/create/versions';
+      export * from './src/create/search';
       export * from 'create-test-seam';
     `,
     resolveDir: frontend,
@@ -70,7 +71,8 @@ const bundled = await build({
 });
 /**
  * @typedef {typeof import('../src/instance-create') & typeof import('../src/create-presenters') &
- * typeof import('../src/views/create/contract') & typeof import('../src/views/create/view-model') & {
+ * typeof import('../src/create/contract') & typeof import('../src/create/versions') &
+ * typeof import('../src/create/search') & {
  * arrange: (response: unknown, failure?: unknown, streamFailure?: unknown) => void,
  * requests: Parameters<typeof import('../src/api').api>[],
  * added: Parameters<typeof import('../src/actions').addInstance>[0][],
@@ -420,7 +422,7 @@ test('actual lifecycle create response opens on Release and retains Snapshot, Le
   );
   assert.deepEqual(
     ui.CHANNEL_ORDER.map((channel) => ui.CHANNEL_LABEL[channel]),
-    ['Release', 'Snapshot', 'Legacy', 'Unknown'],
+    ['Release', 'Snapshot', 'Legacy', 'Other'],
   );
 });
 
@@ -531,10 +533,10 @@ test('loader options bind exact source and Minecraft identity and preserve opaqu
 
 test('loader choice uses backend Automatic, rejects disabled pins and discards stale target pins', () => {
   const parsed = ui.createLoaderBuildsResponse(builds());
-  /** @type {import('../src/views/create/contract').CreateSourceId} */
+  /** @type {import('../src/create/contract').CreateSourceId} */
   const parsedSource = 'net.fabricmc.fabric-loader';
   assert.equal(parsed.source_id, parsedSource);
-  /** @param {string | null} choice @param {import('../src/views/create/contract').CreateSourceId} [source] */
+  /** @param {string | null} choice @param {import('../src/create/contract').CreateSourceId} [source] */
   const select = (choice, source = parsedSource, minecraft = parsed.minecraft_version_id) =>
     ui.createLoaderSelection(parsed, source, minecraft, 'row-auto', choice);
   assert.equal(select(null), 'backend-auto+opaque');
@@ -609,4 +611,70 @@ test('stale preferred build requires explicitly choosing the available older ins
   assert.equal(select(parsed.builds[0].selection_id), '');
   assert.equal(select(parsed.builds[1].selection_id), parsed.builds[1].selection_id);
   assert.equal(select(null), '');
+});
+
+/**
+ * @param {import('../src/create/contract').CreateSourceId} sourceId
+ * @param {string} id
+ * @param {import('../src/create/defaults').Channel} channel
+ */
+function searchRow(sourceId, id, channel = 'release') {
+  return /** @type {import('../src/create/versions').VersionRowModel} */ ({
+    id,
+    sourceId,
+    selectionId: `${sourceId}|${id}`,
+    displayName: id,
+    hint: null,
+    channel,
+    tags: [],
+    downloadState: 'none',
+    createEnabled: true,
+    disabledReason: null,
+  });
+}
+
+test('a typed loader and version resolve to the loader that has that version', () => {
+  /** @type {import('../src/create/defaults').LoaderKey[]} */
+  const offered = ['vanilla', 'fabric', 'quilt', 'forge', 'neoforge'];
+  assert.deepEqual(ui.parseVersionQuery('f1131', offered), { loader: 'forge', version: '1131' });
+  assert.deepEqual(ui.parseVersionQuery('fa1211', offered), { loader: 'fabric', version: '1211' });
+  assert.deepEqual(ui.parseVersionQuery('n1211', offered), { loader: 'neoforge', version: '1211' });
+  assert.deepEqual(ui.parseVersionQuery(' Forge 1.13.1 ', offered), { loader: 'forge', version: '1.13.1' });
+  assert.deepEqual(ui.parseVersionQuery('1.13.1 fo', offered), { loader: 'forge', version: '1.13.1' });
+  assert.deepEqual(ui.parseVersionQuery('b1.7.3', offered), { loader: null, version: 'b1.7.3' });
+  assert.deepEqual(ui.parseVersionQuery('1.21 pre', offered), { loader: null, version: '1.21 pre' });
+  assert.deepEqual(ui.parseVersionQuery('f1131', ['vanilla']), { loader: null, version: 'f1131' });
+
+  const rows = [
+    ...['1.21.11', '1.21.1', '1.14.4'].map((id) => searchRow('net.fabricmc.fabric-loader', id)),
+    ...['1.21.1', '1.13.2', '1.13.1', '1.1'].map((id) => searchRow('net.minecraftforge', id)),
+  ];
+  assert.equal(ui.rankVersions(rows, '1131')[0].selectionId, 'net.minecraftforge|1.13.1');
+  assert.deepEqual(
+    ui.rankVersions(rows, '1211').map((row) => row.selectionId),
+    ['net.fabricmc.fabric-loader|1.21.1', 'net.minecraftforge|1.21.1', 'net.fabricmc.fabric-loader|1.21.11'],
+  );
+});
+
+test('version search reaches every channel and keeps releases ahead of equal matches', () => {
+  const rows = [
+    searchRow('vanilla', '1.21.5-rc1', 'snapshot'),
+    searchRow('vanilla', '1.21.5'),
+    searchRow('vanilla', '1.21'),
+    searchRow('vanilla', '25w14a', 'snapshot'),
+    searchRow('vanilla', '1.2.1', 'legacy'),
+  ];
+  assert.deepEqual(
+    ui.rankVersions(rows, '1.21').map((row) => row.id),
+    ['1.21', '1.21.5', '1.21.5-rc1'],
+  );
+  assert.deepEqual(
+    ui.rankVersions(rows, '121').map((row) => row.id),
+    ['1.21', '1.2.1', '1.21.5', '1.21.5-rc1'],
+  );
+  assert.deepEqual(
+    ui.rankVersions(rows, '25w').map((row) => row.id),
+    ['25w14a'],
+  );
+  assert.equal(ui.rankVersions(rows, '').length, rows.length);
 });

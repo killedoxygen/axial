@@ -3,7 +3,7 @@ import { createInstance } from '../../instance-create';
 import { config } from '../../store';
 import type { ModpackTarget } from '../../types-content';
 import { navigate, openCreateDraft, openCreateModpack } from '../../ui-state';
-import { defaultIconFor, type LoaderKey } from '../create/defaults';
+import { defaultIconFor, type LoaderKey } from '../../create/defaults';
 import { commitInstall } from './actions';
 import type { Fit } from './fit';
 import { selectionOf, unstageAll, type TrayItem } from './state';

@@ -12,7 +12,7 @@ import { InstanceGlyph, type VisualInstance } from '../src/ui/InstanceVisual';
 import { Logo } from '../src/ui/Logo';
 import { MicrosoftMark } from '../src/ui/MicrosoftMark';
 import * as skinThree from '../src/views/accounts/three';
-import { LOADER_LABELS, type LoaderKey } from '../src/views/create/defaults';
+import { LOADER_LABELS, type LoaderKey } from '../src/create/defaults';
 import { LoaderLogo, loaderLogoSrc } from '../src/views/create/loader-logos';
 
 type LooseProps = Record<string, any>;

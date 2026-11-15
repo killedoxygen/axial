@@ -113,7 +113,7 @@ function harness() {
     '../../ui/InstanceVisual': { InstanceTile: 'InstanceTile' },
     '../../ui-state': { navigate() {}, openCreate() {} },
     '../discover/shared': { KIND_ICON: {} },
-    '../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
+    '../../create/defaults': { loaderKeyFromComponentId: () => 'fabric' },
     '../create/loader-logos': { LoaderLogo: 'LoaderLogo' },
     '../../install-item': installItems,
     '../../hooks/use-now': { useNowTicker: () => 0 }, '../../machines/downloads': machine,

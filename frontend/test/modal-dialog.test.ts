@@ -119,6 +119,7 @@ function hooks() {
 
 class Element {
   inert = false;
+  leaving = false;
   disabled = false;
   slot = '';
   tabIndex = 0;
@@ -137,6 +138,7 @@ class Element {
   matches(selector: string): boolean {
     if (selector === ':disabled') return this.disabled;
     if (selector === '[inert]') return this.inert;
+    if (selector === '[data-leaving]') return this.leaving;
     if (selector === '[data-slot="modal-content"]') return this.slot === 'modal-content';
     throw new Error(`Unreviewed focus selector: ${selector}`);
   }
@@ -197,6 +199,7 @@ function harness(
       for (const listener of docListeners.get('focusin') ?? []) listener(event(undefined, target));
     });
   const body = element('body');
+  const reachable: Element[] = [];
   active = body;
   const panel = element('lightbox');
   const opener = element('Rename screenshot');
@@ -220,6 +223,10 @@ function harness(
     HTMLElement: Element,
     document: {
       body,
+      querySelectorAll(selector: string) {
+        assert.equal(selector, '[data-modal-reachable]');
+        return reachable;
+      },
       get activeElement() {
         return active;
       },
@@ -510,6 +517,7 @@ function harness(
     cancel,
     confirm,
     element,
+    reachable,
     render,
     sendKey,
     calls,
@@ -712,6 +720,35 @@ function submitScreenshotRename(h: ReturnType<typeof harness>) {
   h.draft('after.png');
   h.sendKey('Enter');
 }
+
+test('modal tab order reaches notice actions and skips notices that are leaving', () => {
+  const h = harness();
+  const notice = h.element('notice');
+  const proceed = h.element('Create anyway');
+  const dismiss = h.element('Dismiss');
+  notice.children = [proceed, dismiss];
+  for (const child of notice.children) child.parent = notice;
+  h.reachable.push(notice);
+  const last = h.panel.children[h.panel.children.length - 1]!;
+
+  last.focus();
+  h.sendKey('Tab');
+  assert.equal(h.active(), proceed);
+  h.sendKey('Tab', true);
+  assert.equal(h.active(), last);
+  dismiss.focus();
+  h.sendKey('Tab');
+  assert.equal(h.active(), h.opener);
+  h.sendKey('Tab', true);
+  assert.equal(h.active(), dismiss);
+
+  notice.leaving = true;
+  last.focus();
+  h.sendKey('Tab');
+  assert.equal(h.active(), h.opener);
+  h.sendKey('Tab', true);
+  assert.equal(h.active(), last);
+});
 
 for (const outcome of ['success', 'refusal'] as const) {
   test(`a slow screenshot rename ${outcome} retains modal keyboard focus while its invoker is disabled`, async () => {

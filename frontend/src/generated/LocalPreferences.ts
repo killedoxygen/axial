@@ -2,4 +2,12 @@
 import type { OverlayPosition } from "./OverlayPosition";
 import type { ShortcutBinding } from "./ShortcutBinding";
 
-export type LocalPreferences = { theme: string, customHue: number, customVibrancy: number, lightness: number, sounds: boolean, hideSkinNametag: boolean, selectedSkin: string, selectedSkinsByAccount: { [key in string]: string }, shortcuts: { [key in string]: ShortcutBinding }, overlayPositions: { [key in string]: OverlayPosition }, lastUpdateCheckAt: string, dismissedUpdateVersion: string, };
+export type LocalPreferences = { theme: string, customHue: number, customVibrancy: number, lightness: number, sounds: boolean, hideSkinNametag: boolean, selectedSkin: string, selectedSkinsByAccount: { [key in string]: string }, shortcuts: { [key in string]: ShortcutBinding }, overlayPositions: { [key in string]: OverlayPosition }, lastUpdateCheckAt: string, dismissedUpdateVersion: string, 
+/**
+ * How often the user has done each counted thing.
+ */
+habits: { [key in string]: number }, 
+/**
+ * Cautions the user asked not to be shown again.
+ */
+quietCautions: Array<string>, };

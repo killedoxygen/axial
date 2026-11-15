@@ -1,5 +1,5 @@
 import type { JSX } from 'preact';
-import type { LoaderKey } from './defaults';
+import type { LoaderKey } from '../../create/defaults';
 
 const LOADER_LOGO_SRC: Record<LoaderKey, string> = {
   vanilla: 'vanilla_icon.svg',

@@ -11,22 +11,28 @@ import { instances, launchSessions } from '../store';
 import { applyTheme } from '../theme';
 import type { EnrichedInstance } from '../types-instance';
 import type { LaunchSession } from '../types-launch';
-import { commandPaletteOpen, navigate, openAccountSwitcher, openCreate, type Route } from '../ui-state';
+import { commandPaletteOpen, navigate, openAccountSwitcher, openCreate, quickCreate, type Route } from '../ui-state';
+import { LOADER_LABELS, type LoaderKey } from '../create/defaults';
+import { useVersionSearch } from '../create/find';
+import { loaderKeyFromSourceId, type VersionRowModel } from '../create/versions';
+import { LoaderLogo } from '../views/create/loader-logos';
 import { Kbd, KeyLegend, Keys } from './Atoms';
 import { Face } from './Face';
 import { Icon, type IconName } from './Icons';
 import { InstanceFacts, SessionChip } from './InstanceFacts';
 import { InstanceTile } from './InstanceVisual';
 
-type Group = 'instance' | 'jump' | 'action';
+type Group = 'instance' | 'create' | 'jump' | 'action';
 
 const GROUPS: ReadonlyArray<{ id: Group; label: string; verb: string }> = [
   { id: 'instance', label: 'Instances', verb: 'Open' },
+  { id: 'create', label: 'New instance', verb: 'Create' },
   { id: 'jump', label: 'Jump to', verb: 'Open' },
   { id: 'action', label: 'Actions', verb: 'Run' },
 ];
 
 const INSTANCE_LIMIT = 12;
+const CREATE_LIMIT = 3;
 const LEGEND = [
   [['↑', '↓'], 'move'],
   [['↵'], 'select'],
@@ -39,6 +45,9 @@ interface Command {
   /** Matched with the label, never shown. */
   keywords?: string;
   icon?: IconName;
+  loader?: LoaderKey;
+  /** Found by its own search, so not matched against the text again. */
+  found?: boolean;
   instance?: EnrichedInstance;
   session?: LaunchSession;
   keys?: string[];
@@ -166,8 +175,24 @@ function buildCommands(): Command[] {
   ];
 }
 
+/** A version the typed text names, such as `f1131`, offered as the instance it would make. */
+function createCommand(version: VersionRowModel): Command {
+  const loader = loaderKeyFromSourceId(version.sourceId);
+  return {
+    id: `create:${version.selectionId}`,
+    group: 'create',
+    label: `${LOADER_LABELS[loader]} ${version.displayName}`,
+    loader,
+    found: true,
+    perform: () => {
+      quickCreate(version);
+      close();
+    },
+  };
+}
+
 function score(command: Command, query: string): number {
-  if (!query) return 1;
+  if (!query || command.found) return 1;
   const hay = `${command.label} ${command.keywords ?? ''}`.toLowerCase();
   if (hay.startsWith(query)) return 4;
   if (hay.includes(` ${query}`)) return 3;
@@ -223,6 +248,8 @@ function CommandRow({
       <span class="cp-cmd-lead">
         {instance ? (
           <InstanceTile inst={instance} />
+        ) : command.loader ? (
+          <LoaderLogo loader={command.loader} size={16} class="cp-cmd-loader" />
         ) : (
           command.icon && <Icon name={command.icon} size={16} stroke={1.8} />
         )}
@@ -257,8 +284,16 @@ export function CommandPalette(): JSX.Element | null {
   const leaving = useLeave<HTMLDivElement>();
   const drag = useDraggableOverlay<HTMLDivElement>({ id: 'command-center', enabled: open });
 
-  const commands = open ? buildCommands() : [];
-  const sections = useMemo(() => matchSections(commands, query), [commands, query]);
+  // Text with a version in it may name an instance to create; anything else is left to the commands.
+  const versions = useVersionSearch(open && /\d/.test(query) ? query : '', { source: 'vanilla', limit: CREATE_LIMIT });
+  const creatable = (versions?.rows ?? []).filter((version) => version.createEnabled);
+  const commands = open ? [...buildCommands(), ...creatable.map(createCommand)] : [];
+  const sections = useMemo(() => {
+    const matched = matchSections(commands, query);
+    // Text that names a loader is asking for that instance, ahead of whatever else it happens to resemble.
+    const create = versions?.loader ? matched.findIndex((section) => section.items[0]?.group === 'create') : -1;
+    return create > 0 ? [matched[create]!, ...matched.filter((_, index) => index !== create)] : matched;
+  }, [commands, query, versions?.loader]);
   const flat = sections.flatMap((section) => section.items);
   const active = flat.find((command) => command.id === activeId) ?? flat[0] ?? null;
 
