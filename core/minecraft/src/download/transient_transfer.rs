@@ -39,7 +39,6 @@ const MAX_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_RETRY_WINDOW: Duration = Duration::from_secs(2 * 60);
-pub const MAX_MANAGED_TRANSFER_BYTES: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferByteContract {
@@ -711,10 +710,6 @@ impl TransferReport {
         self.bytes
     }
 
-    pub fn declared_length(&self) -> Option<u64> {
-        self.declared_length
-    }
-
     pub fn digests(&self) -> &VerifiedTransferDigests {
         &self.digests
     }
@@ -888,10 +883,6 @@ impl PinnedTransferOrigin {
             }
         }
         Ok(Self { origin, addresses })
-    }
-
-    pub fn address_count(&self) -> usize {
-        self.addresses.len()
     }
 }
 
@@ -1073,22 +1064,6 @@ impl TransferClientConfig {
 
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
-    }
-
-    pub fn idle_read_timeout(&self) -> Duration {
-        self.idle_read_timeout
-    }
-
-    pub fn request_timeout(&self) -> Duration {
-        self.request_timeout
-    }
-
-    pub fn origin_count(&self) -> usize {
-        self.origins.len()
-    }
-
-    pub fn pinned_origin_count(&self) -> usize {
-        self.pinned_origins.len()
     }
 }
 
@@ -1851,11 +1826,6 @@ impl<T> fmt::Debug for TransferTask<T> {
 impl<T: Send + 'static> TransferTask<T> {
     pub fn cancel(&self) {
         self.cancellation.cancel();
-    }
-
-    pub async fn cancel_and_join(self) -> TransferOutcome<T> {
-        self.cancel();
-        self.join().await
     }
 
     pub async fn join(mut self) -> TransferOutcome<T> {
@@ -3252,12 +3222,11 @@ mod tests {
     #[test]
     fn pinned_public_origin_rejects_private_mismatched_and_duplicate_addresses() {
         let origin = || transfer_origin("https://downloads.example.com/file");
-        let pinned = PinnedTransferOrigin::public(
+        PinnedTransferOrigin::public(
             origin(),
             vec!["1.1.1.1:443".parse().expect("public socket address")],
         )
         .expect("public matching-port pin");
-        assert_eq!(pinned.address_count(), 1);
         for (addresses, error) in [
             (Vec::new(), PinnedTransferOriginError::MissingAddresses),
             (
@@ -3428,8 +3397,6 @@ mod tests {
         let config =
             TransferClientConfig::bounded_pinned_public(connect, idle_read, request, vec![pinned])
                 .expect("bounded pinned transport config");
-        assert_eq!(config.origin_count(), 1);
-        assert_eq!(config.pinned_origin_count(), 1);
         assert!(TransferClient::build(config).is_ok());
     }
 
@@ -3769,7 +3736,6 @@ mod tests {
         };
         assert_eq!(authority_drops.load(Ordering::SeqCst), 0);
         assert_eq!(source.report().bytes(), BODY.len() as u64);
-        assert_eq!(source.report().declared_length(), Some(BODY.len() as u64));
         let mut first = Vec::new();
         source.read_to_end(&mut first).expect("first read");
         assert_eq!(first, BODY);

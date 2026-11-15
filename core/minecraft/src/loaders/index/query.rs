@@ -1,4 +1,6 @@
-use super::cache::{resolve_cached, resolve_fresh_cached};
+use super::cache::resolve_cached;
+#[cfg(any(test, feature = "test-support"))]
+use super::cache::resolve_fresh_cached;
 use super::normalize::{normalize_build_index, normalize_supported_versions};
 use crate::loaders::api::{
     loader_components, parse_build_id, validate_loader_build_record_identity,
@@ -25,13 +27,6 @@ const BUILD_INDEX_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub fn fetch_components() -> Vec<LoaderComponentRecord> {
     loader_components()
-}
-
-pub async fn fetch_supported_versions(
-    operation: &ManagedLibraryOperation,
-    component_id: LoaderComponentId,
-) -> Result<(Vec<LoaderGameVersion>, LoaderCatalogState), LoaderError> {
-    fetch_supported_versions_cancellable(operation, component_id, std::future::pending()).await
 }
 
 pub async fn fetch_supported_versions_cancellable(
@@ -122,20 +117,6 @@ async fn fetch_supported_versions_with(
     ))
 }
 
-pub async fn fetch_builds(
-    operation: &ManagedLibraryOperation,
-    component_id: LoaderComponentId,
-    minecraft_version: &str,
-) -> Result<(Vec<LoaderBuildRecord>, LoaderCatalogState), LoaderError> {
-    fetch_builds_cancellable(
-        operation,
-        component_id,
-        minecraft_version,
-        std::future::pending(),
-    )
-    .await
-}
-
 /// Cancellation applies only to acquisition; a received result settles its cache work.
 pub async fn fetch_builds_cancellable(
     operation: &ManagedLibraryOperation,
@@ -205,6 +186,7 @@ where
     Ok((normalized.builds, catalog))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn fetch_cached_builds(
     operation: &ManagedLibraryOperation,
     component_id: LoaderComponentId,

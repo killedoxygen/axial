@@ -29,13 +29,12 @@ pub(crate) use forge_installer::{
     VerifiedInstallerReceiptSource,
 };
 pub use index::{
-    fetch_builds, fetch_builds_cancellable, fetch_cached_builds, fetch_components,
-    fetch_supported_versions, fetch_supported_versions_cancellable,
+    fetch_builds_cancellable, fetch_components, fetch_supported_versions_cancellable,
     resolve_build_record_for_install, resolve_build_record_for_install_cancellable,
 };
 #[cfg(feature = "test-support")]
 pub use index::{
-    fetch_fabric_builds_for_test, fetch_fabric_game_versions_for_test,
+    fetch_cached_builds, fetch_fabric_builds_for_test, fetch_fabric_game_versions_for_test,
     persist_loader_build_cache_fixture_for_test,
     persist_loader_supported_versions_cache_fixture_for_test, resolve_fabric_build_for_test,
 };

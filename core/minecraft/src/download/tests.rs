@@ -32,7 +32,6 @@ use crate::managed::fault::{self, Fault};
 use crate::managed::fs::{ManagedLibraryOperation, ManagedLibraryTestAuthority};
 use crate::managed::publication::ManagedRootPublicationLease;
 use crate::manifest::VersionManifest;
-use crate::paths::{assets_dir, versions_dir};
 use crate::rules::Environment;
 use crate::runtime::{
     RuntimeEnsureEvent, RuntimeId, RuntimeSourceReceipt, TestRuntimeSourceDescriptor,
@@ -82,7 +81,7 @@ fn loader_base_commit_for_test(
 async fn install_version_emits_terminal_error_when_setup_fails() {
     let root = temp_dir("setup-failure");
     fs::create_dir_all(&root).expect("create root");
-    fs::write(versions_dir(&root), b"not a directory").expect("write versions sentinel");
+    fs::write(root.join("versions"), b"not a directory").expect("write versions sentinel");
 
     let downloader = test_manifest_downloader(
         &root,
@@ -92,7 +91,7 @@ async fn install_version_emits_terminal_error_when_setup_fails() {
     );
     let mut events = Vec::new();
     let result = downloader
-        .install_version("1.20.1", |progress| events.push(progress))
+        .install_version_with_facts("1.20.1", |progress| events.push(progress), |_| {})
         .await;
 
     assert!(result.is_err());
@@ -114,8 +113,12 @@ async fn install_version_emits_terminal_error_when_setup_fails() {
 #[tokio::test]
 async fn invalid_library_preflight_precedes_asset_runtime_and_client_effects() {
     let root = temp_dir("library-preflight-before-effects");
-    let client_path = versions_dir(&root).join("preflight").join("preflight.jar");
-    let asset_index_path = assets_dir(&root)
+    let client_path = root
+        .join("versions")
+        .join("preflight")
+        .join("preflight.jar");
+    let asset_index_path = root
+        .join("assets")
         .join("indexes")
         .join("preflight-assets.json");
     for path in [&client_path, &asset_index_path] {
@@ -127,7 +130,7 @@ async fn invalid_library_preflight_precedes_asset_runtime_and_client_effects() {
     let mut events = Vec::new();
 
     let error = downloader
-        .install_version("preflight", |progress| events.push(progress))
+        .install_version_with_facts("preflight", |progress| events.push(progress), |_| {})
         .await
         .expect_err("URL-less exact library must not install");
 
@@ -190,7 +193,7 @@ async fn malformed_client_and_log_contracts_fail_before_install_effects() {
         let before = snapshot_tree(&root);
 
         downloader
-            .install_version("contract-preflight", |_| {})
+            .install_version_with_facts("contract-preflight", |_| {}, |_| {})
             .await
             .expect_err("malformed authenticated contract must fail");
 
@@ -205,7 +208,11 @@ async fn install_version_starts_asset_index_before_library_download_finishes() {
     let (version_url, version_sha1, mut requests, release_library) =
         spawn_overlapped_install_server().await;
     let downloader = test_manifest_downloader(&root, "overlap", &version_url, &version_sha1);
-    let install = tokio::spawn(async move { downloader.install_version("overlap", |_| {}).await });
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version_with_facts("overlap", |_| {}, |_| {})
+            .await
+    });
 
     let mut saw_asset_index = false;
     while !saw_asset_index {
@@ -268,7 +275,7 @@ async fn simultaneous_client_and_asset_terminals_preserve_scheduler_precedence()
 
     let error = timeout(
         Duration::from_secs(60),
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("simultaneous terminal coordinator must settle")
@@ -324,7 +331,7 @@ async fn assert_sibling_failure_drains_blocked_worker(checkpoint: ManagedBlockin
     let install_version_id = version_id.clone();
     let mut install = tokio::spawn(async move {
         downloader
-            .install_version(&install_version_id, |_| {})
+            .install_version_with_facts(&install_version_id, |_| {}, |_| {})
             .await
     });
 
@@ -363,7 +370,7 @@ async fn assert_sibling_failure_drains_blocked_worker(checkpoint: ManagedBlockin
     assert_eq!(exited.load(Ordering::Acquire), 1);
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert_eq!(exited.load(Ordering::Acquire), 1);
-    assert!(!versions_dir(&root).join(&version_id).exists());
+    assert!(!root.join("versions").join(&version_id).exists());
 
     fixture.server.abort();
     let _ = fixture.server.await;
@@ -387,7 +394,11 @@ async fn assert_required_lane_failure_cancels_blocked_sibling(
         &fixture.version_url,
         &fixture.version_sha1,
     );
-    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version_with_facts(version_id, |_| {}, |_| {})
+            .await
+    });
 
     timeout(Duration::from_secs(60), fixture.blocked_started)
         .await
@@ -406,7 +417,7 @@ async fn assert_required_lane_failure_cancels_blocked_sibling(
         .await
         .expect("the blocked sibling connection must close during failure drain")
         .expect("blocked sibling close signal");
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
 
     fixture.server.abort();
     let _ = fixture.server.await;
@@ -488,7 +499,7 @@ async fn behavior_contract_reconstruction_matches_install_without_touching_seede
 
     let installed = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version("reconstruction", |_| {}),
+        downloader.install_version_with_facts("reconstruction", |_| {}, |_| {}),
     )
     .await
     .expect("install must not deadlock the scratch pool")
@@ -628,7 +639,7 @@ async fn normal_install_publishes_and_settles_three_member_version_bundle() {
 
     let receipt = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("normal install should settle")
@@ -714,13 +725,14 @@ async fn managed_install_fixture_leaves_exact_committed_witness_for_app_recovery
 
 fn fixture_bundle_files(root: &Path, version_id: &str) -> [PathBuf; 3] {
     [
-        versions_dir(root)
+        root.join("versions")
             .join(version_id)
             .join(format!("{version_id}.json")),
-        versions_dir(root)
+        root.join("versions")
             .join(version_id)
             .join(format!("{version_id}.jar")),
-        assets_dir(root).join("log_configs/guardian-version-bundle.xml"),
+        root.join("assets")
+            .join("log_configs/guardian-version-bundle.xml"),
     ]
 }
 
@@ -926,7 +938,7 @@ async fn unsettled_version_bundle_move_reconciles_to_a_rolled_back_witness() {
     for file in fixture_bundle_files(&root, version_id) {
         assert!(!file.exists(), "rollback retained {}", file.display());
     }
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
     match classify_managed_install_publication(
         authority.operation().clone(),
         version_id.to_string(),
@@ -982,7 +994,7 @@ async fn version_bundle_ancestors_roll_back_and_later_share_the_assets_root() {
             test_manifest_downloader(&root, next, &fixture.version_url, &fixture.version_sha1)
                 .with_test_asset_object_base_url(fixture.object_base_url.clone());
         downloader
-            .install_version(next, |_| {})
+            .install_version_with_facts(next, |_| {}, |_| {})
             .await
             .expect("Assets lane shares bundle-created root");
         assert!(
@@ -1009,7 +1021,7 @@ async fn retained_version_bundle_witness_refuses_another_publication_until_ackno
         .await
         .expect_err("an unacknowledged witness must refuse another bundle");
     assert!(version_bundle_lane_has_durable_witness(&root));
-    assert!(!versions_dir(&root).join(second).exists());
+    assert!(!root.join("versions").join(second).exists());
     assert!(matches!(
         classify_managed_install_publication(authority.operation().clone(), second.to_string())
             .await,
@@ -1104,293 +1116,6 @@ async fn retained_evidence_refuses_metadata_drift_and_settlement_replacement() {
         ManagedInstallAcknowledgementOutcome::Acknowledged
     ));
     assert_settled_version_bundle_lane(&root);
-    drop(authority);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_activates_only_after_exact_no_effect() {
-    let version_id = "registered-reconstruction-no-effect";
-    let root = temp_dir(version_id);
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open registered reconstruction authority");
-    let install_receipt =
-        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
-            .await
-            .expect("publish registered reconstruction fixture");
-    drop(install_receipt);
-    checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
-        .await
-        .expect("acknowledge exact registered reconstruction fixture");
-    let receipt =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
-            .expect("registered reconstruction receipt");
-    let expected_contract = receipt
-        .activation_contract_id()
-        .expect("derive registered reconstruction contract");
-
-    let verified = verify_registered_known_good_bootstrap(authority.operation().clone(), receipt)
-        .await
-        .expect("empty publication lane admits registered reconstruction");
-    assert_eq!(verified.activation_contract_id(), &expected_contract);
-    let activation_root = root.clone();
-    verified
-        .activate_with(|source, managed_root| async move {
-            assert_eq!(source.version_id(), version_id);
-            assert_eq!(source.activation_contract_id(), &expected_contract);
-            managed_root
-                .validate_read_projection(&activation_root)
-                .expect("activation retains the exact managed root");
-            assert!(!source.inventory().entries().is_empty());
-            Ok::<_, KnownGoodActivationRejected>(())
-        })
-        .await
-        .expect("registered reconstruction activation callback");
-
-    drop(authority);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_rejects_cross_root_and_bundle_mismatch() {
-    let exact_version = "registered-reconstruction-exact-root";
-    let foreign_version = "registered-reconstruction-foreign-bundle";
-    let exact_root = temp_dir(exact_version);
-    let empty_root = temp_dir("registered-reconstruction-empty-root");
-    let exact_authority =
-        ManagedLibraryTestAuthority::open(&exact_root).expect("open exact reconstruction root");
-    let empty_authority =
-        ManagedLibraryTestAuthority::open(&empty_root).expect("open empty reconstruction root");
-    let install_receipt = publish_managed_install_fixture_for_test(
-        exact_authority.operation().clone(),
-        exact_version,
-    )
-    .await
-    .expect("publish exact reconstruction fixture");
-    drop(install_receipt);
-    checkpoint_and_ack_managed_install_for_test(exact_authority.operation().clone(), exact_version)
-        .await
-        .expect("acknowledge exact reconstruction fixture");
-
-    for (operation, receipt) in [
-        (
-            empty_authority.operation().clone(),
-            crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(
-                exact_version,
-            )
-            .expect("cross-root reconstruction receipt"),
-        ),
-        (
-            exact_authority.operation().clone(),
-            crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(
-                foreign_version,
-            )
-            .expect("foreign-bundle reconstruction receipt"),
-        ),
-    ] {
-        let failure = verify_registered_known_good_bootstrap(operation, receipt)
-            .await
-            .expect_err("physical VersionBundle mismatch must reject activation");
-        assert_eq!(
-            failure.kind(),
-            RegisteredKnownGoodBootstrapVerificationFailureKind::PhysicalProjectionMismatch
-        );
-        assert!(matches!(
-            failure.into_recovery(),
-            RegisteredKnownGoodBootstrapVerificationRecovery::PhysicalProjectionMismatch(_)
-        ));
-    }
-
-    drop((exact_authority, empty_authority));
-    let _ = fs::remove_dir_all(exact_root);
-    let _ = fs::remove_dir_all(empty_root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_refuses_committed_publication_without_acknowledging() {
-    let version_id = "registered-reconstruction-committed";
-    let root = temp_dir(version_id);
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open committed reconstruction authority");
-    let install_receipt =
-        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
-            .await
-            .expect("publish committed reconstruction fixture");
-    drop(install_receipt);
-    let reconstruction =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
-            .expect("matching committed reconstruction receipt");
-
-    let failure =
-        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
-            .await
-            .expect_err("committed publication must refuse bootstrap activation");
-    assert_eq!(
-        failure.kind(),
-        RegisteredKnownGoodBootstrapVerificationFailureKind::CommittedPublication
-    );
-    let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
-        failure.into_recovery()
-    else {
-        panic!("committed refusal must retain publication recovery");
-    };
-    assert_eq!(receipt.version_id(), version_id);
-    assert!(matches!(
-        outcome,
-        ManagedInstallDurableOutcome::Committed(_)
-    ));
-    drop(outcome);
-    assert!(matches!(
-        classify_managed_install_publication(authority.operation().clone(), version_id.to_string())
-            .await,
-        ManagedInstallDurableOutcome::Committed(_)
-    ));
-
-    drop(authority);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_refuses_rolled_back_publication_without_acknowledging() {
-    let version_id = "registered-reconstruction-rolled-back";
-    let root = temp_dir(version_id);
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open rolled-back reconstruction root");
-    fault::arm(&version_bundle_lane(&root), Fault::RowFailure, None);
-    publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
-        .await
-        .expect_err("injected VersionBundle promotion failure must roll back");
-    let reconstruction =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
-            .expect("rolled-back reconstruction receipt");
-
-    let failure =
-        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
-            .await
-            .expect_err("rolled-back publication must refuse bootstrap activation");
-    assert_eq!(
-        failure.kind(),
-        RegisteredKnownGoodBootstrapVerificationFailureKind::RolledBackPublication
-    );
-    let RegisteredKnownGoodBootstrapVerificationRecovery::Publication { receipt, outcome } =
-        failure.into_recovery()
-    else {
-        panic!("rolled-back refusal must retain publication recovery");
-    };
-    assert_eq!(receipt.version_id(), version_id);
-    assert!(matches!(
-        outcome,
-        ManagedInstallDurableOutcome::RolledBack { .. }
-    ));
-    drop(outcome);
-    assert!(matches!(
-        classify_managed_install_publication(authority.operation().clone(), version_id.to_string())
-            .await,
-        ManagedInstallDurableOutcome::RolledBack { .. }
-    ));
-
-    drop(authority);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_retains_publication_exclusion_through_callback() {
-    let version_id = "registered-reconstruction-retained-lease";
-    let root = temp_dir(version_id);
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open retained-lease reconstruction root");
-    let install_receipt =
-        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
-            .await
-            .expect("publish retained-lease fixture");
-    drop(install_receipt);
-    checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
-        .await
-        .expect("acknowledge retained-lease fixture");
-    let reconstruction =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
-            .expect("retained-lease reconstruction receipt");
-    let verified =
-        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
-            .await
-            .expect("exact retained-lease reconstruction");
-    let (entered_tx, entered_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    let activation = tokio::spawn(verified.activate_with(
-        move |source, _managed_root| async move {
-            assert_eq!(source.version_id(), version_id);
-            entered_tx.send(()).expect("report activation entry");
-            release_rx.await.expect("release retained activation");
-            Ok::<_, KnownGoodActivationRejected>(())
-        },
-    ));
-    entered_rx.await.expect("activation callback entered");
-
-    let publication_operation = authority.operation().clone();
-    let publication = tokio::spawn(async move {
-        publish_managed_install_fixture_for_test(publication_operation, version_id).await
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !publication.is_finished(),
-        "competing publication bypassed retained bootstrap lease"
-    );
-    release_tx.send(()).expect("release activation callback");
-    activation
-        .await
-        .expect("activation task")
-        .expect("activation callback succeeds");
-    publication
-        .await
-        .expect("publication task")
-        .expect("publication proceeds after activation");
-
-    drop(authority);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn registered_known_good_bootstrap_rejection_has_no_payload_and_releases_exclusion() {
-    let version_id = "registered-reconstruction-fixed-rejection";
-    let root = temp_dir(version_id);
-    let authority =
-        ManagedLibraryTestAuthority::open(&root).expect("open rejected reconstruction root");
-    let install_receipt =
-        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id)
-            .await
-            .expect("publish rejected reconstruction fixture");
-    drop(install_receipt);
-    checkpoint_and_ack_managed_install_for_test(authority.operation().clone(), version_id)
-        .await
-        .expect("acknowledge rejected reconstruction fixture");
-    let reconstruction =
-        crate::known_good::managed_install_reconstruction_receipt_fixture_for_test(version_id)
-            .expect("rejected reconstruction receipt");
-    let verified =
-        verify_registered_known_good_bootstrap(authority.operation().clone(), reconstruction)
-            .await
-            .expect("exact rejected reconstruction");
-
-    assert_eq!(
-        verified
-            .activate_with(|source, managed_root| async move {
-                assert_eq!(source.version_id(), version_id);
-                managed_root
-                    .revalidate()
-                    .expect("rejected callback retains managed root");
-                Err(KnownGoodActivationRejected)
-            })
-            .await,
-        Err(KnownGoodActivationRejected)
-    );
-    timeout(
-        DURABLE_OPERATION_TIMEOUT,
-        publish_managed_install_fixture_for_test(authority.operation().clone(), version_id),
-    )
-    .await
-    .expect("publication exclusion releases after fixed rejection")
-    .expect("publication proceeds after fixed rejection");
-
     drop(authority);
     let _ = fs::remove_dir_all(root);
 }
@@ -1630,7 +1355,11 @@ async fn behavior_contract_nonempty_assets_publish_once_and_match_reconstruction
 
     let mut progress_events = Vec::new();
     let installed = downloader
-        .install_version(version_id, |progress| progress_events.push(progress))
+        .install_version_with_facts(
+            version_id,
+            |progress| progress_events.push(progress),
+            |_| {},
+        )
         .await
         .expect("install nonempty assets")
         .into_activation_source()
@@ -1786,7 +1515,7 @@ async fn behavior_contract_nonempty_assets_publish_once_and_match_reconstruction
         b""
     );
     assert!(
-        !assets_dir(&root).join("virtual").exists(),
+        !root.join("assets").join("virtual").exists(),
         "normal installation must not retain an install-time virtual-copy writer"
     );
     let install_requests = drain_request_paths(&mut fixture.requests);
@@ -1821,7 +1550,11 @@ async fn behavior_contract_normal_install_settles_assets_rollback() {
     let mut progress_events = Vec::new();
     let error = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |event| progress_events.push(event)),
+        downloader.install_version_with_facts(
+            version_id,
+            |event| progress_events.push(event),
+            |_| {},
+        ),
     )
     .await
     .expect("Assets rollback install should settle")
@@ -1845,7 +1578,7 @@ async fn behavior_contract_normal_install_settles_assets_rollback() {
     assert_settled_assets_lane(&root);
     assert_component_lane_absent(&root, "libraries");
     assert_component_lane_absent(&root, "version-bundle");
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
     assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
     assert!(!asset_object_path(&root, &fixture.object_hash).exists());
     assert!(!asset_object_path(&root, &fixture.distinct_hash).exists());
@@ -1867,7 +1600,7 @@ async fn behavior_contract_normal_install_settles_libraries_rollback() {
 
     let error = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("Libraries rollback install should settle")
@@ -1882,7 +1615,7 @@ async fn behavior_contract_normal_install_settles_libraries_rollback() {
     assert_settled_assets_lane(&root);
     assert_settled_libraries_lane(&root);
     assert_component_lane_absent(&root, "version-bundle");
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
     for library in [
         "org/example/exact/1.0.0/exact-1.0.0.jar",
         "org/example/observed/1.0.0/observed-1.0.0.jar",
@@ -1908,13 +1641,13 @@ async fn asset_cache_omits_exact_objects_and_replaces_same_size_corruption() {
     .with_test_asset_object_base_url(fixture.object_base_url.clone());
 
     downloader
-        .install_version(version_id, |_| {})
+        .install_version_with_facts(version_id, |_| {}, |_| {})
         .await
         .expect("initial asset install");
     checkpoint_and_ack_version_bundle(downloader.managed_operation_for_test(), version_id).await;
     drain_request_paths(&mut fixture.requests);
     downloader
-        .install_version(version_id, |_| {})
+        .install_version_with_facts(version_id, |_| {}, |_| {})
         .await
         .expect("exact-cache asset reinstall");
     checkpoint_and_ack_version_bundle(downloader.managed_operation_for_test(), version_id).await;
@@ -1928,7 +1661,7 @@ async fn asset_cache_omits_exact_objects_and_replaces_same_size_corruption() {
     fs::write(asset_object_path(&root, &fixture.object_hash), &corrupt)
         .expect("seed same-size corrupt asset object");
     downloader
-        .install_version(version_id, |_| {})
+        .install_version_with_facts(version_id, |_| {}, |_| {})
         .await
         .expect("corrupt-cache asset reinstall");
     checkpoint_and_ack_version_bundle(downloader.managed_operation_for_test(), version_id).await;
@@ -1968,7 +1701,11 @@ async fn asset_sources_do_not_prewrite_while_the_shared_lease_is_held() {
         &fixture.version_sha1,
     )
     .with_test_asset_object_base_url(fixture.object_base_url.clone());
-    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version_with_facts(version_id, |_| {}, |_| {})
+            .await
+    });
 
     timeout(DURABLE_OPERATION_TIMEOUT, reached)
         .await
@@ -1979,7 +1716,7 @@ async fn asset_sources_do_not_prewrite_while_the_shared_lease_is_held() {
     assert!(!asset_object_path(&root, &fixture.object_hash).exists());
     assert!(!asset_object_path(&root, &fixture.distinct_hash).exists());
     assert!(!asset_object_path(&root, &fixture.empty_hash).exists());
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
     let requests = drain_request_paths(&mut fixture.requests);
     assert_eq!(request_count(&requests, &fixture.object_path), 1);
     assert_eq!(request_count(&requests, &fixture.distinct_path), 1);
@@ -2053,7 +1790,11 @@ async fn asset_cache_drift_at_lease_admission_fails_before_install_effects() {
         &fixture.version_sha1,
     )
     .with_test_asset_object_base_url(fixture.object_base_url.clone());
-    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version_with_facts(version_id, |_| {}, |_| {})
+            .await
+    });
 
     timeout(DURABLE_OPERATION_TIMEOUT, reached)
         .await
@@ -2073,7 +1814,7 @@ async fn asset_cache_drift_at_lease_admission_fails_before_install_effects() {
         corrupt
     );
     assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
     assert!(
         !root.join(".axial-publication/assets").exists(),
         "asset cache drift must fail before lane preparation"
@@ -2100,7 +1841,11 @@ async fn cancelling_install_aborts_blocked_asset_object_acquisition() {
         &fixture.version_sha1,
     )
     .with_test_asset_object_base_url(fixture.object_base_url);
-    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version_with_facts(version_id, |_| {}, |_| {})
+            .await
+    });
 
     timeout(Duration::from_secs(60), fixture.object_started)
         .await
@@ -2119,7 +1864,7 @@ async fn cancelling_install_aborts_blocked_asset_object_acquisition() {
         .expect("asset request close signal");
     assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
     assert!(!asset_object_path(&root, &fixture.object_hash).exists());
-    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(!root.join("versions").join(version_id).exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2133,14 +1878,14 @@ async fn normal_reinstall_omits_exact_cached_library_source() {
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
     downloader
-        .install_version(version_id, |_| {})
+        .install_version_with_facts(version_id, |_| {}, |_| {})
         .await
         .expect("initial normal install");
     checkpoint_and_ack_version_bundle(downloader.managed_operation_for_test(), version_id).await;
     while requests.try_recv().is_ok() {}
 
     downloader
-        .install_version(version_id, |_| {})
+        .install_version_with_facts(version_id, |_| {}, |_| {})
         .await
         .expect("exact-cache reinstall");
     checkpoint_and_ack_version_bundle(downloader.managed_operation_for_test(), version_id).await;
@@ -2181,7 +1926,7 @@ async fn normal_install_accepts_effect_failure_that_settles_committed() {
 
     let receipt = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("effect receipt settlement should terminate")
@@ -2213,18 +1958,19 @@ async fn normal_install_settles_crash_after_artifact_promotion_before_returning(
 
     let error = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("crashed publication settlement should terminate")
     .expect_err("partially promoted bundle should settle rolled back");
 
     assert!(error.to_string().contains("rolled back"));
-    let version_root = versions_dir(&root).join(version_id);
+    let version_root = root.join("versions").join(version_id);
     assert!(!version_root.join(format!("{version_id}.json")).exists());
     assert!(!version_root.join(format!("{version_id}.jar")).exists());
     assert!(
-        !assets_dir(&root)
+        !root
+            .join("assets")
             .join("log_configs/reconstruction-log.xml")
             .exists()
     );
@@ -2238,8 +1984,10 @@ async fn normal_install_settles_crash_after_artifact_promotion_before_returning(
 async fn normal_install_rolls_back_bundle_replacements_before_returning_error() {
     let version_id = "normal-effect-rolled-back";
     let root = temp_dir(version_id);
-    let version_root = versions_dir(&root).join(version_id);
-    let log_path = assets_dir(&root).join("log_configs/reconstruction-log.xml");
+    let version_root = root.join("versions").join(version_id);
+    let log_path = root
+        .join("assets")
+        .join("log_configs/reconstruction-log.xml");
     fs::create_dir_all(&version_root).expect("create previous version root");
     fs::create_dir_all(log_path.parent().expect("log parent")).expect("create previous log root");
     let previous_json = b"previous-version-json";
@@ -2262,7 +2010,7 @@ async fn normal_install_rolls_back_bundle_replacements_before_returning_error() 
 
     let error = timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("rollback settlement should terminate")
@@ -2299,9 +2047,13 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
     let install = tokio::spawn(async move {
         downloader
-            .install_version(version_id, |event| {
-                let _ = progress_tx.send(event);
-            })
+            .install_version_with_facts(
+                version_id,
+                |event| {
+                    let _ = progress_tx.send(event);
+                },
+                |_| {},
+            )
             .await
     });
     timeout(DURABLE_OPERATION_TIMEOUT, reached)
@@ -2361,7 +2113,11 @@ async fn managed_install_owner_panic_retains_recovery_across_retry_cancellation(
     let mut progress_events = Vec::new();
     let recovery = match timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |event| progress_events.push(event)),
+        downloader.install_version_with_facts(
+            version_id,
+            |event| progress_events.push(event),
+            |_| {},
+        ),
     )
     .await
     .expect("panicked publication owner should return")
@@ -2424,7 +2180,7 @@ async fn managed_install_post_effect_owner_panic_recovers_by_durable_classificat
 
     let recovery = match timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("post-effect owner panic should return")
@@ -2468,7 +2224,7 @@ async fn managed_install_active_retry_owner_panic_falls_back_to_durable_recovery
 
     let recovery = match timeout(
         DURABLE_OPERATION_TIMEOUT,
-        downloader.install_version(version_id, |_| {}),
+        downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
     )
     .await
     .expect("permanently unsettled publication should return")
@@ -2518,7 +2274,11 @@ async fn cancelling_normal_install_while_waiting_for_lease_detaches_publication_
         &version_sha1,
     );
 
-    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    let install = tokio::spawn(async move {
+        downloader
+            .install_version_with_facts(version_id, |_| {}, |_| {})
+            .await
+    });
     timeout(DURABLE_OPERATION_TIMEOUT, reached)
         .await
         .expect("normal install should reach lease admission")
@@ -2585,7 +2345,7 @@ async fn normal_install_retries_local_version_bundle_settlement() {
 
         let receipt = timeout(
             DURABLE_OPERATION_TIMEOUT,
-            downloader.install_version(version_id, |_| {}),
+            downloader.install_version_with_facts(version_id, |_| {}, |_| {}),
         )
         .await
         .expect("local settlement retry should terminate")
@@ -3093,7 +2853,8 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
         .expect("managed test library operation");
     let downloader = Downloader::new(operation, runtime_cache);
     assert!(
-        std::mem::size_of_val(&downloader.install_version("1.21.1", |_| {})) < 8192,
+        std::mem::size_of_val(&downloader.install_version_with_facts("1.21.1", |_| {}, |_| {}))
+            < 8192,
         "version-install future should stay comfortably below tokio worker stack limits"
     );
 }
@@ -3353,7 +3114,6 @@ fn library_maven_fallback_job_reuses_when_metadata_missing() {
         .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::default());
-    assert!(!job.expected.has_evidence());
 }
 
 #[test]
@@ -3361,18 +3121,17 @@ fn expected_integrity_ignores_default_mojang_metadata() {
     let expected = ExpectedIntegrity::from_mojang(0, " ");
 
     assert_eq!(expected, ExpectedIntegrity::default());
-    assert!(!expected.has_evidence());
 }
 
 #[tokio::test]
 async fn install_version_rejects_unlisted_local_version_json() {
     let root = temp_dir("unlisted-local-version-json");
-    let version_dir = versions_dir(&root).join("custom");
+    let version_dir = root.join("versions").join("custom");
     fs::create_dir_all(&version_dir).expect("create version directory");
     fs::write(version_dir.join("custom.json"), br#"{"id":"custom"}"#)
         .expect("write local version json");
     let error = Downloader::with_test_install_manifest(&root, empty_test_install_manifest())
-        .install_version("custom", |_| {})
+        .install_version_with_facts("custom", |_| {}, |_| {})
         .await
         .expect_err("unlisted local metadata must not become install authority");
 
@@ -3411,7 +3170,7 @@ async fn install_version_rejects_unsafe_identity_before_filesystem_effects() {
     for version_id in [traversal_id.as_str(), absolute.as_str(), oversized.as_str()] {
         let mut events = Vec::new();
         let error = downloader
-            .install_version(version_id, |progress| events.push(progress))
+            .install_version_with_facts(version_id, |progress| events.push(progress), |_| {})
             .await
             .expect_err("unsafe version identity must fail");
 
@@ -3527,7 +3286,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
 }
 
 fn assert_normal_bundle_contents(root: &Path, version_id: &str, with_log_config: bool) {
-    let version_root = versions_dir(root).join(version_id);
+    let version_root = root.join("versions").join(version_id);
     let version_json =
         fs::read(version_root.join(format!("{version_id}.json"))).expect("published version json");
     assert_eq!(
@@ -3542,15 +3301,18 @@ fn assert_normal_bundle_contents(root: &Path, version_id: &str, with_log_config:
     );
     if with_log_config {
         assert_eq!(
-            fs::read(assets_dir(root).join("log_configs/reconstruction-log.xml"))
-                .expect("published log config"),
+            fs::read(
+                root.join("assets")
+                    .join("log_configs/reconstruction-log.xml")
+            )
+            .expect("published log config"),
             b"<log4j/>"
         );
     }
 }
 
 fn normal_bundle_contents_match(root: &Path, version_id: &str, with_log_config: bool) -> bool {
-    let version_root = versions_dir(root).join(version_id);
+    let version_root = root.join("versions").join(version_id);
     let version_matches = fs::read(version_root.join(format!("{version_id}.json")))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
@@ -3558,8 +3320,11 @@ fn normal_bundle_contents_match(root: &Path, version_id: &str, with_log_config: 
     let client_matches = fs::read(version_root.join(format!("{version_id}.jar")))
         .is_ok_and(|bytes| bytes == b"reconstruction-client");
     let log_matches = !with_log_config
-        || fs::read(assets_dir(root).join("log_configs/reconstruction-log.xml"))
-            .is_ok_and(|bytes| bytes == b"<log4j/>");
+        || fs::read(
+            root.join("assets")
+                .join("log_configs/reconstruction-log.xml"),
+        )
+        .is_ok_and(|bytes| bytes == b"<log4j/>");
     version_matches && client_matches && log_matches
 }
 
@@ -4522,13 +4287,16 @@ fn test_manifest_downloader_from_operation(
 }
 
 fn asset_index_path(root: &Path, asset_index_id: &str) -> PathBuf {
-    assets_dir(root)
+    root.join("assets")
         .join("indexes")
         .join(format!("{asset_index_id}.json"))
 }
 
 fn asset_object_path(root: &Path, hash: &str) -> PathBuf {
-    assets_dir(root).join("objects").join(&hash[..2]).join(hash)
+    root.join("assets")
+        .join("objects")
+        .join(&hash[..2])
+        .join(hash)
 }
 
 fn drain_request_paths(requests: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {

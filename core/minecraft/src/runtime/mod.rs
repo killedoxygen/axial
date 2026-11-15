@@ -40,9 +40,8 @@ pub use layout::{
     ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeLaunchReceipt, RuntimeAbsence,
 };
 pub use model::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, ManagedRuntimeMutationRefused,
-    RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
-    RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureEvent, RuntimeId,
+    RuntimeInstallState, RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
     RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
 pub use probe::{JavaArchitecture, JavaProbeError, JavaProbeReceipt, probe_java};

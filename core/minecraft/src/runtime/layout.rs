@@ -404,11 +404,6 @@ pub(crate) fn runtime_java_relative_path() -> &'static str {
     }
 }
 
-pub(super) fn managed_runtime_executable_present(root: &ManagedDir) -> bool {
-    PortableRelativePath::new_exact(runtime_java_relative_path())
-        .is_ok_and(|relative| matches!(root.inspect_relative_executable(&relative), Ok(Some(_))))
-}
-
 pub(super) fn managed_runtime_executable_ready(root: &ManagedDir) -> bool {
     let Ok(relative) = PortableRelativePath::new_exact(runtime_java_relative_path()) else {
         return false;

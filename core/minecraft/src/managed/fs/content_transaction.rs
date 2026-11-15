@@ -622,10 +622,6 @@ impl fmt::Debug for ManagedContentPlanningSession {
 }
 
 impl ManagedContentPlanningSession {
-    pub fn manifest_state(&self) -> &ManagedContentObservedState {
-        &self.manifest.state
-    }
-
     pub fn manifest_bytes(&self) -> Option<&[u8]> {
         self.manifest.bytes.as_deref()
     }
@@ -699,10 +695,6 @@ impl fmt::Debug for ManagedContentTransactionSession {
 }
 
 impl ManagedContentTransactionSession {
-    pub fn manifest_state(&self) -> &ManagedContentObservedState {
-        &self.manifest.state
-    }
-
     pub fn manifest_bytes(&self) -> Option<&[u8]> {
         self.manifest.bytes.as_deref()
     }
@@ -4463,10 +4455,6 @@ pub struct ManagedContentCommitReceipt {
 }
 
 impl ManagedContentCommitReceipt {
-    pub fn path_count(self) -> usize {
-        self.path_count
-    }
-
     pub fn payload_count(self) -> usize {
         self.payload_count
     }
@@ -4475,12 +4463,6 @@ impl ManagedContentCommitReceipt {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManagedContentCancelReceipt {
     path_count: usize,
-}
-
-impl ManagedContentCancelReceipt {
-    pub fn path_count(self) -> usize {
-        self.path_count
-    }
 }
 
 #[must_use = "content transaction outcomes retain every unsettled effect"]
@@ -9367,7 +9349,7 @@ mod tests {
         let planning = root.observe_manifest().expect("manifest observation");
         assert_eq!(planning.manifest_bytes(), Some(&b"manifest"[..]));
         assert!(matches!(
-            planning.manifest_state(),
+            &planning.manifest.state,
             ManagedContentObservedState::Exact { size: 8, .. }
         ));
         let planning = planning
@@ -9401,7 +9383,7 @@ mod tests {
             .expect("selected transaction subset");
         assert_eq!(session.manifest_bytes(), Some(&b"manifest"[..]));
         assert!(matches!(
-            session.manifest_state(),
+            &session.manifest.state,
             ManagedContentObservedState::Exact { size: 8, .. }
         ));
         let observations = session.observations();
@@ -9788,7 +9770,7 @@ mod tests {
             .observe_manifest()
             .expect("absent manifest observation");
         assert_eq!(
-            planning.manifest_state(),
+            &planning.manifest.state,
             &ManagedContentObservedState::Absent
         );
         assert_eq!(planning.manifest_bytes(), None);
@@ -10132,7 +10114,6 @@ mod tests {
             ManagedContentTransactionOutcome::Committed(receipt) => receipt,
             _ => panic!("manifest-only transaction must commit"),
         };
-        assert_eq!(receipt.path_count(), 0);
         assert_eq!(receipt.payload_count(), 0);
         assert_eq!(
             std::fs::read(temporary.path().join(MANIFEST_NAME)).expect("manifest"),
@@ -10165,7 +10146,6 @@ mod tests {
             ManagedContentTransactionOutcome::Committed(receipt) => receipt,
             _ => panic!("bounded effect transaction must commit"),
         };
-        assert_eq!(receipt.path_count(), 1);
         assert_eq!(receipt.payload_count(), 0);
     }
 

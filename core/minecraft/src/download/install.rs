@@ -26,12 +26,8 @@ use super::model::{
     ManagedInstallPostActivationAcknowledgement, ManagedInstallPublicationCandidates,
     ManagedInstallPublicationEvidenceId, ManagedInstallPublicationRecovery,
     ManagedInstallPublicationRecoveryState, ManagedInstallReceiptVerificationFailure,
-    ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence,
-    RegisteredKnownGoodBootstrapVerificationFailure,
-    RegisteredKnownGoodBootstrapVerificationFailureKind,
-    RegisteredKnownGoodBootstrapVerificationFailureState, SelectedDownloadArtifactKind,
-    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt,
-    VerifiedRegisteredKnownGoodBootstrap, progress,
+    ManagedInstallRollbackEffect, ManagedInstallRolledBackEvidence, SelectedDownloadArtifactKind,
+    VerifiedManagedInstallCheckpointReceipt, VerifiedManagedInstallReceipt, progress,
 };
 use super::plan::{TransferPlan, TransferPlanContribution};
 #[cfg(test)]
@@ -72,7 +68,7 @@ use crate::managed::component::lifecycle::{
     ComponentPublicationRecovery, ComponentPublicationSourceIdentity,
     ManagedComponentLifecycleOutcome, RetainedComponentPublicationSource,
     StagedComponentPublicationSource, classify_component_settlement, lifecycle_outcome,
-    projection_is_exact, publish_managed_component_effect, publish_version_bundle_component,
+    publish_managed_component_effect, publish_version_bundle_component,
 };
 use crate::managed::component::publication::ComponentRollbackEffect;
 use crate::managed::component::table::{ManagedComponentArtifactKind, ManagedComponentKind};
@@ -1281,23 +1277,6 @@ impl Downloader {
             unreachable!("source-only downloader cannot materialize a runtime");
         };
         runtime_cache
-    }
-
-    pub async fn install_version<F>(
-        &self,
-        version_id: &str,
-        mut send: F,
-    ) -> Result<KnownGoodInstallReceipt, DownloadError>
-    where
-        F: FnMut(DownloadProgress),
-    {
-        Box::pin(self.install_version_with_fact_sender(
-            version_id,
-            &mut send,
-            None,
-            std::future::pending(),
-        ))
-        .await
     }
 
     pub(crate) async fn reconstruct_version(
@@ -2966,110 +2945,6 @@ pub async fn classify_managed_install_publication_candidates(
     .await
 }
 
-/// Verifies a reconstruction for first-authority bootstrap under an exact managed root.
-///
-/// The caller must prove that no persisted known-good snapshot exists. This bootstrap must not
-/// replace an existing persisted known-good snapshot; restart rehydration uses the checkpoint
-/// verifier instead.
-pub async fn verify_registered_known_good_bootstrap(
-    managed_root: ManagedLibraryOperation,
-    receipt: KnownGoodReconstructionReceipt,
-) -> Result<VerifiedRegisteredKnownGoodBootstrap, RegisteredKnownGoodBootstrapVerificationFailure> {
-    let retained_root = managed_root.clone();
-    match classify_managed_install_publication_retaining_no_effect(
-        managed_root,
-        ManagedInstallPublicationCandidates::one_unchecked(receipt.version_id().to_string()),
-    )
-    .await
-    {
-        Ok(publication_lease) => {
-            let activation_contract_id = match receipt.activation_contract_id() {
-                Ok(activation_contract_id) => activation_contract_id,
-                Err(_) => {
-                    drop(publication_lease);
-                    return Err(
-                        RegisteredKnownGoodBootstrapVerificationFailure {
-                            state: RegisteredKnownGoodBootstrapVerificationFailureState::InvalidActivationContract(receipt),
-                            kind: RegisteredKnownGoodBootstrapVerificationFailureKind::InvalidActivationContract,
-                        },
-                    );
-                }
-            };
-            let projection = match receipt
-                .component_projection(ManagedKnownGoodComponent::VersionBundle)
-            {
-                Ok(projection) => projection,
-                Err(_) => {
-                    drop(publication_lease);
-                    return Err(
-                        RegisteredKnownGoodBootstrapVerificationFailure {
-                            state: RegisteredKnownGoodBootstrapVerificationFailureState::PhysicalProjectionMismatch(receipt),
-                            kind: RegisteredKnownGoodBootstrapVerificationFailureKind::PhysicalProjectionMismatch,
-                        },
-                    );
-                }
-            };
-            if !projection_is_exact(
-                &publication_lease,
-                projection,
-                ManagedComponentKind::VersionBundle,
-            )
-            .await
-            {
-                drop(publication_lease);
-                return Err(
-                    RegisteredKnownGoodBootstrapVerificationFailure {
-                        state: RegisteredKnownGoodBootstrapVerificationFailureState::PhysicalProjectionMismatch(receipt),
-                        kind: RegisteredKnownGoodBootstrapVerificationFailureKind::PhysicalProjectionMismatch,
-                    },
-                );
-            }
-            Ok(VerifiedRegisteredKnownGoodBootstrap {
-                receipt,
-                activation_contract_id,
-                managed_root: retained_root,
-                publication_lease,
-            })
-        }
-        Err(outcome) => {
-            let kind = match &outcome {
-                ManagedInstallDurableOutcome::NoEffect => {
-                    unreachable!("retained classifier returns its NoEffect lease")
-                }
-                ManagedInstallDurableOutcome::Mismatch => {
-                    RegisteredKnownGoodBootstrapVerificationFailureKind::MismatchedPublication
-                }
-                ManagedInstallDurableOutcome::Committed(_) => {
-                    RegisteredKnownGoodBootstrapVerificationFailureKind::CommittedPublication
-                }
-                ManagedInstallDurableOutcome::RolledBack { .. } => {
-                    RegisteredKnownGoodBootstrapVerificationFailureKind::RolledBackPublication
-                }
-                ManagedInstallDurableOutcome::Indeterminate(_) => {
-                    RegisteredKnownGoodBootstrapVerificationFailureKind::IndeterminatePublication
-                }
-            };
-            Err(RegisteredKnownGoodBootstrapVerificationFailure {
-                state: RegisteredKnownGoodBootstrapVerificationFailureState::Publication {
-                    receipt,
-                    outcome,
-                },
-                kind,
-            })
-        }
-    }
-}
-
-async fn classify_managed_install_publication_retaining_no_effect(
-    managed_root: ManagedLibraryOperation,
-    candidates: ManagedInstallPublicationCandidates,
-) -> Result<ManagedRootPublicationLease, ManagedInstallDurableOutcome> {
-    let (lease, candidates) =
-        acquire_managed_install_publication_classification(managed_root.clone(), candidates)
-            .await?;
-    classify_managed_install_publication_lease(lease, managed_root, candidates).await
-}
-
 async fn acquire_managed_install_publication_classification(
     managed_root: ManagedLibraryOperation,
     candidates: ManagedInstallPublicationCandidates,
@@ -3516,28 +3391,6 @@ impl VerifiedManagedInstallCheckpointReceipt<KnownGoodReconstructionReceipt> {
                 .into_activation_source_with_contract(self.activation_contract_id),
         )
         .await
-    }
-}
-
-impl VerifiedRegisteredKnownGoodBootstrap {
-    pub async fn activate_with<F, Fut>(self, activate: F) -> Result<(), KnownGoodActivationRejected>
-    where
-        F: FnOnce(KnownGoodActivationSource, ManagedLibraryOperation) -> Fut,
-        Fut: std::future::Future<Output = Result<(), KnownGoodActivationRejected>>,
-    {
-        let Self {
-            receipt,
-            activation_contract_id,
-            managed_root,
-            publication_lease,
-        } = self;
-        let activated = activate(
-            receipt.into_activation_source_with_contract(activation_contract_id),
-            managed_root,
-        )
-        .await;
-        drop(publication_lease);
-        activated
     }
 }
 

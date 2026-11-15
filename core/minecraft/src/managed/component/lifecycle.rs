@@ -644,44 +644,6 @@ async fn classify_settled_component(
     }
 }
 
-/// Whether every canonical file in `projection` already holds its exact projected bytes.
-pub(crate) async fn projection_is_exact(
-    lease: &ManagedRootPublicationLease,
-    projection: ManagedComponentProjection<'_>,
-    component: ManagedComponentKind,
-) -> bool {
-    let Ok(rows) = projection_rows(component, &projection) else {
-        return false;
-    };
-    if lease.revalidate().is_err() {
-        return false;
-    }
-    let root = lease.root().clone();
-    let exact = run_publication_blocking(move || {
-        root.observe_validated(
-            || {
-                root.revalidate()?;
-                let mut parents = ComponentCanonicalParents::default();
-                for row in rows {
-                    let planned = parents.plan(&root, component, &row.path)?;
-                    let ComponentCanonicalObservation::Regular(observed) = planned.observe()?
-                    else {
-                        return Ok(false);
-                    };
-                    if observed.size() != row.size || observed.sha1() != row.sha1 {
-                        return Ok(false);
-                    }
-                }
-                root.revalidate()?;
-                Ok(true)
-            },
-            ComponentEffectsError::from,
-        )
-    })
-    .await;
-    matches!(exact, Ok(Ok(true))) && lease.revalidate().is_ok()
-}
-
 #[cfg(test)]
 async fn prepare_component_intent_projection<S>(
     lease: ManagedRootPublicationLease,

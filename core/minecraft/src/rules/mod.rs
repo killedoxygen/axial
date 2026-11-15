@@ -83,6 +83,7 @@ pub fn current_os_arch() -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn native_classifier_key() -> String {
     let name = if current_os_name() == "osx" {
         "macos"
