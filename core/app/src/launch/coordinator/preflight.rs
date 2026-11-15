@@ -474,6 +474,7 @@ impl LaunchCoordinator {
                 let mut bundle_guard = None;
                 let mut observed_damage = None;
                 let mut runtime_absence = None;
+                let mut runtime_replaced = false;
                 let mut refused_reasons = None;
                 let mut captured_context = None;
                 let mut result = async {
@@ -607,6 +608,10 @@ impl LaunchCoordinator {
                                 runtime_absence = Some(absence);
                                 None
                             }
+                            Ok(RuntimeObservation::Outdated) => {
+                                runtime_replaced = true;
+                                None
+                            }
                             Err(error @ (JavaDiscoveryError::Missing | JavaDiscoveryError::NotExecutable))
                                 if diagnostics && settings.java_override_origin.is_some() =>
                             {
@@ -658,7 +663,7 @@ impl LaunchCoordinator {
                                 &host,
                                 PreflightReadiness {
                                     launchable: true,
-                                    reasons: if runtime_absence.is_some() {
+                                    reasons: if runtime_absence.is_some() || runtime_replaced {
                                         vec![PreflightReadinessReason {
                                             id: PreflightReadinessReasonId::ManagedRuntimeMissing,
                                             severity: PreflightReadinessSeverity::Recoverable,

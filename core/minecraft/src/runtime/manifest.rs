@@ -72,6 +72,10 @@ pub(super) async fn acquire_runtime_source(
     component: &super::model::RuntimeId,
     primary_platform: &str,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    // Mojang's legacy runtime is older than the admitted Java 8 floor.
+    if component.as_str() == super::temurin::COMPONENT {
+        return super::temurin::acquire().await;
+    }
     acquire_runtime_source_from_catalog(component, primary_platform, RUNTIME_MANIFEST_URL).await
 }
 
@@ -130,6 +134,7 @@ fn authenticate_runtime_source_bytes(
         bytes: Arc::from(bytes),
         expected,
         manifest,
+        archive: None,
     })
 }
 
@@ -217,9 +222,32 @@ pub struct RuntimeSourceReceipt {
     bytes: Arc<[u8]>,
     expected: RuntimeDownloadManifest,
     manifest: ComponentManifest,
+    /// File bytes of a digest-verified archive source; absent for sources
+    /// whose files are fetched individually.
+    archive: Option<Arc<super::temurin::RuntimeArchive>>,
 }
 
 impl RuntimeSourceReceipt {
+    pub(super) fn from_archive(
+        component: super::model::RuntimeId,
+        expected: RuntimeDownloadManifest,
+        bytes: Vec<u8>,
+        manifest: ComponentManifest,
+        archive: Arc<super::temurin::RuntimeArchive>,
+    ) -> Self {
+        Self {
+            component,
+            bytes: Arc::from(bytes),
+            expected,
+            manifest,
+            archive: Some(archive),
+        }
+    }
+
+    pub(super) fn archive(&self) -> Option<&Arc<super::temurin::RuntimeArchive>> {
+        self.archive.as_ref()
+    }
+
     pub fn component(&self) -> &super::model::RuntimeId {
         &self.component
     }

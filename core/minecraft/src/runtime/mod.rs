@@ -14,6 +14,7 @@ mod manifest;
 mod model;
 mod probe;
 mod rosetta;
+mod temurin;
 
 pub use discovery::{
     ManagedRuntimeMarkerState, is_known_runtime_component, list_java_runtimes,

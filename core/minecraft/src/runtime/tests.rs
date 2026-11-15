@@ -3072,3 +3072,53 @@ async fn serve_body(body: &[u8]) -> String {
 async fn serve_bodies(body: &[u8], count: usize) -> Server {
     serve(vec![response("200 OK", &[], body); count]).await
 }
+
+#[tokio::test]
+#[ignore = "downloads the real Temurin 8 JRE from Adoptium"]
+async fn real_temurin_java8_source_publishes_a_verified_legacy_runtime() {
+    let java_version = JavaVersion {
+        component: "jre-legacy".into(),
+        major_version: 8,
+    };
+    let source = super::acquire_preferred_runtime_source(&java_version)
+        .await
+        .expect("authenticated Temurin 8 source");
+    assert!(source.archive().is_some());
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let (_cancel, mut control) = runtime_materialization_control();
+    let receipt = materialize_missing_runtime_source(
+        &cache,
+        &java_version,
+        source,
+        &mut |_| {},
+        &mut control,
+    )
+    .await
+    .expect("published Temurin runtime")
+    .expect("publication receipt");
+    let component = RuntimeId::from("jre-legacy".to_string());
+    assert!(receipt.revalidate(&cache, &component).await);
+    drop(receipt);
+    let admitted = cache
+        .admit_component("jre-legacy")
+        .unwrap()
+        .expect("published component");
+    assert!(admitted.verified_manifest().is_some());
+    assert!(admitted.launch_receipt().is_ok());
+    let release = std::fs::read_to_string(
+        admitted
+            .java_executable_path()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("release"),
+    )
+    .expect("runtime release file");
+    let update = release
+        .lines()
+        .find_map(|line| line.strip_prefix("JAVA_VERSION=\"1.8.0_"))
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .expect("Java 8 update in release file");
+    assert!(update >= 312, "{release}");
+}

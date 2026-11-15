@@ -46,7 +46,7 @@ const RUNTIME_LZMA_SCRATCH_BYTES: u64 =
     MAX_RUNTIME_FILE_BYTES + RUNTIME_LZMA_DICTIONARY_BYTES as u64 + RUNTIME_LZMA_INPUT_BYTES as u64;
 const RUNTIME_TREE_VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
-fn runtime_source_failure(
+pub(super) fn runtime_source_failure(
     component: &RuntimeId,
     kind: RuntimeSourceFailureKind,
     detail: impl Into<String>,
@@ -1863,6 +1863,7 @@ async fn materialize_runtime_tree_with_cancellation(
             dest_dir,
             projection,
             component_manifest.files.clone(),
+            source.archive().cloned(),
             observer,
             admission,
             cancellation,
@@ -2413,6 +2414,7 @@ pub(super) async fn install_runtime_manifest_files(
         &managed,
         temp_dir,
         files,
+        None,
         observer,
         RuntimeManifestAdmission {
             download_bytes: admitted_download_bytes,
@@ -2428,6 +2430,7 @@ async fn install_runtime_manifest_files_with_concurrency(
     temp_dir: &ManagedDir,
     projection: &Path,
     files: HashMap<String, ComponentManifestFile>,
+    archive: Option<std::sync::Arc<super::temurin::RuntimeArchive>>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
     admission: RuntimeManifestAdmission,
     cancellation: &mut Cancellation,
@@ -2442,6 +2445,7 @@ async fn install_runtime_manifest_files_with_concurrency(
             projection,
             &relative_path,
             file,
+            None,
             None,
             &mut entry_cancellation,
         )
@@ -2474,7 +2478,7 @@ async fn install_runtime_manifest_files_with_concurrency(
             })
         })
         .collect::<Vec<_>>();
-    let download_client = if source_urls.is_empty() {
+    let download_client = if source_urls.is_empty() || archive.is_some() {
         None
     } else {
         Some(runtime_transfer_client(component, source_urls)?)
@@ -2482,6 +2486,7 @@ async fn install_runtime_manifest_files_with_concurrency(
     let mut file_downloads =
         futures_util::stream::iter(plan.file_entries.into_iter().map(|entry| {
             let download_client = download_client.clone();
+            let archive = archive.clone();
             let temp_dir = temp_dir.clone();
             let projection = projection.to_path_buf();
             let component = component.clone();
@@ -2497,6 +2502,7 @@ async fn install_runtime_manifest_files_with_concurrency(
                     &relative_path,
                     file,
                     download_client,
+                    archive,
                     &mut cancellation,
                 ))
                 .await?;
@@ -2558,6 +2564,7 @@ async fn install_runtime_manifest_files_with_concurrency(
             projection,
             &relative_path,
             file,
+            None,
             None,
             &mut link_cancellation,
         )
@@ -2656,6 +2663,7 @@ pub(super) async fn install_runtime_manifest_file(
         relative_path,
         file,
         client,
+        None,
         &mut cancellation,
     ))
     .await
@@ -2668,6 +2676,7 @@ async fn install_runtime_manifest_file_until_cancelled(
     relative_path: &str,
     file: ComponentManifestFile,
     download_client: Option<crate::download::TransferClient>,
+    archive: Option<std::sync::Arc<super::temurin::RuntimeArchive>>,
     cancellation: &mut RuntimeCancellationSet,
 ) -> Result<(), JavaRuntimeLookupError> {
     if cancellation.is_cancelled() {
@@ -2718,6 +2727,30 @@ async fn install_runtime_manifest_file_until_cancelled(
     }
     let RuntimeFileDownloadSelection { raw, lzma } =
         select_runtime_file_downloads(component, relative_path, file.downloads)?;
+    if let Some(archive) = archive {
+        // Bytes proven by the archive digest; the manifest digest is rechecked
+        // as they are imported.
+        let bytes = archive.get(relative_path).cloned().ok_or_else(|| {
+            JavaRuntimeLookupError::Install("runtime archive entry is absent".to_string())
+        })?;
+        let (Some(size), Some(sha1)) = (raw.size, raw.sha1.as_deref().and_then(runtime_sha1_bytes))
+        else {
+            return Err(JavaRuntimeLookupError::Install(
+                "runtime archive entry proof is invalid".to_string(),
+            ));
+        };
+        temp_dir
+            .import_relative_authenticated(&relative, std::io::Cursor::new(bytes), size, sha1)
+            .await
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        #[cfg(unix)]
+        if file.executable {
+            temp_dir
+                .make_file_executable_relative(&relative)
+                .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        }
+        return Ok(());
+    }
 
     let client = download_client.ok_or_else(|| {
         JavaRuntimeLookupError::Install("runtime transfer client is absent".to_string())

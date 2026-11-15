@@ -50,6 +50,8 @@ pub(crate) struct SelectedRuntime {
 pub(crate) enum RuntimeObservation {
     Ready(SelectedRuntime),
     Missing(Arc<axial_minecraft::runtime::RuntimeAbsence>),
+    /// The app-managed runtime is below the admitted floor; launch replaces it.
+    Outdated,
 }
 
 /// Selections shared by every row of one admitted projection, keyed by the
@@ -101,6 +103,7 @@ impl RuntimeObservation {
             Self::Missing(absence) => absence
                 .revalidate()
                 .map_err(|_| JavaDiscoveryError::Replaced),
+            Self::Outdated => Ok(()),
         }
     }
 }
@@ -179,7 +182,15 @@ impl RuntimeDiscovery {
             .map_err(|_| JavaDiscoveryError::Replaced)?
             .is_some()
         {
-            return self.select(java, override_value, cancellation).await;
+            return match self.select(java, override_value, cancellation).await {
+                // An app-managed runtime below the admitted floor is replaced
+                // by the rebuild owner from the current compliant source.
+                Err(JavaDiscoveryError::OutdatedJava8) => {
+                    self.rebuild(java, cancellation).await?;
+                    self.select(java, override_value, cancellation).await
+                }
+                selected => selected,
+            };
         }
         let source = tokio::select! {
             biased;
@@ -231,6 +242,51 @@ impl RuntimeDiscovery {
         }
         drop(receipt);
         Ok(selected)
+    }
+
+    /// Replaces the preferred managed component when it does not match the
+    /// current source, through the existing verified rebuild owner.
+    async fn rebuild(
+        &self,
+        java: &JavaVersion,
+        cancellation: &CancellationToken,
+    ) -> Result<(), JavaDiscoveryError> {
+        let source = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(JavaDiscoveryError::Cancelled),
+            source = async {
+                #[cfg(feature = "test-support")]
+                if let Some(endpoints) = &self.test_endpoints {
+                    return axial_minecraft::runtime::acquire_preferred_runtime_source_at_test_endpoint(java, endpoints).await;
+                }
+                axial_minecraft::runtime::acquire_preferred_runtime_source(java).await
+            } => source.map_err(provision_error)?,
+        };
+        let (cancel, mut control) = axial_minecraft::runtime::runtime_materialization_control();
+        let mut observer = |_| {};
+        let result = {
+            let producer = axial_minecraft::runtime::materialize_preferred_runtime_source(
+                &self.cache,
+                java,
+                source,
+                &mut observer,
+                &mut control,
+            );
+            tokio::pin!(producer);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    cancel.cancel_before_publication();
+                    producer.await
+                }
+                result = &mut producer => result,
+            }
+        };
+        match (result, control.finish()) {
+            (Ok(Some(_)), true) => Ok(()),
+            (Ok(_), _) | (_, false) => Err(JavaDiscoveryError::Cancelled),
+            (Err(error), _) => Err(provision_error(error)),
+        }
     }
 
     /// Observes readiness once per projection key. Later rows reuse the same
@@ -288,9 +344,13 @@ impl RuntimeDiscovery {
                 return Ok(RuntimeObservation::Missing(Arc::new(absence)));
             }
         }
-        self.select(java, override_value, cancellation)
-            .await
-            .map(RuntimeObservation::Ready)
+        match self.select(java, override_value, cancellation).await {
+            // Launch replaces an outdated app-managed runtime before spawning.
+            Err(JavaDiscoveryError::OutdatedJava8) if override_value.trim().is_empty() => {
+                Ok(RuntimeObservation::Outdated)
+            }
+            selected => selected.map(RuntimeObservation::Ready),
+        }
     }
 
     pub(crate) async fn select(
@@ -690,6 +750,33 @@ mod proof_tests {
         assert!(started.is_ok() && aborted && owned);
         assert_eq!(later.unwrap().probe.info().update, 3);
         assert_eq!(discovery.probes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn an_app_managed_java_8_below_the_floor_is_replaced_not_admitted() {
+        let (_scratch, cache, tasks, discovery) = fixture().await;
+        let legacy = JavaVersion {
+            component: "jre-legacy".into(),
+            major_version: 8,
+        };
+        cache
+            .write_ready_component_for_test(
+                "jre-legacy",
+                format!(
+                    "#!/bin/sh\nprintf 'java.version = 1.8.0_51\\nos.arch = {}\\njava.vendor = Oracle Corporation\\n' >&2\n",
+                    std::env::consts::ARCH
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let selected = discovery.select(&legacy, "", &cancel).await.err();
+        let observed = discovery
+            .observe_for_preflight(&RuntimeProjection::default(), &legacy, "", &cancel)
+            .await;
+        tasks.shutdown(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(selected, Some(JavaDiscoveryError::OutdatedJava8));
+        assert!(matches!(observed, Ok(RuntimeObservation::Outdated)));
     }
 
     #[tokio::test]
