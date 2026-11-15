@@ -341,9 +341,21 @@ function connectLaunchEvents(
   unsubscribe = subscribeSession(sessionId, {
     status: (snapshot) => {
       if (closed) return;
-      pollSubscription?.close();
-      pollSubscription = null;
+      // A stream snapshot ends fallback polling only once it proves this exact
+      // session incarnation at or beyond the latest state already applied.
+      const session = launchSessions.value[instanceId];
+      const update = launchStatusUpdate(snapshot, sessionId);
+      const converged =
+        !!update &&
+        session?.sessionId === sessionId &&
+        snapshot.instance_id === instanceId &&
+        update.launchedAt === session.launchedAt &&
+        update.revision >= session.statusRevision;
       onStatus(snapshot, streamHandle);
+      if (converged && !closed) {
+        pollSubscription?.close();
+        pollSubscription = null;
+      }
     },
     log: (entry) => {
       if (!closed) appendSessionLog(entry, sessionId, instanceId, instanceName);

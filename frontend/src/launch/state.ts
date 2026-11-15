@@ -24,6 +24,8 @@ export interface InstanceLaunchDraft {
 
 export interface LaunchStatusUpdate {
   revision: number;
+  /** The launched incarnation the snapshot describes. */
+  launchedAt: string;
   viewModel: SessionViewModel;
   notice: SessionNotice | null;
   outcome: SessionOutcome | null;
@@ -39,6 +41,7 @@ export function launchStatusUpdate(snapshot: SessionSnapshot, sessionId: string)
   if (!Number.isSafeInteger(snapshot.revision) || snapshot.revision < 0) return null;
   return {
     revision: snapshot.revision,
+    launchedAt: snapshot.launched_at,
     viewModel: snapshot.view_model,
     notice: snapshot.notice,
     outcome: snapshot.outcome,
@@ -148,7 +151,13 @@ export function updateLaunchSessionState(instanceId: string, patch: Partial<Laun
 
 function applyLaunchStatusUpdate(instanceId: string, sessionId: string, update: LaunchStatusUpdate): boolean {
   const current = launchSessions.value[instanceId];
-  if (!current || current.sessionId !== sessionId || update.revision <= current.statusRevision) return false;
+  if (
+    !current ||
+    current.sessionId !== sessionId ||
+    current.launchedAt !== update.launchedAt ||
+    update.revision <= current.statusRevision
+  )
+    return false;
   launchSessions.value = {
     ...launchSessions.value,
     [instanceId]: {

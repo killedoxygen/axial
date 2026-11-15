@@ -1728,3 +1728,31 @@ test('install ring estimates advance only on accepted snapshots and reset for ea
   await h.machine.applyInstallQueueResponse(snapshot('epoch-2', 1, 'version_json', 0, 'retry'));
   assert.equal(h.machine.activeDownload.value!.ringPct, 0);
 });
+
+test('fallback polling stops only when a stream snapshot converges on this incarnation', async () => {
+  const h = launchHarness();
+  await flush();
+  const intervals = (): number => h.clock.intervals.size;
+  assert.equal(intervals(), 1, 'polling covers the stream until it converges');
+  h.emit(status(2), 'status');
+  await flush();
+  for (const stale of [
+    { ...status(9), launched_at: '2026-09-08T07:00:00Z' },
+    { ...status(9), session_id: 'session-2' },
+    status(1),
+  ]) {
+    h.emit(stale, 'status');
+    await flush();
+  }
+  assert.equal(intervals(), 0, 'the convergent snapshot at revision 2 ended polling');
+  h.interruptStream();
+  await flush();
+  assert.equal(intervals(), 1, 'a disconnected stream resumes polling');
+  h.emit({ ...status(9), launched_at: '2026-09-08T07:00:00Z' }, 'status');
+  h.emit(status(1), 'status');
+  await flush();
+  assert.equal(intervals(), 1, 'a foreign incarnation or older replay cannot stop polling');
+  h.emit(status(3), 'status');
+  await flush();
+  assert.equal(intervals(), 0);
+});
