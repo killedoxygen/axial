@@ -69,7 +69,8 @@ fn service_with_directories(
         tasks.clone(),
         runtime.clone(),
     )
-    .unwrap();
+    .unwrap()
+    .with_physical_work(crate::install::artifacts::tests::fixture_physical_work());
     let settings = Arc::new(SettingsStore::new(storage.clone()).unwrap());
     let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());
     let auth = Arc::new(AuthService::new(

@@ -75,7 +75,8 @@ fn compose_fixture(
             tasks.clone(),
             runtime.clone(),
         )
-        .unwrap(),
+        .unwrap()
+        .with_physical_work(crate::install::artifacts::tests::fixture_physical_work()),
     );
     let client = ProviderClient::new(ClientConfig::default()).unwrap();
     let content = Arc::new(ContentService::new(client.clone()).unwrap());
