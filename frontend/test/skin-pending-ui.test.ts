@@ -89,6 +89,9 @@ function harness(
   let skinsRead: (() => Promise<unknown>) | null = null;
   let statusRead: (() => Promise<unknown>) | null = null;
   let cancelRead: (() => Promise<unknown>) | null = null;
+  let normalize: (body: unknown) => Promise<unknown> = async () => {
+    throw new Error('Unexpected skin normalization');
+  };
   let confirm: () => Promise<boolean> = async () => true;
   const transport = {
     async request(method: string, path: string, body?: unknown) {
@@ -100,6 +103,7 @@ function harness(
         profileSaves.push({ path, body: JSON.stringify(body) });
         return skin;
       }
+      if (method === 'POST' && url.pathname === '/skins/normalize') return normalize(body);
       if (method !== 'GET') {
         assert.ok(url.searchParams.get('expected_account_id'));
         assert.ok(url.searchParams.get('expected_selection_revision'));
@@ -214,6 +218,9 @@ function harness(
     setCancelRead(read: () => Promise<unknown>) {
       cancelRead = read;
     },
+    setNormalize(read: (body: unknown) => Promise<unknown>) {
+      normalize = read;
+    },
     setConfirm(read: () => Promise<boolean>) {
       confirm = read;
     },
@@ -259,19 +266,25 @@ test('native picker validation failures reach the upload hook and wardrobe notic
       commands.push(command);
       throw message;
     });
+    const hooks = {
+      useEffect() {},
+      useRef: <V>(value: V) => ({ current: value }),
+      useState: <V>(value: V) => [value, () => {}],
+    };
     const { useSavedSkinUploadWorkflow } = loadSource<typeof import('../src/accounts/use-saved-skin-upload-workflow')>(
       'accounts/use-saved-skin-upload-workflow.ts',
       {
-        'platform/native': native,
         'accounts/wardrobe-state': h.machine,
         'accounts/api': h.api,
         'accounts/types': { NO_CAPE_VALUE: '__none' },
         'accounts/use-png-drop': { usePngDrop: () => ({}) },
-        'preact/hooks': {
-          useEffect() {},
-          useRef: <V>(value: V) => ({ current: value }),
-          useState: <V>(value: V) => [value, () => {}],
-        },
+        'accounts/use-staged-skin-png': loadSource('accounts/use-staged-skin-png.ts', {
+          'platform/native': native,
+          'accounts/wardrobe-state': h.machine,
+          'accounts/api': h.api,
+          'preact/hooks': hooks,
+        }),
+        'preact/hooks': hooks,
       },
     );
     let browserPickerOpened = false;
@@ -289,6 +302,231 @@ test('native picker validation failures reach the upload hook and wardrobe notic
     assert.equal(browserPickerOpened, false);
     assert.deepEqual(h.calls, []);
   }
+});
+
+/** Keeps hook state across renders so a workflow observes its own earlier updates; effects mount once. */
+function hookRuntime() {
+  const slots: unknown[] = [];
+  const mountEffects: (() => void | (() => void))[] = [];
+  const cleanups: (() => void)[] = [];
+  let cursor = 0;
+  let mounted = false;
+  let writes = 0;
+  const hooks = {
+    useRef<V>(initial: V) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = { current: initial };
+      return slots[index] as { current: V };
+    },
+    useState<V>(initial: V): [V, (next: V | ((current: V) => V)) => void] {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = initial;
+      return [
+        slots[index] as V,
+        (next) => {
+          writes += 1;
+          slots[index] = typeof next === 'function' ? (next as (current: V) => V)(slots[index] as V) : next;
+        },
+      ];
+    },
+    useEffect(run: () => void | (() => void), dependencies: unknown[]) {
+      cursor++;
+      assert.equal(dependencies.length, 0, 'Staged skin PNG effects run once per mount');
+      if (!mounted) mountEffects.push(run);
+    },
+  };
+  return {
+    hooks,
+    render<T>(hook: () => T): T {
+      cursor = 0;
+      const result = hook();
+      if (!mounted) {
+        mounted = true;
+        for (const run of mountEffects.splice(0)) {
+          const cleanup = run();
+          if (cleanup) cleanups.push(cleanup);
+        }
+      }
+      return result;
+    },
+    unmount() {
+      for (const cleanup of cleanups.splice(0)) cleanup();
+    },
+    get writes() {
+      return writes;
+    },
+  };
+}
+
+/** The production staging owner over the harness transport, with each normalization answered by the test. */
+function stagedSkinPngFixture(h: ReturnType<typeof harness>) {
+  const runtime = hookRuntime();
+  const revoked: string[] = [];
+  const normalizations = new Map<string, ReturnType<typeof deferred<unknown>>>();
+  h.setNormalize((body) => {
+    const request = deferred<unknown>();
+    normalizations.set((body as File).name, request);
+    return request.promise;
+  });
+  const staged = loadSource<typeof import('../src/accounts/use-staged-skin-png')>(
+    'accounts/use-staged-skin-png.ts',
+    {
+      'platform/native': { pickNativeSkinFile: async () => null },
+      'accounts/wardrobe-state': h.machine,
+      'accounts/api': h.api,
+      'preact/hooks': runtime.hooks,
+    },
+    {
+      URL: {
+        createObjectURL: (file: File) => `blob:${file.name}`,
+        revokeObjectURL: (url: string) => revoked.push(url),
+      },
+    },
+  );
+  const stubs = {
+    'accounts/wardrobe-state': h.machine,
+    'accounts/api': h.api,
+    'accounts/types': { NO_CAPE_VALUE: '__none' },
+    'accounts/use-png-drop': { usePngDrop: () => ({}) },
+    'accounts/use-staged-skin-png': staged,
+    'preact/hooks': runtime.hooks,
+  };
+  return {
+    runtime,
+    revoked,
+    stubs,
+    png: (name: string) => new File([new Uint8Array([137, 80, 78, 71])], name, { type: 'image/png' }),
+    async answer(name: string, outcome: { variant: 'classic' | 'slim' } | { error: string }) {
+      const request = normalizations.get(name);
+      assert.ok(request, `${name} was sent for normalization`);
+      request.resolve(
+        'error' in outcome
+          ? Promise.reject(new Error(outcome.error))
+          : {
+              texture_key: 'f'.repeat(64),
+              variant_suggestion: outcome.variant,
+              normalized_data_url: `data:image/png;base64,${name}`,
+            },
+      );
+      await settle();
+    },
+  };
+}
+
+test('a staged upload keeps only its latest PNG, revokes each preview once and ignores late validation', async () => {
+  const h = harness();
+  h.machine.setWardrobeContext(context());
+  await settle();
+  const f = stagedSkinPngFixture(h);
+  const { useSavedSkinUploadWorkflow } = loadSource<typeof import('../src/accounts/use-saved-skin-upload-workflow')>(
+    'accounts/use-saved-skin-upload-workflow.ts',
+    f.stubs,
+  );
+  const render = () => f.runtime.render(useSavedSkinUploadWorkflow);
+  const input = { value: 'chosen.png' } as HTMLInputElement;
+  render().fileInputRef.current = input;
+
+  render().stageUploadFile(new File(['text'], 'notes.txt', { type: 'text/plain' }));
+  assert.equal(render().stagedUpload, null);
+  assert.equal(input.value, '');
+  assert.deepEqual(inlineErrors(h), ['Upload a PNG skin file.']);
+
+  render().stageUploadFile(f.png('first.png'));
+  render().setStagedCapeId('cape-a');
+  render().stageUploadFile(f.png('second.png'));
+  assert.deepEqual(inlineErrors(h), []);
+  assert.deepEqual(f.revoked, ['blob:first.png']);
+  assert.equal(render().stagedCapeId, '__none');
+  await f.answer('first.png', { variant: 'slim' });
+  assert.equal(render().stagedUpload?.objectUrl, 'blob:second.png');
+  assert.equal(render().stagedUpload?.normalizeStatus, 'checking');
+  assert.equal(render().stagedCanSave, false);
+
+  await f.answer('second.png', { variant: 'slim' });
+  const ready = render();
+  assert.equal(ready.stagedUpload?.normalizeStatus, 'ready');
+  assert.equal(ready.stagedUpload?.normalizedDataUrl, 'data:image/png;base64,second.png');
+  assert.equal(ready.stagedVariant, 'slim');
+  assert.equal(ready.stagedCanSave, true);
+  ready.setUploadVariant('classic');
+  assert.equal(render().stagedVariant, 'classic');
+
+  render().stageUploadFile(f.png('third.png'));
+  input.value = 'third.png';
+  render().clearStagedUpload();
+  assert.equal(input.value, '');
+  await f.answer('third.png', { error: 'Skin PNG must be 64x64.' });
+  assert.equal(render().stagedUpload, null);
+
+  render().stageUploadFile(f.png('fourth.png'));
+  await f.answer('fourth.png', { error: 'Skin PNG must be 64x64.' });
+  assert.equal(render().stagedUpload?.normalizeError, 'Skin PNG must be 64x64.');
+  assert.equal(render().stagedCanSave, false);
+
+  render().stageUploadFile(f.png('fifth.png'));
+  f.runtime.unmount();
+  const writes = f.runtime.writes;
+  await f.answer('fifth.png', { error: 'Skin PNG must be 64x64.' });
+  assert.equal(f.runtime.writes, writes);
+  assert.deepEqual(f.revoked, [
+    'blob:first.png',
+    'blob:second.png',
+    'blob:third.png',
+    'blob:fourth.png',
+    'blob:fifth.png',
+  ]);
+  assert.deepEqual(
+    h.calls.filter(([method]) => method !== 'GET'),
+    ['first', 'second', 'third', 'fourth', 'fifth'].map(() => ['POST', '/skins/normalize']),
+  );
+});
+
+test('an edit replacement adopts only its current detected model and a closed edit ignores late validation', async () => {
+  const h = harness();
+  h.machine.setWardrobeContext(context());
+  await settle();
+  const f = stagedSkinPngFixture(h);
+  const { useSavedSkinEditWorkflow } = loadSource<typeof import('../src/accounts/use-saved-skin-edit-workflow')>(
+    'accounts/use-saved-skin-edit-workflow.ts',
+    {
+      ...f.stubs,
+      'app/toast': { toast() {} },
+      'ui/Dialog': { showConfirm: async () => true },
+    },
+  );
+  const render = () => f.runtime.render(useSavedSkinEditWorkflow);
+
+  render().stageEditReplacementFile(f.png('unopened.png'));
+  assert.equal(render().editReplacement, null);
+  assert.deepEqual(f.revoked, []);
+
+  assert.equal(await render().startEdit(skin), true);
+  render().stageEditReplacementFile(f.png('first.png'));
+  render().stageEditReplacementFile(f.png('second.png'));
+  await f.answer('first.png', { variant: 'slim' });
+  assert.equal(render().editVariant, 'classic');
+  assert.equal(render().editReplacementReady, false);
+
+  await f.answer('second.png', { variant: 'slim' });
+  const ready = render();
+  assert.equal(ready.editVariant, 'slim');
+  assert.equal(ready.editReplacementReady, true);
+  assert.equal(ready.editReplacement?.normalizedDataUrl, 'data:image/png;base64,second.png');
+  ready.setEditVariant('classic');
+  assert.equal(render().editVariant, 'classic');
+  assert.equal(render().savedSkinEditHasChanges(skin), true);
+
+  render().clearEditReplacement();
+  assert.equal(render().savedSkinEditHasChanges(skin), false);
+
+  render().stageEditReplacementFile(f.png('third.png'));
+  render().cancelEdit();
+  await f.answer('third.png', { variant: 'slim' });
+  const closed = render();
+  assert.equal(closed.editKey, null);
+  assert.equal(closed.editReplacement, null);
+  assert.equal(closed.editVariant, 'classic');
+  assert.deepEqual(f.revoked, ['blob:first.png', 'blob:second.png', 'blob:third.png']);
 });
 
 test('native drop refusal becomes an Error usable by the wardrobe read-error consumer', async () => {

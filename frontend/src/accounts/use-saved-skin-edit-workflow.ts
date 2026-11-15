@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import {
   applySavedSkin,
   captureWardrobeContext,
@@ -11,33 +11,30 @@ import {
   wardrobeData,
   wardrobeOp,
 } from './wardrobe-state';
-import { pickNativeSkinFile } from '../platform/native';
 import { toast } from '../app/toast';
 import { showConfirm } from '../ui/Dialog';
 import {
   boundedMessage,
   suggestedSavedSkinVariant,
   isPngFile,
-  normalizeSkinUpload,
   replaceSavedSkinTexture,
   skinActionErrorMessage,
   updateSavedSkin,
 } from './api';
 import { usePngDrop } from './use-png-drop';
-import { NO_CAPE_VALUE, type StagedSkinUpload } from './types';
+import { useStagedSkinPng } from './use-staged-skin-png';
+import { NO_CAPE_VALUE } from './types';
 import { type SavedSkinRecord } from '../generated/SavedSkinRecord';
 import { type SkinVariant } from '../generated/SkinVariant';
 
 export function useSavedSkinEditWorkflow() {
-  const editTextureInputRef = useRef<HTMLInputElement | null>(null);
-  const editReplacementUrlRef = useRef<string | null>(null);
-  const editReplacementTokenRef = useRef(0);
   const editDetectTokenRef = useRef(0);
-  const [editReplacement, setEditReplacement] = useState<StagedSkinUpload | null>(null);
   const [editReplacementDragActive, setEditReplacementDragActive] = useState(false);
   const [editKey, setEditKey] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editVariant, setEditVariant] = useState<SkinVariant>('classic');
+  const replacement = useStagedSkinPng({ onDetected: setEditVariant });
+  const editReplacement = replacement.staged;
   const [editCapeId, setEditCapeId] = useState<string>(NO_CAPE_VALUE);
   const [editDetectBusyKey, setEditDetectBusyKey] = useState<string | null>(null);
   const [editDetectError, setEditDetectError] = useState<string | null>(null);
@@ -48,14 +45,8 @@ export function useSavedSkinEditWorkflow() {
   const editReplacementReady = !editReplacement || editReplacement.normalizeStatus === 'ready';
 
   const clearEditReplacement = (): void => {
-    editReplacementTokenRef.current += 1;
-    if (editReplacementUrlRef.current) {
-      URL.revokeObjectURL(editReplacementUrlRef.current);
-      editReplacementUrlRef.current = null;
-    }
-    setEditReplacement(null);
+    replacement.clear();
     setEditReplacementDragActive(false);
-    if (editTextureInputRef.current) editTextureInputRef.current.value = '';
   };
 
   const savedSkinEditHasChanges = (skin: SavedSkinRecord): boolean => {
@@ -144,64 +135,15 @@ export function useSavedSkinEditWorkflow() {
   const stageEditReplacementFile = (file: File): void => {
     if (!editKey) return;
     if (!isPngFile(file)) {
-      setWardrobeNotice('Choose a PNG skin file.');
-      if (editTextureInputRef.current) editTextureInputRef.current.value = '';
+      replacement.refuse('Choose a PNG skin file.');
       return;
     }
     if (editBusyKey) {
-      setWardrobeNotice('Wait for the current skin edit to finish.');
-      if (editTextureInputRef.current) editTextureInputRef.current.value = '';
+      replacement.refuse('Wait for the current skin edit to finish.');
       return;
     }
-
-    const objectUrl = URL.createObjectURL(file);
-    editReplacementTokenRef.current += 1;
-    const token = editReplacementTokenRef.current;
-    if (editReplacementUrlRef.current) URL.revokeObjectURL(editReplacementUrlRef.current);
-    editReplacementUrlRef.current = objectUrl;
-    setWardrobeNotice(null);
     setEditDetectError(null);
-    setEditReplacement({
-      file,
-      objectUrl,
-      detectedVariant: 'classic',
-      detectingVariant: true,
-      normalizeStatus: 'checking',
-    });
-
-    void normalizeSkinUpload(file)
-      .then((metadata) => {
-        if (token !== editReplacementTokenRef.current) return;
-        setEditVariant(metadata.variant_suggestion);
-        setEditReplacement((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectedVariant: metadata.variant_suggestion,
-                detectingVariant: false,
-                normalizeStatus: 'ready',
-                normalizeError: undefined,
-                normalizedDataUrl: metadata.normalized_data_url,
-              }
-            : current,
-        );
-      })
-      .catch((err) => {
-        if (token !== editReplacementTokenRef.current) return;
-        setEditReplacement((current) =>
-          current?.objectUrl === objectUrl
-            ? {
-                ...current,
-                detectingVariant: false,
-                normalizeStatus: 'error',
-                normalizeError: boundedMessage(
-                  err instanceof Error ? err.message : undefined,
-                  'Skin validation failed.',
-                ),
-              }
-            : current,
-        );
-      });
+    replacement.stage(file);
   };
 
   const editReplacementDrop = usePngDrop({
@@ -213,20 +155,7 @@ export function useSavedSkinEditWorkflow() {
   });
 
   const openEditTexturePicker = (): void => {
-    if (editTextureInputRef.current) editTextureInputRef.current.value = '';
-    void (async () => {
-      try {
-        const nativeFile = await pickNativeSkinFile();
-        if (nativeFile) {
-          stageEditReplacementFile(nativeFile);
-          return;
-        }
-        if (nativeFile === null) return;
-        editTextureInputRef.current?.click();
-      } catch (err) {
-        setWardrobeNotice(boundedMessage(err instanceof Error ? err.message : undefined, 'Could not open skin file.'));
-      }
-    })();
+    replacement.openPicker(stageEditReplacementFile);
   };
 
   const saveSkinMetadata = async (textureKey: string, applyAfterSave = false): Promise<void> => {
@@ -303,18 +232,8 @@ export function useSavedSkinEditWorkflow() {
     });
   };
 
-  useEffect(() => {
-    return () => {
-      editReplacementTokenRef.current += 1;
-      if (editReplacementUrlRef.current) {
-        URL.revokeObjectURL(editReplacementUrlRef.current);
-        editReplacementUrlRef.current = null;
-      }
-    };
-  }, []);
-
   return {
-    editTextureInputRef,
+    editTextureInputRef: replacement.inputRef,
     editReplacement,
     editReplacementDragActive,
     editKey,
