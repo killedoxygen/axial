@@ -1,0 +1,206 @@
+{
+  "version": {
+    "id": "1.16.5-forge-36.2.34",
+    "inheritsFrom": "1.16.5",
+    "type": "release",
+    "mainClass": "cpw.mods.modlauncher.Launcher",
+    "logging": {},
+    "arguments": {
+      "game": [
+        "--launchTarget",
+        "fmlclient",
+        "--fml.forgeVersion",
+        "36.2.34",
+        "--fml.mcVersion",
+        "1.16.5",
+        "--fml.forgeGroup",
+        "net.minecraftforge",
+        "--fml.mcpVersion",
+        "20210115.111550"
+      ],
+      "jvm": [
+        "-XX:+IgnoreUnrecognizedVMOptions",
+        "--add-exports=java.base/sun.security.util=ALL-UNNAMED",
+        "--add-exports=jdk.naming.dns/com.sun.jndi.dns=java.naming",
+        "--add-opens=java.base/java.util.jar=ALL-UNNAMED"
+      ]
+    },
+    "libraries": [
+      {
+        "name": "net.minecraftforge:forge:1.16.5-36.2.34",
+        "downloads": {
+          "artifact": {
+            "path": "net/minecraftforge/forge/1.16.5-36.2.34/forge-1.16.5-36.2.34.jar",
+            "url": "",
+            "sha1": "b05f056824252928b59c746f8a28fe2cf36db6c0",
+            "size": 212608
+          }
+        }
+      }
+    ]
+  },
+  "install": {
+    "spec": 0,
+    "profile": "forge",
+    "version": "1.16.5-forge-36.2.34",
+    "minecraft": "1.16.5",
+    "path": "net.minecraftforge:forge:1.16.5-36.2.34",
+    "data": {
+      "MAPPINGS": {
+        "client": "[de.oceanlabs.mcp:mcp_config:1.16.5-20210115.111550:mappings@txt]"
+      },
+      "BINPATCH": {
+        "client": "/data/client.lzma"
+      },
+      "MC_SLIM": {
+        "client": "[net.minecraft:client:1.16.5-20210115.111550:slim]"
+      },
+      "MC_SLIM_SHA": {
+        "client": "'045d6edac8fe1b004e159c49704b5b729f551079'"
+      },
+      "MC_EXTRA": {
+        "client": "[net.minecraft:client:1.16.5-20210115.111550:extra]"
+      },
+      "MC_EXTRA_SHA": {
+        "client": "'4aef4168f94d97bc73bf510213b2518942f931d1'"
+      },
+      "MC_SRG": {
+        "client": "[net.minecraft:client:1.16.5-20210115.111550:srg]"
+      },
+      "PATCHED": {
+        "client": "[net.minecraftforge:forge:1.16.5-36.2.34:client]"
+      },
+      "PATCHED_SHA": {
+        "client": "'f0b1ece7b16290e61d1cd76b67b94ae499ecdd9a'"
+      },
+      "MCP_VERSION": {
+        "client": "'20210115.111550'"
+      }
+    },
+    "processors": [
+      {
+        "jar": "net.minecraftforge:installertools:1.2.6",
+        "args": [
+          "--task",
+          "MCP_DATA",
+          "--input",
+          "[de.oceanlabs.mcp:mcp_config:1.16.5-20210115.111550@zip]",
+          "--output",
+          "{MAPPINGS}",
+          "--key",
+          "mappings"
+        ]
+      },
+      {
+        "jar": "net.minecraftforge:jarsplitter:1.1.4",
+        "args": [
+          "--input",
+          "{MINECRAFT_JAR}",
+          "--slim",
+          "{MC_SLIM}",
+          "--extra",
+          "{MC_EXTRA}",
+          "--srg",
+          "{MAPPINGS}"
+        ],
+        "outputs": {
+          "{MC_SLIM}": "{MC_SLIM_SHA}",
+          "{MC_EXTRA}": "{MC_EXTRA_SHA}"
+        }
+      },
+      {
+        "jar": "net.md-5:SpecialSource:1.8.5",
+        "args": [
+          "--in-jar",
+          "{MC_SLIM}",
+          "--out-jar",
+          "{MC_SRG}",
+          "--srg-in",
+          "{MAPPINGS}"
+        ]
+      },
+      {
+        "jar": "net.minecraftforge:binarypatcher:1.0.12",
+        "args": [
+          "--clean",
+          "{MC_SRG}",
+          "--output",
+          "{PATCHED}",
+          "--apply",
+          "{BINPATCH}"
+        ],
+        "outputs": {
+          "{PATCHED}": "{PATCHED_SHA}"
+        }
+      }
+    ],
+    "libraries": [
+      {
+        "name": "de.oceanlabs.mcp:mcp_config:1.16.5-20210115.111550@zip",
+        "downloads": {
+          "artifact": {
+            "path": "de/oceanlabs/mcp/mcp_config/1.16.5-20210115.111550/mcp_config-1.16.5-20210115.111550.zip",
+            "url": "https://maven.minecraftforge.net/de/oceanlabs/mcp/mcp_config/1.16.5-20210115.111550/mcp_config-1.16.5-20210115.111550.zip",
+            "sha1": "a81464c686be42933aacac7898f8c0d50edccf51",
+            "size": 777652
+          }
+        }
+      },
+      {
+        "name": "net.md-5:SpecialSource:1.8.5",
+        "downloads": {
+          "artifact": {
+            "path": "net/md-5/SpecialSource/1.8.5/SpecialSource-1.8.5.jar",
+            "url": "https://maven.minecraftforge.net/net/md-5/SpecialSource/1.8.5/SpecialSource-1.8.5.jar",
+            "sha1": "c670c493c436a885c872fa4810bc698628b95922",
+            "size": 81179
+          }
+        }
+      },
+      {
+        "name": "net.minecraftforge:binarypatcher:1.0.12",
+        "downloads": {
+          "artifact": {
+            "path": "net/minecraftforge/binarypatcher/1.0.12/binarypatcher-1.0.12.jar",
+            "url": "https://maven.minecraftforge.net/net/minecraftforge/binarypatcher/1.0.12/binarypatcher-1.0.12.jar",
+            "sha1": "971ea098f83ef2e1b96c1b7849465bb79fd05838",
+            "size": 16491
+          }
+        }
+      },
+      {
+        "name": "net.minecraftforge:forge:1.16.5-36.2.34:universal",
+        "downloads": {
+          "artifact": {
+            "path": "net/minecraftforge/forge/1.16.5-36.2.34/forge-1.16.5-36.2.34-universal.jar",
+            "url": "",
+            "sha1": "24aa8afad1764e4ff18eea3071cbb54461943523",
+            "size": 2773337
+          }
+        }
+      },
+      {
+        "name": "net.minecraftforge:installertools:1.2.6",
+        "downloads": {
+          "artifact": {
+            "path": "net/minecraftforge/installertools/1.2.6/installertools-1.2.6.jar",
+            "url": "https://maven.minecraftforge.net/net/minecraftforge/installertools/1.2.6/installertools-1.2.6.jar",
+            "sha1": "21965826afe136f0d789858727317838e0435dbf",
+            "size": 68585
+          }
+        }
+      },
+      {
+        "name": "net.minecraftforge:jarsplitter:1.1.4",
+        "downloads": {
+          "artifact": {
+            "path": "net/minecraftforge/jarsplitter/1.1.4/jarsplitter-1.1.4.jar",
+            "url": "https://maven.minecraftforge.net/net/minecraftforge/jarsplitter/1.1.4/jarsplitter-1.1.4.jar",
+            "sha1": "57ce2d6564c1176b23a911ef57127ff3c45bffb3",
+            "size": 7405
+          }
+        }
+      }
+    ]
+  }
+}
