@@ -2777,7 +2777,7 @@ mod tests {
     ) -> super::ProcessorRuntime {
         let program = br#"#!/bin/sh
 case "$*" in
-  *-version*) printf '%s\n' 'openjdk version "17.0.1"' >&2; exit 0 ;;
+  *-version*) printf '%s\n' 'openjdk version "17.0.1"' "os.arch = $(uname -m)" >&2; exit 0 ;;
 esac
 /bin/cp "$5" "$6"
 if [ "$4" != derived-missing ]; then

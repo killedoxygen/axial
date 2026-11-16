@@ -2545,7 +2545,7 @@ mod tests {
         let fake_java = format!(
             r#"#!/bin/sh
 case "$*" in
-  *-version*) printf '%s\n' 'openjdk version "17.0.1"' >&2; exit 0 ;;
+  *-version*) printf '%s\n' 'openjdk version "17.0.1"' "os.arch = $(uname -m)" >&2; exit 0 ;;
 esac
 for last do :; done
 if [ ! -e {processor_state} ]; then
@@ -6178,7 +6178,7 @@ printf '%s' 'processor-terminal' > "$last"
                 r#"#!/bin/sh
 set -eu
 case "$*" in
-  *-version*) printf '%s\n' 'openjdk version "21.0.1"' >&2; exit 0 ;;
+  *-version*) printf '%s\n' 'openjdk version "21.0.1"' "os.arch = $(uname -m)" >&2; exit 0 ;;
 esac
 tool=$3
 shift 3
@@ -6218,7 +6218,7 @@ esac
         fn start() -> Self {
             let fake_java = br#"#!/bin/sh
 case "$*" in
-  *-version*) printf '%s\n' 'openjdk version "17.0.1"' >&2; exit 0 ;;
+  *-version*) printf '%s\n' 'openjdk version "17.0.1"' "os.arch = $(uname -m)" >&2; exit 0 ;;
 esac
 case "$4" in
   single) printf '%s' 'processor-terminal' > "$5" ;;
