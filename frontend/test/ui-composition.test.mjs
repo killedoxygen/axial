@@ -794,13 +794,14 @@ test('session hydration restores backend process controls and excludes explicitl
   assert.throws(() => launch.liveSessions([active, active]));
 });
 
-/** @param {{queueFailure?: boolean, registryFailure?: boolean, sessionFailure?: boolean, activeSessions?: ReturnType<typeof session>[], optionalFailure?: boolean}} [options] */
+/** @param {{queueFailure?: boolean, registryFailure?: boolean, sessionFailure?: boolean, activeSessions?: ReturnType<typeof session>[], optionalFailure?: boolean, queueBusy?: number}} [options] */
 function bootstrapHarness({
   queueFailure = false,
   registryFailure = false,
   sessionFailure = false,
   activeSessions = [],
   optionalFailure = false,
+  queueBusy = 0,
 } = {}) {
   const appStore = /** @type {typeof import('../src/app/store')} */ (loadSource('src/app/store.ts'));
   const settings = /** @type {typeof import('../src/settings/state')} */ (loadSource('src/settings/state.ts'));
@@ -831,6 +832,14 @@ function bootstrapHarness({
       calls.push([method, path]);
       if (path === '/install/queue') {
         queueAttempts++;
+        if (queueBusy > 0) {
+          queueBusy--;
+          throw Object.assign(new Error('Recovery still settling'), {
+            name: 'ApiError',
+            status: 409,
+            statusText: 'Conflict',
+          });
+        }
         if (failQueue) throw new Error('Queue state unavailable');
       }
       if (failRegistry && path === '/instances') throw new Error('Registry state unavailable');
@@ -856,7 +865,7 @@ function bootstrapHarness({
   const bootstrap = loadSource(
     'src/app/bootstrap.ts',
     {
-      'platform/transport': { initializeApiBase: async () => {} },
+      'platform/transport': { initializeApiBase: async () => {}, isApiError },
       'app/App': { preloadDeferredViews() {} },
       'settings/api': apiModule('settings/api.ts', call),
       'music/api': apiModule('music/api.ts', call),
@@ -918,6 +927,7 @@ test('bootstrap refuses false readiness on failed queue hydration and joins conc
   await first;
   assert.equal(harness.store.bootstrapState.value, 'error');
   assert.equal(harness.store.bootstrapError.value, 'Queue state unavailable');
+  assert.equal(harness.store.bootstrapFailure.value, 'transport');
   assert.equal(harness.queueAttempts(), 1);
   harness.recoverQueue();
   await harness.bootstrap.startApplicationBootstrap();
@@ -965,4 +975,16 @@ test('a bootstrap retry refreshes readiness even when only the parallel session 
   assert.equal(harness.store.bootstrapState.value, 'ready');
   assert.deepEqual(harness.reconnects, [['instance-1', 'Updated world']]);
   assert.equal(harness.calls.filter(([, path]) => path === '/instances').length, 2);
+});
+
+test('bootstrap waits through a busy refusal while recovery settles instead of reporting a connection failure', async () => {
+  const harness = bootstrapHarness({ queueBusy: 1 });
+  const attempt = harness.bootstrap.startApplicationBootstrap();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(harness.store.bootstrapFailure.value, 'settling');
+  assert.equal(harness.store.bootstrapState.value, 'loading');
+  await attempt;
+  assert.equal(harness.store.bootstrapState.value, 'ready');
+  assert.equal(harness.store.bootstrapFailure.value, null);
+  assert.equal(harness.queueAttempts(), 2);
 });

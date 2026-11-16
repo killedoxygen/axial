@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { startApplicationBootstrap } from '../bootstrap';
-import { bootstrapError, bootstrapState } from '../store';
+import { bootstrapError, bootstrapFailure, bootstrapState } from '../store';
 import { Logo } from '../../ui/Logo';
 import { WindowStrip } from './WindowControls';
 
@@ -80,7 +80,9 @@ export function BootSplash(): JSX.Element | null {
         <Logo className="cp-boot-logo" motion="assembly" size={64} style={bootLogoStyle(progress)} />
         {state === 'error' ? (
           <>
-            <div class="cp-boot-error-title">Failed to connect</div>
+            <div class="cp-boot-error-title">
+              {bootstrapFailure.value === 'transport' ? 'Failed to connect' : 'Could not load launcher state'}
+            </div>
             <div class="cp-boot-error-msg">
               {bootstrapError.value || 'The launcher could not load its initial state.'}
             </div>
@@ -93,7 +95,9 @@ export function BootSplash(): JSX.Element | null {
             <div class="cp-boot-bar">
               <div class="cp-boot-bar-fill" style={{ '--done': progress / 100 }} />
             </div>
-            <div class="cp-boot-label">Starting Axial…</div>
+            <div class="cp-boot-label">
+              {bootstrapFailure.value === 'settling' ? 'Waiting for recovered work to settle…' : 'Starting Axial…'}
+            </div>
           </>
         )}
       </div>

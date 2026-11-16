@@ -499,6 +499,7 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
     config: h.configState,
     appVersion: signal(''),
     bootstrapError: signal<string | null>(null),
+    bootstrapFailure: signal<string | null>(null),
     bootstrapState: signal('loading'),
     devMode: signal(false),
     instances: signal([]),
@@ -524,7 +525,7 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
   const bootstrap = source<typeof import('../src/app/bootstrap')>(
     'app/bootstrap.ts',
     {
-      'platform/transport': { initializeApiBase: async () => {} },
+      'platform/transport': { initializeApiBase: async () => {}, isApiError: () => false },
       'app/App': {
         preloadDeferredViews() {
           deferredCalls.push('views');
