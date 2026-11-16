@@ -794,14 +794,43 @@ test('session hydration restores backend process controls and excludes explicitl
   assert.throws(() => launch.liveSessions([active, active]));
 });
 
-/** @param {{queueFailure?: boolean, registryFailure?: boolean, sessionFailure?: boolean, activeSessions?: ReturnType<typeof session>[], optionalFailure?: boolean, queueBusy?: number}} [options] */
+/**
+ * The real transport, over a fetch that answers each request with the next serialized owner refusal, so startup
+ * classifies exactly what the API sends.
+ * @param {Array<{status: number, body: string}>} refusals
+ */
+function refusingTransport(refusals) {
+  const transport = /** @type {typeof import('../src/platform/transport')} */ (
+    loadSource(
+      'src/platform/transport.ts',
+      { 'platform/native': { getNativeApiTransportBootstrap: async () => null } },
+      {
+        __AXIAL_WEB_API_BASE__: 'http://127.0.0.1:9',
+        __AXIAL_TEST_API_CAPABILITY__: 'test-capability',
+        fetch: async () => {
+          const refusal = refusals.shift();
+          assert.ok(refusal);
+          return new Response(refusal.body, {
+            status: refusal.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        },
+        Response,
+        Headers,
+      },
+    )
+  );
+  return { transport, pending: () => refusals.length };
+}
+
+/** @param {{queueFailure?: boolean, registryFailure?: boolean, sessionFailure?: boolean, activeSessions?: ReturnType<typeof session>[], optionalFailure?: boolean, queueRefusals?: Array<{status: number, body: string}>}} [options] */
 function bootstrapHarness({
   queueFailure = false,
   registryFailure = false,
   sessionFailure = false,
   activeSessions = [],
   optionalFailure = false,
-  queueBusy = 0,
+  queueRefusals = [],
 } = {}) {
   const appStore = /** @type {typeof import('../src/app/store')} */ (loadSource('src/app/store.ts'));
   const settings = /** @type {typeof import('../src/settings/state')} */ (loadSource('src/settings/state.ts'));
@@ -816,6 +845,7 @@ function bootstrapHarness({
   let failRegistry = registryFailure;
   let failSessions = sessionFailure;
   let queueAttempts = 0;
+  const refusing = refusingTransport([...queueRefusals]);
   /** @type {Record<string, unknown>} */
   const values = {
     '/config': { onboarding_done: true },
@@ -832,14 +862,8 @@ function bootstrapHarness({
       calls.push([method, path]);
       if (path === '/install/queue') {
         queueAttempts++;
-        if (queueBusy > 0) {
-          queueBusy--;
-          throw Object.assign(new Error('Recovery still settling'), {
-            name: 'ApiError',
-            status: 409,
-            statusText: 'Conflict',
-          });
-        }
+        // The real transport decodes the owner's serialized refusal.
+        if (refusing.pending() > 0) return refusing.transport.request(/** @type {any} */ (method), path);
         if (failQueue) throw new Error('Queue state unavailable');
       }
       if (failRegistry && path === '/instances') throw new Error('Registry state unavailable');
@@ -865,7 +889,11 @@ function bootstrapHarness({
   const bootstrap = loadSource(
     'src/app/bootstrap.ts',
     {
-      'platform/transport': { initializeApiBase: async () => {}, isApiError },
+      'platform/transport': {
+        initializeApiBase: async () => {},
+        isApiError: refusing.transport.isApiError,
+        isRepeatableRefusal: refusing.transport.isRepeatableRefusal,
+      },
       'app/App': { preloadDeferredViews() {} },
       'settings/api': apiModule('settings/api.ts', call),
       'music/api': apiModule('music/api.ts', call),
@@ -977,14 +1005,34 @@ test('a bootstrap retry refreshes readiness even when only the parallel session 
   assert.equal(harness.calls.filter(([, path]) => path === '/instances').length, 2);
 });
 
-test('bootstrap waits through a busy refusal while recovery settles instead of reporting a connection failure', async () => {
-  const harness = bootstrapHarness({ queueBusy: 1 });
+// Bodies exactly as `routes::error` serializes them (pinned by its own test).
+const INSTANCE_BUSY = {
+  status: 409,
+  body: '{"error":"The instance is busy. Wait for the current operation to finish.","retry":"busy"}',
+};
+const SETTLEMENT_REQUIRED = {
+  status: 409,
+  body: '{"error":"The operation requires settlement before this instance can be used."}',
+};
+const SETTINGS_UNAVAILABLE = { status: 503, body: '{"error":"Settings are temporarily unavailable."}' };
+
+test('bootstrap waits only through an owner busy refusal, never on the status class alone', async () => {
+  const harness = bootstrapHarness({ queueRefusals: [INSTANCE_BUSY] });
   const attempt = harness.bootstrap.startApplicationBootstrap();
   await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.equal(harness.store.bootstrapFailure.value, 'settling');
+  assert.equal(harness.store.bootstrapFailure.value, 'busy');
   assert.equal(harness.store.bootstrapState.value, 'loading');
   await attempt;
   assert.equal(harness.store.bootstrapState.value, 'ready');
   assert.equal(harness.store.bootstrapFailure.value, null);
   assert.equal(harness.queueAttempts(), 2);
+
+  for (const refusal of [SETTLEMENT_REQUIRED, SETTINGS_UNAVAILABLE]) {
+    const refused = bootstrapHarness({ queueRefusals: [refusal] });
+    await refused.bootstrap.startApplicationBootstrap();
+    assert.equal(refused.store.bootstrapState.value, 'error');
+    assert.equal(refused.store.bootstrapFailure.value, 'refused');
+    assert.equal(refused.store.bootstrapError.value, JSON.parse(refusal.body).error);
+    assert.equal(refused.queueAttempts(), 1, 'a genuine refusal is not repeated automatically');
+  }
 });

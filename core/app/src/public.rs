@@ -8,12 +8,27 @@ use ts_rs::TS;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ErrorResponse {
     pub error: String,
+    /// Set only by an owner that refused before any effect because other work
+    /// holds what the request needs; the same request may be repeated once
+    /// that work finishes. Absent for every other refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retry: Option<Retry>,
+}
+
+/// When a refused request may be repeated unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum Retry {
+    /// After the work currently holding the state finishes.
+    Busy,
 }
 
 impl ErrorResponse {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             error: message.into(),
+            retry: None,
         }
     }
 }

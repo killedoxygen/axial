@@ -96,7 +96,7 @@ export function BootSplash(): JSX.Element | null {
               <div class="cp-boot-bar-fill" style={{ '--done': progress / 100 }} />
             </div>
             <div class="cp-boot-label">
-              {bootstrapFailure.value === 'settling' ? 'Waiting for recovered work to settle…' : 'Starting Axial…'}
+              {bootstrapFailure.value === 'busy' ? 'Waiting for current work to finish…' : 'Starting Axial…'}
             </div>
           </>
         )}

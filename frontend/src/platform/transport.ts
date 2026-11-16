@@ -97,6 +97,14 @@ export function isApiError(error: unknown): error is ApiError {
   return error instanceof Error && error.name === 'ApiError' && typeof (error as Partial<ApiError>).status === 'number';
 }
 
+/**
+ * The owner refused before any effect because other work holds what the request needs, and marked the same request
+ * repeatable once that work finishes. The HTTP status alone never says this.
+ */
+export function isRepeatableRefusal(error: unknown): boolean {
+  return isApiError(error) && isErrorPayload(error.payload) && error.payload.retry === 'busy';
+}
+
 export type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 /** A JSON command or read. The response is the generated wire type the route returns. */

@@ -13,7 +13,7 @@ use axial_app::{
     performance::{
         PerformanceMutationError,
     },
-    public::ErrorResponse,
+    public::{ErrorResponse, Retry},
     resources::{ResourceError, folders::FolderError, mods::ModImportError},
     settings::SettingsError,
     skins::{SkinError, library::SkinLibraryError, lookup::ProfileMediaError},
@@ -56,9 +56,21 @@ impl IntoResponse for ApiError {
 pub(crate) trait PublicError: Sized + Display {
     fn status(&self) -> StatusCode;
 
+    /// Only refusals the owner makes before any effect, because other work
+    /// holds the state, may be repeated unchanged.
+    fn retry(&self) -> Option<Retry> {
+        None
+    }
+
     /// Owners whose failures carry more than a message override the body.
     fn into_api(self) -> ApiError {
-        ApiError::new(self.status(), self.to_string())
+        ApiError::body(
+            self.status(),
+            ErrorResponse {
+                error: self.to_string(),
+                retry: self.retry(),
+            },
+        )
     }
 }
 
@@ -279,6 +291,10 @@ impl PublicError for InstanceError {
             | Self::VersionUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
+
+    fn retry(&self) -> Option<Retry> {
+        matches!(self, Self::Busy).then_some(Retry::Busy)
+    }
 }
 
 impl PublicError for DeletionError {
@@ -312,6 +328,10 @@ impl PublicError for InstallError {
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    fn retry(&self) -> Option<Retry> {
+        matches!(self, Self::Busy | Self::AtCapacity).then_some(Retry::Busy)
     }
 }
 
@@ -436,5 +456,60 @@ impl PublicError for UpdateError {
             self.to_string().chars().take(500).collect()
         };
         update_failure(self.status(), code, message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body(error: impl PublicError) -> (StatusCode, serde_json::Value) {
+        let response = error.into_api().into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 << 10)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn only_owner_busy_refusals_are_marked_repeatable() {
+        for (error, status) in [
+            (body(InstanceError::Busy).await, StatusCode::CONFLICT),
+            (body(InstallError::Busy).await, StatusCode::CONFLICT),
+            (body(InstallError::AtCapacity).await, StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            assert_eq!(error.0, status);
+            assert_eq!(error.1["retry"], "busy", "{}", error.1);
+        }
+        // Genuine conflicts and unavailability with the same status classes
+        // keep their own copy and carry no retry.
+        for (error, status) in [
+            (body(InstanceError::SettlementRequired).await, StatusCode::CONFLICT),
+            (body(InstallError::NotReady).await, StatusCode::CONFLICT),
+            (body(InstanceError::SetupUnavailable).await, StatusCode::SERVICE_UNAVAILABLE),
+            (body(SettingsError::Unavailable).await, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            assert_eq!(error.0, status);
+            let object = error.1.as_object().unwrap();
+            assert_eq!(object.keys().collect::<Vec<_>>(), ["error"], "{}", error.1);
+        }
+        // The exact bodies the frontend startup test replays through its transport.
+        for (error, serialized) in [
+            (
+                body(InstanceError::Busy).await.1,
+                r#"{"error":"The instance is busy. Wait for the current operation to finish.","retry":"busy"}"#,
+            ),
+            (
+                body(InstanceError::SettlementRequired).await.1,
+                r#"{"error":"The operation requires settlement before this instance can be used."}"#,
+            ),
+            (
+                body(SettingsError::Unavailable).await.1,
+                r#"{"error":"Settings are temporarily unavailable."}"#,
+            ),
+        ] {
+            assert_eq!(error, serde_json::from_str::<serde_json::Value>(serialized).unwrap());
+        }
     }
 }

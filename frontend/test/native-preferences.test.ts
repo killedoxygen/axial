@@ -525,7 +525,11 @@ test('bootstrap retains its visible retry state until native hydration succeeds 
   const bootstrap = source<typeof import('../src/app/bootstrap')>(
     'app/bootstrap.ts',
     {
-      'platform/transport': { initializeApiBase: async () => {}, isApiError: () => false },
+      'platform/transport': {
+        initializeApiBase: async () => {},
+        isApiError: () => false,
+        isRepeatableRefusal: () => false,
+      },
       'app/App': {
         preloadDeferredViews() {
           deferredCalls.push('views');

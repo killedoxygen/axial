@@ -12,7 +12,7 @@ import { initializeNativePreferences, nativePreferencesHydrated } from './prefer
 import { local } from './local-state';
 import { Sound, bindButtonSounds } from './sound';
 import { appVersion, bootstrapError, bootstrapFailure, bootstrapState, devMode } from './store';
-import { isApiError } from '../platform/transport';
+import { isApiError, isRepeatableRefusal } from '../platform/transport';
 import { config, systemInfo } from '../settings/state';
 import { instances } from '../instances/state';
 import { launchSessions, liveSessions } from '../launch/state';
@@ -26,16 +26,17 @@ let apiInitialized = false;
 let activeAttempt: Promise<void> | null = null;
 let nativeInterfaceReady = false;
 
-/** Startup attempts made automatically while the launcher reports work still settling. */
-const SETTLING_RETRIES = 8;
+/** Startup attempts made automatically while an owner reports its state busy with other work. */
+const BUSY_RETRIES = 8;
 
 /**
- * A refusal the API makes while recovery or installs still own the state it reads (busy or temporarily
- * unavailable) is not a connection failure: startup waits and tries again. Anything without an API response is.
+ * No response is a connection failure. An owner's typed busy refusal was made before any effect, so startup waits and
+ * repeats; every other refusal keeps its own message. A repeat starts from a fresh status read, so setup runs again
+ * only while the status owner still requires it and a lost setup response is never replayed blindly.
  */
-function bootstrapFailureKind(error: unknown): 'transport' | 'settling' | 'refused' {
+function bootstrapFailureKind(error: unknown): 'transport' | 'busy' | 'refused' {
   if (!isApiError(error)) return 'transport';
-  return error.status === 409 || error.status === 503 ? 'settling' : 'refused';
+  return isRepeatableRefusal(error) ? 'busy' : 'refused';
 }
 
 export function startApplicationBootstrap(): Promise<void> {
@@ -52,8 +53,8 @@ export function startApplicationBootstrap(): Promise<void> {
         return;
       } catch (error: unknown) {
         const kind = bootstrapFailureKind(error);
-        if (kind === 'settling' && attempt < SETTLING_RETRIES) {
-          bootstrapFailure.value = 'settling';
+        if (kind === 'busy' && attempt < BUSY_RETRIES) {
+          bootstrapFailure.value = 'busy';
           await new Promise((resolve) => setTimeout(resolve, Math.min(8000, 500 * 2 ** attempt)));
           continue;
         }
