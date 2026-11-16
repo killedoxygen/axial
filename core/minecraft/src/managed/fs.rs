@@ -5786,8 +5786,6 @@ impl ManagedNativeDirectory {
         }
     }
 }
- }
-}
 
 impl ManagedLibraryFile {
     pub fn copy_create_only(
