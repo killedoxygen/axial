@@ -2307,7 +2307,7 @@ impl InstallQueue {
                 }
                 let scratch = work
                     .try_reserve_scratch(bytes)
-                    .map_err(|_| InstallError::AtCapacity)?;
+                    .map_err(|error| artifacts::inspection_capacity(&work, error, "inventory_record"))?;
                 let record: String = row.get(1)?;
                 Ok(Some((record, scratch)))
             })?;
@@ -2336,7 +2336,7 @@ impl InstallQueue {
                     }
                     Ok(inspected)
                 },
-            ).map_err(|_| InstallError::AtCapacity)?
+            ).map_err(|error| artifacts::inspection_capacity(&work, error, "inventory_worker"))?
         }).await.map_err(|_| InstallError::NotReady)?
     }
 

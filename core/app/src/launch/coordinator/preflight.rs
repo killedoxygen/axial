@@ -312,7 +312,10 @@ impl LaunchCoordinator {
                     .await
                     .map_err(|_| LaunchError::PreparationFailed)?
             })
-            .map_err(|_| LaunchError::AtCapacity)?
+            .map_err(|cause| {
+                tracing::debug!(stage = "readiness_finalization_task", ?cause, "Launch readiness admission refused.");
+                LaunchError::AtCapacity
+            })?
             .join()
             .await
             .map_err(|_| LaunchError::PreparationFailed)??;
@@ -906,7 +909,10 @@ impl LaunchCoordinator {
                 drop(bundle_guard);
                 result
             })
-            .map_err(|_| LaunchError::AtCapacity)?;
+            .map_err(|cause| {
+                tracing::debug!(stage = "readiness_task", ?cause, "Launch readiness admission refused.");
+                LaunchError::AtCapacity
+            })?;
         let result = task.join().await;
         projection.scan = scan_slot.lock().unwrap().clone();
         if result.is_ok() {

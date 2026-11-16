@@ -24,6 +24,24 @@ use std::{
 
 pub(crate) const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 
+pub(super) fn inspection_capacity(
+    work: &axial_resource::PhysicalWorkOwner,
+    error: axial_resource::PhysicalWorkError,
+    stage: &'static str,
+) -> super::queue::InstallError {
+    let observed = work.snapshot(axial_resource::PhysicalWorkClass::Foreground);
+    tracing::debug!(
+        stage,
+        cause = ?error,
+        active_admissions = observed.active_admissions,
+        running_workers = observed.running_workers,
+        available_workers = observed.available_workers,
+        available_scratch_bytes = observed.available_scratch_bytes,
+        "Installed inventory admission refused."
+    );
+    super::queue::InstallError::AtCapacity
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Inspection {
     Summary,
@@ -95,6 +113,12 @@ impl InventoryBudget {
             )
             .ok_or(InstallError::AtCapacity)?;
         if checks > self.remaining_checks {
+            tracing::debug!(
+                stage = "inventory_projection_checks",
+                requested_checks = checks,
+                remaining_checks = self.remaining_checks,
+                "Installed inventory projection budget refused."
+            );
             return Err(InstallError::AtCapacity);
         }
         let metadata = format!("versions/{0}/{0}.json", inventory.version_id);
@@ -119,14 +143,20 @@ impl InventoryBudget {
 
     fn reserve(&mut self, checks: u64, bytes: u64) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
-        let remaining_checks = self
-            .remaining_checks
-            .checked_sub(checks)
-            .ok_or(InstallError::AtCapacity)?;
-        let remaining_bytes = self
-            .remaining_bytes
-            .checked_sub(bytes)
-            .ok_or(InstallError::AtCapacity)?;
+        let (Some(remaining_checks), Some(remaining_bytes)) = (
+            self.remaining_checks.checked_sub(checks),
+            self.remaining_bytes.checked_sub(bytes),
+        ) else {
+            tracing::debug!(
+                stage = "inventory_projection_budget",
+                requested_checks = checks,
+                requested_bytes = bytes,
+                remaining_checks = self.remaining_checks,
+                remaining_bytes = self.remaining_bytes,
+                "Installed inventory projection budget refused."
+            );
+            return Err(InstallError::AtCapacity);
+        };
         self.remaining_checks = remaining_checks;
         self.remaining_bytes = remaining_bytes;
         Ok(())
@@ -364,12 +394,12 @@ impl<'de> serde::de::Visitor<'de> for Files<'_> {
                         self.0.at_capacity = true;
                         A::Error::custom("installed inventory capacity exceeded")
                     })?;
-                let slots = axial_resource::process_physical_work()
-                    .try_reserve_scratch(bytes)
-                    .map_err(|_| {
-                        self.0.at_capacity = true;
-                        A::Error::custom("installed inventory capacity exceeded")
-                    })?;
+                let work = axial_resource::process_physical_work();
+                let slots = work.try_reserve_scratch(bytes).map_err(|error| {
+                    inspection_capacity(&work, error, "inventory_decode_slots");
+                    self.0.at_capacity = true;
+                    A::Error::custom("installed inventory capacity exceeded")
+                })?;
                 files.try_reserve_exact(additional).map_err(|_| {
                     self.0.at_capacity = true;
                     A::Error::custom("installed inventory allocation failed")
@@ -902,9 +932,10 @@ impl InventoryEvidence {
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<InventoryEvidence>() as u64))
             .and_then(|bytes| bytes.checked_add(1024))
             .ok_or(InstallError::AtCapacity)?;
-        retained.scratch = axial_resource::process_physical_work()
+        let work = axial_resource::process_physical_work();
+        retained.scratch = work
             .try_reserve_scratch(bytes)
-            .map_err(|_| InstallError::AtCapacity)?;
+            .map_err(|error| inspection_capacity(&work, error, "inventory_retention"))?;
         Ok(evidence.clone())
     }
 
