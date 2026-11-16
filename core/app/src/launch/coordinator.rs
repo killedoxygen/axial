@@ -398,10 +398,6 @@ impl LaunchCoordinator {
         )?;
         let (max_memory_mb, min_memory_mb, _) = effective.heap_bounds(heap.max_mb);
         let options = launch_options(&effective, max_memory_mb, min_memory_mb)?;
-        let composition = self
-            .performance
-            .settled_for_launch(&admitted)
-            .map_err(composition_error)?;
         let library_operation = admitted
             .generation()
             .managed_library()
@@ -473,7 +469,13 @@ impl LaunchCoordinator {
             environment
                 .features
                 .insert("has_custom_resolution".into(), options.resolution.is_some());
-            let (runtime, files, natives) = tokio::join!(
+            let (composition, runtime, files, natives) = tokio::join!(
+                stages.time("composition", "Managed files", async {
+                    self.performance
+                        .settled_for_launch(&admitted)
+                        .await
+                        .map_err(composition_error)
+                }),
                 stages.time(
                     "runtime",
                     "Java runtime",
@@ -517,9 +519,11 @@ impl LaunchCoordinator {
                     Ok::<_, LaunchError>(natives)
                 }),
             );
+            let composition = composition?;
             let runtime = runtime.map_err(LaunchError::RuntimeFailure)?;
             let (game_libraries, game_assets) = files?;
             Ok::<_, LaunchError>((
+                composition,
                 installed,
                 installed_versions,
                 runtime,
@@ -529,8 +533,15 @@ impl LaunchCoordinator {
             ))
         };
         let (account, installation) = tokio::join!(account, installation);
-        let (installed, installed_versions, runtime, game_libraries, game_assets, prepared_natives) =
-            installation?;
+let (
+            composition,
+            installed,
+            installed_versions,
+            runtime,
+            game_libraries,
+            game_assets,
+            prepared_natives,
+        ) = installation?;
         let (selection, auth, secrets, credential_expires_at) = account?;
         if cancellation.is_cancelled() {
             return Err(LaunchError::Cancelled);

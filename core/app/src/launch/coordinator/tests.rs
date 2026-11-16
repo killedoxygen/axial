@@ -3343,3 +3343,66 @@ fn transport_cannot_supply_command_authority() {
     invalid.max_memory_mb = Some(-1);
     assert_eq!(invalid.validate(), Err(LaunchError::InvalidMemory));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn play_admits_settled_managed_files_and_refuses_changed_ones_through_the_owner() {
+    let (root, coordinator, id) = preflight_fixture().await;
+    std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+    let admitted = coordinator.admit(&id).unwrap();
+    crate::performance::duplicate::seed_managed(&admitted).await;
+    let mods = admitted
+        .game_directory()
+        .read_projection()
+        .unwrap()
+        .join("mods");
+    let prepare = |admitted: RegisteredInstance| {
+        let coordinator = coordinator.clone();
+        let id = id.clone();
+        async move {
+            let native_retention = Mutex::new(None);
+            let libraries = Arc::new(super::super::libraries::Retention::new(
+                admitted.game_directory().clone(),
+            ));
+            let mut request = request();
+            request.instance_id = id;
+            request.username = None;
+            let prepared = coordinator
+                .prepare(
+                    admitted,
+                    &request,
+                    &CancellationToken::new(),
+                    &native_retention,
+                    libraries.clone(),
+                    super::super::session::LaunchAttemptTelemetry::started(None, "vanilla"),
+                )
+                .await;
+            let composition = match &prepared {
+                Ok(prepared) => Some(prepared.revalidate_composition().await),
+                Err(_) => None,
+            };
+            if let Ok(prepared) = prepared.as_ref() {
+                super::super::prepare::settle_natives(prepared.natives()).await;
+            }
+            super::super::libraries::settle(libraries).await;
+            (prepared.map(drop), composition)
+        }
+    };
+    let (settled, composition) = prepare(admitted).await;
+    let original = std::fs::read(mods.join("current.jar")).unwrap();
+    std::fs::write(mods.join("current.jar"), b"externally changed").unwrap();
+    let (changed, _) = prepare(coordinator.admit(&id).unwrap()).await;
+    std::fs::write(mods.join("current.jar"), original).unwrap();
+    let retained = coordinator.performance.has_unsettled_effects();
+    let recovered = coordinator.performance.recover_pending().await;
+    coordinator
+        .tasks
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(settled, Ok(()));
+    assert!(matches!(composition, Some(Ok(()))));
+    assert_eq!(changed, Err(LaunchError::PerformanceUnsettled));
+    assert!(retained, "the changed composition stays owned until recovery settles it");
+    assert_eq!(recovered.unwrap(), 1);
+}

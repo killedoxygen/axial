@@ -416,21 +416,43 @@ pub struct PerformanceService {
     retained: Arc<Mutex<BTreeMap<String, RetainedOperation>>>,
 }
 
-/// Owner proof that an admitted instance has no pending composition operation,
-/// queued or running command, or retained unsettled effect. Launch holds the
-/// instance lease, which excludes new composition work; spawn rechecks this.
+/// Owner proof that an admitted instance's composition is absent or fully
+/// settled: no pending operation, queued or running command or retained
+/// effect, and the instance's managed files proven against their recorded
+/// state. Launch holds the instance lease, which excludes new composition
+/// work; `revalidate` repeats the whole proof immediately before spawn.
 pub struct CompositionSettled {
     service: PerformanceService,
     instance: RegisteredInstance,
+    state: Option<CompositionState>,
 }
 
 impl CompositionSettled {
+    /// The cheap owner checks: instance binding and the owner's records.
     pub fn validate_current(&self) -> Result<(), PerformanceMutationError> {
         self.instance
             .validate_current()
             .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
         self.service
             .check_settled(&self.instance.record().instance.id)
+    }
+
+    /// Repeats the complete proof and requires the same recorded state.
+    pub async fn revalidate(&self) -> Result<(), PerformanceMutationError> {
+        self.validate_current()?;
+        // Effect authority is bound only for the proof, never retained by
+        // the prepared session.
+        let bound = self.service.bind(self.instance.clone()).await?;
+        let inspection = bound
+            .authority
+            .prove_settled(&bound.identity, &bound.effects)
+            .await
+            .map_err(|_| PerformanceMutationError::Unsettled)?;
+        drop(bound);
+        if inspection.health == BundleHealth::Invalid || inspection.state != self.state {
+            return Err(PerformanceMutationError::Unsettled);
+        }
+        self.validate_current()
     }
 }
 
@@ -913,9 +935,11 @@ impl PerformanceService {
     /// Settle existing obligations and pin the selected mode's launch plan under
     /// launch's admission. Applying or removing bundles requires an explicit
     /// Performance command; Play does not authorize new content mutations.
-    /// Authoritative settled-or-absent composition state for an ordinary launch.
-    /// Reads only owner state; it plans nothing and writes nothing.
-    pub fn settled_for_launch(
+    /// Authoritative settled-or-absent composition state for an ordinary
+    /// launch. A proven state writes nothing. Anything the read-only proof
+    /// cannot establish goes through the owner's recovery, which checkpoints,
+    /// reconciles and retains the instance when it cannot settle.
+    pub async fn settled_for_launch(
         &self,
         instance: &RegisteredInstance,
     ) -> Result<CompositionSettled, PerformanceMutationError> {
@@ -923,9 +947,27 @@ impl PerformanceService {
             .validate_current()
             .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
         self.check_settled(&instance.record().instance.id)?;
+        let bound = self.bind(instance.clone()).await?;
+        let inspection = match bound
+            .authority
+            .prove_settled(&bound.identity, &bound.effects)
+            .await
+        {
+            Ok(inspection) if inspection.health != BundleHealth::Invalid => inspection,
+            _ => {
+                let inspection = self.recover_bound(&bound).await?;
+                if inspection.health == BundleHealth::Invalid {
+                    return Err(PerformanceMutationError::Unsettled);
+                }
+                inspection
+            }
+        };
+        drop(bound);
+        self.check_settled(&instance.record().instance.id)?;
         Ok(CompositionSettled {
             service: self.clone(),
             instance: instance.clone(),
+            state: inspection.state,
         })
     }
 
@@ -3235,43 +3277,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_managed_mode_preserves_user_sodium_without_resolving_or_applying_a_bundle() {
+    async fn launch_proves_absent_composition_without_writes_and_preserves_user_mods() {
         let (_root, service, admitted) = launch_fixture().await;
         let path = admitted.directory().read_projection().unwrap();
         std::fs::write(path.join("mods/sodium-fabric.jar"), b"user-selected Sodium").unwrap();
         let before = payload_files(&path);
-        let prepared = service
-            .prepare_for_launch(
-                &admitted,
-                service.resolution_request(
-                    "1.21.4".into(),
-                    "fabric".into(),
-                    PerformanceMode::Managed,
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(prepared.plan().mode, PerformanceMode::Managed);
-        assert!(
-            prepared
-                .plan()
-                .mods
-                .iter()
-                .any(|item| item.project_id == "AANobbMI")
-        );
-        assert!(
-            prepared
-                .planned
-                .request()
-                .installed_mods
-                .iter()
-                .any(|item| item == "sodium")
-        );
-        assert_eq!(
-            prepared.effective(),
-            crate::performance::effective::effective_performance_plan(prepared.plan())
-        );
-        prepared.validate_current().unwrap();
+        let settled = service.settled_for_launch(&admitted).await.unwrap();
+        assert!(settled.state.is_none());
+        settled.revalidate().await.unwrap();
         assert_eq!(payload_files(&path), before);
         assert!(!path.join("mods/.axial-performance").exists());
         assert_eq!(service.pending_count().unwrap(), 0);
@@ -3279,28 +3292,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_vanilla_and_custom_preserve_managed_artifacts_and_history() {
+    async fn launch_proves_settled_managed_artifacts_and_history_without_writes() {
         let (_root, service, admitted) = launch_fixture().await;
         super::super::duplicate::seed_managed(&admitted).await;
         let path = admitted.directory().read_projection().unwrap();
         let before = payload_files(&path);
         assert!(before.contains_key(std::path::Path::new("mods/current.jar")));
         assert!(before.keys().any(|path| path.ends_with("snapshot.json")));
-        for mode in [PerformanceMode::Vanilla, PerformanceMode::Custom] {
-            let prepared = service
-                .prepare_for_launch(
-                    &admitted,
-                    service.resolution_request("1.21.4".into(), "fabric".into(), mode),
-                )
-                .await
-                .unwrap();
-            assert_eq!(prepared.plan().mode, mode);
-            assert!(prepared.plan().mods.is_empty());
-            prepared.validate_current().unwrap();
-            assert_eq!(payload_files(&path), before);
-            assert_eq!(service.pending_count().unwrap(), 0);
-            assert!(!service.has_unsettled_effects());
-        }
+        let settled = service.settled_for_launch(&admitted).await.unwrap();
+        assert!(settled.state.is_some());
+        settled.revalidate().await.unwrap();
+        assert_eq!(payload_files(&path), before);
+        assert_eq!(service.pending_count().unwrap(), 0);
+        assert!(!service.has_unsettled_effects());
+
+        // A managed artifact changed after the proof fails the spawn recheck.
+        let original = std::fs::read(path.join("mods/current.jar")).unwrap();
+        std::fs::write(path.join("mods/current.jar"), b"changed before spawn").unwrap();
+        assert!(matches!(
+            settled.revalidate().await,
+            Err(PerformanceMutationError::Unsettled)
+        ));
+        std::fs::write(path.join("mods/current.jar"), original).unwrap();
+        settled.revalidate().await.unwrap();
     }
 
     #[tokio::test]
@@ -3312,18 +3326,9 @@ mod tests {
         std::fs::write(path.join("mods/current.jar"), b"externally changed").unwrap();
         let before = payload_files(&path);
         let id = admitted.record().instance.id.clone();
-        for mode in [
-            PerformanceMode::Managed,
-            PerformanceMode::Vanilla,
-            PerformanceMode::Custom,
-        ] {
+        for _ in 0..2 {
             assert!(matches!(
-                service
-                    .prepare_for_launch(
-                        &admitted,
-                        service.resolution_request("1.21.4".into(), "fabric".into(), mode,)
-                    )
-                    .await,
+                service.settled_for_launch(&admitted).await,
                 Err(PerformanceMutationError::Unsettled)
             ));
             assert_eq!(payload_files(&path), before);

@@ -335,6 +335,32 @@ impl ManagedCompositionAuthority {
         Ok(inspection)
     }
 
+    /// Read-only proof that the instance's composition is absent or fully
+    /// settled: its effect owner has nothing unsettled, no publication or
+    /// reconciliation obligation remains, and every managed artifact matches
+    /// its recorded size and SHA-512. Writes nothing; any unproven state is
+    /// an error for the caller's recovery path.
+    pub async fn prove_settled(
+        &self,
+        identity: &ManagedInstanceIdentity,
+        effects: &ManagedInstanceEffectAuthority,
+    ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
+        let instance = self.validate_identity(identity, effects).await?;
+        let settled = effects.clone();
+        run_managed_blocking(PhysicalIoClass::Metadata, move || settled.require_settled())
+            .await
+            .map_err(|_| ManagedMutationError::task_stopped("prove_settled"))?
+            .map_err(|error| ManagedMutationError::indeterminate("prove_settled", error))?;
+        match open_mods_if_present(instance, "prove_settled").await? {
+            None => Ok(absent_inspection(None, None)),
+            Some(mods) => run_managed_blocking(PhysicalIoClass::Read, move || {
+                recovered_inspection(mods)
+            })
+            .await
+            .map_err(|_| ManagedMutationError::task_stopped("prove_settled"))?,
+        }
+    }
+
     pub async fn ensure_installed<
         BeforeTargetEffect,
         BeforeTargetEffectFuture,

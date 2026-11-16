@@ -136,6 +136,19 @@ impl PreparedSession {
         std::mem::take(&mut self.secrets)
     }
 
+    /// Repeats the composition owner's complete settled proof; the process
+    /// actor awaits it immediately before spawning.
+    pub(super) async fn revalidate_composition(&self) -> Result<(), PrepareError> {
+        self.composition.revalidate().await.map_err(|error| {
+            tracing::warn!(
+                stage = "composition_revalidate",
+                cause = error.diagnostic_code(),
+                "Launch plan rejected."
+            );
+            LaunchError::PerformanceUnsettled
+        })
+    }
+
     /// Repeated by the process actor immediately before spawning. Refreshes,
     /// profile changes and account switches cannot substitute a new identity
     /// into an already prepared command.
@@ -318,7 +331,7 @@ pub(super) mod tests {
             crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
-        let composition = performance.settled_for_launch(&instance).unwrap();
+        let composition = performance.settled_for_launch(&instance).await.unwrap();
         let mut files = Vec::new();
         let object = hex::encode(Sha1::digest(b"step"));
         let index = format!(

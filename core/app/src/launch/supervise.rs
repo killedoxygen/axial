@@ -63,7 +63,11 @@ pub(super) async fn run(
         sentinel.settled = true;
         return;
     }
-    if let Err(error) = prepared.validate_before_spawn() {
+    let validated = match prepared.revalidate_composition().await {
+        Ok(()) => prepared.validate_before_spawn(),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = validated {
         tracing::warn!(
             stage = "input_revalidation",
             cause = ?error,
