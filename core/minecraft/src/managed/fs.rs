@@ -4870,7 +4870,9 @@ impl ManagedLibraryOperation {
     /// only when `listed` accepts its manifest bytes and the directory holds
     /// exactly the files that manifest lists, each with the listed size and
     /// SHA-1, plus the manifest. Any other entry is left untouched. At most
-    /// `limit` directories are examined. Blocking capability I/O.
+    /// `limit` directories are examined, with aggregate limits of 16 MiB of
+    /// manifests, 4096 retained file guards and 512 MiB of payload verification.
+    /// Entries beyond those budgets stay untouched. Blocking capability I/O.
     pub fn recover_native_directories(
         &self,
         limit: usize,
@@ -4878,6 +4880,9 @@ impl ManagedLibraryOperation {
     ) -> io::Result<Vec<ManagedNativeDirectory>> {
         const MANIFEST: &str = ".axial-native-manifest.json";
         const MAX_MANIFEST_BYTES: u64 = 4 << 20;
+        const MAX_BATCH_MANIFEST_BYTES: u64 = 16 << 20;
+        const MAX_BATCH_FILES: usize = 4096;
+        const MAX_BATCH_PAYLOAD_BYTES: u64 = 512 << 20;
         self.revalidate()?;
         let managed = self.managed_directory().map_err(loader_io)?;
         let Some(natives) = managed
@@ -4891,12 +4896,18 @@ impl ManagedLibraryOperation {
             return Ok(Vec::new());
         };
         let mut recovered = Vec::new();
+        let mut manifest_bytes = 0_u64;
+        let mut file_count = 0_usize;
+        let mut payload_bytes = 0_u64;
         for name in natives.entries_bounded(limit).map_err(loader_io)? {
             let Some(name) = name.to_str().map(str::to_owned) else {
                 continue;
             };
             let generated = name.strip_prefix("native-").is_some_and(|id| {
-                id.len() == 32 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
             });
             if !generated {
                 continue;
@@ -4908,36 +4919,73 @@ impl ManagedLibraryOperation {
                 let Some(manifest_guard) = directory.inspect_regular_file(MANIFEST)? else {
                     return Ok(None);
                 };
-                let manifest =
-                    directory.read_guarded_file_bounded(MANIFEST, &manifest_guard, MAX_MANIFEST_BYTES)?;
-                let Some(files) = listed(&manifest).filter(|files| files.len() <= 4096) else {
+                if manifest_guard.size > MAX_MANIFEST_BYTES {
+                    return Ok(None);
+                }
+                let Some(total) = manifest_bytes.checked_add(manifest_guard.size) else {
                     return Ok(None);
                 };
+                if total > MAX_BATCH_MANIFEST_BYTES {
+                    return Ok(None);
+                }
+                manifest_bytes = total;
+                let manifest = directory.read_guarded_file_bounded(
+                    MANIFEST,
+                    &manifest_guard,
+                    MAX_MANIFEST_BYTES,
+                )?;
+                let Some(files) = listed(&manifest).filter(|files| files.len() < 4096) else {
+                    return Ok(None);
+                };
+                let Some(count) = file_count.checked_add(files.len() + 1) else {
+                    return Ok(None);
+                };
+                if count > MAX_BATCH_FILES {
+                    return Ok(None);
+                }
+                file_count = count;
+                let manifest_name = PortableFileName::new_exact(MANIFEST)
+                    .map_err(|_| LoaderError::Verify("native manifest name".into()))?;
+                let mut names = std::collections::HashSet::from([manifest_name.key()]);
+                let mut portable_files = Vec::with_capacity(files.len());
+                let mut bytes = manifest_guard.size;
+                for (file, size, _) in &files {
+                    let Ok(portable) = PortableFileName::new_exact(file) else {
+                        return Ok(None);
+                    };
+                    if !names.insert(portable.key()) || *size > (128 << 20) {
+                        return Ok(None);
+                    }
+                    let Some(total) = bytes.checked_add(*size) else {
+                        return Ok(None);
+                    };
+                    bytes = total;
+                    portable_files.push(portable);
+                }
+                let Some(total) = payload_bytes.checked_add(bytes) else {
+                    return Ok(None);
+                };
+                if total > MAX_BATCH_PAYLOAD_BYTES {
+                    return Ok(None);
+                }
+                payload_bytes = total;
                 let entries = directory.entries_bounded(files.len() + 1)?;
                 if entries.len() != files.len() + 1 {
                     return Ok(None);
                 }
                 let mut guards = Vec::with_capacity(entries.len());
-                for (file, size, sha1) in &files {
-                    let Ok(portable) = PortableFileName::new_exact(file) else {
-                        return Ok(None);
-                    };
-                    if file == MANIFEST {
-                        return Ok(None);
-                    }
+                for ((file, size, sha1), portable) in files.iter().zip(portable_files) {
                     let Some(guard) = directory.inspect_regular_file(file)? else {
                         return Ok(None);
                     };
-                    if directory.sha1_guarded_file_bytes(file, &guard, *size)? != *sha1 {
+                    if guard.size != *size
+                        || directory.sha1_guarded_file_bytes(file, &guard, *size)? != *sha1
+                    {
                         return Ok(None);
                     }
                     guards.push((portable, guard));
                 }
-                guards.push((
-                    PortableFileName::new_exact(MANIFEST)
-                        .map_err(|_| LoaderError::Verify("native manifest name".into()))?,
-                    manifest_guard,
-                ));
+                guards.push((manifest_name, manifest_guard));
                 let relative = PortableRelativePath::new_exact(&format!("cache/natives/{name}"))
                     .map_err(|_| LoaderError::Verify("native directory name".into()))?;
                 let receipt = ManagedNativeDirectory {
@@ -7531,6 +7579,132 @@ mod library_lifecycle_tests {
                 .observe_file(&batch_path("link"))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn native_recovery_requires_unique_members_and_exact_sizes() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let manifest = ".axial-native-manifest.json";
+        for invalid in ["duplicate", "portable alias", "manifest alias", "size"] {
+            let native = operation
+                .publish_native_directory(vec![
+                    (
+                        PortableFileName::new_exact("native.bin").unwrap(),
+                        b"native".to_vec(),
+                    ),
+                    (
+                        PortableFileName::new_exact("other.bin").unwrap(),
+                        b"other".to_vec(),
+                    ),
+                    (
+                        PortableFileName::new_exact(manifest).unwrap(),
+                        b"{}".to_vec(),
+                    ),
+                ])
+                .await
+                .unwrap();
+            let path = temporary.path().join(native.relative_path().as_str());
+            drop(native);
+            let names = match invalid {
+                "duplicate" => ["native.bin", "native.bin"],
+                "portable alias" => ["native.bin", "NATIVE.BIN"],
+                "manifest alias" => ["native.bin", ".AXIAL-NATIVE-MANIFEST.JSON"],
+                _ => ["native.bin", "other.bin"],
+            };
+            let recovered = operation
+                .recover_native_directories(16, |_| {
+                    Some(
+                        names
+                            .into_iter()
+                            .map(|name| {
+                                let content = if name == "other.bin" {
+                                    &b"other"[..]
+                                } else {
+                                    &b"native"[..]
+                                };
+                                let size = content.len() as u64 + u64::from(invalid == "size");
+                                (name.to_owned(), size, Sha1::digest(content).into())
+                            })
+                            .collect(),
+                    )
+                })
+                .unwrap();
+            assert!(
+                recovered.is_empty(),
+                "{invalid} must not grant cleanup authority"
+            );
+            assert_eq!(std::fs::read(path.join("native.bin")).unwrap(), b"native");
+            assert_eq!(std::fs::read(path.join("other.bin")).unwrap(), b"other");
+            assert_eq!(std::fs::read(path.join(manifest)).unwrap(), b"{}");
+            // The same directory is recoverable through its complete, exact inventory.
+            for native in operation
+                .recover_native_directories(16, |_| {
+                    Some(vec![
+                        ("native.bin".into(), 6, Sha1::digest(b"native").into()),
+                        ("other.bin".into(), 5, Sha1::digest(b"other").into()),
+                    ])
+                })
+                .unwrap()
+            {
+                native.settle().unwrap();
+            }
+            assert!(!path.exists());
+        }
+        drop(operation);
+        root.settle().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_recovery_bounds_manifest_reads_across_the_whole_batch() {
+        let temporary =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let mut manifest = vec![b' '; 4 << 20];
+        manifest[..2].copy_from_slice(b"{}");
+        let mut paths = Vec::new();
+        for _ in 0..5 {
+            let path = temporary.path().join(format!(
+                "cache/natives/native-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(".axial-native-manifest.json"), &manifest).unwrap();
+            paths.push(path);
+        }
+        let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+        let operation = root.try_acquire().unwrap();
+        let reads = std::cell::Cell::new(0);
+        let recovered = operation
+            .recover_native_directories(16, |bytes| {
+                assert_eq!(bytes, manifest);
+                reads.set(reads.get() + 1);
+                Some(Vec::new())
+            })
+            .unwrap();
+        assert_eq!(reads.get(), 4);
+        assert_eq!(recovered.len(), 4);
+        for directory in &recovered {
+            directory.settle().unwrap();
+        }
+        drop(recovered);
+        let remaining: Vec<_> = paths.iter().filter(|path| path.exists()).collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            std::fs::read(remaining[0].join(".axial-native-manifest.json")).unwrap(),
+            manifest
+        );
+        let recovered = operation
+            .recover_native_directories(16, |_| Some(Vec::new()))
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        for directory in &recovered {
+            directory.settle().unwrap();
+        }
+        drop((recovered, operation));
+        root.settle().unwrap();
+        assert!(paths.iter().all(|path| !path.exists()));
     }
 
     #[tokio::test]
