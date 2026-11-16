@@ -501,9 +501,7 @@ impl DesktopLifecycle {
                 })?;
             if let Err(error) = result {
                 if !services.server.is_shutdown_settled() {
-                    return Err(
-                        "The local API did not stop cleanly. Try the same action again.".into(),
-                    );
+                    return Err(error);
                 }
                 tracing::warn!(%error, "Local API shutdown settled after a worker error");
             }
@@ -1297,9 +1295,10 @@ mod tests {
         assert!(lifecycle.finish_update_settled().is_err());
         assert!(lifecycle.prepare_update_process_exit().await.is_err());
         let close = lifecycle.prepare_exit(TerminalIntent::Close).await;
-        assert!(
-            close.is_err(),
-            "live native effects still require settlement"
+        assert_eq!(
+            close,
+            Err("Content file effects have not settled. The local API remains available.".into()),
+            "preserve the unsettled API owner's safe refusal"
         );
         assert_ne!(
             close,
