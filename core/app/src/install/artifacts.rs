@@ -614,7 +614,7 @@ impl ActivatedVersion {
         let evidence = InventoryEvidence {
             pin,
             operation,
-            guards,
+            guards: Arc::new(guards),
             missing,
             scratch: None,
         };
@@ -652,6 +652,158 @@ impl ActivatedVersion {
         };
         receipt.revalidate()?;
         Ok(VersionInspection::Ready(receipt))
+    }
+}
+
+/// Ready inventories a library keeps between launches, and their total
+/// accounted size. Retention has its own ceiling rather than holding process
+/// scratch, which governs transient work and must be whole whenever it is idle.
+const MAX_RETAINED_INVENTORIES: usize = 2;
+const MAX_RETAINED_INVENTORY_BYTES: u64 = 32 << 20;
+
+/// Verified results of ready inspections, kept between launches. An entry holds
+/// no generation pin, library operation or descriptor, so it never delays
+/// retirement; reuse rebinds it to the caller's pin and rechecks every
+/// inventoried revision, the same evidence `Reverified` digest reuse accepts.
+#[derive(Clone, Default)]
+pub(crate) struct InventoryRetention {
+    entries: Arc<std::sync::Mutex<Vec<Arc<RetainedInventory>>>>,
+}
+
+struct RetainedInventory {
+    library: crate::library::LibraryId,
+    generation: crate::library::GenerationId,
+    version_id: String,
+    /// SHA-256 of the exact `inventory_json` record this inspection verified.
+    record: [u8; 32],
+    guards: Arc<Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>>,
+    version: VersionJson,
+    exact: Arc<BTreeMap<String, (String, u64)>>,
+    client: PortableRelativePath,
+    bytes: u64,
+}
+
+impl RetainedInventory {
+    fn matches(&self, pin: &GenerationPin, version_id: &str, record: &[u8; 32]) -> bool {
+        self.library == pin.library_id()
+            && self.generation == pin.generation()
+            && self.version_id == version_id
+            && self.record == *record
+    }
+}
+
+impl InventoryRetention {
+    /// A ready receipt for this exact record under `pin`, when every retained
+    /// revision still holds. A failed recheck forgets the entry.
+    pub(crate) fn reuse(
+        &self,
+        pin: &GenerationPin,
+        version_id: &str,
+        record: &[u8; 32],
+    ) -> Option<InstalledVersionReceipt> {
+        let retained = self
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.matches(pin, version_id, record))
+            .cloned()?;
+        let receipt = (|| {
+            let projection = pin.read_projection().ok()?;
+            let receipt = InstalledVersionReceipt {
+                evidence: Arc::new(InventoryEvidence {
+                    pin: pin.clone(),
+                    operation: pin.managed_library().ok()?,
+                    guards: retained.guards.clone(),
+                    missing: Vec::new(),
+                    scratch: None,
+                }),
+                version: retained.version.clone(),
+                exact: retained.exact.clone(),
+                client_jar: retained.client.join_under(&projection),
+            };
+            receipt.revalidate().ok()?;
+            Some(receipt)
+        })();
+        if receipt.is_none() {
+            self.entries
+                .lock()
+                .unwrap()
+                .retain(|entry| !Arc::ptr_eq(entry, &retained));
+        }
+        receipt
+    }
+
+    /// Retains a fresh ready inspection of `record`, charging its revision
+    /// table, path names, exact map and parsed metadata to the retention
+    /// ceiling. An inventory that cannot fit is not retained.
+    pub(crate) fn insert(
+        &self,
+        pin: &GenerationPin,
+        record: &[u8; 32],
+        record_bytes: u64,
+        receipt: &InstalledVersionReceipt,
+    ) {
+        let version_id = receipt.version.id.clone();
+        let Ok(client) =
+            PortableRelativePath::new_exact(&format!("versions/{version_id}/{version_id}.jar"))
+        else {
+            return;
+        };
+        let metadata_bytes = receipt
+            .exact
+            .get(&format!("versions/{version_id}/{version_id}.json"))
+            .map_or(16 << 20, |(_, size)| *size);
+        let guards = &receipt.evidence.guards;
+        let Some(bytes) = (guards.capacity() as u64)
+            .checked_mul(std::mem::size_of::<(
+                PortableRelativePath,
+                axial_fs::FileRevisionObservation,
+            )>() as u64)
+            .and_then(|bytes| {
+                bytes.checked_add((guards.len() as u64).checked_mul(
+                    axial_minecraft::portable_path::MAX_PORTABLE_RELATIVE_PATH_BYTES as u64,
+                )?)
+            })
+            // The exact map's strings come from the record; its nodes are charged per entry.
+            .and_then(|bytes| bytes.checked_add(record_bytes))
+            .and_then(|bytes| bytes.checked_add((receipt.exact.len() as u64).checked_mul(128)?))
+            // Parsed metadata is charged at twice its verified file size.
+            .and_then(|bytes| bytes.checked_add(metadata_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RetainedInventory>() as u64))
+        else {
+            return;
+        };
+        if bytes > MAX_RETAINED_INVENTORY_BYTES {
+            return;
+        }
+        let retained = Arc::new(RetainedInventory {
+            library: pin.library_id(),
+            generation: pin.generation(),
+            version_id,
+            record: *record,
+            guards: guards.clone(),
+            version: receipt.version.clone(),
+            exact: receipt.exact.clone(),
+            client,
+            bytes,
+        });
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|entry| {
+            !(entry.library == retained.library && entry.version_id == retained.version_id)
+        });
+        while entries.len() >= MAX_RETAINED_INVENTORIES
+            || entries.iter().map(|entry| entry.bytes).sum::<u64>() + bytes
+                > MAX_RETAINED_INVENTORY_BYTES
+        {
+            entries.remove(0);
+        }
+        entries.push(retained);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
     }
 }
 
@@ -709,7 +861,7 @@ impl ObservedDamage {
 pub(crate) struct InventoryEvidence {
     pin: GenerationPin,
     operation: ManagedLibraryOperation,
-    guards: Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>,
+    guards: Arc<Vec<(PortableRelativePath, axial_fs::FileRevisionObservation)>>,
     missing: Vec<FileAbsence>,
     scratch: Option<axial_resource::PhysicalScratchPermit>,
 }

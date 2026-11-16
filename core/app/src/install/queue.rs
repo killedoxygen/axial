@@ -242,6 +242,7 @@ struct Inner {
     observers: Mutex<Observers>,
     observer_join: tokio::sync::Mutex<()>,
     natives: super::vanilla::NativeRetention,
+    inventories: artifacts::InventoryRetention,
 }
 struct Observers {
     closed: bool,
@@ -584,6 +585,7 @@ impl InstallQueue {
                 }),
                 observer_join: tokio::sync::Mutex::new(()),
                 natives: super::vanilla::NativeRetention::default(),
+                inventories: artifacts::InventoryRetention::default(),
             }),
             work: axial_resource::process_physical_work(),
             telemetry: None,
@@ -2259,6 +2261,11 @@ impl InstallQueue {
         let storage = self.inner.storage.clone();
         let pin = pin.clone();
         let work = self.work.clone();
+        // Only launch-time readiness reuses a retained inventory; projections
+        // charge their own budgets and diagnostics need every damaged file.
+        let retention =
+            (inspection == artifacts::Inspection::Reverified && !diagnostics && budget.is_none())
+                .then(|| self.inner.inventories.clone());
         tokio::task::spawn_blocking(move || {
             let record = storage.read(|db| {
                 let mut statement = db.prepare("SELECT length(CAST(inventory_json AS BLOB)), inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'")?;
@@ -2280,10 +2287,25 @@ impl InstallQueue {
             work.try_run_inline(
                 axial_resource::PhysicalWorkRequest::foreground(axial_resource::PhysicalIoClass::Read, 0),
                 move || {
+                    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(record.as_bytes()).into();
+                    if let Some(receipt) = retention
+                        .as_ref()
+                        .and_then(|retention| retention.reuse(&pin, &version_id, &digest))
+                    {
+                        return Ok(artifacts::VersionInspection::Ready(receipt));
+                    }
+                    let record_bytes = record.len() as u64;
                     let activated = artifacts::DecodedVersion::decode(&record)?;
                     drop(record);
                     drop(scratch);
-                    activated.inspect(pin, &version_id, inspection, diagnostics, budget)
+                    let inspected =
+                        activated.inspect(pin.clone(), &version_id, inspection, diagnostics, budget)?;
+                    if let (Some(retention), artifacts::VersionInspection::Ready(receipt)) =
+                        (&retention, &inspected)
+                    {
+                        retention.insert(&pin, &digest, record_bytes, receipt);
+                    }
+                    Ok(inspected)
                 },
             ).map_err(|_| InstallError::AtCapacity)?
         }).await.map_err(|_| InstallError::NotReady)?
@@ -7417,6 +7439,40 @@ pub(crate) mod tests {
         assert_eq!(after, before);
         assert!(
             matches!(observed, Err(InstallError::NotReady)),
+            "{observed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_inventory_is_reused_only_while_every_revision_holds() {
+        let (root, _storage, library, _exclusions, owner, queue) = fixture();
+        let version = "retained-inventory-fixture";
+        install_ready_fixture(&queue, version).await;
+        let pin = library.admit().unwrap();
+        let first = queue.ready_version(&pin, version).await.unwrap();
+        assert_eq!(queue.inner.inventories.len(), 1);
+        let reused = queue.ready_version(&pin, version).await.unwrap();
+        assert_eq!(reused.version(), first.version());
+        assert_eq!(reused.client_jar(), first.client_jar());
+        assert!(reused.revalidate().is_ok());
+        drop((first, reused));
+        std::fs::write(
+            root.path()
+                .join(format!("versions/{version}/{version}.jar")),
+            b"changed",
+        )
+        .unwrap();
+        let observed = queue.ready_version(&pin, version).await;
+        let retained = queue.inner.inventories.len();
+        queue.shutdown_queued().unwrap();
+        owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(retained, 0);
+        assert!(
+            matches!(observed, Err(InstallError::ClientJarCorrupt)),
             "{observed:?}"
         );
     }
