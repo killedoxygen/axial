@@ -2472,15 +2472,41 @@ impl ManagedDir {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 verify_operation_admission(&self.inner.operation_pin)?;
+                tracing::debug!(stage = "file_absence", "Guarded file check refused");
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
         if !guard.identity.matches(&file)? {
+            tracing::debug!(stage = "file_identity", "Guarded file check refused");
             return Ok(None);
         }
-        let matches =
-            file.validate_revision(&guard.revision).is_ok() && guard.revision.size() == guard.size;
+        let matches = match file.validate_revision(&guard.revision) {
+            Ok(()) => guard.revision.size() == guard.size,
+            Err(error) => {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    // Diagnostic observation only: the retained guard and refusal
+                    // remain unchanged, including if this later read fails.
+                    let observed = file.revision().ok();
+                    let size_matches = observed
+                        .as_ref()
+                        .map(|revision| revision.size() == guard.size);
+                    let rename_stable_metadata_matches = observed.as_ref().map(|revision| {
+                        guard.revision.has_same_rename_stable_metadata(revision)
+                    });
+                    tracing::debug!(
+                        stage = "file_revision_comparison",
+                        io_error_kind = ?error.kind(),
+                        native_code = ?error.raw_os_error(),
+                        observation_available = observed.is_some(),
+                        ?size_matches,
+                        ?rename_stable_metadata_matches,
+                        "Guarded file check refused"
+                    );
+                }
+                false
+            }
+        };
         verify_operation_admission(&self.inner.operation_pin)?;
         Ok(matches.then_some(file))
     }
