@@ -503,6 +503,7 @@ impl LaunchCoordinator {
                         Some(inputs) => Some(
                             super::libraries::prepare(
                                 inputs,
+                                &library_operation,
                                 library_retention.clone(),
                                 cancellation,
                             )

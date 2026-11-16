@@ -15,7 +15,7 @@ use axial_minecraft::{
         TransferPublicationOutcome, TransferUnsettledObligation, VerifiedTransferDiscardObligation,
         VerifiedTransferDiscardOutcome, transfer_cancellation_channel,
     },
-    managed_path::ManagedLibraryFile,
+    managed_path::{ManagedLibraryFile, ManagedLibraryOperation},
 };
 use axial_resource::{
     PhysicalIoClass, PhysicalWorkOwner, PhysicalWorkRequest, process_physical_work,
@@ -122,8 +122,43 @@ impl Retention {
     }
 }
 
+/// Shared read validation; file effects retain their own full admission.
+pub(super) fn observe_preparation<T>(
+    library: &ManagedLibraryOperation,
+    game: &ScopedDirectory,
+    prepare: impl FnOnce() -> Result<T, LaunchError>,
+) -> Result<T, LaunchError> {
+    let mut observed = None;
+    let closing = library
+        .observe_validated(|| {
+            game.capability().observe_validated(|| {
+                observed = Some((|| {
+                    library
+                        .revalidate()
+                        .map_err(|_| LaunchError::InstallUnavailable)?;
+                    game.revalidate()
+                        .map_err(|_| LaunchError::PreparationFailed)?;
+                    let result = prepare()?;
+                    library
+                        .revalidate()
+                        .map_err(|_| LaunchError::InstallUnavailable)?;
+                    game.revalidate()
+                        .map_err(|_| LaunchError::PreparationFailed)?;
+                    Ok(result)
+                })());
+            })
+        })
+        .and_then(|closing| closing);
+    match (observed, closing) {
+        (Some(Err(error)), _) => Err(error),
+        (Some(Ok(value)), Ok(())) => Ok(value),
+        _ => Err(LaunchError::PreparationFailed),
+    }
+}
+
 pub(super) async fn prepare(
     inputs: GameLibraries,
+    library: &ManagedLibraryOperation,
     retention: Arc<Retention>,
     cancellation: &CancellationToken,
 ) -> Result<Prepared, LaunchError> {
@@ -139,46 +174,49 @@ pub(super) async fn prepare(
         .await
         .map_err(super::coordinator::physical_work_error)?;
     let (sender, cancelled) = transfer_cancellation_channel();
+    let library = library.clone();
     let work = admission.run(move |_| {
         if cancelled.is_cancelled() {
             return Err(LaunchError::Cancelled);
         }
-        let directory = prepare_directory(
-            &retention,
-            &retention.game,
-            &LeafName::new("lib").expect("fixed game library directory"),
-        )?;
-        let mut files = Vec::with_capacity(inputs.sources.len());
-        if inputs.sources.len() != inputs.requirements.entries().len() {
-            return Err(LaunchError::InstallUnavailable);
-        }
-        for (source, requirement) in inputs.sources.iter().zip(inputs.requirements.entries()) {
-            let name = LeafName::new(requirement.file_name())
-                .map_err(|_| LaunchError::InstallUnavailable)?;
-            let digest: [u8; 20] = hex::decode(requirement.sha1())
-                .ok()
-                .and_then(|bytes| bytes.try_into().ok())
-                .ok_or(LaunchError::InstallUnavailable)?;
-            files.push(prepare_file(
-                source,
-                &directory,
-                name,
-                requirement.size(),
-                digest,
+        observe_preparation(&library, &retention.game, || {
+            let directory = prepare_directory(
                 &retention,
-                cancelled.clone(),
-            )?);
-        }
-        let prepared = Prepared {
-            directory,
-            sources: inputs.sources,
-            files,
-            work: retention.work.clone(),
-        };
-        prepared
-            .check()
-            .map_err(|_| LaunchError::PreparationFailed)?;
-        Ok(prepared)
+                &retention.game,
+                &LeafName::new("lib").expect("fixed game library directory"),
+            )?;
+            let mut files = Vec::with_capacity(inputs.sources.len());
+            if inputs.sources.len() != inputs.requirements.entries().len() {
+                return Err(LaunchError::InstallUnavailable);
+            }
+            for (source, requirement) in inputs.sources.iter().zip(inputs.requirements.entries()) {
+                let name = LeafName::new(requirement.file_name())
+                    .map_err(|_| LaunchError::InstallUnavailable)?;
+                let digest: [u8; 20] = hex::decode(requirement.sha1())
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or(LaunchError::InstallUnavailable)?;
+                files.push(prepare_file(
+                    source,
+                    &directory,
+                    name,
+                    requirement.size(),
+                    digest,
+                    &retention,
+                    cancelled.clone(),
+                )?);
+            }
+            let prepared = Prepared {
+                directory,
+                sources: inputs.sources,
+                files,
+                work: retention.work.clone(),
+            };
+            prepared
+                .check()
+                .map_err(|_| LaunchError::PreparationFailed)?;
+            Ok(prepared)
+        })
     });
     tokio::pin!(work);
     let result = tokio::select! {
@@ -567,6 +605,86 @@ pub(super) mod tests {
             &fixture.retention,
             cancellation,
         )
+    }
+
+    #[test]
+    fn preparation_observation_refuses_displaced_inputs_and_preserves_prior_errors() {
+        for (source, cancelled) in [(false, false), (false, true), (true, false), (true, true)] {
+            let fixture = fixture();
+            let library = fixture._library.admit().unwrap().managed_library().unwrap();
+            let directory = lib_directory(&fixture.retention).unwrap();
+            let original = copy(&fixture, &directory).unwrap();
+            let mut ran = false;
+            let result = observe_preparation(&library, &fixture.retention.game, || {
+                ran = true;
+                if source {
+                    fixture.source.revalidate().unwrap();
+                    std::fs::rename(
+                        fixture.temporary.path().join("libraries/fml/source.jar"),
+                        fixture.temporary.path().join("libraries/fml/preserved.jar"),
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        fixture.temporary.path().join("libraries/fml/source.jar"),
+                        b"new",
+                    )
+                    .unwrap();
+                } else {
+                    directory.revalidate().unwrap();
+                    std::fs::rename(
+                        fixture.temporary.path().join("game/lib"),
+                        fixture.temporary.path().join("game/preserved-lib"),
+                    )
+                    .unwrap();
+                    std::fs::create_dir(fixture.temporary.path().join("game/lib")).unwrap();
+                    std::fs::write(fixture.temporary.path().join("game/lib/user.jar"), b"user")
+                        .unwrap();
+                }
+                if cancelled {
+                    Err(LaunchError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(ran, "the preparation ran before its closing validation");
+            assert_eq!(
+                result,
+                Err(if cancelled {
+                    LaunchError::Cancelled
+                } else {
+                    LaunchError::PreparationFailed
+                })
+            );
+            assert!(!fixture.retention.has_pending());
+            if source {
+                assert_eq!(
+                    std::fs::read(fixture.temporary.path().join("libraries/fml/preserved.jar"))
+                        .unwrap(),
+                    b"abc"
+                );
+                assert_eq!(
+                    std::fs::read(fixture.temporary.path().join("libraries/fml/source.jar"))
+                        .unwrap(),
+                    b"new"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(
+                        fixture
+                            .temporary
+                            .path()
+                            .join("game/preserved-lib/required.jar")
+                    )
+                    .unwrap(),
+                    b"abc"
+                );
+                assert_eq!(
+                    std::fs::read(fixture.temporary.path().join("game/lib/user.jar")).unwrap(),
+                    b"user"
+                );
+            }
+            drop(original);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::library::GenerationPin;
 use axial_minecraft::known_good::{KnownGoodActivationSource, KnownGoodIntegrity, KnownGoodRoot};
 use axial_minecraft::loaders::{LoaderInstallBaseCommit, VerifiedLoaderInstallBaseCommit};
 use axial_minecraft::managed_path::{
-    FileAbsence, FileObservation, ManagedLibraryFile, ManagedLibraryOperation,
+    FileAbsence, FileObservation, ManagedLibraryFile, ManagedLibraryFileBatch, ManagedLibraryOperation,
 };
 use axial_minecraft::portable_path::{PortableFileName, PortableRelativePath};
 use axial_minecraft::{
@@ -914,6 +914,14 @@ impl InventoryEvidence {
 
     /// Opens an inventoried file only while it keeps its verified revision.
     fn exact_file(&self, path: &str) -> Result<ManagedLibraryFile, super::queue::InstallError> {
+        self.exact_file_in(path, &mut self.operation.file_batch())
+    }
+
+    fn exact_file_in(
+        &self,
+        path: &str,
+        batch: &mut ManagedLibraryFileBatch,
+    ) -> Result<ManagedLibraryFile, super::queue::InstallError> {
         use super::queue::InstallError;
         // Guards follow the inventory's path order.
         let index = self
@@ -921,8 +929,7 @@ impl InventoryEvidence {
             .binary_search_by(|(recorded, _)| recorded.as_str().cmp(path))
             .map_err(|_| InstallError::NotReady)?;
         let (path, revision) = &self.guards[index];
-        let file = self
-            .operation
+        let file = batch
             .observe_file(path)
             .map_err(|_| InstallError::NotReady)?
             .ok_or(InstallError::NotReady)?;
@@ -1009,12 +1016,17 @@ pub(crate) struct LegacyAssetInputs {
 }
 
 impl LegacyAssetInputs {
+    pub(crate) fn source_batch(&self) -> ManagedLibraryFileBatch {
+        self.evidence.operation.file_batch()
+    }
+
     pub(crate) fn source(
         &self,
         file: &axial_minecraft::LegacyAssetFile,
+        batch: &mut ManagedLibraryFileBatch,
     ) -> Result<ManagedLibraryFile, super::queue::InstallError> {
         self.evidence
-            .exact_file(&format!("assets/{}", file.object_path()))
+            .exact_file_in(&format!("assets/{}", file.object_path()), batch)
     }
 }
 

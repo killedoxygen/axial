@@ -62,7 +62,7 @@ pub(super) async fn prepare(
             ))
         }
         LegacyAssetLayout::Resources => {
-            prepare_resources(inputs, retention, cancellation).await?;
+            prepare_resources(inputs, library, retention, cancellation).await?;
             Ok(Some(game_dir.join(RESOURCES)))
         }
     }
@@ -74,6 +74,7 @@ const RESOURCES: &str = "resources";
 /// created from verified objects; a differing file is refused, not replaced.
 async fn prepare_resources(
     inputs: LegacyAssetInputs,
+    library: &ManagedLibraryOperation,
     retention: Arc<Retention>,
     cancellation: &CancellationToken,
 ) -> Result<(), LaunchError> {
@@ -86,35 +87,42 @@ async fn prepare_resources(
         .await
         .map_err(super::coordinator::physical_work_error)?;
     let (sender, cancelled) = transfer_cancellation_channel();
+    let library = library.clone();
     let work = admission.run(move |_| {
-        let mut directories = HashMap::<&str, ScopedDirectory>::new();
-        let root = libraries::prepare_directory(
-            &retention,
-            &retention.game,
-            &LeafName::new(RESOURCES).expect("fixed resources directory"),
-        )?;
-        directories.insert("", root);
-        for file in &inputs.assets.files {
-            if cancelled.is_cancelled() {
-                return Err(LaunchError::Cancelled);
-            }
-            let path = file.path.as_str();
-            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-            let directory = prepare_parent(&retention, &mut directories, parent)?;
-            let source = inputs
-                .source(file)
-                .map_err(super::coordinator::install_read_error)?;
-            libraries::prepare_file(
-                &source,
-                &directory,
-                LeafName::new(name).map_err(|_| LaunchError::InstallUnavailable)?,
-                file.size,
-                file.sha1,
-                &retention,
-                cancelled.clone(),
-            )?;
+        if cancelled.is_cancelled() {
+            return Err(LaunchError::Cancelled);
         }
-        Ok(())
+        libraries::observe_preparation(&library, &retention.game, || {
+            let mut directories = HashMap::<&str, ScopedDirectory>::new();
+            let root = libraries::prepare_directory(
+                &retention,
+                &retention.game,
+                &LeafName::new(RESOURCES).expect("fixed resources directory"),
+            )?;
+            directories.insert("", root);
+            let mut sources = inputs.source_batch();
+            for file in &inputs.assets.files {
+                if cancelled.is_cancelled() {
+                    return Err(LaunchError::Cancelled);
+                }
+                let path = file.path.as_str();
+                let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+                let directory = prepare_parent(&retention, &mut directories, parent)?;
+                let source = inputs
+                    .source(file, &mut sources)
+                    .map_err(super::coordinator::install_read_error)?;
+                libraries::prepare_file(
+                    &source,
+                    &directory,
+                    LeafName::new(name).map_err(|_| LaunchError::InstallUnavailable)?,
+                    file.size,
+                    file.sha1,
+                    &retention,
+                    cancelled.clone(),
+                )?;
+            }
+            Ok(())
+        })
     });
     tokio::pin!(work);
     let result = tokio::select! {
