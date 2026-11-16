@@ -238,6 +238,13 @@ impl NativeRetention {
             NativeSlot::Recovered { directory } => directory.settle(),
             _ => unreachable!("only unused native directories can be settled"),
         };
+        if let Err(error) = &result {
+            tracing::warn!(
+                io_error_kind = ?error.kind(),
+                native_code = ?error.raw_os_error(),
+                "Retained native directory settlement failed"
+            );
+        }
         let mut ledger = self.lock();
         match &result {
             Ok(()) => ledger.entries.retain(|entry| entry.id != id),
@@ -324,10 +331,35 @@ impl NativeRetention {
         match failure {
             Some(error) => Err(error),
             None if self.lock().entries.is_empty() => Ok(()),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::ResourceBusy,
-                "retained native libraries are still in use",
-            )),
+            None => {
+                let ledger = self.lock();
+                let reserved = ledger
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry.slot, NativeSlot::Reserved))
+                    .count();
+                let in_use = ledger
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry.slot, NativeSlot::InUse { .. }))
+                    .count();
+                let settling = ledger
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry.slot, NativeSlot::Settling))
+                    .count();
+                tracing::warn!(
+                    retained = ledger.entries.len(),
+                    reserved,
+                    in_use,
+                    settling,
+                    "Native retention still owns active directories"
+                );
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "retained native libraries are still in use",
+                ))
+            }
         }
     }
 
@@ -999,7 +1031,8 @@ mod tests {
 
     struct NativeFixture {
         root: tempfile::TempDir,
-        authority: axial_minecraft::managed_path::ManagedLibraryTestAuthority,
+        library: crate::library::LibraryLifecycle,
+        authority: ManagedLibraryOperation,
         retention: NativeRetention,
     }
 
@@ -1007,11 +1040,15 @@ mod tests {
         fn new() -> Self {
             let root =
                 tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-            let authority =
-                axial_minecraft::managed_path::ManagedLibraryTestAuthority::open(root.path())
-                    .unwrap();
+            let crate::library::LibraryOpenOutcome::Ready(library) =
+                crate::library::LibraryLifecycle::open(root.path())
+            else {
+                panic!("admitted native fixture library");
+            };
+            let authority = library.admit().unwrap().managed_library().unwrap();
             Self {
                 root,
+                library,
                 authority,
                 retention: NativeRetention::default(),
             }
@@ -1045,7 +1082,7 @@ mod tests {
 
         async fn prepare(&self, version: &VersionJson) -> PreparedNatives {
             prepare_natives_with_exact_files(
-                self.authority.operation(),
+                &self.authority,
                 self.root.path(),
                 version,
                 &axial_minecraft::default_environment(),
@@ -1056,6 +1093,18 @@ mod tests {
             .unwrap()
             .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_settles_retained_natives_after_library_admission_closes() {
+        let fixture = NativeFixture::new();
+        let prepared = fixture.prepare(&fixture.version(0)).await;
+        let path = prepared.path().to_owned();
+        prepared.settle().unwrap();
+        fixture.library.close_admission();
+        fixture.retention.settle_idle().unwrap();
+        assert_eq!(fixture.retention.retained(), 0);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -1217,7 +1266,7 @@ mod tests {
         std::fs::create_dir(&foreign).unwrap();
         std::fs::write(foreign.join("kept.bin"), b"kept").unwrap();
 
-        let operation = fixture.authority.operation().clone();
+        let operation = fixture.authority.clone();
         let settled = tokio::task::spawn_blocking(move || {
             recover_native_directories(&operation, &NativeRetention::default())
         })

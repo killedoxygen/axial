@@ -5634,6 +5634,15 @@ struct ManagedNativeCleanup {
     complete: bool,
 }
 
+fn report_native_cleanup_failure(stage: &'static str, error: &io::Error) {
+    tracing::debug!(
+        stage,
+        io_error_kind = ?error.kind(),
+        native_code = ?error.raw_os_error(),
+        "Native directory check failed"
+    );
+}
+
 impl ManagedNativeDirectory {
     pub fn relative_path(&self) -> &PortableRelativePath {
         &self.relative
@@ -5668,27 +5677,47 @@ impl ManagedNativeDirectory {
     }
 
     fn validate_contents(&self, cleanup: &ManagedNativeCleanup) -> io::Result<()> {
-        self.operation.revalidate()?;
-        cleanup.directory.revalidate().map_err(loader_io)?;
-        if cleanup
+        self.operation
+            .revalidate()
+            .inspect_err(|error| report_native_cleanup_failure("admission", error))?;
+        cleanup
+            .directory
+            .revalidate()
+            .map_err(loader_io)
+            .inspect_err(|error| report_native_cleanup_failure("directory", error))?;
+        let entries = cleanup
             .directory
             .entries_bounded(cleanup.guards.len() + 1)
-            .map_err(loader_io)?
-            .len()
-            != cleanup.guards.len()
-        {
+            .map_err(loader_io)
+            .inspect_err(|error| report_native_cleanup_failure("membership", error))?
+            .len();
+        if entries != cleanup.guards.len() {
+            tracing::debug!(
+                stage = "membership",
+                expected = cleanup.guards.len(),
+                observed = entries,
+                "Native directory check failed"
+            );
             return Err(io::Error::other("native directory entries changed"));
         }
-        for (name, guard) in &cleanup.guards {
+        for (index, (name, guard)) in cleanup.guards.iter().enumerate() {
             if !cleanup
                 .directory
                 .file_guard_matches(name.as_str(), guard)
-                .map_err(loader_io)?
+                .map_err(loader_io)
+                .inspect_err(|error| report_native_cleanup_failure("file_observation", error))?
             {
+                tracing::debug!(
+                    stage = "file_revision",
+                    member_index = index,
+                    "Native directory check failed"
+                );
                 return Err(io::Error::other("native payload changed"));
             }
         }
-        self.operation.revalidate()
+        self.operation
+            .revalidate()
+            .inspect_err(|error| report_native_cleanup_failure("closing_admission", error))
     }
 
     /// Settle only this fresh extraction after the process and output readers
@@ -5702,13 +5731,26 @@ impl ManagedNativeDirectory {
         if cleanup.complete {
             return Ok(());
         }
-        self.operation.authority.root.settle().map_err(loader_io)?;
+        self.operation
+            .authority
+            .root
+            .settle()
+            .map_err(loader_io)
+            .inspect_err(|error| report_native_cleanup_failure("root_effects", error))?;
         if !cleanup.started {
             self.validate_contents(&cleanup)?;
             cleanup.started = true;
         }
         while let Some((name, guard)) = cleanup.guards.last() {
             if let Err(error) = cleanup.directory.remove_guarded_file(name.as_str(), guard) {
+                match &error {
+                    LoaderError::Io(error) => report_native_cleanup_failure("file_removal", error),
+                    _ => tracing::debug!(
+                        stage = "file_removal",
+                        failure = "managed_check",
+                        "Native directory check failed"
+                    ),
+                }
                 // A retained park/removal may have completed despite its first
                 // error. Only a settled owner and exact absence advance it.
                 self.operation.authority.root.settle().map_err(loader_io)?;
@@ -5733,12 +5775,18 @@ impl ManagedNativeDirectory {
             }
             ManagedExactChildCleanup::Known(directory) => {
                 cleanup.directory = directory;
+                tracing::debug!(
+                    stage = "directory_removal",
+                    "Native directory settlement refused"
+                );
                 Err(io::Error::other(
                     "native directory cleanup remains unsettled or contains changed files",
                 ))
             }
         }
     }
+}
+ }
 }
 
 impl ManagedLibraryFile {
