@@ -29,12 +29,19 @@ pub enum FailureClass {
 pub struct LaunchEvidence {
     pub boot_observed: bool,
     pub failure_classes: Vec<FailureClass>,
+    pub(super) graphics_api_unavailable: bool,
+    pub(super) graphics_window_creation_failed: bool,
 }
 
 impl LaunchEvidence {
     pub fn observe_line(&mut self, line: &str) {
         self.boot_observed |= boot_marker_detected(line);
         self.observe_failure(classify_startup_failure_text(line));
+        self.graphics_api_unavailable |= line.trim() == "[LWJGL] GLFW_API_UNAVAILABLE error";
+        self.graphics_window_creation_failed |= is_uncaught_glfw_window_failure(line);
+        if self.graphics_api_unavailable && self.graphics_window_creation_failed {
+            self.observe_failure(FailureClass::GraphicsUnavailable);
+        }
     }
 
     pub fn observe_failure(&mut self, class: FailureClass) {
@@ -304,6 +311,23 @@ fn is_graphics_unavailable_failure(text: &str) -> bool {
             == "GLFW error 65542: WGL: The driver does not appear to support OpenGL"
 }
 
+fn is_uncaught_glfw_window_failure(text: &str) -> bool {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("<log4j:Message><![CDATA[")
+        .and_then(|text| text.strip_suffix("]]></log4j:Message>"))
+        .unwrap_or(text);
+    let Some((line, message)) = text
+        .strip_prefix("[java.lang.ThreadGroup:uncaughtException:")
+        .and_then(|text| text.split_once("]: "))
+    else {
+        return false;
+    };
+    !line.is_empty()
+        && line.bytes().all(|value| value.is_ascii_digit())
+        && message == "java.lang.RuntimeException: Failed to create the GLFW window"
+}
+
 pub fn classify_launch_failure(
     stdout_classes: &[FailureClass],
     exit_code: Option<i32>,
@@ -565,6 +589,7 @@ mod tests {
         let evidence = LaunchEvidence {
             boot_observed: false,
             failure_classes: vec![FailureClass::StartupStalled],
+            ..Default::default()
         };
         let facts = SessionExitFacts {
             stop_requested: true,
@@ -657,6 +682,63 @@ mod tests {
                 classify_startup_failure_text(output),
                 expected,
                 "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn glfw_api_diagnostics_require_an_uncaught_window_failure_in_either_stream_order() {
+        const API: &str = "[LWJGL] GLFW_API_UNAVAILABLE error";
+        const FATAL: &str = "<log4j:Message><![CDATA[[java.lang.ThreadGroup:uncaughtException:1052]: java.lang.RuntimeException: Failed to create the GLFW window]]></log4j:Message>";
+        for lines in [[API, FATAL], [FATAL, API]] {
+            let mut evidence = LaunchEvidence::default();
+            evidence.observe_failure(FailureClass::LoaderBootstrapFailure);
+            for line in lines {
+                evidence.observe_line(line);
+            }
+            let outcome = classify_session_outcome(
+                SessionExitFacts {
+                    exit_code: Some(1),
+                    ..exit_facts()
+                },
+                &evidence,
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.failure_class,
+                Some(FailureClass::GraphicsUnavailable)
+            );
+            assert_eq!(
+                outcome.summary,
+                "The game could not create a window because OpenGL is unavailable."
+            );
+        }
+        for lines in [
+            [
+                API,
+                "<log4j:Message><![CDATA[Failed to create window: ]]></log4j:Message>",
+            ],
+            [
+                FATAL,
+                "GLFW_API_UNAVAILABLE error troubleshooting documentation",
+            ],
+            [
+                API,
+                "<log4j:Message><![CDATA[[java.lang.ThreadGroup:uncaughtException:unknown]: java.lang.RuntimeException: Failed to create the GLFW window]]></log4j:Message>",
+            ],
+            [
+                API,
+                "<log4j:Message><![CDATA[java.lang.RuntimeException: Failed to create the GLFW window]]></log4j:Message>",
+            ],
+        ] {
+            let mut evidence = LaunchEvidence::default();
+            for line in lines {
+                evidence.observe_line(line);
+            }
+            assert!(
+                !evidence
+                    .failure_classes
+                    .contains(&FailureClass::GraphicsUnavailable)
             );
         }
     }

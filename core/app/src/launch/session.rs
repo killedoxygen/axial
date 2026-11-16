@@ -389,6 +389,7 @@ impl ObservedSettlement {
             &super::outcome::LaunchEvidence {
                 boot_observed: self.boot_observed,
                 failure_classes: self.failure_classes.clone(),
+                ..Default::default()
             },
         )
         .expect("settled process facts")
@@ -1080,6 +1081,12 @@ mod settlement_tests {
     use super::*;
 
     const GRAPHICS_FAILURE: &[u8] = b"<log4j:Message><![CDATA[Setting user: session-secret]]></log4j:Message>\n<log4j:Message><![CDATA[LWJGL Version: 3.3.1 build 7]]></log4j:Message>\n<log4j:Message><![CDATA[Failed to create window: ]]></log4j:Message>\n<log4j:Throwable><![CDATA[enh$a: GLFW error 65542: WGL: The driver does not appear to support OpenGL\n\tat org.lwjgl.glfw.GLFW.nglfwCreateWindow(GLFW.java:2024)\n]]></log4j:Throwable>\n";
+    const FORGE_GRAPHICS_FAILURE: &[u8] = concat!(
+        "[LWJGL] GLFW_API_UNAVAILABLE error\n",
+        "<log4j:Message><![CDATA[[org.lwjgl.glfw.GLFWErrorCallback$1:invoke:106]: Stacktrace :]]></log4j:Message>\n",
+        "<log4j:Message><![CDATA[[org.lwjgl.glfw.GLFWErrorCallback$1:invoke:110]: cpw.mods.modlauncher.TransformationServiceDecorator.onInitialize(TransformationServiceDecorator.java:68)]]></log4j:Message>\n",
+        "<log4j:Message><![CDATA[[java.lang.ThreadGroup:uncaughtException:1052]: java.lang.RuntimeException: Failed to create the GLFW window]]></log4j:Message>\n",
+    ).as_bytes();
 
     fn collect(output: &[u8]) -> LogCollector {
         let mut logs = LogCollector::new(vec!["session-secret".into(), "enh$a".into()]);
@@ -1109,71 +1116,87 @@ mod settlement_tests {
     }
 
     #[test]
-    fn graphics_startup_failure_survives_zero_exit_redaction_and_report_readback() {
-        let logs = collect(GRAPHICS_FAILURE);
-        assert!(logs.evidence().boot_observed && logs.outputs_drained());
-        let observation = settlement(&logs);
-        assert!(observation.validate());
-        let restored: ObservedSettlement =
-            serde_json::from_slice(&serde_json::to_vec(&observation).unwrap()).unwrap();
-        assert_eq!(restored, observation);
-        let snapshot = restored.snapshot(
-            "11111111-1111-4111-8111-111111111111".into(),
-            "3e6fa5da-7b17-47f8-b7fd-0a610923d951".parse().unwrap(),
-        );
-        let wire = serde_json::to_value(&snapshot).unwrap();
-        assert_eq!(
-            wire["outcome"],
-            serde_json::json!({
-                "kind": "failed",
-                "reason": "startup_failed",
-                "failure_class": "graphics_unavailable",
-                "summary": "The game could not create a window because OpenGL is unavailable."
-            })
-        );
-        assert_eq!(wire["exit_code"], 0);
-        assert_eq!(wire["view_model"]["terminal"], true);
-        assert!(snapshot.tree_settled && snapshot.output_drained);
-        let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
-        let reports = LaunchReportStore::new(storage).unwrap();
-        let report = LaunchProofRecord::from_session(SessionReportInput {
-            session_id: snapshot.session_id.clone(),
-            instance_id: snapshot.instance_id.to_string(),
-            version_id: observation.version_id.clone(),
-            launched_at: observation.launched_at.clone(),
-            ended_at: observation.ended_at.clone(),
-            outcome: snapshot.outcome.unwrap(),
-            entries: logs.entries(),
-            exit_code: Some(0),
-            boot_duration_ms: Some(1),
-            logs_dropped: 0,
-        });
-        reports
-            .record(
-                report.clone(),
-                &super::super::logs::Redactor::new(Vec::new()),
-            )
-            .unwrap();
-        let saved = reports.get(&report.session_id).unwrap().unwrap();
-        assert!(observation.matches_report(&saved));
-        assert_eq!(saved.session_outcome, report.session_outcome);
-        let projected = SessionSnapshot::from_report(&saved, saved.instance_id.parse().unwrap());
-        let notice = serde_json::to_value(projected).unwrap()["notice"].clone();
-        assert_eq!(
-            notice,
-            serde_json::json!({
-                "message": "The game could not create a window because OpenGL is unavailable.",
-                "tone": "err"
-            })
-        );
-        let saved_wire = serde_json::to_string(&saved).unwrap();
-        assert!(!saved_wire.contains("session-secret") && !saved_wire.contains("enh$a"));
-        assert!(
-            saved
-                .logs
-                .iter()
-                .any(|line| line.text == super::super::logs::REDACTED_LINE)
-        );
+    fn graphics_startup_failures_survive_redaction_and_report_readback() {
+        for (output, exit_code, boot_observed, version, redacted) in [
+            (GRAPHICS_FAILURE, 0, true, "1.20.1", true),
+            (FORGE_GRAPHICS_FAILURE, 1, false, "1.16.5", false),
+        ] {
+            let logs = collect(output);
+            assert_eq!(logs.evidence().boot_observed, boot_observed);
+            assert!(logs.outputs_drained());
+            let mut observation = settlement(&logs);
+            observation.version_id = version.into();
+            observation.process = SettledProcess::ChildExited {
+                exit_code: Some(exit_code),
+                signal: None,
+                stop_requested: false,
+                was_running: boot_observed,
+                spawn_failed: false,
+            };
+            assert!(observation.validate());
+            let restored: ObservedSettlement =
+                serde_json::from_slice(&serde_json::to_vec(&observation).unwrap()).unwrap();
+            assert_eq!(restored, observation);
+            let snapshot = restored.snapshot(
+                "11111111-1111-4111-8111-111111111111".into(),
+                "3e6fa5da-7b17-47f8-b7fd-0a610923d951".parse().unwrap(),
+            );
+            let wire = serde_json::to_value(&snapshot).unwrap();
+            assert_eq!(
+                wire["outcome"],
+                serde_json::json!({
+                    "kind": "failed",
+                    "reason": "startup_failed",
+                    "failure_class": "graphics_unavailable",
+                    "summary": "The game could not create a window because OpenGL is unavailable."
+                })
+            );
+            assert_eq!(wire["exit_code"], exit_code);
+            assert_eq!(wire["view_model"]["terminal"], true);
+            assert!(snapshot.tree_settled && snapshot.output_drained);
+            let storage = Arc::new(crate::storage::MetadataStore::in_memory().unwrap());
+            let reports = LaunchReportStore::new(storage).unwrap();
+            let report = LaunchProofRecord::from_session(SessionReportInput {
+                session_id: snapshot.session_id.clone(),
+                instance_id: snapshot.instance_id.to_string(),
+                version_id: observation.version_id.clone(),
+                launched_at: observation.launched_at.clone(),
+                ended_at: observation.ended_at.clone(),
+                outcome: snapshot.outcome.unwrap(),
+                entries: logs.entries(),
+                exit_code: Some(exit_code),
+                boot_duration_ms: boot_observed.then_some(1),
+                logs_dropped: 0,
+            });
+            reports
+                .record(
+                    report.clone(),
+                    &super::super::logs::Redactor::new(Vec::new()),
+                )
+                .unwrap();
+            let saved = reports.get(&report.session_id).unwrap().unwrap();
+            assert!(observation.matches_report(&saved));
+            assert_eq!(saved.session_outcome, report.session_outcome);
+            let projected =
+                SessionSnapshot::from_report(&saved, saved.instance_id.parse().unwrap());
+            let notice = serde_json::to_value(projected).unwrap()["notice"].clone();
+            assert_eq!(
+                notice,
+                serde_json::json!({
+                    "message": "The game could not create a window because OpenGL is unavailable.",
+                    "tone": "err"
+                })
+            );
+            let saved_wire = serde_json::to_string(&saved).unwrap();
+            assert!(!saved_wire.contains("session-secret") && !saved_wire.contains("enh$a"));
+            assert_eq!(
+                saved
+                    .logs
+                    .iter()
+                    .any(|line| line.text == super::super::logs::REDACTED_LINE),
+                redacted
+            );
+        }
     }
 
     #[test]
