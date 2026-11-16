@@ -164,6 +164,8 @@ pub enum InstallError {
     RosettaRequired,
     #[error("No Java runtime for this version is published for this computer.")]
     RuntimeUnavailable,
+    #[error("Loader preparation failed before installation could finish.")]
+    LoaderProcessor,
     #[error(
         "There is not enough disk space to install this version. Free some space and try again."
     )]
@@ -198,11 +200,18 @@ impl InstallFailureCause for LoaderInstallError {
     fn cause(&self) -> InstallError {
         match self {
             LoaderInstallError::BaseInstallFailed(failure) => failure.error().cause(),
-            LoaderInstallError::Active(failure) => match failure.source() {
-                axial_minecraft::LoaderError::BaseInstallFailed { error, .. } => error.cause(),
-                axial_minecraft::LoaderError::Cancelled => InstallError::Cancelled,
-                _ => InstallError::Failed,
-            },
+            LoaderInstallError::Active(failure) => failure.source().cause(),
+            _ => InstallError::Failed,
+        }
+    }
+}
+
+impl InstallFailureCause for axial_minecraft::LoaderError {
+    fn cause(&self) -> InstallError {
+        match self {
+            Self::BaseInstallFailed { error, .. } => error.cause(),
+            Self::Cancelled => InstallError::Cancelled,
+            Self::ProcessorFailed(_) => InstallError::LoaderProcessor,
             _ => InstallError::Failed,
         }
     }
@@ -3880,6 +3889,21 @@ fn project(state: &State) -> InstallQueueStateResponse {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn processor_failures_keep_their_safe_cause_in_the_serialized_view() {
+        let failure = axial_minecraft::LoaderError::ProcessorFailed(
+            "private path /profile?token=secret".into(),
+        );
+        let view = serde_json::to_value(failure_view(failure.cause(), None)).unwrap();
+        assert_eq!(
+            view["summary"],
+            "Loader preparation failed before installation could finish."
+        );
+        assert_eq!(view["state_id"], "failed");
+        assert!(!view.to_string().contains("private"));
+        assert!(!view.to_string().contains("secret"));
+    }
 
     #[test]
     fn settled_failures_keep_the_safe_platform_cause_and_truthful_retry() {

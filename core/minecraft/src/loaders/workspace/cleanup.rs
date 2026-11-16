@@ -360,14 +360,31 @@ impl ProcessorWorkspace {
     }
 
     pub(crate) fn validate_live_bounds(&self) -> Result<(), LoaderError> {
+        let report = |stage: &'static str, source: &LoaderError| {
+            let (io_kind, native_code) = match source {
+                LoaderError::Io(error) => (Some(error.kind()), error.raw_os_error()),
+                _ => (None, None),
+            };
+            tracing::debug!(
+                stage,
+                ?io_kind,
+                ?native_code,
+                "Processor workspace sample refused"
+            );
+        };
         self.owner_root
-            .validate_exact_child_directories(&["processor-stage", "runtime"])?;
+            .validate_exact_child_directories(&["processor-stage", "runtime"])
+            .inspect_err(|error| report("layout", error))?;
         let limits = ManagedTreeLimits::processor_stage();
-        let stage = self.stage.validate_tree_usage_no_links(limits)?;
+        let stage = self.stage
+            .validate_tree_usage_no_links(limits)
+            .inspect_err(|error| report("stage_usage", error))?;
         let runtime = self
             .owner_root
-            .open_child("runtime")?
-            .validate_tree_usage_allow_links(limits)?;
+            .open_child("runtime")
+            .inspect_err(|error| report("runtime_open", error))?
+            .validate_tree_usage_allow_links(limits)
+            .inspect_err(|error| report("runtime_usage", error))?;
         if stage
             .entries()
             .saturating_add(runtime.entries())
@@ -375,6 +392,12 @@ impl ProcessorWorkspace {
             > 4096
             || stage.bytes().saturating_add(runtime.bytes()) > (512_u64 << 20)
         {
+            tracing::debug!(
+                stage = "aggregate_bound",
+                entries = stage.entries().saturating_add(runtime.entries()).saturating_add(2),
+                bytes = stage.bytes().saturating_add(runtime.bytes()),
+                "Processor workspace sample refused"
+            );
             return Err(LoaderError::Verify(
                 "processor temporary root exceeds its admitted bound".to_string(),
             ));
