@@ -305,6 +305,13 @@ impl PublicError for DeletionError {
             _ => StatusCode::CONFLICT,
         }
     }
+
+    fn retry(&self) -> Option<Retry> {
+        match self {
+            Self::Instance(error) => error.retry(),
+            _ => None,
+        }
+    }
 }
 
 impl PublicError for InstallError {

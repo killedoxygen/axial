@@ -1106,7 +1106,8 @@ async fn interrupted_launch_preservation_journey(existing: bool) {
             assert_eq!(
                 response,
                 json!({
-                    "error":axial_app::instances::model::InstanceError::Busy.to_string()
+                    "error":axial_app::instances::model::InstanceError::Busy.to_string(),
+                    "retry":"busy"
                 })
             );
         }
@@ -1409,10 +1410,9 @@ async fn observed_settlement_crash_helper() {
     );
     assert!(natives[0].join(".axial-native-manifest.json").is_file());
     let processes = observe_and_stop_session(&api, session).await;
-    assert!(
-        !natives[0].exists(),
-        "owned native directory must be removed before helper exit"
-    );
+    // The verified directory stays retained for the next launch; this exit
+    // bypasses shutdown, so startup recovery must settle it from its manifest.
+    assert!(natives[0].join(".axial-native-manifest.json").is_file());
     let gone = tokio::time::timeout(Duration::from_secs(5), tokio::process::Command::new("python3")
         .args(["-c", "import os, sys\nfor pid in sys.argv[1:]:\n    try: os.kill(int(pid), 0)\n    except ProcessLookupError: continue\n    raise SystemExit('fixture process remains alive: ' + pid)\n"])
         .args(processes.iter().map(u64::to_string))
@@ -1548,7 +1548,8 @@ async fn preflight_preserves_safe_memory_override_and_budget_diagnostics() {
         assert_eq!(
             response["memory"],
             json!({
-                "max_memory_mb":maximum,"min_memory_mb":minimum,"min_clamped":clamped
+                "max_memory_mb":maximum,"min_memory_mb":minimum,"min_clamped":clamped,
+                "source":"explicit"
             })
         );
         assert_eq!(response["overrides"], overrides);
@@ -2008,7 +2009,7 @@ async fn publication_preflight(retain_runtime: &mut bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn degraded_versions_block_preflight_and_play_without_repairing() {
+async fn unrelated_degraded_versions_neither_block_the_target_nor_get_repaired() {
     use futures_util::FutureExt;
 
     let _process_work = PROCESS_WORK.lock().await;
@@ -2135,54 +2136,41 @@ async fn degraded_versions_block_preflight_and_play_without_repairing() {
                 assert_eq!(detail["launch_action"]["launchable"], true);
                 assert_eq!(detail["launch_action"]["primary_action"], "launch");
             }
-            let degraded_reason = json!({
-                "id":"installed_versions_degraded","severity":"blocking",
-                "message":"Could not verify installed versions. Check the library folder and try again."
-            });
-            for ((status, response), expected) in [
-                (degraded, json!([degraded_reason.clone()])),
-                (combined, json!([
-                    {"id":"client_jar_missing","severity":"blocking",
-                     "message":"Client game files are missing. Install this version before launching."},
-                    degraded_reason
-                ])),
+            // The malformed entry is outside this target's inheritance chain:
+            // it is reported by the scan but never blocks or repairs the target.
+            let (status, response) = degraded;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["launchable"], true, "{response}");
+            assert_eq!(response["readiness"], json!({"launchable":true,"reasons":[]}));
+            // The target's own missing client still blocks, alone.
+            let (status, response) = combined;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["launchable"], false, "{response}");
+            assert_eq!(response["readiness"]["reasons"], json!([
+                {"id":"client_jar_missing","severity":"blocking",
+                 "message":"Client game files are missing. Install this version before launching."}
+            ]));
+            for ((detail_status, detail), (list_status, list), launchable) in [
+                (degraded_detail, degraded_list, true),
+                (combined_detail, combined_list, false),
             ] {
-                assert_eq!(status, StatusCode::OK, "{response}");
-                assert_eq!(response["instance_id"], instance);
-                assert_eq!(response["status"], "ready", "{response}");
-                assert_eq!(response["launchable"], false, "{response}");
-                assert_eq!(response["error"]["code"], "installed_versions_degraded");
-                assert_eq!(response["error"]["error"],
-                    "Could not verify installed versions. Check the library folder and try again.");
-                let mut reasons = response["readiness"]["reasons"].clone();
-                reasons.as_array_mut().unwrap().sort_by(|left, right| {
-                    left["id"].as_str().cmp(&right["id"].as_str())
-                });
-                assert_eq!(response["readiness"]["launchable"], false);
-                assert_eq!(reasons, expected);
-            }
-            for ((detail_status, detail), (list_status, list)) in
-                [(degraded_detail, degraded_list), (combined_detail, combined_list)]
-            {
                 assert_eq!(detail_status, StatusCode::OK, "{detail}");
                 assert_eq!(list_status, StatusCode::OK, "{list}");
                 assert_eq!(list["instances"].as_array().unwrap().len(), 1);
                 for observed in [&detail, &list["instances"][0]] {
                     assert_eq!(observed["id"], instance);
-                    assert_eq!(observed["launch_action"]["launchable"], false);
-                    assert_eq!(observed["launch_action"]["primary_action"], "blocked");
-                    assert_eq!(observed["needs_install"], "");
+                    assert_eq!(observed["launch_action"]["launchable"], launchable);
                 }
             }
-            assert_eq!(play_status, StatusCode::CONFLICT, "{play_body}");
-            assert_eq!(play_body, json!({
-                "code":"installed_versions_degraded",
-                "error":"Could not verify installed versions. Check the library folder and try again."
-            }));
+            assert!(play_status.is_success(), "{play_body}");
             assert_eq!(requests_after, requests_before);
             assert_eq!(queue_after, queue_before);
-            assert_eq!(sessions, json!({"sessions":[]}));
-            assert_eq!(reports, json!({"reports":[]}));
+            let sessions = sessions["sessions"].as_array().unwrap();
+            assert_eq!(sessions.len(), 1, "{sessions:?}");
+            assert_eq!(sessions[0]["instance_id"], instance);
+            assert_eq!(sessions[0]["phase"], "exited");
+            assert_eq!(sessions[0]["tree_settled"], true);
+            assert_eq!(reports["reports"].as_array().unwrap().len(), 1, "{reports}");
         }
     })
     .catch_unwind()
@@ -3423,7 +3411,7 @@ async fn preflight_reports_installed_file_damage_without_launching_or_repairing(
         assert_eq!(readiness, json!({"launchable":false,"reasons":reasons}));
         assert_eq!(
             response["memory"],
-            json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false})
+            json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false,"source":"explicit"})
         );
         assert_eq!(
             response["overrides"],
@@ -3753,7 +3741,7 @@ async fn preflight_reports_missing_java_override_without_launching() {
         );
         assert_eq!(
             response["memory"],
-            json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false})
+            json!({"max_memory_mb":2048,"min_memory_mb":1024,"min_clamped":false,"source":"explicit"})
         );
         assert_eq!(
             response["overrides"],
