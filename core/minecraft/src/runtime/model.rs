@@ -191,3 +191,91 @@ pub enum JavaRuntimeLookupError {
     #[error("managed runtime mutation was refused before effects")]
     ManagedMutationRefused,
 }
+
+/// Java 8 builds older than this update cannot run supported versions safely.
+pub const JAVA_8_MINIMUM_UPDATE: u32 = 312;
+
+/// The Java a launch or loader processor may run, and the build managed
+/// acquisition may provision: the exact major, Java 8 at update
+/// [`JAVA_8_MINIMUM_UPDATE`] or newer, and the host architecture or x86_64
+/// where this host translates it (Rosetta 2 on Apple silicon, x64 emulation on
+/// Windows on Arm).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JavaRequirement {
+    pub major: u32,
+    pub architecture: super::probe::JavaArchitecture,
+    pub translates_x86_64: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JavaRequirementRefusal {
+    InvalidVersion,
+    IncompatibleVersion { required: u32, actual: u32 },
+    OutdatedJava8,
+    UnknownArchitecture,
+    IncompatibleArchitecture {
+        required: super::probe::JavaArchitecture,
+        actual: super::probe::JavaArchitecture,
+    },
+}
+
+impl JavaRequirement {
+    pub fn for_current_host(major: u32) -> Self {
+        Self {
+            major,
+            architecture: super::probe::JavaArchitecture::parse(std::env::consts::ARCH),
+            translates_x86_64: cfg!(all(
+                any(target_os = "macos", target_os = "windows"),
+                target_arch = "aarch64"
+            )),
+        }
+    }
+
+    /// The version alone, as published metadata states it before download.
+    pub fn admits_version(&self, major: u32, update: u32) -> Result<(), JavaRequirementRefusal> {
+        if self.major == 0 || major == 0 {
+            return Err(JavaRequirementRefusal::InvalidVersion);
+        }
+        if major != self.major {
+            return Err(JavaRequirementRefusal::IncompatibleVersion {
+                required: self.major,
+                actual: major,
+            });
+        }
+        if major == 8 && update < JAVA_8_MINIMUM_UPDATE {
+            return Err(JavaRequirementRefusal::OutdatedJava8);
+        }
+        Ok(())
+    }
+
+    pub fn admits_architecture(
+        &self,
+        architecture: super::probe::JavaArchitecture,
+    ) -> Result<(), JavaRequirementRefusal> {
+        use super::probe::JavaArchitecture;
+        if architecture == JavaArchitecture::Unknown || self.architecture == JavaArchitecture::Unknown
+        {
+            return Err(JavaRequirementRefusal::UnknownArchitecture);
+        }
+        let translated = self.translates_x86_64
+            && self.architecture == JavaArchitecture::Aarch64
+            && architecture == JavaArchitecture::X86_64;
+        if architecture != self.architecture && !translated {
+            return Err(JavaRequirementRefusal::IncompatibleArchitecture {
+                required: self.architecture,
+                actual: architecture,
+            });
+        }
+        Ok(())
+    }
+
+    /// A probed runtime: its reported version and architecture.
+    pub fn validate(
+        &self,
+        info: &JavaRuntimeInfo,
+        architecture: super::probe::JavaArchitecture,
+    ) -> Result<(), JavaRequirementRefusal> {
+        self.admits_version(info.major, info.update)?;
+        self.admits_architecture(architecture)
+    }
+}

@@ -8,7 +8,7 @@ use super::{
     jvm,
     model::{LaunchOptions, LaunchPlanError, LaunchPlanRequest, ValidatedLaunchCommand},
 };
-use crate::runtime::model::JavaSelectionRequirement;
+use crate::runtime::model::JavaRequirement;
 use axial_minecraft::{
     LaunchVars, build_classpath, default_environment, effective_java_version_for,
     launch::java_path_argument, resolve_arguments, resolve_libraries,
@@ -26,7 +26,7 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         &version.kind,
         &version.java_version,
     );
-    JavaSelectionRequirement::for_current_host(java.major_version as u32)
+    JavaRequirement::for_current_host(java.major_version as u32)
         .validate(request.runtime.info(), request.runtime.architecture())
         .map_err(|_| LaunchPlanError::RuntimeIncompatible)?;
     if !valid_player_name(&request.auth)
@@ -37,7 +37,7 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         return Err(LaunchPlanError::InvalidAccount);
     }
     let settings = &request.settings;
-    validate_options(settings, &request.target_version_id, request.runtime.info())?;
+    validate_options(settings, &request.target_version_id)?;
     let (maximum, minimum) = heap(settings);
     let mut environment = default_environment();
     environment.features.insert(
@@ -94,11 +94,7 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
             .unwrap_or_default(),
     };
     let (mut args, game_args) = resolve_arguments(version, &environment, &vars);
-    args.extend(jvm::launcher_args(
-        settings.performance_mode,
-        &settings.jvm_preset,
-        request.runtime.info(),
-    ));
+    args.extend(settings.launcher_args.iter().cloned());
     args.extend([format!("-Xmx{maximum}M"), format!("-Xms{minimum}M")]);
     configure_native_paths(&mut args, &natives);
     if request.auth.is_offline()
@@ -197,16 +193,13 @@ fn valid_player_name(auth: &super::model::LaunchAuthContext) -> bool {
     }
 }
 
-/// Refuses an explicit preset the target or runtime cannot run. Vanilla adds
-/// no launcher flags, so it never applies or refuses a preset.
-pub(crate) fn validate_options(
-    settings: &LaunchOptions,
-    target: &str,
-    info: &axial_minecraft::JavaRuntimeInfo,
-) -> Result<(), LaunchPlanError> {
-    validate_settings(settings, Some(info))?;
+/// Refuses an explicit preset meant for another game family. Vanilla adds no
+/// launcher flags, so it never applies or refuses a preset; whether the VM
+/// runs a preset is proven by `jvm::proven_launcher_args`.
+pub(crate) fn validate_options(settings: &LaunchOptions, target: &str) -> Result<(), LaunchPlanError> {
+    validate_settings(settings)?;
     if settings.performance_mode != crate::settings::ConfigPerformanceMode::Vanilla
-        && !jvm::preset_supported(&settings.jvm_preset, target, info)
+        && !jvm::preset_targets(&settings.jvm_preset, target)
     {
         return Err(LaunchPlanError::IncompatiblePreset);
     }
@@ -220,10 +213,7 @@ fn heap(settings: &LaunchOptions) -> (i32, i32) {
     )
 }
 
-pub(crate) fn validate_settings(
-    settings: &LaunchOptions,
-    info: Option<&axial_minecraft::JavaRuntimeInfo>,
-) -> Result<(), LaunchPlanError> {
+pub(crate) fn validate_settings(settings: &LaunchOptions) -> Result<(), LaunchPlanError> {
     if let Some((width, height)) = settings.resolution {
         if !(320..=16384).contains(&width) || !(320..=16384).contains(&height) {
             return Err(LaunchPlanError::InvalidResolution);
@@ -235,7 +225,7 @@ pub(crate) fn validate_settings(
     {
         return Err(LaunchPlanError::InvalidMemory);
     }
-    validate_extra_args(&settings.extra_jvm_args, info)
+    validate_extra_args(&settings.extra_jvm_args)
 }
 
 pub(crate) fn split_extra_args(input: &str) -> Result<Vec<String>, LaunchPlanError> {
@@ -245,10 +235,9 @@ pub(crate) fn split_extra_args(input: &str) -> Result<Vec<String>, LaunchPlanErr
     shlex::split(input).ok_or(LaunchPlanError::InvalidJvmArguments)
 }
 
-fn validate_extra_args(
-    args: &[String],
-    info: Option<&axial_minecraft::JavaRuntimeInfo>,
-) -> Result<(), LaunchPlanError> {
+/// Explicit arguments pass to the VM as written, which reports what it does
+/// not support; only launcher-owned settings and option ordering are refused.
+fn validate_extra_args(args: &[String]) -> Result<(), LaunchPlanError> {
     let unlock = args
         .iter()
         .position(|arg| arg == "-XX:+UnlockExperimentalVMOptions");
@@ -287,17 +276,7 @@ fn validate_extra_args(
         {
             return Err(LaunchPlanError::ReservedJvmArgument);
         }
-        if info.is_some_and(|info| {
-            (arg == "-XX:+UseShenandoahGC" && !jvm::supports_shenandoah(info))
-                || (arg == "-XX:+UseZGC" && !jvm::supports_zgc(info))
-                || (arg == "-XX:+ZGenerational" && !jvm::supports_generational_zgc(info))
-        }) {
-            return Err(LaunchPlanError::UnsupportedJvmOption);
-        }
         if arg.starts_with("-XX:G1NewSizePercent=") || arg.starts_with("-XX:G1MaxNewSizePercent=") {
-            if info.is_some_and(|info| !jvm::supports_hotspot_tuning(info)) {
-                return Err(LaunchPlanError::UnsupportedJvmOption);
-            }
             if unlock.is_none_or(|unlock| unlock > index) {
                 return Err(LaunchPlanError::JvmOptionOrdering);
             }
@@ -434,15 +413,6 @@ mod tests {
         }
         assert!(!valid_player_name(&LaunchAuthContext::offline("ab")));
     }
-    fn info() -> axial_minecraft::JavaRuntimeInfo {
-        axial_minecraft::JavaRuntimeInfo {
-            id: String::new(),
-            major: 17,
-            update: 10,
-            distribution: "temurin".into(),
-            path: String::new(),
-        }
-    }
     #[test]
     fn explicit_arguments_cannot_replace_owned_entrypoints_paths_or_runtime_scratch() {
         for arg in [
@@ -462,7 +432,7 @@ mod tests {
             "Main",
         ] {
             assert!(
-                validate_extra_args(&[arg.into()], Some(&info())).is_err(),
+                validate_extra_args(&[arg.into()]).is_err(),
                 "{arg}"
             );
         }
@@ -474,7 +444,7 @@ mod tests {
         ] {
             for argument in [format!("-D{key}=/verified/natives"), format!("-D{key}")] {
                 assert_eq!(
-                    validate_extra_args(&[argument.clone()], Some(&info())),
+                    validate_extra_args(&[argument.clone()]),
                     Err(LaunchPlanError::ReservedJvmArgument)
                 );
                 // Provider arguments are stripped rather than refused.
@@ -484,7 +454,7 @@ mod tests {
             }
         }
         for allowed in ["-Dexample=value", "-Djna.tmpdir.other=value"] {
-            assert!(validate_extra_args(&[allowed.into()], Some(&info())).is_ok());
+            assert!(validate_extra_args(&[allowed.into()]).is_ok());
         }
     }
     #[test]
@@ -503,7 +473,6 @@ mod tests {
                     "-XX:G1NewSizePercent=20".into(),
                     "-XX:+UnlockExperimentalVMOptions".into()
                 ],
-                Some(&info())
             ),
             Err(LaunchPlanError::JvmOptionOrdering)
         );

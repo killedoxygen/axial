@@ -35,6 +35,14 @@ pub(crate) type RuntimeArchive = HashMap<String, Arc<[u8]>>;
 #[derive(Deserialize)]
 struct Release {
     binary: Binary,
+    version: ReleaseVersion,
+}
+
+/// Adoptium's version of the release; `security` is Java 8's update.
+#[derive(Deserialize)]
+struct ReleaseVersion {
+    major: u32,
+    security: u32,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +165,16 @@ fn select_package(bytes: &[u8], format: Format) -> Result<Package, JavaRuntimeLo
         Format::TarGz => ".tar.gz",
     };
     let package = match releases.as_mut_slice() {
+        [release]
+            if super::model::JavaRequirement::for_current_host(8)
+                .admits_version(release.version.major, release.version.security)
+                .is_err() =>
+        {
+            return Err(failure(
+                RuntimeSourceFailureKind::PolicyRejected,
+                "Temurin 8 metadata names a release below the required Java 8 update",
+            ));
+        }
         [release] => std::mem::replace(
             &mut release.binary.package,
             Package {
@@ -467,7 +485,7 @@ mod tests {
             serde_json::json!([{ "binary": { "package": {
                 "link": link, "checksum": checksum, "size": size,
                 "name": link.rsplit('/').next().unwrap(),
-            }}}])
+            }}, "version": { "major": 8, "minor": 0, "security": 512 }}])
             .to_string()
         };
         let good =
@@ -497,6 +515,24 @@ mod tests {
             );
         }
         assert!(select_package(b"[]", Format::TarGz).is_err());
+        let release = |major: u32, security: u32| {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&package(&good, &digest, 10)).unwrap();
+            value[0]["version"] = serde_json::json!({ "major": major, "security": security });
+            value.to_string()
+        };
+        assert!(select_package(release(8, 312).as_bytes(), Format::TarGz).is_ok());
+        for (major, security) in [(8, 311), (11, 512), (0, 0)] {
+            assert!(
+                select_package(release(major, security).as_bytes(), Format::TarGz).is_err(),
+                "{major}u{security}"
+            );
+        }
+        let unversioned = serde_json::json!([{ "binary": { "package": {
+            "link": good, "checksum": digest, "size": 10,
+            "name": good.rsplit('/').next().unwrap(),
+        }}}]);
+        assert!(select_package(unversioned.to_string().as_bytes(), Format::TarGz).is_err());
     }
 
     #[test]

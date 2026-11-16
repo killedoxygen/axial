@@ -58,6 +58,8 @@ pub(crate) struct LaunchOptions {
     pub extra_jvm_args: Vec<String>,
     /// An explicit preset, or empty for Automatic.
     pub jvm_preset: String,
+    /// The mode's and preset's flags this exact runtime proved it applies.
+    pub launcher_args: Vec<String>,
     pub performance_mode: crate::settings::ConfigPerformanceMode,
     pub launcher_name: String,
     pub launcher_version: String,
@@ -71,6 +73,7 @@ impl Default for LaunchOptions {
             resolution: None,
             extra_jvm_args: Vec::new(),
             jvm_preset: String::new(),
+            launcher_args: Vec::new(),
             performance_mode: crate::settings::ConfigPerformanceMode::Managed,
             launcher_name: "Axial".into(),
             launcher_version: env!("CARGO_PKG_VERSION").into(),
@@ -197,8 +200,6 @@ pub enum LaunchPlanError {
         "Custom JVM arguments override launcher-managed memory, paths, agents, or entrypoints. Remove those arguments before launching."
     )]
     ReservedJvmArgument,
-    #[error("The selected JVM options are unsupported by this Java runtime.")]
-    UnsupportedJvmOption,
     #[error(
         "Experimental JVM options require UnlockExperimentalVMOptions before dependent arguments."
     )]

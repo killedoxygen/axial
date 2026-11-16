@@ -113,7 +113,7 @@ pub use rules::default_environment;
 #[cfg(feature = "test-support")]
 pub use runtime::runtime_publication_lock_available_for_test;
 pub use runtime::{
-    JavaArchitecture, JavaProbeError, JavaProbeReceipt, JavaRuntimeInfo, JavaRuntimeLookupError,
+    JavaArchitecture, JavaProbeError, JavaRequirement, JavaRequirementRefusal, JavaProbeReceipt, JavaRuntimeInfo, JavaRuntimeLookupError,
     JavaRuntimeResult, ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeComponent,
     ManagedRuntimeFailureReceipt, ManagedRuntimeLaunchReceipt, ManagedRuntimeMarkerState,
     ManagedRuntimeQuarantineObligation, ManagedRuntimeQuarantineObservation,

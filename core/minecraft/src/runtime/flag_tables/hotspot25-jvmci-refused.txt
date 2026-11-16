@@ -1,0 +1,5 @@
+Error: VM option 'EnableJVMCI' is experimental and must be enabled via -XX:+UnlockExperimentalVMOptions.
+Error: The unlock option must precede 'EnableJVMCI'.
+Improperly specified VM option 'EnableJVMCI'
+Error: Could not create the Java Virtual Machine.
+Error: A fatal exception has occurred. Program will exit.

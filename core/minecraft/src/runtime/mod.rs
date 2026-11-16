@@ -41,7 +41,8 @@ pub use layout::{
     ManagedRuntimeCache, ManagedRuntimeComponent, ManagedRuntimeLaunchReceipt, RuntimeAbsence,
 };
 pub use model::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureEvent, RuntimeId,
+    JAVA_8_MINIMUM_UPDATE, JavaRequirement, JavaRequirementRefusal, JavaRuntimeInfo,
+    JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureEvent, RuntimeId,
     RuntimeInstallState, RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
     RuntimeSourceFailure, RuntimeSourceFailureKind,
 };

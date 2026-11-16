@@ -1,17 +1,23 @@
 //! The one launch JVM policy: the launcher flags each performance mode adds to
-//! a game's own version arguments, explicit preset compatibility, and heap
-//! resolution. Explicit choices are honoured or refused, never rewritten.
+//! a game's own version arguments and explicit preset compatibility. Explicit
+//! choices are honoured or refused, never rewritten.
 //!
 //! - Managed with the Automatic preset adds only what the runtime's own
-//!   ergonomics lack for Minecraft: G1 on Java 8, whose default is Parallel GC.
+//!   ergonomics lack for Minecraft: G1 on Java 8, whose default is Parallel GC,
+//!   and only where that exact VM proves it applies G1.
 //! - Vanilla adds nothing beyond the heap.
 //! - Custom adds only the user's explicit preset.
+//!
+//! A preset's flags are admitted only after the exact verified runtime starts
+//! with them and reports each applied (`JavaProbeReceipt::applies_options`);
+//! vendor names and major versions are never taken as capability.
 //!
 //! No mode caps compiler or GC threads for the process lifetime or pre-touches
 //! the heap: both slowed measured startup and neither is reversible after boot.
 
+use super::model::LaunchPlanError;
 use crate::settings::ConfigPerformanceMode;
-use axial_minecraft::JavaRuntimeInfo;
+use axial_minecraft::{JavaProbeReceipt, JavaRuntimeInfo};
 
 pub const PRESET_SMOOTH: &str = "smooth";
 pub const PRESET_PERFORMANCE: &str = "performance";
@@ -22,26 +28,34 @@ pub const PRESET_LEGACY_PVP: &str = "legacy_pvp";
 pub const PRESET_LEGACY_HEAVY: &str = "legacy_heavy";
 
 
-/// The launcher flags for `mode` and an already admitted explicit `preset`
-/// (empty for Automatic).
-pub(crate) fn launcher_args(
+/// The launcher flags `mode` and `preset` add on this exact runtime. An
+/// explicit preset is refused unless the VM applies every one of its flags;
+/// Automatic adds Java 8's G1 only where the VM applies it, and nothing else.
+pub(crate) async fn proven_launcher_args(
     mode: ConfigPerformanceMode,
     preset: &str,
-    info: &JavaRuntimeInfo,
-) -> Vec<String> {
-    match (mode, preset.trim()) {
-        (ConfigPerformanceMode::Vanilla, _) => Vec::new(),
-        (ConfigPerformanceMode::Managed, "") => managed_defaults(info),
-        (ConfigPerformanceMode::Custom, "") => Vec::new(),
-        (_, preset) => preset_args(preset, info),
+    probe: &JavaProbeReceipt,
+    cancellation: impl std::future::Future<Output = ()>,
+) -> Result<Vec<String>, LaunchPlanError> {
+    let (args, explicit) = match (mode, preset.trim()) {
+        (ConfigPerformanceMode::Vanilla, _) | (ConfigPerformanceMode::Custom, "") => {
+            return Ok(Vec::new());
+        }
+        (ConfigPerformanceMode::Managed, "") if probe.info().major <= 8 => {
+            (vec!["-XX:+UseG1GC".to_string()], false)
+        }
+        (ConfigPerformanceMode::Managed, "") => return Ok(Vec::new()),
+        (_, preset) => (preset_args(preset, probe.info()), true),
+    };
+    if args.is_empty() {
+        return Err(LaunchPlanError::IncompatiblePreset);
     }
-}
-
-fn managed_defaults(info: &JavaRuntimeInfo) -> Vec<String> {
-    if info.major <= 8 && supports_hotspot_tuning(info) {
-        vec!["-XX:+UseG1GC".into()]
-    } else {
-        Vec::new()
+    match probe.applies_options(&args, cancellation).await {
+        Ok(true) => Ok(args),
+        Ok(false) if explicit => Err(LaunchPlanError::IncompatiblePreset),
+        Ok(false) => Ok(Vec::new()),
+        // Callers observe their own cancellation before classifying this.
+        Err(_) => Err(LaunchPlanError::RuntimeChanged),
     }
 }
 
@@ -55,7 +69,7 @@ fn preset_args(preset: &str, info: &JavaRuntimeInfo) -> Vec<String> {
             let mut args = vec!["-XX:+UseZGC".to_string()];
             // JEP 490 makes ZGC generational unconditionally in JDK 24 and
             // obsoletes this selector.
-            if supports_generational_zgc(info) && info.major < 24 {
+            if (21..24).contains(&info.major) {
                 args.push("-XX:+ZGenerational".to_string());
             }
             args
@@ -86,36 +100,17 @@ fn g1_args(pause_millis: i32) -> Vec<String> {
     ]
 }
 
-/// Whether an explicit preset runs on this target and runtime. An explicit
-/// incompatible choice is refused, never replaced by another preset.
-pub(crate) fn preset_supported(preset: &str, version_id: &str, info: &JavaRuntimeInfo) -> bool {
+/// Whether an explicit preset is meant for this game target: the legacy
+/// presets for 1.12 and older, the concurrent collectors for newer versions.
+/// Whether the runtime can run it is proven separately on the exact VM.
+pub(crate) fn preset_targets(preset: &str, version_id: &str) -> bool {
     let legacy_family = is_legacy_family(version_id);
     match preset.trim() {
-        "" => true,
-        _ if !supports_hotspot_tuning(info) => false,
+        "" | PRESET_PERFORMANCE | PRESET_GRAALVM => true,
         PRESET_LEGACY | PRESET_LEGACY_PVP | PRESET_LEGACY_HEAVY => legacy_family,
-        PRESET_SMOOTH => supports_shenandoah(info) && !legacy_family,
-        PRESET_ULTRA_LOW_LATENCY => supports_zgc(info) && !legacy_family,
-        PRESET_GRAALVM => info.distribution == "graalvm" && info.major >= 17,
-        PRESET_PERFORMANCE => true,
+        PRESET_SMOOTH | PRESET_ULTRA_LOW_LATENCY => !legacy_family,
         _ => false,
     }
-}
-
-pub fn supports_hotspot_tuning(info: &JavaRuntimeInfo) -> bool {
-    info.distribution != "openj9"
-}
-
-pub fn supports_shenandoah(info: &JavaRuntimeInfo) -> bool {
-    supports_hotspot_tuning(info) && info.major >= 11 && info.distribution != "graalvm"
-}
-
-pub fn supports_zgc(info: &JavaRuntimeInfo) -> bool {
-    supports_hotspot_tuning(info) && info.major >= 17 && info.distribution != "graalvm"
-}
-
-pub fn supports_generational_zgc(info: &JavaRuntimeInfo) -> bool {
-    supports_zgc(info) && info.major >= 21
 }
 
 fn is_legacy_family(version_id: &str) -> bool {
@@ -127,83 +122,124 @@ fn is_legacy_family(version_id: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn info(major: u32, distribution: &str) -> JavaRuntimeInfo {
-        JavaRuntimeInfo {
-            id: "runtime".to_string(),
-            major,
-            update: 0,
-            distribution: distribution.to_string(),
-            path: "/java".to_string(),
-        }
-    }
-
     #[test]
-    fn modes_add_only_their_own_flags() {
-        let modern = info(21, "openjdk");
-        let legacy = info(8, "openjdk");
-        assert!(launcher_args(ConfigPerformanceMode::Managed, "", &modern).is_empty());
-        assert_eq!(
-            launcher_args(ConfigPerformanceMode::Managed, "", &legacy),
-            ["-XX:+UseG1GC"]
-        );
-        assert!(launcher_args(ConfigPerformanceMode::Managed, "", &info(8, "openj9")).is_empty());
-        for preset in ["", PRESET_PERFORMANCE] {
-            assert!(launcher_args(ConfigPerformanceMode::Vanilla, preset, &legacy).is_empty());
-        }
-        assert!(launcher_args(ConfigPerformanceMode::Custom, "", &legacy).is_empty());
-        let custom = launcher_args(ConfigPerformanceMode::Custom, PRESET_PERFORMANCE, &modern);
-        assert!(custom.contains(&"-XX:MaxGCPauseMillis=37".into()));
-        for mode in [
-            ConfigPerformanceMode::Managed,
-            ConfigPerformanceMode::Custom,
+    fn explicit_presets_target_their_own_game_family() {
+        for (preset, version, targeted) in [
+            (PRESET_LEGACY_PVP, "1.8.9", true),
+            (PRESET_LEGACY, "1.20.4", false),
+            (PRESET_SMOOTH, "1.8.9", false),
+            (PRESET_ULTRA_LOW_LATENCY, "1.21.1", true),
+            (PRESET_PERFORMANCE, "1.8.9", true),
+            (PRESET_GRAALVM, "1.20.4", true),
+            ("", "1.21.1", true),
+            ("unknown", "1.21.1", false),
         ] {
-            for preset in [
-                "",
-                PRESET_SMOOTH,
-                PRESET_PERFORMANCE,
-                PRESET_ULTRA_LOW_LATENCY,
-                PRESET_LEGACY,
-            ] {
-                let args = launcher_args(mode, preset, &modern);
-                assert!(
-                    !args.iter().any(|arg| arg.starts_with("-XX:CICompilerCount")
-                        || arg.starts_with("-XX:ParallelGCThreads")
-                        || arg.starts_with("-XX:ConcGCThreads")
-                        || arg == "-XX:+AlwaysPreTouch"),
-                    "{preset}: {args:?}"
-                );
-            }
+            assert_eq!(preset_targets(preset, version), targeted, "{preset} on {version}");
         }
-    }
-
-    #[test]
-    fn explicit_presets_are_admitted_only_where_they_run() {
-        for (preset, version, major, distribution, supported) in [
-            (PRESET_PERFORMANCE, "1.20.4", 21, "openj9", false),
-            (PRESET_GRAALVM, "1.20.4", 21, "graalvm", true),
-            (PRESET_GRAALVM, "1.20.4", 21, "openjdk", false),
-            (PRESET_LEGACY_PVP, "1.8.9", 8, "openjdk", true),
-            (PRESET_LEGACY, "1.20.4", 21, "openjdk", false),
-            (PRESET_SMOOTH, "1.8.9", 17, "openjdk", false),
-            (PRESET_SMOOTH, "1.20.4", 8, "openjdk", false),
-            (PRESET_ULTRA_LOW_LATENCY, "1.21.1", 21, "openjdk", true),
-            (PRESET_ULTRA_LOW_LATENCY, "1.21.1", 11, "openjdk", false),
-            ("", "1.21.1", 21, "openj9", true),
+        for preset in [
+            PRESET_SMOOTH,
+            PRESET_PERFORMANCE,
+            PRESET_ULTRA_LOW_LATENCY,
+            PRESET_LEGACY,
         ] {
-            assert_eq!(
-                preset_supported(preset, version, &info(major, distribution)),
-                supported,
-                "{preset} on {version} java {major} {distribution}"
+            let args = preset_args(preset, &info(21));
+            assert!(
+                !args.iter().any(|arg| arg.starts_with("-XX:CICompilerCount")
+                    || arg.starts_with("-XX:ParallelGCThreads")
+                    || arg.starts_with("-XX:ConcGCThreads")
+                    || arg == "-XX:+AlwaysPreTouch"),
+                "{preset}: {args:?}"
             );
         }
-        assert!(
-            preset_args(PRESET_ULTRA_LOW_LATENCY, &info(21, "openjdk"))
-                .contains(&"-XX:+ZGenerational".into())
-        );
-        assert!(
-            !preset_args(PRESET_ULTRA_LOW_LATENCY, &info(24, "openjdk"))
-                .contains(&"-XX:+ZGenerational".into())
-        );
+        assert!(preset_args(PRESET_ULTRA_LOW_LATENCY, &info(21)).contains(&"-XX:+ZGenerational".into()));
+        assert!(!preset_args(PRESET_ULTRA_LOW_LATENCY, &info(24)).contains(&"-XX:+ZGenerational".into()));
     }
 
+    fn info(major: u32) -> JavaRuntimeInfo {
+        JavaRuntimeInfo {
+            id: String::new(),
+            major,
+            update: 0,
+            distribution: String::new(),
+            path: String::new(),
+        }
+    }
+
+    /// A VM that answers flag-table probes with `axial-minecraft`'s
+    /// `runtime/flag_tables`: HotSpot 25 tables captured from a real runtime,
+    /// and the Java 8 and OpenJ9 layouts written to those formats.
+    #[cfg(unix)]
+    async fn vm(root: &std::path::Path, version: &str, g1_table: &str) -> JavaProbeReceipt {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tables = "../minecraft/src/runtime/flag_tables";
+        let table = |name: &str| {
+            std::fs::canonicalize(format!("{}/{tables}/{name}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap()
+                .display()
+                .to_string()
+        };
+        let java = root.join("java");
+        std::fs::write(
+            &java,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *EnableJVMCI*) cat '{refused}' >&2; exit 1;;\n\
+                 *UseZGC*) cat '{zgc}';;\n\
+                 *PrintFlagsFinal*) cat '{g1}';;\n\
+                 *) printf 'java.version = {version}\\nos.arch = aarch64\\n' >&2;;\n\
+                 esac\n",
+                refused = table("hotspot25-jvmci-refused.txt"),
+                zgc = table("hotspot25-zgc.txt"),
+                g1 = table(g1_table),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        axial_minecraft::probe_java(&java, None, std::future::pending())
+            .await
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launcher_flags_are_admitted_only_where_the_exact_vm_applies_them() {
+        use ConfigPerformanceMode::{Custom, Managed, Vanilla};
+        let roots: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap())
+            .collect();
+        let modern = vm(roots[0].path(), "25.0.1", "hotspot25-g1.txt").await;
+        let legacy = vm(roots[1].path(), "1.8.0_472", "java8-layout-g1.txt").await;
+        let openj9 = vm(roots[2].path(), "1.8.0_472", "openj9-no-table.txt").await;
+        let proven = |mode, preset, probe| proven_launcher_args(mode, preset, probe, std::future::pending());
+
+        assert_eq!(proven(Managed, "", &modern).await, Ok(Vec::new()));
+        assert_eq!(proven(Managed, "", &legacy).await, Ok(vec!["-XX:+UseG1GC".to_string()]));
+        // Automatic adds nothing where the VM does not prove G1, and refuses nothing.
+        assert_eq!(proven(Managed, "", &openj9).await, Ok(Vec::new()));
+        assert_eq!(proven(Vanilla, PRESET_PERFORMANCE, &openj9).await, Ok(Vec::new()));
+        assert_eq!(proven(Custom, "", &openj9).await, Ok(Vec::new()));
+
+        let performance = proven(Custom, PRESET_PERFORMANCE, &modern).await.unwrap();
+        assert!(performance.contains(&"-XX:MaxGCPauseMillis=37".to_string()));
+        assert_eq!(
+            proven(Managed, PRESET_ULTRA_LOW_LATENCY, &modern).await,
+            Ok(vec!["-XX:+UseZGC".to_string(), "-XX:+DisableExplicitGC".to_string()])
+        );
+        // Explicit presets the VM refuses or silently ignores are refused, never replaced.
+        for (preset, probe) in [
+            (PRESET_GRAALVM, &modern),
+            (PRESET_PERFORMANCE, &openj9),
+            (PRESET_LEGACY_PVP, &openj9),
+        ] {
+            assert_eq!(
+                proven(Custom, preset, probe).await,
+                Err(LaunchPlanError::IncompatiblePreset),
+                "{preset}"
+            );
+        }
+        assert_eq!(
+            proven(Custom, "unknown", &modern).await,
+            Err(LaunchPlanError::IncompatiblePreset)
+        );
+    }
 }

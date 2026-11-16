@@ -672,15 +672,25 @@ impl LaunchCoordinator {
                         );
                         let (max_memory_mb, min_memory_mb, _) = settings.heap_bounds(heap.max_mb);
                         let options = launch_options(&settings, max_memory_mb, min_memory_mb)?;
-                        match runtime {
-                            Some(runtime) => crate::launch::plan::validate_options(
-                                &options,
-                                &target.minecraft_version,
-                                runtime.probe.info(),
-                            ).map(|_| ()),
-                            None => crate::launch::plan::validate_settings(&options, None),
+                        // A runtime still to be provisioned proves its flags at launch.
+                        let validated = match (
+                            crate::launch::plan::validate_options(&options, &target.minecraft_version),
+                            &runtime,
+                        ) {
+                            (Ok(()), Some(runtime)) => crate::launch::jvm::proven_launcher_args(
+                                options.performance_mode,
+                                &options.jvm_preset,
+                                &runtime.probe,
+                                cancel.cancelled(),
+                            )
+                            .await
+                            .map(|_| ()),
+                            (validated, _) => validated,
+                        };
+                        if cancel.is_cancelled() {
+                            return Err(LaunchError::Cancelled);
                         }
-                        .map_err(|error| {
+                        validated.map_err(|error| {
                             tracing::warn!(
                                 ?error,
                                 stage = "validate_options",

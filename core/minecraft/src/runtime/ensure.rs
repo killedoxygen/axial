@@ -268,18 +268,19 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
         admit_processor_program(install_directory, &program_path).inspect_err(|error| {
             trace_ephemeral_processor_runtime_failure("probed_executable_admission", error);
         })?;
-    let observed_major = probe_receipt.info().major;
     let expected_major = u32::try_from(java_version.major_version).unwrap_or(u32::MAX);
-    if observed_major != expected_major {
+    if let Err(refusal) = super::model::JavaRequirement::for_current_host(expected_major)
+        .validate(probe_receipt.info(), probe_receipt.architecture())
+    {
         let error = JavaRuntimeLookupError::Probe(
-            "processor runtime Java major does not match the authenticated base requirement"
-                .to_string(),
+            "processor runtime does not meet the authenticated base Java requirement".to_string(),
         );
         tracing::warn!(
-            stage = "probed_major_validation",
+            stage = "probed_requirement_validation",
             category = "probe",
             expected_major,
-            observed_major,
+            observed_major = probe_receipt.info().major,
+            ?refusal,
             "Ephemeral processor runtime preparation failed"
         );
         return Err(error);

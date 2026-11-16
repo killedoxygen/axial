@@ -397,7 +397,7 @@ impl LaunchCoordinator {
             &host,
         )?;
         let (max_memory_mb, min_memory_mb, _) = effective.heap_bounds(heap.max_mb);
-        let options = launch_options(&effective, max_memory_mb, min_memory_mb)?;
+        let mut options = launch_options(&effective, max_memory_mb, min_memory_mb)?;
         let library_operation = admitted
             .generation()
             .managed_library()
@@ -476,12 +476,28 @@ impl LaunchCoordinator {
                         .await
                         .map_err(composition_error)
                 }),
-                stages.time(
-                    "runtime",
-                    "Java runtime",
-                    self.runtimes
-                        .prepare_for_launch(&required, &effective.java_path, cancellation),
-                ),
+                stages.time("runtime", "Java runtime", async {
+                    let runtime = self
+                        .runtimes
+                        .prepare_for_launch(&required, &effective.java_path, cancellation)
+                        .await
+                        .map_err(LaunchError::RuntimeFailure)?;
+                    let launcher_args = super::jvm::proven_launcher_args(
+                        options.performance_mode,
+                        &options.jvm_preset,
+                        &runtime.probe,
+                        cancellation.cancelled(),
+                    )
+                    .await;
+                    if cancellation.is_cancelled() {
+                        return Err(LaunchError::Cancelled);
+                    }
+                    let launcher_args = launcher_args.map_err(|error| {
+                        tracing::warn!(?error, stage = "launcher_args", "Launch plan rejected.");
+                        LaunchError::PlanRejected
+                    })?;
+                    Ok::<_, LaunchError>((runtime, launcher_args))
+                }),
                 stages.time("game_files", "Game libraries and assets", async {
                     let game_libraries = match game_libraries {
                         Some(inputs) => Some(
@@ -525,7 +541,7 @@ impl LaunchCoordinator {
                 }),
             );
             let composition = composition?;
-            let runtime = runtime.map_err(LaunchError::RuntimeFailure)?;
+            let runtime = runtime?;
             let (game_libraries, game_assets) = files?;
             Ok::<_, LaunchError>((
                 composition,
@@ -548,6 +564,8 @@ let (
             prepared_natives,
         ) = installation?;
         let (selection, auth, secrets, credential_expires_at) = account?;
+        let (runtime, launcher_args) = runtime;
+        options.launcher_args = launcher_args;
         if cancellation.is_cancelled() {
             return Err(LaunchError::Cancelled);
         }

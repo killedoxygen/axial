@@ -7,7 +7,7 @@
 //! changed. A projection shares each selection across its rows and rechecks
 //! it once before publication.
 
-use super::model::{JavaDiscoveryError, JavaRuntimesResponse, JavaSelectionRequirement};
+use super::model::{JavaDiscoveryError, JavaRequirement, JavaRuntimesResponse};
 use crate::tasks::{CancellationToken, TaskOwner};
 use axial_minecraft::{
     JavaProbeReceipt, JavaVersion, ManagedRuntimeCache, ManagedRuntimeLaunchReceipt, probe_java,
@@ -447,7 +447,7 @@ impl RuntimeDiscovery {
         override_value: &str,
         cancellation: &CancellationToken,
     ) -> Result<(SelectedRuntime, Result<(), JavaDiscoveryError>), JavaDiscoveryError> {
-        let requirement = JavaSelectionRequirement::for_current_host(
+        let requirement = JavaRequirement::for_current_host(
             u32::try_from(java.major_version).map_err(|_| JavaDiscoveryError::InvalidVersion)?,
         );
         let requested = override_value.trim();
@@ -476,7 +476,9 @@ impl RuntimeDiscovery {
                 manifest: None,
             }
         };
-        let admitted = requirement.validate(selected.probe.info(), selected.probe.architecture());
+        let admitted = requirement
+            .validate(selected.probe.info(), selected.probe.architecture())
+            .map_err(JavaDiscoveryError::from);
         Ok((selected, admitted))
     }
 

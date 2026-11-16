@@ -20,7 +20,11 @@ use tokio::process::Command;
 
 const MAX_EXECUTABLE_BYTES: u64 = 64 << 20;
 const MAX_OUTPUT_BYTES: usize = 64 << 10;
+/// A capability probe prints the VM's complete final flag table.
+const MAX_FLAG_TABLE_BYTES: usize = 1 << 20;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Distinct option sets one receipt remembers; launcher presets are fewer.
+const MAX_REMEMBERED_OPTION_SETS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +98,10 @@ pub struct JavaProbeReceipt {
     identity: ExecutableIdentity,
     info: JavaRuntimeInfo,
     architecture: JavaArchitecture,
+    /// The deadline this runtime was probed within, reused for its capability probes.
+    timeout: Duration,
+    /// Option sets already started on these exact bytes, and whether the VM applied them.
+    applied: std::sync::Arc<std::sync::Mutex<Vec<(Vec<String>, bool)>>>,
 }
 
 impl JavaProbeReceipt {
@@ -122,6 +130,106 @@ impl JavaProbeReceipt {
         self.revalidate()?;
         Ok(self.identity.selected.clone())
     }
+
+    /// Whether this exact VM accepts and applies every `-XX:` option in
+    /// `options`: it must start with them and list each in its final flag table
+    /// as set from the command line, booleans with the requested value. A VM
+    /// that ignores options it does not know, or prints no HotSpot flag table,
+    /// proves nothing. The answer is remembered for these exact bytes.
+    pub async fn applies_options(
+        &self,
+        options: &[String],
+        cancellation: impl Future<Output = ()>,
+    ) -> Result<bool, JavaProbeError> {
+        if let Some((_, applied)) = self
+            .applied
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(remembered, _)| remembered.as_slice() == options)
+        {
+            self.revalidate()?;
+            return Ok(*applied);
+        }
+        if options.iter().any(|option| !option.starts_with("-XX:")) {
+            return Ok(false);
+        }
+        self.revalidate()?;
+        let mut args = options.to_vec();
+        args.extend(["-XX:+PrintFlagsFinal".to_owned(), "-version".to_owned()]);
+        let table = run(
+            &self.identity.selected,
+            &args,
+            MAX_FLAG_TABLE_BYTES,
+            cancellation,
+            self.timeout,
+        )
+        .await?;
+        self.revalidate()?;
+        let applied = table.is_some_and(|table| {
+            options
+                .iter()
+                .all(|option| flag_applied(&table, option))
+        });
+        let mut remembered = self.applied.lock().unwrap();
+        if remembered.len() < MAX_REMEMBERED_OPTION_SETS
+            && !remembered.iter().any(|(known, _)| known.as_slice() == options)
+        {
+            remembered.push((options.to_vec(), applied));
+        }
+        Ok(applied)
+    }
+}
+
+/// Whether `-XX:` `option` appears in a HotSpot `-XX:+PrintFlagsFinal` table as
+/// set from the command line. Java 8 marks changed flags `:=`; later releases
+/// name the `{command line}` origin.
+fn flag_applied(table: &str, option: &str) -> bool {
+    let Some(flag) = option.strip_prefix("-XX:") else {
+        return false;
+    };
+    let (name, expected) = match flag.split_once('=') {
+        Some((name, value)) => (name, FlagValue::Exact(value)),
+        None => match flag.split_at_checked(1) {
+            Some(("+", name)) => (name, FlagValue::Bool("true")),
+            Some(("-", name)) => (name, FlagValue::Bool("false")),
+            _ => return false,
+        },
+    };
+    table.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(_kind), Some(listed), Some(operator), Some(value)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let from_command_line = operator == ":=" || line.contains("{command line}");
+        listed == name
+            && matches!(operator, "=" | ":=")
+            && from_command_line
+            && match expected {
+                FlagValue::Bool(expected) => value == expected,
+                FlagValue::Exact(expected) => {
+                    value == expected || flag_size(expected).is_some_and(|size| value == size.to_string())
+                }
+            }
+    })
+}
+
+enum FlagValue<'a> {
+    Bool(&'static str),
+    Exact(&'a str),
+}
+
+/// A HotSpot size option's byte count, such as `16M`.
+fn flag_size(value: &str) -> Option<u64> {
+    let (digits, scale) = match value.as_bytes().last()? {
+        b'k' | b'K' => (&value[..value.len() - 1], 1 << 10),
+        b'm' | b'M' => (&value[..value.len() - 1], 1 << 20),
+        b'g' | b'G' => (&value[..value.len() - 1], 1 << 30),
+        _ => (value, 1),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 pub async fn probe_java(
@@ -151,7 +259,15 @@ async fn probe_with_timeout(
     timeout: Duration,
 ) -> Result<JavaProbeReceipt, JavaProbeError> {
     let identity = fingerprint(path)?;
-    let output = run(&identity.selected, cancellation, timeout).await?;
+    let output = run(
+        &identity.selected,
+        &["-XshowSettings:properties".to_owned(), "-version".to_owned()],
+        MAX_OUTPUT_BYTES,
+        cancellation,
+        timeout,
+    )
+    .await?
+    .ok_or(JavaProbeError::Failed)?;
     if fingerprint(path).map_err(|_| JavaProbeError::Replaced)? != identity {
         return Err(JavaProbeError::Replaced);
     }
@@ -167,16 +283,21 @@ async fn probe_with_timeout(
         identity,
         architecture: property(&output, "os.arch")
             .map_or(JavaArchitecture::Unknown, JavaArchitecture::parse),
+        timeout,
+        applied: std::sync::Arc::default(),
     })
 }
 
+/// Runs `executable` with `args`; `None` when it exits unsuccessfully.
 async fn run(
     executable: &Path,
+    args: &[String],
+    limit: usize,
     cancellation: impl Future<Output = ()>,
     timeout: Duration,
-) -> Result<String, JavaProbeError> {
+) -> Result<Option<String>, JavaProbeError> {
     let mut command = Command::new(executable);
-    command.args(["-XshowSettings:properties", "-version"]);
+    command.args(args);
     // Launcher-injected JVM options must not run agents or alter this diagnostic.
     for key in [
         "JAVA_TOOL_OPTIONS",
@@ -195,18 +316,21 @@ async fn run(
         }
     };
     let completed = async {
-        let (stderr, stdout) =
-            tokio::try_join!(read_bounded(output.stderr), read_bounded(output.stdout))?;
-        if stderr.len() + stdout.len() > MAX_OUTPUT_BYTES {
+        let (stderr, stdout) = tokio::try_join!(
+            read_bounded(output.stderr, limit),
+            read_bounded(output.stdout, limit)
+        )?;
+        if stderr.len() + stdout.len() > limit {
             return Err(JavaProbeError::OutputLimit);
         }
         match process.wait().await {
-            Ok(status) if status.success() => Ok(format!(
+            Ok(status) if status.success() => Ok(Some(format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&stderr),
                 String::from_utf8_lossy(&stdout)
-            )),
-            _ => Err(JavaProbeError::Failed),
+            ))),
+            Ok(_) => Ok(None),
+            Err(_) => Err(JavaProbeError::Failed),
         }
     };
     let result = tokio::select! {
@@ -220,14 +344,17 @@ async fn run(
     result
 }
 
-async fn read_bounded(stream: impl AsyncRead + Unpin) -> Result<Vec<u8>, JavaProbeError> {
+async fn read_bounded(
+    stream: impl AsyncRead + Unpin,
+    limit: usize,
+) -> Result<Vec<u8>, JavaProbeError> {
     let mut bytes = Vec::new();
     stream
-        .take(MAX_OUTPUT_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .await
         .map_err(|_| JavaProbeError::Failed)?;
-    if bytes.len() > MAX_OUTPUT_BYTES {
+    if bytes.len() > limit {
         return Err(JavaProbeError::OutputLimit);
     }
     Ok(bytes)
@@ -547,6 +674,8 @@ mod tests {
                 path: String::new(),
             },
             architecture: JavaArchitecture::X86_64,
+            timeout: PROBE_TIMEOUT,
+            applied: std::sync::Arc::default(),
         };
         let windowed = receipt(fingerprint(&javaw).unwrap());
         assert_eq!(windowed.revalidate_cli_executable(), Ok(javaw.clone()));
@@ -675,5 +804,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.unwrap_err(), JavaProbeError::OutputLimit);
+    }
+
+    #[test]
+    fn flag_tables_prove_only_options_set_from_the_command_line() {
+        // Captured from Microsoft OpenJDK 25.0.1 with each preset's flags.
+        let g1 = include_str!("flag_tables/hotspot25-g1.txt");
+        let zgc = include_str!("flag_tables/hotspot25-zgc.txt");
+        for option in [
+            "-XX:+UseG1GC",
+            "-XX:MaxGCPauseMillis=37",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:G1NewSizePercent=20",
+            "-XX:G1HeapRegionSize=16M",
+            "-XX:+DisableExplicitGC",
+        ] {
+            assert!(flag_applied(g1, option), "{option}");
+        }
+        for (table, option) in [
+            (g1, "-XX:MaxGCPauseMillis=38"),
+            (g1, "-XX:-UseG1GC"),
+            (g1, "-XX:+UseZGC"),
+            (zgc, "-XX:+UseG1GC"),
+            (zgc, "-XX:G1HeapRegionSize=16M"),
+            (zgc, "-XX:+ZGenerational"),
+            (zgc, "-Xmx1G"),
+        ] {
+            assert!(!flag_applied(table, option), "{option}");
+        }
+        assert!(flag_applied(zgc, "-XX:+UseZGC"));
+        // Java 8 marks changed flags with `:=` and names no origin. This and
+        // the OpenJ9 response follow those formats; neither was captured here.
+        let java8 = include_str!("flag_tables/java8-layout-g1.txt");
+        assert!(flag_applied(java8, "-XX:+UseG1GC"));
+        assert!(flag_applied(java8, "-XX:G1HeapRegionSize=16M"));
+        assert!(!flag_applied(java8, "-XX:-UseParallelGC"));
+        // OpenJ9 ignores HotSpot options it does not know and prints no table.
+        let openj9 = include_str!("flag_tables/openj9-no-table.txt");
+        assert!(!flag_applied(openj9, "-XX:+UseG1GC"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn option_capability_is_the_vm_response_and_is_remembered_for_exact_bytes() {
+        let root = tempfile::tempdir_in(crate::test_temp_root()).unwrap();
+        let tables = root.path().join("tables");
+        fs::create_dir(&tables).unwrap();
+        for (name, table) in [
+            ("g1", include_str!("flag_tables/hotspot25-g1.txt")),
+            ("refused", include_str!("flag_tables/hotspot25-jvmci-refused.txt")),
+            ("openj9", include_str!("flag_tables/openj9-no-table.txt")),
+        ] {
+            fs::write(tables.join(name), table).unwrap();
+        }
+        let calls = root.path().join("calls");
+        let java = script(
+            root.path(),
+            &format!(
+                "case \"$*\" in\n\
+                 *EnableJVMCI*) cat '{tables}/refused' >&2; exit 1;;\n\
+                 *UseShenandoahGC*) echo run >> '{calls}'; cat '{tables}/openj9';;\n\
+                 *PrintFlagsFinal*) echo run >> '{calls}'; cat '{tables}/g1';;\n\
+                 *) {VALID};;\n\
+                 esac",
+                tables = tables.display(),
+                calls = calls.display(),
+            ),
+        );
+        let receipt = probe(&java).await.unwrap();
+        let g1: Vec<String> = ["-XX:+UseG1GC", "-XX:MaxGCPauseMillis=37"]
+            .map(String::from)
+            .into();
+        let pending = || std::future::pending::<()>();
+        assert_eq!(receipt.applies_options(&g1, pending()).await, Ok(true));
+        assert_eq!(receipt.clone().applies_options(&g1, pending()).await, Ok(true));
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        let jvmci: Vec<String> = ["-XX:+EnableJVMCI"].map(String::from).into();
+        assert_eq!(receipt.applies_options(&jvmci, pending()).await, Ok(false));
+        let ignored: Vec<String> = ["-XX:+UseShenandoahGC"].map(String::from).into();
+        assert_eq!(receipt.applies_options(&ignored, pending()).await, Ok(false));
+        let other: Vec<String> = ["-Xss2m"].map(String::from).into();
+        assert_eq!(receipt.applies_options(&other, pending()).await, Ok(false));
+        fs::write(&java, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(
+            receipt.applies_options(&g1, pending()).await,
+            Err(JavaProbeError::Replaced)
+        );
     }
 }

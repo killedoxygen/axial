@@ -1,0 +1,16 @@
+[Global flags]
+     bool DisableExplicitGC                        = true                                      {product} {command line}
+     bool EnableJVMCI                              = false                          {JVMCI experimental} {default}
+   size_t G1HeapRegionSize                         = 16777216                                  {product} {command line}
+     uint G1NewSizePercent                         = 20                                   {experimental} {command line}
+     uint G1ReservePercent                         = 20                                        {product} {command line}
+    uintx MaxGCPauseMillis                         = 37                                        {product} {command line}
+    ccstr ShenandoahGCHeuristics                   = adaptive                                  {product} {default}
+     bool UnlockExperimentalVMOptions              = true                                 {experimental} {command line}
+     bool UseG1GC                                  = true                                      {product} {command line}
+     bool UseJVMCICompiler                         = false                          {JVMCI experimental} {default}
+     bool UseShenandoahGC                          = false                                     {product} {default}
+     bool UseZGC                                   = false                                     {product} {default}
+openjdk version "25.0.1" 2025-10-21 LTS
+OpenJDK Runtime Environment Microsoft-12574220 (build 25.0.1+8-LTS)
+OpenJDK 64-Bit Server VM Microsoft-12574220 (build 25.0.1+8-LTS, mixed mode)

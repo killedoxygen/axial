@@ -1,0 +1,12 @@
+[Global flags]
+     bool DisableExplicitGC                        = true                                      {product} {command line}
+   size_t G1HeapRegionSize                         = 0                                         {product} {default}
+     uint G1ReservePercent                         = 10                                        {product} {default}
+    uintx MaxGCPauseMillis                         = 18446744073709551614                      {product} {default}
+    ccstr ShenandoahGCHeuristics                   = adaptive                                  {product} {default}
+     bool UseG1GC                                  = false                                     {product} {default}
+     bool UseShenandoahGC                          = false                                     {product} {default}
+     bool UseZGC                                   = true                                      {product} {command line}
+openjdk version "25.0.1" 2025-10-21 LTS
+OpenJDK Runtime Environment Microsoft-12574220 (build 25.0.1+8-LTS)
+OpenJDK 64-Bit Server VM Microsoft-12574220 (build 25.0.1+8-LTS, mixed mode)

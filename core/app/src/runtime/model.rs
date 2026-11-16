@@ -1,7 +1,7 @@
 //! Runtime wire compatibility and explicit selection policy.
 
 pub use axial_minecraft::{
-    JavaArchitecture, JavaProbeError, JavaRuntimeInfo, JavaRuntimeResult, JavaVersion,
+    JavaArchitecture, JavaProbeError, JavaRequirement, JavaRequirementRefusal, JavaRuntimeInfo, JavaRuntimeResult, JavaVersion,
     ManagedRuntimeCache, ManagedRuntimeLaunchReceipt, RuntimeEnsureEvent, RuntimeId,
     RuntimeInstallState, RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
@@ -12,60 +12,6 @@ use thiserror::Error;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, TS)]
 pub struct JavaRuntimesResponse {
     pub runtimes: Vec<JavaRuntimeResult>,
-}
-
-/// Exact Minecraft major and native architecture unless a successful macOS
-/// probe has already demonstrated the retained x86_64 translation path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JavaSelectionRequirement {
-    pub major: u32,
-    pub architecture: JavaArchitecture,
-    pub allow_macos_x86_64_translation: bool,
-}
-
-impl JavaSelectionRequirement {
-    pub fn for_current_host(major: u32) -> Self {
-        Self {
-            major,
-            architecture: JavaArchitecture::parse(std::env::consts::ARCH),
-            allow_macos_x86_64_translation: cfg!(all(target_os = "macos", target_arch = "aarch64")),
-        }
-    }
-
-    pub fn validate(
-        &self,
-        info: &JavaRuntimeInfo,
-        architecture: JavaArchitecture,
-    ) -> Result<(), JavaDiscoveryError> {
-        if self.major == 0 || info.major == 0 {
-            return Err(JavaDiscoveryError::InvalidVersion);
-        }
-        if info.major != self.major {
-            return Err(JavaDiscoveryError::IncompatibleVersion {
-                required: self.major,
-                actual: info.major,
-            });
-        }
-        // The baseline's hard Java 8 floor belongs to runtime validation.
-        if self.major == 8 && info.update < 312 {
-            return Err(JavaDiscoveryError::OutdatedJava8);
-        }
-        if architecture == JavaArchitecture::Unknown
-            || self.architecture == JavaArchitecture::Unknown
-        {
-            return Err(JavaDiscoveryError::UnknownArchitecture);
-        }
-        let translated = self.allow_macos_x86_64_translation
-            && self.architecture == JavaArchitecture::Aarch64
-            && architecture == JavaArchitecture::X86_64;
-        if architecture != self.architecture && !translated {
-            return Err(JavaDiscoveryError::IncompatibleArchitecture {
-                required: self.architecture,
-                actual: architecture,
-            });
-        }
-        Ok(())
-    }
 }
 
 /// Bounded public failure vocabulary. Raw paths, process output and OS errors
@@ -120,6 +66,22 @@ pub enum JavaDiscoveryError {
     SettlementRequired,
 }
 
+impl From<JavaRequirementRefusal> for JavaDiscoveryError {
+    fn from(refusal: JavaRequirementRefusal) -> Self {
+        match refusal {
+            JavaRequirementRefusal::InvalidVersion => Self::InvalidVersion,
+            JavaRequirementRefusal::IncompatibleVersion { required, actual } => {
+                Self::IncompatibleVersion { required, actual }
+            }
+            JavaRequirementRefusal::OutdatedJava8 => Self::OutdatedJava8,
+            JavaRequirementRefusal::UnknownArchitecture => Self::UnknownArchitecture,
+            JavaRequirementRefusal::IncompatibleArchitecture { required, actual } => {
+                Self::IncompatibleArchitecture { required, actual }
+            }
+        }
+    }
+}
+
 impl From<JavaProbeError> for JavaDiscoveryError {
     fn from(error: JavaProbeError) -> Self {
         match error {
@@ -154,36 +116,40 @@ mod tests {
 
     #[test]
     fn selection_enforces_major_update_and_architecture() {
-        let request = JavaSelectionRequirement {
+        let request = JavaRequirement {
             major: 8,
             architecture: JavaArchitecture::Aarch64,
-            allow_macos_x86_64_translation: false,
+            translates_x86_64: false,
+        };
+        let request = |info: &JavaRuntimeInfo, architecture| {
+            request
+                .validate(info, architecture)
+                .map_err(JavaDiscoveryError::from)
         };
         assert_eq!(
-            request.validate(&info(8, 311), JavaArchitecture::Aarch64),
+            request(&info(8, 311), JavaArchitecture::Aarch64),
             Err(JavaDiscoveryError::OutdatedJava8)
         );
         assert!(
-            request
-                .validate(&info(8, 312), JavaArchitecture::Aarch64)
-                .is_ok()
+            request(&info(8, 312), JavaArchitecture::Aarch64).is_ok()
         );
         assert!(matches!(
-            request.validate(&info(17, 10), JavaArchitecture::Aarch64),
+            request(&info(17, 10), JavaArchitecture::Aarch64),
             Err(JavaDiscoveryError::IncompatibleVersion { .. })
         ));
         assert!(matches!(
-            request.validate(&info(8, 312), JavaArchitecture::X86_64),
+            request(&info(8, 312), JavaArchitecture::X86_64),
             Err(JavaDiscoveryError::IncompatibleArchitecture { .. })
         ));
         assert_eq!(
-            request.validate(&info(8, 312), JavaArchitecture::Unknown),
+            request(&info(8, 312), JavaArchitecture::Unknown),
             Err(JavaDiscoveryError::UnknownArchitecture)
         );
         assert!(
-            JavaSelectionRequirement {
-                allow_macos_x86_64_translation: true,
-                ..request
+            JavaRequirement {
+                major: 8,
+                architecture: JavaArchitecture::Aarch64,
+                translates_x86_64: true,
             }
             .validate(&info(8, 312), JavaArchitecture::X86_64)
             .is_ok()
