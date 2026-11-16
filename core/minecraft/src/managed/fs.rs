@@ -17,7 +17,7 @@ use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work
 use sha1::{Digest as _, Sha1};
 use sha2::{Sha256, Sha512};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -3411,7 +3411,7 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
     ) -> Result<(), FileRemovalFailure> {
-        use FileRemovalFailure::{AppliedUnsettled, Indeterminate, NoEffect};
+        use FileRemovalFailure::NoEffect;
         let (file, expected) = (|| {
             let name_leaf = leaf(name)?;
             if !self.file_guard_matches_locked(transition, name, guard)? {
@@ -3457,6 +3457,16 @@ impl ManagedDir {
             Ok((file, expected))
         })()
         .map_err(NoEffect)?;
+        self.remove_file_with_content_locked(transition, file, expected)
+    }
+
+    fn remove_file_with_content_locked(
+        &self,
+        transition: &ManagedEffectTransition<'_>,
+        file: FileCapability,
+        expected: ExpectedFileContent,
+    ) -> Result<(), FileRemovalFailure> {
+        use FileRemovalFailure::{AppliedUnsettled, Indeterminate, NoEffect};
         match self.inner.directory.park_file(file.park_request(expected)) {
             FileParkOutcome::Parked(parked) => {
                 retain_parked_file_removal_locked(transition, parked);
@@ -5009,9 +5019,15 @@ impl ManagedLibraryOperation {
                     {
                         return Ok(None);
                     }
-                    guards.push((portable, guard));
+                    guards.push((portable, NativeFile { guard, sha256: None }));
                 }
-                guards.push((manifest_name, manifest_guard));
+                guards.push((
+                    manifest_name,
+                    NativeFile {
+                        guard: manifest_guard,
+                        sha256: None,
+                    },
+                ));
                 let relative = PortableRelativePath::new_exact(&format!("cache/natives/{name}"))
                     .map_err(|_| LoaderError::Verify("native directory name".into()))?;
                 let receipt = ManagedNativeDirectory {
@@ -5115,13 +5131,13 @@ impl ManagedLibraryOperation {
                         .write_new_exact_retained(name.as_str(), &bytes),
                 );
                 match result {
-                    Ok(guard) => cleanup.guards.push((name, guard)),
+                    Ok(guard) => cleanup.guards.push((name, NativeFile::published(guard, &bytes))),
                     Err(ManagedCreateOnlyWriteFailure::BeforePromotion(error)) => {
                         return Err(loader_io(error));
                     }
                     Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
                         if let Some(guard) = final_guard {
-                            cleanup.guards.push((name, guard));
+                            cleanup.guards.push((name, NativeFile::published(guard, &bytes)));
                         }
                         return Err(io::Error::other(
                             "native file publication remains unsettled",
@@ -5655,9 +5671,65 @@ struct ManagedNativeCleanup {
     parent: ManagedDir,
     name: String,
     directory: ManagedDir,
-    guards: Vec<(PortableFileName, ManagedFileGuard)>,
+    guards: Vec<(PortableFileName, NativeFile)>,
     started: bool,
     complete: bool,
+}
+
+struct NativeFile {
+    guard: ManagedFileGuard,
+    // Published bytes are known before any game can use the file. Recovery
+    // instead captures exact guards and settles them before any reuse.
+    sha256: Option<[u8; 32]>,
+}
+
+impl NativeFile {
+    fn published(guard: ManagedFileGuard, bytes: &[u8]) -> Self {
+        Self {
+            guard,
+            sha256: Some(Sha256::digest(bytes).into()),
+        }
+    }
+
+    fn open(&self, directory: &ManagedDir, name: &str) -> Result<FileCapability, LoaderError> {
+        let file = directory.inner.directory.open_file(&leaf(name)?)?;
+        if !self.guard.identity.matches(&file)? {
+            return Err(LoaderError::Verify("native file identity changed".into()));
+        }
+        if let Err(error) = file.validate_revision(&self.guard.revision) {
+            let Some(sha256) = self.sha256 else {
+                return Err(error.into());
+            };
+            file.validate_content(&ExpectedFileContent::immutable(
+                self.guard.revision.retained(),
+                sha256,
+            ))?;
+        }
+        verify_operation_admission(&directory.inner.operation_pin)?;
+        Ok(file)
+    }
+
+    fn remove(&self, directory: &ManagedDir, name: &str) -> Result<(), LoaderError> {
+        let Some(sha256) = self.sha256 else {
+            return directory.remove_guarded_file(name, &self.guard);
+        };
+        let root = directory.inner.root.clone();
+        let transition = root.transition();
+        root.settle_locked(&transition)?;
+        directory.revalidate_locked(&transition)?;
+        let file = self.open(directory, name)?;
+        directory
+            .remove_file_with_content_locked(
+                &transition,
+                file,
+                ExpectedFileContent::immutable(self.guard.revision.retained(), sha256),
+            )
+            .map_err(|failure| match failure {
+                FileRemovalFailure::NoEffect(error)
+                | FileRemovalFailure::AppliedUnsettled(error)
+                | FileRemovalFailure::Indeterminate(error) => error,
+            })
+    }
 }
 
 fn report_native_cleanup_failure(stage: &'static str, error: &io::Error) {
@@ -5711,34 +5783,35 @@ impl ManagedNativeDirectory {
             .revalidate()
             .map_err(loader_io)
             .inspect_err(|error| report_native_cleanup_failure("directory", error))?;
-        let entries = cleanup
+        let entries: std::collections::HashSet<_> = cleanup
             .directory
             .entries_bounded(cleanup.guards.len() + 1)
             .map_err(loader_io)
             .inspect_err(|error| report_native_cleanup_failure("membership", error))?
-            .len();
-        if entries != cleanup.guards.len() {
+            .into_iter()
+            .collect();
+        if entries.len() != cleanup.guards.len()
+            || cleanup
+                .guards
+                .iter()
+                .any(|(name, _)| !entries.contains(OsStr::new(name.as_str())))
+        {
             tracing::debug!(
                 stage = "membership",
                 expected = cleanup.guards.len(),
-                observed = entries,
+                observed = entries.len(),
                 "Native directory check failed"
             );
             return Err(io::Error::other("native directory entries changed"));
         }
-        for (index, (name, guard)) in cleanup.guards.iter().enumerate() {
-            if !cleanup
-                .directory
-                .file_guard_matches(name.as_str(), guard)
-                .map_err(loader_io)
-                .inspect_err(|error| report_native_cleanup_failure("file_observation", error))?
-            {
+        for (index, (name, file)) in cleanup.guards.iter().enumerate() {
+            if let Err(error) = file.open(&cleanup.directory, name.as_str()) {
                 tracing::debug!(
                     stage = "file_revision",
                     member_index = index,
                     "Native directory check failed"
                 );
-                return Err(io::Error::other("native payload changed"));
+                return Err(loader_io(error));
             }
         }
         self.operation
@@ -5767,8 +5840,8 @@ impl ManagedNativeDirectory {
             self.validate_contents(&cleanup)?;
             cleanup.started = true;
         }
-        while let Some((name, guard)) = cleanup.guards.last() {
-            if let Err(error) = cleanup.directory.remove_guarded_file(name.as_str(), guard) {
+        while let Some((name, file)) = cleanup.guards.last() {
+            if let Err(error) = file.remove(&cleanup.directory, name.as_str()) {
                 match &error {
                     LoaderError::Io(error) => report_native_cleanup_failure("file_removal", error),
                     _ => tracing::debug!(
@@ -7857,6 +7930,99 @@ mod library_lifecycle_tests {
         assert!(!temporary.path().join("cache").exists());
         drop(operation);
         root.settle().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_content_guards_authenticate_original_bytes_after_metadata_changes() {
+        for change in ["metadata", "bytes", "name", "replacement"] {
+            let temporary =
+                tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+            let root = ManagedLibraryRoot::open_for_test(temporary.path()).unwrap();
+            let operation = root.try_acquire().unwrap();
+            let native = operation
+                .publish_native_directory(vec![
+                    (
+                        PortableFileName::new_exact("native.bin").unwrap(),
+                        b"native bytes".to_vec(),
+                    ),
+                    (
+                        PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
+                        b"{}".to_vec(),
+                    ),
+                ])
+                .await
+                .unwrap();
+            let projection = temporary.path().join(native.relative_path().as_str());
+            let path = projection.join("native.bin");
+            let original_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let observed = operation
+                .observe_file(
+                    &PortableRelativePath::new_exact(&format!(
+                        "{}/native.bin",
+                        native.relative_path().as_str()
+                    ))
+                    .unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+            let writer = std::fs::File::options().write(true).open(&path).unwrap();
+            let original = writer.metadata().unwrap().permissions();
+            for _ in 0..64 {
+                let mut changed = original.clone();
+                changed.set_readonly(!original.readonly());
+                writer.set_permissions(changed).unwrap();
+                writer.set_permissions(original.clone()).unwrap();
+                if observed.revalidate().is_err() {
+                    break;
+                }
+            }
+            drop(writer);
+            assert!(
+                observed.revalidate().is_err(),
+                "fixture must observe metadata revision drift"
+            );
+            if change == "bytes" {
+                std::fs::write(&path, b"edited bytes").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(original_time))
+                    .unwrap();
+            } else if change == "name" {
+                std::fs::rename(&path, projection.join("Native.bin")).unwrap();
+            } else if change == "replacement" {
+                std::fs::rename(&path, temporary.path().join("original.bin")).unwrap();
+                std::fs::write(&path, b"native bytes").unwrap();
+            }
+            if change == "metadata" {
+                native.revalidate().unwrap();
+                native.settle().unwrap();
+                assert!(!projection.exists());
+            } else {
+                assert!(native.revalidate().is_err(), "{change}");
+                assert!(native.settle().is_err(), "{change}");
+                assert_eq!(
+                    std::fs::read(projection.join(".axial-native-manifest.json")).unwrap(),
+                    b"{}"
+                );
+                let retained = if change == "name" {
+                    projection.join("Native.bin")
+                } else {
+                    path
+                };
+                assert_eq!(
+                    std::fs::read(retained).unwrap(),
+                    if change == "bytes" {
+                        &b"edited bytes"[..]
+                    } else {
+                        &b"native bytes"[..]
+                    }
+                );
+            }
+            drop((observed, native, operation));
+            root.settle().unwrap();
+        }
     }
 
     #[tokio::test]

@@ -31,6 +31,117 @@ fn acquire_test_root(path: &Path) -> RootSession {
     }
 }
 
+fn change_file_metadata(path: &Path, file: &FileCapability, revision: &FileRevision) {
+    let writer = File::options()
+        .write(true)
+        .open(path)
+        .expect("metadata writer");
+    let original = writer.metadata().unwrap().permissions();
+    for _ in 0..64 {
+        let mut changed = original.clone();
+        changed.set_readonly(!original.readonly());
+        writer.set_permissions(changed).unwrap();
+        writer.set_permissions(original.clone()).unwrap();
+        if file.validate_revision(revision).is_err() {
+            assert!(revision.has_same_rename_stable_metadata(&file.revision().unwrap()));
+            return;
+        }
+    }
+    panic!("fixture did not observe a real metadata revision change");
+}
+
+#[test]
+fn immutable_content_park_accepts_metadata_drift_without_refreshing_original_revision() {
+    let temporary = crate::test_tempdir().unwrap();
+    let path = temporary.path().join("native.bin");
+    std::fs::write(&path, b"native bytes").unwrap();
+    let session = acquire_test_root(temporary.path());
+    let root = session.root().unwrap();
+    let file = root
+        .open_file(&LeafName::new("native.bin").unwrap())
+        .unwrap();
+    let revision = file.revision().unwrap();
+    change_file_metadata(&path, &file, &revision);
+    let digest = Sha256::digest(b"native bytes").into();
+    let request = match root
+        .park_file(file.park_request(ExpectedFileContent::new(revision.retained(), digest)))
+    {
+        FileParkOutcome::NoEffect { request, .. } => request,
+        _ => panic!("exact revision must refuse metadata drift before any effect"),
+    };
+    let (file, retained, digest) = request.into_parts();
+    assert!(file.validate_revision(&retained).is_err());
+    file.validate_content(&ExpectedFileContent::immutable(retained.retained(), digest))
+        .unwrap();
+    assert!(file.validate_revision(&revision).is_err());
+    let parked =
+        match root.park_file(file.park_request(ExpectedFileContent::immutable(retained, digest))) {
+            FileParkOutcome::Parked(parked) => parked,
+            _ => panic!("original identity and bytes must admit metadata drift"),
+        };
+    assert!(matches!(parked.remove(), FileRemovalOutcome::Applied(())));
+    assert!(!path.exists());
+    drop(root);
+    assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+}
+
+#[test]
+fn immutable_content_park_preserves_in_place_byte_changes_with_restored_mtime() {
+    let temporary = crate::test_tempdir().unwrap();
+    let path = temporary.path().join("native.bin");
+    std::fs::write(&path, b"native bytes").unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let session = acquire_test_root(temporary.path());
+    let root = session.root().unwrap();
+    let file = root
+        .open_file(&LeafName::new("native.bin").unwrap())
+        .unwrap();
+    let revision = file.revision().unwrap();
+    std::fs::write(&path, b"edited bytes").unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert!(revision.has_same_rename_stable_metadata(&file.revision().unwrap()));
+    let request = match root.park_file(file.park_request(ExpectedFileContent::immutable(
+        revision,
+        Sha256::digest(b"native bytes").into(),
+    ))) {
+        FileParkOutcome::NoEffect { request, .. } => request,
+        _ => panic!("changed bytes must refuse before any effect"),
+    };
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited bytes");
+    drop((request, root));
+    assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+}
+
+#[test]
+fn immutable_content_park_preserves_same_bytes_replacements() {
+    let temporary = crate::test_tempdir().unwrap();
+    let path = temporary.path().join("native.bin");
+    std::fs::write(&path, b"native bytes").unwrap();
+    let session = acquire_test_root(temporary.path());
+    let root = session.root().unwrap();
+    let leaf = LeafName::new("native.bin").unwrap();
+    let original = root.open_file(&leaf).unwrap();
+    let revision = original.revision().unwrap();
+    std::fs::rename(&path, temporary.path().join("original.bin")).unwrap();
+    std::fs::write(&path, b"native bytes").unwrap();
+    let replacement = root.open_file(&leaf).unwrap();
+    let request = match root.park_file(replacement.park_request(ExpectedFileContent::immutable(
+        revision,
+        Sha256::digest(b"native bytes").into(),
+    ))) {
+        FileParkOutcome::NoEffect { request, .. } => request,
+        _ => panic!("same bytes do not authenticate a replacement identity"),
+    };
+    assert_eq!(std::fs::read(&path).unwrap(), b"native bytes");
+    drop((request, original, root));
+    assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+}
+
 #[test]
 fn root_session_creates_a_missing_nested_root() {
     let temporary = crate::test_tempdir().expect("temporary parent");

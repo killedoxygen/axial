@@ -231,13 +231,33 @@ impl FileRevision {
 pub struct ExpectedFileContent {
     pub(crate) revision: FileRevision,
     pub(crate) sha256: [u8; 32],
+    metadata: ContentMetadata,
+}
+
+enum ContentMetadata {
+    Exact,
+    Immutable,
 }
 
 impl_redacted_debug!(ExpectedFileContent);
 
 impl ExpectedFileContent {
     pub fn new(revision: FileRevision, sha256: [u8; 32]) -> Self {
-        Self { revision, sha256 }
+        Self {
+            revision,
+            sha256,
+            metadata: ContentMetadata::Exact,
+        }
+    }
+
+    /// Retains the original identity, size, data timestamp and digest. Other
+    /// metadata may change; admission still hashes the original expected bytes.
+    pub fn immutable(revision: FileRevision, sha256: [u8; 32]) -> Self {
+        Self {
+            revision,
+            sha256,
+            metadata: ContentMetadata::Immutable,
+        }
     }
 }
 
@@ -254,8 +274,12 @@ impl FileParkRequest {
     }
 
     pub(crate) fn validate_revision(&self, operation: &CapabilityOperation) -> io::Result<()> {
-        self.file
-            .validate_revision_in(operation, &self.expected.revision)
+        match self.expected.metadata {
+            ContentMetadata::Exact => self
+                .file
+                .validate_revision_in(operation, &self.expected.revision),
+            ContentMetadata::Immutable => self.file.validate_content_in(operation, &self.expected),
+        }
     }
 
     pub(crate) fn validate_authority_after_namespace_change(
@@ -479,6 +503,48 @@ impl FileCapability {
         self.validate(&operation)?;
         self.validate_revision_in(&operation, expected)?;
         self.validate(&operation)
+    }
+
+    /// Authenticates original content without replacing its retained revision.
+    pub fn validate_content(&self, expected: &ExpectedFileContent) -> io::Result<()> {
+        let authority = self.parent.authority()?;
+        let operation = authority.enter_observation()?;
+        self.validate_content_in(&operation, expected)
+    }
+
+    fn validate_content_in(
+        &self,
+        operation: &CapabilityOperation,
+        expected: &ExpectedFileContent,
+    ) -> io::Result<()> {
+        use sha2::{Digest, Sha256};
+
+        self.validate(operation)?;
+        self.validate_content_revision_in(operation, &expected.revision)?;
+        let before = platform::file_receipt_fields(&self.handle)?;
+        let mut digest = Sha256::new();
+        let mut offset = 0_u64;
+        let mut bytes = vec![0_u8; 64 * 1024];
+        while offset < expected.revision.size {
+            let wanted = (expected.revision.size - offset).min(bytes.len() as u64) as usize;
+            let read = platform::read_at(&self.handle, &mut bytes[..wanted], offset)?;
+            if read == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            digest.update(&bytes[..read]);
+            offset += read as u64;
+        }
+        let mut probe = [0_u8; 1];
+        if platform::read_at(&self.handle, &mut probe, offset)? != 0
+            || <[u8; 32]>::from(digest.finalize()) != expected.sha256
+            || platform::file_receipt_fields(&self.handle)? != before
+        {
+            return Err(identity_changed(
+                "file did not match its original content proof",
+            ));
+        }
+        self.validate_content_revision_in(operation, &expected.revision)?;
+        self.validate(operation)
     }
 
     pub fn validate_revision_observation(

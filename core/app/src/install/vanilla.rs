@@ -39,8 +39,8 @@ struct NativeTree {
 }
 
 impl NativeTree {
-    /// The directory's exact membership and file guards, and every source
-    /// archive's revision, still match what was extracted and published.
+    /// Exact membership, original file identities and bytes, and every source
+    /// archive's revision still match what was extracted and published.
     fn revalidate(&self) -> Result<(), NativePreparationError> {
         self.directory
             .revalidate()
@@ -1093,6 +1093,53 @@ mod tests {
             .unwrap()
             .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_drift_preserves_native_reuse_and_shutdown_settlement() {
+        let fixture = NativeFixture::new();
+        let version = fixture.version(0);
+        let prepared = fixture.prepare(&version).await;
+        let path = prepared.path().to_owned();
+        let observed = fixture
+            .authority
+            .observe_file(
+                &PortableRelativePath::new_exact(&format!(
+                    "{}/fixture-native.bin",
+                    prepared.tree.directory.relative_path().as_str(),
+                ))
+                .unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let writer = std::fs::File::options()
+            .write(true)
+            .open(path.join("fixture-native.bin"))
+            .unwrap();
+        let original = writer.metadata().unwrap().permissions();
+        for _ in 0..64 {
+            let mut changed = original.clone();
+            changed.set_readonly(!original.readonly());
+            writer.set_permissions(changed).unwrap();
+            writer.set_permissions(original.clone()).unwrap();
+            if observed.revalidate().is_err() {
+                break;
+            }
+        }
+        drop(writer);
+        assert!(
+            observed.revalidate().is_err(),
+            "fixture must observe metadata drift"
+        );
+        prepared.revalidate().unwrap();
+        prepared.settle().unwrap();
+        let reused = fixture.prepare(&version).await;
+        assert_eq!(reused.path(), path);
+        reused.settle().unwrap();
+        fixture.library.close_admission();
+        fixture.retention.settle_idle().unwrap();
+        assert_eq!(fixture.retention.retained(), 0);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
