@@ -144,9 +144,11 @@ impl Drop for ActivityLease {
             .activity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        ledger.count = ledger.count.saturating_sub(1);
-        ledger.reserved_mib = ledger.reserved_mib.saturating_sub(self.reserved_mib);
-        ledger.revision = ledger.revision.wrapping_add(1);
+        // Admission recorded this lease's count and reservation exactly and
+        // kept a revision for its release.
+        ledger.count -= 1;
+        ledger.reserved_mib -= self.reserved_mib;
+        ledger.revision += 1;
         let revision = ledger.revision;
         drop(ledger);
         self.owner.activity_changed.send_replace(revision);
@@ -281,6 +283,9 @@ impl PhysicalWorkOwner {
     /// Records one host activity, sized from the ledger it joins: `size` sees
     /// every other activity's reservation and returns this one's, so two
     /// concurrent starts can never both size against the same free memory.
+    /// A reservation the ledger cannot represent exactly, or a revision space
+    /// that could not also order every live lease's release, is refused as
+    /// `at_capacity`; revisions never repeat.
     pub fn begin_activity<E>(
         &self,
         size: impl FnOnce(&ActivitySnapshot) -> Result<u64, E>,
@@ -295,9 +300,18 @@ impl PhysicalWorkOwner {
             return Err(at_capacity);
         }
         let reserved_mib = size(&ledger)?;
+        let Some((total_mib, revision)) = ledger.reserved_mib.checked_add(reserved_mib).zip(
+            // This admission, then one release per live lease including this one.
+            ledger
+                .revision
+                .checked_add(ledger.count as u64 + 2)
+                .map(|_| ledger.revision + 1),
+        ) else {
+            return Err(at_capacity);
+        };
         ledger.count += 1;
-        ledger.reserved_mib = ledger.reserved_mib.saturating_add(reserved_mib);
-        ledger.revision = ledger.revision.wrapping_add(1);
+        ledger.reserved_mib = total_mib;
+        ledger.revision = revision;
         let revision = ledger.revision;
         drop(ledger);
         self.inner.activity_changed.send_replace(revision);
@@ -873,8 +887,25 @@ mod tests {
         assert_eq!((after.count, after.reserved_mib), (1, 512));
         assert!(after.revision > snapshot.revision);
         assert_eq!(owner.begin_activity(|_| Err("refused"), "full").unwrap_err(), "refused");
+        // A reservation the ledger cannot add exactly is refused, not saturated.
+        assert_eq!(
+            owner.begin_activity(|_| Ok(u64::MAX), "full").unwrap_err(),
+            "full"
+        );
+        assert_eq!(owner.activity(), after);
         drop(second);
         assert_eq!(owner.activity().count, 0);
+
+        // Revisions are refused before they could repeat, keeping one for
+        // every live lease's release.
+        let exhausted = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        exhausted.inner.activity.lock().unwrap().revision = u64::MAX - 3;
+        let live = exhausted.begin_activity(|_| Ok::<_, ()>(1), ()).unwrap();
+        assert_eq!(exhausted.activity().revision, u64::MAX - 2);
+        assert_eq!(exhausted.begin_activity(|_| Ok(1), "full").unwrap_err(), "full");
+        drop(live);
+        assert_eq!(exhausted.activity().revision, u64::MAX - 1);
+        assert_eq!(exhausted.activity().count, 0);
     }
 
     #[tokio::test]
