@@ -74,6 +74,8 @@ enum NativeSlot {
     /// Settlement failed (its files no longer match their proof); the exact
     /// obligation stays owned here and the tree is never reused.
     Unresolved { tree: Arc<NativeTree> },
+    /// Startup cleanup is retained before its first file effect and on failure.
+    Recovered { directory: Arc<ManagedNativeDirectory> },
 }
 
 struct RetainedNatives {
@@ -121,9 +123,9 @@ struct NativeReservation {
 }
 
 impl NativeReservation {
-    fn commit(mut self, tree: Arc<NativeTree>) {
+    fn commit(mut self, slot: NativeSlot) {
         if let Some(entry) = self.retention.lock().get(self.id) {
-            entry.slot = NativeSlot::InUse { tree, users: 1 };
+            entry.slot = slot;
             self.committed = true;
         }
     }
@@ -173,7 +175,7 @@ impl NativeRetention {
                 entry.slot = NativeSlot::Settling;
                 drop(ledger);
                 // A failed settlement stays owned as an unresolved entry.
-                let _ = self.settle_entry(id, candidate);
+                let _ = self.settle_entry(id, NativeSlot::Unresolved { tree: candidate });
                 None
             }
             _ => None,
@@ -193,7 +195,7 @@ impl NativeRetention {
             if ledger.entries.len() < MAX_RETAINED_NATIVES
                 && ledger.bytes() + bytes <= MAX_RETAINED_NATIVE_BYTES
             {
-                ledger.next += 1;
+                ledger.next = ledger.next.checked_add(1)?;
                 let id = ledger.next;
                 ledger.entries.push(RetainedNatives {
                     id,
@@ -223,25 +225,48 @@ impl NativeRetention {
             let id = oldest.id;
             drop(ledger);
             // A failed settlement stays owned and counted as unresolved.
-            let _ = self.settle_entry(id, tree);
+            let _ = self.settle_entry(id, NativeSlot::Unresolved { tree });
         }
         None
     }
 
-    /// One settlement attempt for an entry already marked settling: it is
-    /// forgotten when its files are gone and kept unresolved otherwise.
-    fn settle_entry(&self, id: u64, tree: Arc<NativeTree>) -> std::io::Result<()> {
-        let result = tree.directory.settle();
+    /// Settle a reserved entry, forgetting it only after all its files are gone.
+    /// A failure retains the exact receipt for another owner-driven attempt.
+    fn settle_entry(&self, id: u64, retained: NativeSlot) -> std::io::Result<()> {
+        let result = match &retained {
+            NativeSlot::Unresolved { tree } => tree.directory.settle(),
+            NativeSlot::Recovered { directory } => directory.settle(),
+            _ => unreachable!("only unused native directories can be settled"),
+        };
         let mut ledger = self.lock();
         match &result {
             Ok(()) => ledger.entries.retain(|entry| entry.id != id),
             Err(_) => {
                 if let Some(entry) = ledger.get(id) {
-                    entry.slot = NativeSlot::Unresolved { tree };
+                    entry.slot = retained;
                 }
             }
         }
         result
+    }
+
+    fn recover_directory(&self, directory: ManagedNativeDirectory) -> std::io::Result<()> {
+        let bytes = directory
+            .retained_storage_bound()?
+            .checked_add(std::mem::size_of::<RetainedNatives>() as u64)
+            .ok_or_else(|| std::io::Error::other("native recovery storage exceeds capacity"))?;
+        let reservation = self.reserve([0; 32], bytes).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "native recovery capacity unavailable",
+            )
+        })?;
+        let id = reservation.id;
+        let directory = Arc::new(directory);
+        reservation.commit(NativeSlot::Recovered {
+            directory: directory.clone(),
+        });
+        self.settle_entry(id, NativeSlot::Recovered { directory })
     }
 
     /// Ends one session's use. True when the tree stays retained for reuse;
@@ -276,20 +301,23 @@ impl NativeRetention {
                 .entries
                 .iter_mut()
                 .filter_map(|entry| {
-                    let tree = match std::mem::replace(&mut entry.slot, NativeSlot::Settling) {
-                        NativeSlot::Idle { tree, .. } | NativeSlot::Unresolved { tree } => tree,
+                    let retained = match std::mem::replace(&mut entry.slot, NativeSlot::Settling) {
+                        NativeSlot::Idle { tree, .. } | NativeSlot::Unresolved { tree } => {
+                            NativeSlot::Unresolved { tree }
+                        }
+                        NativeSlot::Recovered { directory } => NativeSlot::Recovered { directory },
                         other => {
                             entry.slot = other;
                             return None;
                         }
                     };
-                    Some((entry.id, tree))
+                    Some((entry.id, retained))
                 })
                 .collect::<Vec<_>>()
         };
         let mut failure = None;
-        for (id, tree) in unused {
-            if let Err(error) = self.settle_entry(id, tree) {
+        for (id, retained) in unused {
+            if let Err(error) = self.settle_entry(id, retained) {
                 failure.get_or_insert(error);
             }
         }
@@ -446,6 +474,7 @@ const MAX_RECOVERED_NATIVE_DIRECTORIES: usize = 256;
 /// else stays exactly as found. Returns how many were settled. Blocking I/O.
 pub(crate) fn recover_native_directories(
     library: &ManagedLibraryOperation,
+    retention: &NativeRetention,
 ) -> std::io::Result<usize> {
     let listed = |bytes: &[u8]| {
         let manifest: NativeManifest = serde_json::from_slice(bytes).ok()?;
@@ -462,7 +491,7 @@ pub(crate) fn recover_native_directories(
     let mut settled = 0;
     let mut failure = None;
     for directory in library.recover_native_directories(MAX_RECOVERED_NATIVE_DIRECTORIES, listed)? {
-        match directory.settle() {
+        match retention.recover_directory(directory) {
             Ok(()) => settled += 1,
             Err(error) => {
                 failure.get_or_insert(error);
@@ -563,7 +592,7 @@ pub(crate) async fn prepare_natives_with_exact_files(
     let tree = Arc::new(tree);
     // Without reserved capacity this session owns its directory alone.
     let retention = reservation.map(|reservation| {
-        reservation.commit(tree.clone());
+        reservation.commit(NativeSlot::InUse { tree: tree.clone(), users: 1 });
         retention.expect("a reservation comes from the retention")
     });
     Ok(Some(PreparedNatives {
@@ -1121,6 +1150,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_startup_cleanup_stays_owned_until_shutdown_can_retry() {
+        let fixture = NativeFixture::new();
+        let published = fixture
+            .authority
+            .publish_native_directory(vec![
+                (
+                    PortableFileName::new_exact("native.bin").unwrap(),
+                    b"native".to_vec(),
+                ),
+                (
+                    PortableFileName::new_exact(".axial-native-manifest.json").unwrap(),
+                    b"{}".to_vec(),
+                ),
+            ])
+            .await
+            .unwrap();
+        let path = fixture.root.path().join(published.relative_path().as_str());
+        drop(published);
+        let mut recovered = fixture
+            .authority
+            .recover_native_directories(16, |_| {
+                Some(vec![(
+                    "native.bin".into(),
+                    6,
+                    Sha1::digest(b"native").into(),
+                )])
+            })
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        std::fs::write(path.join("unlisted.bin"), b"preserved").unwrap();
+        let retention = NativeRetention::default();
+        assert!(
+            retention
+                .recover_directory(recovered.pop().unwrap())
+                .is_err()
+        );
+        assert_eq!(retention.retained(), 1);
+        assert!(retention.settle_idle().is_err());
+        assert_eq!(retention.retained(), 1);
+        assert_eq!(std::fs::read(path.join("native.bin")).unwrap(), b"native");
+        assert_eq!(
+            std::fs::read(path.join("unlisted.bin")).unwrap(),
+            b"preserved"
+        );
+        std::fs::remove_file(path.join("unlisted.bin")).unwrap();
+        retention.settle_idle().unwrap();
+        assert_eq!(retention.retained(), 0);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
     async fn leftover_directories_are_settled_only_when_their_manifest_proves_them() {
         let fixture = NativeFixture::new();
         let mut paths = Vec::new();
@@ -1138,15 +1218,23 @@ mod tests {
         std::fs::write(foreign.join("kept.bin"), b"kept").unwrap();
 
         let operation = fixture.authority.operation().clone();
-        let settled = tokio::task::spawn_blocking(move || recover_native_directories(&operation))
-            .await
-            .unwrap()
-            .unwrap();
+        let settled = tokio::task::spawn_blocking(move || {
+            recover_native_directories(&operation, &NativeRetention::default())
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(settled, 1);
         assert!(!paths[0].exists(), "a proven directory is settled");
-        assert_eq!(std::fs::read(paths[1].join("unlisted.bin")).unwrap(), b"user file");
+        assert_eq!(
+            std::fs::read(paths[1].join("unlisted.bin")).unwrap(),
+            b"user file"
+        );
         assert!(paths[1].join("fixture-native.bin").exists());
-        assert_eq!(std::fs::read(paths[2].join("fixture-native.bin")).unwrap(), b"changed");
+        assert_eq!(
+            std::fs::read(paths[2].join("fixture-native.bin")).unwrap(),
+            b"changed"
+        );
         assert_eq!(std::fs::read(foreign.join("kept.bin")).unwrap(), b"kept");
     }
 

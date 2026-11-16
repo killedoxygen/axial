@@ -5639,6 +5639,23 @@ impl ManagedNativeDirectory {
         &self.relative
     }
 
+    /// Conservative private bookkeeping capacity, excluding shared filesystem
+    /// authority. Each guard owns bounded portable names and a file proof.
+    pub fn retained_storage_bound(&self) -> io::Result<u64> {
+        let cleanup = self
+            .cleanup
+            .lock()
+            .map_err(|_| io::Error::other("native cleanup lock was poisoned"))?;
+        cleanup
+            .guards
+            .capacity()
+            .checked_mul(4096)
+            .and_then(|bytes| bytes.checked_add(cleanup.name.capacity()))
+            .and_then(|bytes| bytes.checked_add(4096))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::other("native cleanup storage exceeds capacity"))
+    }
+
     pub fn revalidate(&self) -> io::Result<()> {
         let cleanup = self
             .cleanup

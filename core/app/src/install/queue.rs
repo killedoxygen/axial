@@ -2245,7 +2245,7 @@ impl InstallQueue {
         let operation = pin
             .managed_library()
             .map_err(|_| InstallError::LibraryUnavailable)?;
-        super::vanilla::recover_native_directories(&operation)
+        super::vanilla::recover_native_directories(&operation, &self.inner.natives)
             .map_err(|_| InstallError::SettlementRequired)
     }
 
