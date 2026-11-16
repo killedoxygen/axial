@@ -22,6 +22,7 @@ use axial_resource::{
 };
 use sha1::{Digest, Sha1};
 use std::{
+    borrow::Borrow,
     io::{self, Read},
     num::NonZeroU64,
     sync::{Arc, Mutex},
@@ -187,6 +188,12 @@ pub(super) async fn prepare(
                 return Err(LaunchError::InstallUnavailable);
             }
             for (source, requirement) in inputs.sources.iter().zip(inputs.requirements.entries()) {
+                if cancelled.is_cancelled() {
+                    return Err(LaunchError::Cancelled);
+                }
+                source
+                    .revalidate()
+                    .map_err(|_| LaunchError::InstallUnavailable)?;
                 let name = LeafName::new(requirement.file_name())
                     .map_err(|_| LaunchError::InstallUnavailable)?;
                 let digest: [u8; 20] = hex::decode(requirement.sha1())
@@ -194,7 +201,7 @@ pub(super) async fn prepare(
                     .and_then(|bytes| bytes.try_into().ok())
                     .ok_or(LaunchError::InstallUnavailable)?;
                 files.push(prepare_file(
-                    source,
+                    || Ok(source),
                     &directory,
                     name,
                     requirement.size(),
@@ -386,8 +393,8 @@ pub(super) fn check_files(directory: &ScopedDirectory, files: &[FileProof]) -> i
     Ok(())
 }
 
-pub(super) fn prepare_file(
-    source: &ManagedLibraryFile,
+pub(super) fn prepare_file<S: Borrow<ManagedLibraryFile>>(
+    source: impl FnOnce() -> Result<S, LaunchError>,
     directory: &ScopedDirectory,
     name: LeafName,
     size: u64,
@@ -398,14 +405,16 @@ pub(super) fn prepare_file(
     if cancellation.is_cancelled() {
         return Err(LaunchError::Cancelled);
     }
-    source
-        .revalidate()
-        .map_err(|_| LaunchError::InstallUnavailable)?;
     if let Some(file) =
         existing_file(directory, &name, size, digest).map_err(|_| LaunchError::PreparationFailed)?
     {
         return Ok(file);
     }
+    let input = source()?;
+    let source = input.borrow();
+    source
+        .revalidate()
+        .map_err(|_| LaunchError::InstallUnavailable)?;
     let contract = TransferContract::authenticated_exact(
         NonZeroU64::new(size).ok_or(LaunchError::InstallUnavailable)?,
         ExpectedTransferDigests::sha1(digest),
@@ -548,7 +557,7 @@ pub(super) mod tests {
         let directory = lib_directory(&retention).unwrap();
         let (_sender, cancellation) = transfer_cancellation_channel();
         let file = prepare_file(
-            &source,
+            || Ok(&source),
             &directory,
             LeafName::new("required.jar").unwrap(),
             3,
@@ -616,7 +625,7 @@ pub(super) mod tests {
     fn copy(fixture: &Fixture, directory: &ScopedDirectory) -> Result<FileProof, LaunchError> {
         let (_sender, cancellation) = transfer_cancellation_channel();
         let file = prepare_file(
-            &fixture.source,
+            || Ok(&fixture.source),
             directory,
             LeafName::new("required.jar").unwrap(),
             3,
@@ -627,6 +636,39 @@ pub(super) mod tests {
         check_files(directory, std::slice::from_ref(&file))
             .map_err(|_| LaunchError::PreparationFailed)?;
         Ok(file)
+    }
+
+    #[test]
+    fn warm_target_reuse_keeps_the_original_source_guard_for_admission() {
+        let fixture = fixture();
+        let directory = lib_directory(&fixture.retention).unwrap();
+        drop(copy(&fixture, &directory).unwrap());
+        let source = fixture.temporary.path().join("libraries/fml/source.jar");
+        let preserved = fixture.temporary.path().join("libraries/fml/preserved.jar");
+        std::fs::rename(&source, &preserved).unwrap();
+        std::fs::write(&source, b"abc").unwrap();
+        let warm = copy(&fixture, &directory).unwrap();
+        let Fixture { _library, retention, source, temporary } = fixture;
+        let prepared = Prepared {
+            directory,
+            sources: vec![source],
+            files: vec![warm],
+            work: retention.work.clone(),
+        };
+        let refused = prepared.revalidate();
+        let bytes = [
+            std::fs::read(temporary.path().join("libraries/fml/source.jar")).unwrap(),
+            std::fs::read(preserved).unwrap(),
+            std::fs::read(temporary.path().join("game/lib/required.jar")).unwrap(),
+        ];
+        let pending = retention.has_pending();
+        drop(prepared);
+        drop(retention);
+        drop(_library);
+        drop(temporary);
+        assert!(refused.is_err());
+        assert!(bytes.iter().all(|bytes| bytes == b"abc"));
+        assert!(!pending);
     }
 
     #[test]
@@ -824,7 +866,7 @@ pub(super) mod tests {
                 .unwrap();
             }
             let result = prepare_file(
-                &fixture.source,
+                || Ok(&fixture.source),
                 &directory,
                 LeafName::new("required.jar").unwrap(),
                 3,

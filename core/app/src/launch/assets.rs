@@ -115,11 +115,12 @@ async fn prepare_resources(
                         if cancelled.is_cancelled() {
                             return Err(LaunchError::Cancelled);
                         }
-                        let source = inputs
-                            .source(file, &mut sources)
-                            .map_err(super::coordinator::install_read_error)?;
                         proofs.push(libraries::prepare_file(
-                            &source,
+                            || {
+                                inputs
+                                    .source(file, &mut sources)
+                                    .map_err(super::coordinator::install_read_error)
+                            },
                             &directory,
                             LeafName::new(split(file.path.as_str()).1)
                                 .map_err(|_| LaunchError::InstallUnavailable)?,
@@ -335,5 +336,25 @@ mod tests {
         );
         assert_eq!(std::fs::read(tree.join("sound/user.ogg")).unwrap(), b"user");
         fixture.installed.revalidate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_resources_cannot_hide_a_replaced_installed_object() {
+        let fixture = fixture("map_to_resources");
+        fixture.prepare().await.unwrap();
+        let hash = hex::encode(Sha1::digest(b"step"));
+        let source = fixture.path(&format!("assets/objects/{}/{hash}", &hash[..2]));
+        let preserved = fixture.path("preserved-source");
+        std::fs::rename(&source, &preserved).unwrap();
+        std::fs::write(&source, b"step").unwrap();
+        let refused = fixture.prepare().await;
+        let source_bytes = std::fs::read(source).unwrap();
+        let preserved_bytes = std::fs::read(preserved).unwrap();
+        let target_bytes = std::fs::read(fixture.path("game/resources/sound/step.ogg")).unwrap();
+        drop(fixture);
+        assert_eq!(refused, Err(LaunchError::InstallUnavailable));
+        assert_eq!(source_bytes, b"step");
+        assert_eq!(preserved_bytes, b"step");
+        assert_eq!(target_bytes, b"step");
     }
 }
