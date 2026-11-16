@@ -37,7 +37,7 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         return Err(LaunchPlanError::InvalidAccount);
     }
     let settings = &request.settings;
-    validate_options(settings, &request.target_version_id)?;
+    validate_options(settings, &request.target_version_id, &version.kind)?;
     let (maximum, minimum) = heap(settings);
     let mut environment = default_environment();
     environment.features.insert(
@@ -196,10 +196,14 @@ fn valid_player_name(auth: &super::model::LaunchAuthContext) -> bool {
 /// Refuses an explicit preset meant for another game family. Vanilla adds no
 /// launcher flags, so it never applies or refuses a preset; whether the VM
 /// runs a preset is proven by `jvm::proven_launcher_args`.
-pub(crate) fn validate_options(settings: &LaunchOptions, target: &str) -> Result<(), LaunchPlanError> {
+pub(crate) fn validate_options(
+    settings: &LaunchOptions,
+    target: &str,
+    version_kind: &str,
+) -> Result<(), LaunchPlanError> {
     validate_settings(settings)?;
     if settings.performance_mode != crate::settings::ConfigPerformanceMode::Vanilla
-        && !jvm::preset_targets(&settings.jvm_preset, target)
+        && !jvm::preset_targets(&settings.jvm_preset, target, version_kind)
     {
         return Err(LaunchPlanError::IncompatiblePreset);
     }
@@ -288,6 +292,56 @@ fn validate_extra_args(args: &[String]) -> Result<(), LaunchPlanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_presets_admit_historical_versions_using_their_manifest_kind() {
+        for mode in [
+            crate::settings::ConfigPerformanceMode::Managed,
+            crate::settings::ConfigPerformanceMode::Custom,
+        ] {
+            for preset in [
+                jvm::PRESET_LEGACY,
+                jvm::PRESET_LEGACY_PVP,
+                jvm::PRESET_LEGACY_HEAVY,
+            ] {
+                let settings = LaunchOptions {
+                    jvm_preset: preset.into(),
+                    performance_mode: mode,
+                    ..Default::default()
+                };
+                for (version, kind) in [
+                    ("b1.0.2", "old_beta"),
+                    ("a1.2.6", "old_alpha"),
+                    ("c0.30_01c", "old_alpha"),
+                    ("rd-132211", "old_alpha"),
+                    ("1.12.2", "release"),
+                ] {
+                    assert_eq!(
+                        validate_options(&settings, version, kind),
+                        Ok(()),
+                        "{preset} on {version}"
+                    );
+                }
+                assert_eq!(
+                    validate_options(&settings, "1.13", "release"),
+                    Err(LaunchPlanError::IncompatiblePreset)
+                );
+                assert_eq!(
+                    validate_options(&settings, "future-version", "release"),
+                    Err(LaunchPlanError::IncompatiblePreset)
+                );
+            }
+            let settings = LaunchOptions {
+                jvm_preset: jvm::PRESET_SMOOTH.into(),
+                performance_mode: mode,
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_options(&settings, "b1.0.2", "old_beta"),
+                Err(LaunchPlanError::IncompatiblePreset)
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

@@ -833,11 +833,20 @@ mod tests {
             assert!(!flag_applied(table, option), "{option}");
         }
         assert!(flag_applied(zgc, "-XX:+UseZGC"));
-        // Java 8 marks changed flags with `:=` and names no origin. This and
-        // the OpenJ9 response follow those formats; neither was captured here.
-        let java8 = include_str!("flag_tables/java8-layout-g1.txt");
-        assert!(flag_applied(java8, "-XX:+UseG1GC"));
-        assert!(flag_applied(java8, "-XX:G1HeapRegionSize=16M"));
+        // Captured from Temurin 8u512 on Windows: changed flags use `:=`.
+        let java8 = include_str!("flag_tables/temurin8-g1.txt");
+        for option in [
+            "-XX:+UseG1GC",
+            "-XX:MaxGCPauseMillis=200",
+            "-XX:+UnlockExperimentalVMOptions",
+            "-XX:G1NewSizePercent=20",
+            "-XX:G1ReservePercent=20",
+            "-XX:G1HeapRegionSize=16M",
+            "-XX:+DisableExplicitGC",
+        ] {
+            assert!(flag_applied(java8, option), "{option}");
+        }
+        assert!(!flag_applied(java8, "-XX:MaxGCPauseMillis=37"));
         assert!(!flag_applied(java8, "-XX:-UseParallelGC"));
         // OpenJ9 ignores HotSpot options it does not know and prints no table.
         let openj9 = include_str!("flag_tables/openj9-no-table.txt");

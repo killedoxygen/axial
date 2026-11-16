@@ -674,7 +674,11 @@ impl LaunchCoordinator {
                         let options = launch_options(&settings, max_memory_mb, min_memory_mb)?;
                         // A runtime still to be provisioned proves its flags at launch.
                         let validated = match (
-                            crate::launch::plan::validate_options(&options, &target.minecraft_version),
+                            crate::launch::plan::validate_options(
+                                &options,
+                                &target.minecraft_version,
+                                &version.kind,
+                            ),
                             &runtime,
                         ) {
                             (Ok(()), Some(runtime)) => crate::launch::jvm::proven_launcher_args(

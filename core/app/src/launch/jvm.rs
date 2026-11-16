@@ -101,10 +101,11 @@ fn g1_args(pause_millis: i32) -> Vec<String> {
 }
 
 /// Whether an explicit preset is meant for this game target: the legacy
-/// presets for 1.12 and older, the concurrent collectors for newer versions.
+/// presets for alpha, beta and releases through 1.12, the concurrent collectors
+/// for newer versions.
 /// Whether the runtime can run it is proven separately on the exact VM.
-pub(crate) fn preset_targets(preset: &str, version_id: &str) -> bool {
-    let legacy_family = is_legacy_family(version_id);
+pub(crate) fn preset_targets(preset: &str, version_id: &str, version_kind: &str) -> bool {
+    let legacy_family = is_legacy_family(version_id, version_kind);
     match preset.trim() {
         "" | PRESET_PERFORMANCE | PRESET_GRAALVM => true,
         PRESET_LEGACY | PRESET_LEGACY_PVP | PRESET_LEGACY_HEAVY => legacy_family,
@@ -113,7 +114,10 @@ pub(crate) fn preset_targets(preset: &str, version_id: &str) -> bool {
     }
 }
 
-fn is_legacy_family(version_id: &str) -> bool {
+fn is_legacy_family(version_id: &str, version_kind: &str) -> bool {
+    if matches!(version_kind, "old_alpha" | "old_beta") {
+        return true;
+    }
     let mut parts = version_id.split('.').map(str::parse::<u32>);
     matches!((parts.next(), parts.next()), (Some(Ok(1)), Some(Ok(minor))) if minor <= 12)
 }
@@ -134,7 +138,11 @@ mod tests {
             ("", "1.21.1", true),
             ("unknown", "1.21.1", false),
         ] {
-            assert_eq!(preset_targets(preset, version), targeted, "{preset} on {version}");
+            assert_eq!(
+                preset_targets(preset, version, "release"),
+                targeted,
+                "{preset} on {version}"
+            );
         }
         for preset in [
             PRESET_SMOOTH,
@@ -151,8 +159,13 @@ mod tests {
                 "{preset}: {args:?}"
             );
         }
-        assert!(preset_args(PRESET_ULTRA_LOW_LATENCY, &info(21)).contains(&"-XX:+ZGenerational".into()));
-        assert!(!preset_args(PRESET_ULTRA_LOW_LATENCY, &info(24)).contains(&"-XX:+ZGenerational".into()));
+        assert!(
+            preset_args(PRESET_ULTRA_LOW_LATENCY, &info(21)).contains(&"-XX:+ZGenerational".into())
+        );
+        assert!(
+            !preset_args(PRESET_ULTRA_LOW_LATENCY, &info(24))
+                .contains(&"-XX:+ZGenerational".into())
+        );
     }
 
     fn info(major: u32) -> JavaRuntimeInfo {
@@ -166,8 +179,8 @@ mod tests {
     }
 
     /// A VM that answers flag-table probes with `axial-minecraft`'s
-    /// `runtime/flag_tables`: HotSpot 25 tables captured from a real runtime,
-    /// and the Java 8 and OpenJ9 layouts written to those formats.
+    /// `runtime/flag_tables`: captured HotSpot 25 and Temurin 8 tables,
+    /// and an OpenJ9 response written to its no-table layout.
     #[cfg(unix)]
     async fn vm(root: &std::path::Path, version: &str, g1_table: &str) -> JavaProbeReceipt {
         use std::os::unix::fs::PermissionsExt as _;
@@ -205,25 +218,40 @@ mod tests {
     async fn launcher_flags_are_admitted_only_where_the_exact_vm_applies_them() {
         use ConfigPerformanceMode::{Custom, Managed, Vanilla};
         let roots: Vec<_> = (0..3)
-            .map(|_| tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap())
+            .map(|_| {
+                tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+            })
             .collect();
         let modern = vm(roots[0].path(), "25.0.1", "hotspot25-g1.txt").await;
-        let legacy = vm(roots[1].path(), "1.8.0_472", "java8-layout-g1.txt").await;
+        let legacy = vm(roots[1].path(), "1.8.0_512", "temurin8-g1.txt").await;
         let openj9 = vm(roots[2].path(), "1.8.0_472", "openj9-no-table.txt").await;
-        let proven = |mode, preset, probe| proven_launcher_args(mode, preset, probe, std::future::pending());
+        let proven =
+            |mode, preset, probe| proven_launcher_args(mode, preset, probe, std::future::pending());
 
         assert_eq!(proven(Managed, "", &modern).await, Ok(Vec::new()));
-        assert_eq!(proven(Managed, "", &legacy).await, Ok(vec!["-XX:+UseG1GC".to_string()]));
+        assert_eq!(
+            proven(Managed, "", &legacy).await,
+            Ok(vec!["-XX:+UseG1GC".to_string()])
+        );
+        let legacy_args = proven(Managed, PRESET_LEGACY, &legacy).await.unwrap();
+        assert!(legacy_args.contains(&"-XX:MaxGCPauseMillis=200".to_string()));
+        assert!(legacy_args.contains(&"-XX:G1ReservePercent=20".to_string()));
         // Automatic adds nothing where the VM does not prove G1, and refuses nothing.
         assert_eq!(proven(Managed, "", &openj9).await, Ok(Vec::new()));
-        assert_eq!(proven(Vanilla, PRESET_PERFORMANCE, &openj9).await, Ok(Vec::new()));
+        assert_eq!(
+            proven(Vanilla, PRESET_PERFORMANCE, &openj9).await,
+            Ok(Vec::new())
+        );
         assert_eq!(proven(Custom, "", &openj9).await, Ok(Vec::new()));
 
         let performance = proven(Custom, PRESET_PERFORMANCE, &modern).await.unwrap();
         assert!(performance.contains(&"-XX:MaxGCPauseMillis=37".to_string()));
         assert_eq!(
             proven(Managed, PRESET_ULTRA_LOW_LATENCY, &modern).await,
-            Ok(vec!["-XX:+UseZGC".to_string(), "-XX:+DisableExplicitGC".to_string()])
+            Ok(vec![
+                "-XX:+UseZGC".to_string(),
+                "-XX:+DisableExplicitGC".to_string()
+            ])
         );
         // Explicit presets the VM refuses or silently ignores are refused, never replaced.
         for (preset, probe) in [
