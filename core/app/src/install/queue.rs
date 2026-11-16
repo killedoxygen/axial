@@ -211,6 +211,7 @@ impl InstallFailureCause for axial_minecraft::LoaderError {
         match self {
             Self::BaseInstallFailed { error, .. } => error.cause(),
             Self::Cancelled => InstallError::Cancelled,
+            Self::ArtifactMissing(_) => InstallError::LoaderUnavailable,
             Self::ProcessorFailed(_) => InstallError::LoaderProcessor,
             _ => InstallError::Failed,
         }
@@ -3891,18 +3892,24 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn processor_failures_keep_their_safe_cause_in_the_serialized_view() {
-        let failure = axial_minecraft::LoaderError::ProcessorFailed(
-            "private path /profile?token=secret".into(),
-        );
-        let view = serde_json::to_value(failure_view(failure.cause(), None)).unwrap();
-        assert_eq!(
-            view["summary"],
-            "Loader preparation failed before installation could finish."
-        );
-        assert_eq!(view["state_id"], "failed");
-        assert!(!view.to_string().contains("private"));
-        assert!(!view.to_string().contains("secret"));
+    fn loader_failures_keep_their_safe_cause_in_the_serialized_view() {
+        let private = "private path /profile?token=secret";
+        for (failure, summary) in [
+            (
+                axial_minecraft::LoaderError::ProcessorFailed(private.into()),
+                "Loader preparation failed before installation could finish.",
+            ),
+            (
+                axial_minecraft::LoaderError::ArtifactMissing(private.into()),
+                "The selected loader build is unavailable.",
+            ),
+        ] {
+            let view = serde_json::to_value(failure_view(failure.cause(), None)).unwrap();
+            assert_eq!(view["summary"], summary);
+            assert_eq!(view["state_id"], "failed");
+            assert!(!view.to_string().contains("private"));
+            assert!(!view.to_string().contains("secret"));
+        }
     }
 
     #[test]
