@@ -272,6 +272,18 @@ impl ServerHandle {
             .map_err(|_| {
                 "Application work has not settled. The local API remains available.".to_string()
             })?;
+        // Sessions and their tasks have settled; release the native
+        // directories retained for reuse before file settlement.
+        let installs = self.installs.clone();
+        if !matches!(
+            tokio::task::spawn_blocking(move || installs.settle_retained_natives()).await,
+            Ok(Ok(()))
+        ) {
+            return Err(
+                "Retained native libraries have not settled. The local API remains available."
+                    .into(),
+            );
+        }
         if !matches!(
             tokio::time::timeout(DOMAIN_SHUTDOWN_TIMEOUT, self.installs.join_observers()).await,
             Ok(Ok(()))

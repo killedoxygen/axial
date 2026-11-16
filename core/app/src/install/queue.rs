@@ -241,6 +241,7 @@ struct Inner {
     scheduling: AtomicBool,
     observers: Mutex<Observers>,
     observer_join: tokio::sync::Mutex<()>,
+    natives: super::vanilla::NativeRetention,
 }
 struct Observers {
     closed: bool,
@@ -582,6 +583,7 @@ impl InstallQueue {
                     tasks: JoinSet::new(),
                 }),
                 observer_join: tokio::sync::Mutex::new(()),
+                natives: super::vanilla::NativeRetention::default(),
             }),
             work: axial_resource::process_physical_work(),
             telemetry: None,
@@ -2219,6 +2221,17 @@ impl InstallQueue {
         )
         .await?
         .into_ready()
+    }
+
+    /// Verified native directories this queue's library keeps for reuse.
+    pub(crate) fn natives(&self) -> super::vanilla::NativeRetention {
+        self.inner.natives.clone()
+    }
+
+    /// Settles every retained native directory no session uses. Called once
+    /// launches have stopped (shutdown); blocking I/O.
+    pub fn settle_retained_natives(&self) -> std::io::Result<()> {
+        self.inner.natives.settle_idle(None)
     }
 
     pub(crate) async fn has_ready_version(

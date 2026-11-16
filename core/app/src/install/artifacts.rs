@@ -1091,6 +1091,7 @@ impl InstalledVersionReceipt {
         library: &ManagedLibraryOperation,
         root: &Path,
         environment: &Environment,
+        retention: Option<super::vanilla::NativeRetention>,
     ) -> Result<Option<super::vanilla::PreparedNatives>, super::vanilla::NativePreparationError>
     {
         self.evidence
@@ -1103,6 +1104,7 @@ impl InstalledVersionReceipt {
             &self.version,
             environment,
             self.exact.clone(),
+            retention,
         )
         .await
     }
@@ -1812,6 +1814,7 @@ pub(crate) mod tests {
                             &pin.managed_library().unwrap(),
                             temporary.path(),
                             &axial_minecraft::default_environment(),
+                            None,
                         )
                         .await
                         .unwrap()

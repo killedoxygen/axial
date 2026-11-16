@@ -507,7 +507,12 @@ impl LaunchCoordinator {
                 }),
                 stages.time("natives", "Native libraries", async {
                     let natives = installed
-                        .prepare_natives(&library_operation, &library_dir, &environment)
+                        .prepare_natives(
+                            &library_operation,
+                            &library_dir,
+                            &environment,
+                            Some(self.installs.natives()),
+                        )
                         .await
                         .map_err(|_| LaunchError::InstallUnavailable)?
                         .map(Arc::new);

@@ -1426,6 +1426,7 @@ mod tests {
             &version,
             &axial_minecraft::default_environment(),
             Arc::default(),
+            None,
         )
         .await
         .unwrap()

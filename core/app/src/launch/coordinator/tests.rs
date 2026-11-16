@@ -580,6 +580,7 @@ async fn historical_fml_client_requires_install_before_launch() {
                 &operation,
                 root.path(),
                 &axial_minecraft::default_environment(),
+                None,
             )
             .await
             .unwrap()
