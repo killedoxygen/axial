@@ -2233,7 +2233,7 @@ impl InstallQueue {
     /// Settles every retained native directory no session uses. Called once
     /// launches have stopped (shutdown); blocking I/O.
     pub fn settle_retained_natives(&self) -> std::io::Result<()> {
-        self.inner.natives.settle_idle(None)
+        self.inner.natives.settle_idle()
     }
 
     pub(crate) async fn has_ready_version(

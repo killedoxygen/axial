@@ -55,182 +55,275 @@ impl NativeTree {
     }
 }
 
-/// Native directories retained in this process for reuse by later sessions.
+/// Native directories retention owns at once, whether in use, idle, being
+/// settled, unresolved, or reserved for a publication in progress.
 const MAX_RETAINED_NATIVES: usize = 4;
-/// How long an unused retained directory is kept before it is settled.
-const NATIVE_IDLE_RETENTION: std::time::Duration = std::time::Duration::from_secs(300);
+/// Accounted bookkeeping all retained directories may hold: their source
+/// paths and names, published file guards and names, and the entries.
+const MAX_RETAINED_NATIVE_BYTES: u64 = 4 << 20;
+/// Accounted guard state per published native file beyond its name.
+const NATIVE_FILE_GUARD_BYTES: u64 = 256;
 
-struct RetainedNatives {
-    key: [u8; 32],
-    tree: Arc<NativeTree>,
-    users: usize,
-    idle_since: Option<std::time::Instant>,
+enum NativeSlot {
+    /// Capacity held for a publication that has not finished.
+    Reserved,
+    InUse { tree: Arc<NativeTree>, users: usize },
+    Idle { tree: Arc<NativeTree>, since: std::time::Instant },
+    /// Its settlement is running; still counted until it reports.
+    Settling,
     /// Settlement failed (its files no longer match their proof); the exact
     /// obligation stays owned here and the tree is never reused.
-    unresolved: bool,
+    Unresolved { tree: Arc<NativeTree> },
+}
+
+struct RetainedNatives {
+    id: u64,
+    key: [u8; 32],
+    bytes: u64,
+    slot: NativeSlot,
+}
+
+#[derive(Default)]
+struct NativeLedger {
+    next: u64,
+    entries: Vec<RetainedNatives>,
+}
+
+impl NativeLedger {
+    fn bytes(&self) -> u64 {
+        self.entries.iter().map(|entry| entry.bytes).sum()
+    }
+
+    fn get(&mut self, id: u64) -> Option<&mut RetainedNatives> {
+        self.entries.iter_mut().find(|entry| entry.id == id)
+    }
 }
 
 /// Bounded reuse of verified native directories across this process's
-/// sessions. An entry is reused only after its exact proof is rechecked;
-/// unused entries are settled when evicted, after `NATIVE_IDLE_RETENTION`,
-/// or when the owner releases them (shutdown). Nothing persists across a
+/// sessions. Capacity for every owned directory, including one still being
+/// published, settled or left unresolved, is reserved before publication; at
+/// capacity an idle directory is settled first, and otherwise the session
+/// owns its directory alone. An entry is reused only after its exact proof is
+/// rechecked. Unused entries are settled on eviction and when the owner
+/// releases them at shutdown; there is no timer. Nothing persists across a
 /// restart.
 #[derive(Clone, Default)]
 pub(crate) struct NativeRetention {
-    entries: Arc<std::sync::Mutex<Vec<RetainedNatives>>>,
+    ledger: Arc<std::sync::Mutex<NativeLedger>>,
+}
+
+/// Capacity reserved for one fresh publication; dropping it uncommitted
+/// returns the capacity.
+struct NativeReservation {
+    retention: NativeRetention,
+    id: u64,
+    committed: bool,
+}
+
+impl NativeReservation {
+    fn commit(mut self, tree: Arc<NativeTree>) {
+        if let Some(entry) = self.retention.lock().get(self.id) {
+            entry.slot = NativeSlot::InUse { tree, users: 1 };
+            self.committed = true;
+        }
+    }
+}
+
+impl Drop for NativeReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let id = self.id;
+            self.retention.lock().entries.retain(|entry| entry.id != id);
+        }
+    }
 }
 
 impl NativeRetention {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<RetainedNatives>> {
-        self.entries
+    fn lock(&self) -> std::sync::MutexGuard<'_, NativeLedger> {
+        self.ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A retained tree for `key`, if its proof still holds. Blocking I/O.
+    /// A retained tree for `key`, if its proof still holds. A retained idle
+    /// tree whose proof fails is settled, or kept unresolved. Blocking I/O.
     fn reuse(&self, key: &[u8; 32]) -> Option<Arc<NativeTree>> {
-        let candidate = self
-            .lock()
-            .iter()
-            .find(|entry| &entry.key == key && !entry.unresolved)
-            .map(|entry| entry.tree.clone())?;
-        if candidate.revalidate().is_err() {
-            return None;
+        let (id, candidate) = self.lock().entries.iter().find_map(|entry| match &entry.slot {
+            NativeSlot::InUse { tree, .. } | NativeSlot::Idle { tree, .. } if &entry.key == key => {
+                Some((entry.id, tree.clone()))
+            }
+            _ => None,
+        })?;
+        let proven = candidate.revalidate().is_ok();
+        let mut ledger = self.lock();
+        let entry = ledger.get(id)?;
+        match &mut entry.slot {
+            NativeSlot::InUse { tree, users } if proven && Arc::ptr_eq(tree, &candidate) => {
+                *users += 1;
+                Some(candidate)
+            }
+            NativeSlot::Idle { tree, .. } if Arc::ptr_eq(tree, &candidate) => {
+                if proven {
+                    entry.slot = NativeSlot::InUse {
+                        tree: candidate.clone(),
+                        users: 1,
+                    };
+                    return Some(candidate);
+                }
+                entry.slot = NativeSlot::Settling;
+                drop(ledger);
+                // A failed settlement stays owned as an unresolved entry.
+                let _ = self.settle_entry(id, candidate);
+                None
+            }
+            _ => None,
         }
-        let mut entries = self.lock();
-        let entry = entries
-            .iter_mut()
-            .find(|entry| Arc::ptr_eq(&entry.tree, &candidate))?;
-        entry.users += 1;
-        entry.idle_since = None;
-        Some(candidate)
     }
 
-    /// Records a fresh tree in use and returns idle entries over capacity,
-    /// which the caller settles.
-    fn insert(&self, key: [u8; 32], tree: Arc<NativeTree>) -> Vec<([u8; 32], Arc<NativeTree>)> {
-        let mut entries = self.lock();
-        let mut evicted = Vec::new();
-        // An idle entry for the same inputs failed its proof; settle it.
-        entries.retain(|entry| {
-            let replaced = entry.key == key && entry.users == 0 && !entry.unresolved;
-            if replaced {
-                evicted.push((entry.key, entry.tree.clone()));
-            }
-            !replaced
-        });
-        entries.push(RetainedNatives {
-            key,
-            tree,
-            users: 1,
-            idle_since: None,
-            unresolved: false,
-        });
-        while entries.len() > MAX_RETAINED_NATIVES {
-            let Some(oldest) = entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.users == 0 && !entry.unresolved)
-                .min_by_key(|(_, entry)| entry.idle_since)
-                .map(|(index, _)| index)
-            else {
-                break;
-            };
-            let entry = entries.remove(oldest);
-            evicted.push((entry.key, entry.tree));
+    /// Capacity for a fresh tree of `bytes` accounted size, settling the
+    /// least recently used idle entries to make room. `None` when every
+    /// owned directory is in use or unresolved: the caller's session then
+    /// owns its directory alone. Blocking I/O.
+    fn reserve(&self, key: [u8; 32], bytes: u64) -> Option<NativeReservation> {
+        if bytes > MAX_RETAINED_NATIVE_BYTES {
+            return None;
         }
-        evicted
+        for _ in 0..=MAX_RETAINED_NATIVES {
+            let mut ledger = self.lock();
+            if ledger.entries.len() < MAX_RETAINED_NATIVES
+                && ledger.bytes() + bytes <= MAX_RETAINED_NATIVE_BYTES
+            {
+                ledger.next += 1;
+                let id = ledger.next;
+                ledger.entries.push(RetainedNatives {
+                    id,
+                    key,
+                    bytes,
+                    slot: NativeSlot::Reserved,
+                });
+                return Some(NativeReservation {
+                    retention: self.clone(),
+                    id,
+                    committed: false,
+                });
+            }
+            let oldest = ledger
+                .entries
+                .iter_mut()
+                .filter(|entry| matches!(entry.slot, NativeSlot::Idle { .. }))
+                .min_by_key(|entry| match entry.slot {
+                    NativeSlot::Idle { since, .. } => since,
+                    _ => unreachable!("filtered to idle entries"),
+                })?;
+            let NativeSlot::Idle { tree, .. } =
+                std::mem::replace(&mut oldest.slot, NativeSlot::Settling)
+            else {
+                unreachable!("filtered to idle entries");
+            };
+            let id = oldest.id;
+            drop(ledger);
+            // A failed settlement stays owned and counted as unresolved.
+            let _ = self.settle_entry(id, tree);
+        }
+        None
+    }
+
+    /// One settlement attempt for an entry already marked settling: it is
+    /// forgotten when its files are gone and kept unresolved otherwise.
+    fn settle_entry(&self, id: u64, tree: Arc<NativeTree>) -> std::io::Result<()> {
+        let result = tree.directory.settle();
+        let mut ledger = self.lock();
+        match &result {
+            Ok(()) => ledger.entries.retain(|entry| entry.id != id),
+            Err(_) => {
+                if let Some(entry) = ledger.get(id) {
+                    entry.slot = NativeSlot::Unresolved { tree };
+                }
+            }
+        }
+        result
     }
 
     /// Ends one session's use. True when the tree stays retained for reuse;
     /// false when the caller owns its settlement.
-    fn release(&self, tree: &Arc<NativeTree>) -> bool {
-        let mut entries = self.lock();
-        let Some(entry) = entries
-            .iter_mut()
-            .find(|entry| Arc::ptr_eq(&entry.tree, tree))
-        else {
+    fn release(&self, released: &Arc<NativeTree>) -> bool {
+        let mut ledger = self.lock();
+        let Some(entry) = ledger.entries.iter_mut().find(|entry| {
+            matches!(&entry.slot, NativeSlot::InUse { tree, .. } if Arc::ptr_eq(tree, released))
+        }) else {
             return false;
         };
-        entry.users = entry.users.saturating_sub(1);
-        if entry.users == 0 {
-            entry.idle_since = Some(std::time::Instant::now());
-            drop(entries);
-            self.schedule_expiry();
+        if let NativeSlot::InUse { tree, users } = &mut entry.slot {
+            *users -= 1;
+            if *users == 0 {
+                entry.slot = NativeSlot::Idle {
+                    tree: tree.clone(),
+                    since: std::time::Instant::now(),
+                };
+            }
         }
         true
     }
 
-    fn schedule_expiry(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let retention = self.clone();
-        runtime.spawn(async move {
-            tokio::time::sleep(NATIVE_IDLE_RETENTION).await;
-            let _ = tokio::task::spawn_blocking(move || {
-                retention.settle_idle(Some(NATIVE_IDLE_RETENTION))
-            })
-            .await;
-        });
-    }
-
-    /// Settles unused entries (older than `older_than`, or all). An entry
-    /// whose settlement fails stays retained with its exact obligation.
+    /// Settles every unused and unresolved entry once launches have
+    /// stopped. Succeeds only when retention owns nothing afterwards; an
+    /// entry in use, mid-publication or still unresolved is reported and kept.
     /// Blocking I/O.
-    pub(crate) fn settle_idle(&self, older_than: Option<std::time::Duration>) -> std::io::Result<()> {
-        let idle = {
-            let mut entries = self.lock();
-            let mut idle = Vec::new();
-            entries.retain(|entry| {
-                let expired = entry.users == 0
-                    && entry.idle_since.is_some_and(|since| {
-                        older_than.is_none_or(|limit| since.elapsed() >= limit)
-                    });
-                if expired {
-                    idle.push((entry.key, entry.tree.clone()));
-                }
-                !expired
-            });
-            idle
+    pub(crate) fn settle_idle(&self) -> std::io::Result<()> {
+        let unused = {
+            let mut ledger = self.lock();
+            ledger
+                .entries
+                .iter_mut()
+                .filter_map(|entry| {
+                    let tree = match std::mem::replace(&mut entry.slot, NativeSlot::Settling) {
+                        NativeSlot::Idle { tree, .. } | NativeSlot::Unresolved { tree } => tree,
+                        other => {
+                            entry.slot = other;
+                            return None;
+                        }
+                    };
+                    Some((entry.id, tree))
+                })
+                .collect::<Vec<_>>()
         };
         let mut failure = None;
-        for (key, tree) in idle {
-            if let Err(error) = tree.directory.settle() {
-                self.retain_unresolved(key, tree);
+        for (id, tree) in unused {
+            if let Err(error) = self.settle_entry(id, tree) {
                 failure.get_or_insert(error);
             }
         }
-        failure.map_or(Ok(()), Err)
-    }
-
-    /// Keeps a tree whose settlement failed as an owned, unusable obligation.
-    fn retain_unresolved(&self, key: [u8; 32], tree: Arc<NativeTree>) {
-        self.lock().push(RetainedNatives {
-            key,
-            tree,
-            users: 0,
-            idle_since: Some(std::time::Instant::now()),
-            unresolved: true,
-        });
-    }
-
-    /// One settlement attempt for an evicted tree, off the async thread; a
-    /// failure is retained here rather than retried in the launch path.
-    async fn settle_evicted(&self, key: [u8; 32], tree: Arc<NativeTree>) {
-        let attempt = tree.clone();
-        if !matches!(
-            tokio::task::spawn_blocking(move || attempt.directory.settle()).await,
-            Ok(Ok(()))
-        ) {
-            self.retain_unresolved(key, tree);
+        match failure {
+            Some(error) => Err(error),
+            None if self.lock().entries.is_empty() => Ok(()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::ResourceBusy,
+                "retained native libraries are still in use",
+            )),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn retained(&self) -> usize {
-        self.lock().len()
+        self.lock().entries.len()
     }
+}
+
+/// The bookkeeping a fresh tree from `extraction` will retain.
+fn native_entry_bytes(extraction: &NativeExtraction, library_root: &Path) -> u64 {
+    let sources = extraction.sources.iter().fold(0_u64, |bytes, source| {
+        bytes.saturating_add(
+            (source.path.as_os_str().len() + source.name.len() + std::mem::size_of::<NativeSource>())
+                as u64,
+        )
+    });
+    let files = extraction.files.iter().fold(0_u64, |bytes, (name, _)| {
+        bytes.saturating_add(name.as_str().len() as u64 + NATIVE_FILE_GUARD_BYTES)
+    });
+    sources
+        .saturating_add(files)
+        .saturating_add(library_root.as_os_str().len() as u64 + 512)
+        .saturating_add((std::mem::size_of::<NativeTree>() + std::mem::size_of::<RetainedNatives>()) as u64)
 }
 
 /// One session's use of verified native files. Settling releases the use;
@@ -365,7 +458,7 @@ pub(crate) async fn prepare_natives_with_exact_files(
     enum Planned {
         None,
         Reused(Arc<NativeTree>),
-        Fresh([u8; 32], NativeExtraction),
+        Fresh(Option<NativeReservation>, NativeExtraction),
     }
     let root = library_root.to_owned();
     let operation = library.clone();
@@ -381,13 +474,18 @@ pub(crate) async fn prepare_natives_with_exact_files(
             return Ok(Planned::Reused(tree));
         }
         Ok(match plan_native_extraction(&operation, &root, &version, &environment, &exact)? {
-            Some(extraction) => Planned::Fresh(key, extraction),
+            Some(extraction) => {
+                let reservation = reuse
+                    .as_ref()
+                    .and_then(|retention| retention.reserve(key, native_entry_bytes(&extraction, &root)));
+                Planned::Fresh(reservation, extraction)
+            }
             None => Planned::None,
         })
     })
     .await
     .map_err(|_| NativePreparationError::Archive)??;
-    let (key, extraction) = match planned {
+    let (reservation, extraction) = match planned {
         Planned::None => return Ok(None),
         Planned::Reused(tree) => {
             return Ok(Some(PreparedNatives {
@@ -396,7 +494,7 @@ pub(crate) async fn prepare_natives_with_exact_files(
                 released: std::sync::atomic::AtomicBool::new(false),
             }));
         }
-        Planned::Fresh(key, extraction) => (key, extraction),
+        Planned::Fresh(reservation, extraction) => (reservation, extraction),
     };
 
     // All sources were authenticated and all archive entries checked before any
@@ -425,11 +523,11 @@ pub(crate) async fn prepare_natives_with_exact_files(
     })
     .await?;
     let tree = Arc::new(tree);
-    if let Some(retention) = &retention {
-        for (evicted_key, evicted) in retention.insert(key, tree.clone()) {
-            retention.settle_evicted(evicted_key, evicted).await;
-        }
-    }
+    // Without reserved capacity this session owns its directory alone.
+    let retention = reservation.map(|reservation| {
+        reservation.commit(tree.clone());
+        retention.expect("a reservation comes from the retention")
+    });
     Ok(Some(PreparedNatives {
         tree,
         retention,
@@ -832,83 +930,188 @@ where
 mod tests {
     use super::*;
 
+    struct NativeFixture {
+        root: tempfile::TempDir,
+        authority: axial_minecraft::managed_path::ManagedLibraryTestAuthority,
+        retention: NativeRetention,
+    }
+
+    impl NativeFixture {
+        fn new() -> Self {
+            let root =
+                tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+            let authority =
+                axial_minecraft::managed_path::ManagedLibraryTestAuthority::open(root.path())
+                    .unwrap();
+            Self {
+                root,
+                authority,
+                retention: NativeRetention::default(),
+            }
+        }
+
+        /// A version whose one native archive is distinct for each `n`.
+        fn version(&self, n: usize) -> VersionJson {
+            use sha1::{Digest, Sha1};
+            use std::io::Write;
+            let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            archive
+                .start_file("fixture-native.bin", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            write!(archive, "owned native fixture {n}").unwrap();
+            let archive = archive.finish().unwrap().into_inner();
+            let path = format!("fixture/native-{n}.jar");
+            std::fs::create_dir_all(self.root.path().join("libraries/fixture")).unwrap();
+            std::fs::write(self.root.path().join("libraries").join(&path), &archive).unwrap();
+            serde_json::from_value(serde_json::json!({
+                "id": format!("fixture-{n}"), "libraries": [{
+                    "name": format!("fixture:native:{n}"),
+                    "natives": {"osx":"fixture-native", "linux":"fixture-native", "windows":"fixture-native"},
+                    "downloads": {"classifiers":{"fixture-native":{
+                        "path": path, "sha1":format!("{:x}", Sha1::digest(&archive)),
+                        "size":archive.len(), "url":"https://invalid.example/native.jar"
+                    }}}
+                }]
+            }))
+            .unwrap()
+        }
+
+        async fn prepare(&self, version: &VersionJson) -> PreparedNatives {
+            prepare_natives_with_exact_files(
+                self.authority.operation(),
+                self.root.path(),
+                version,
+                &axial_minecraft::default_environment(),
+                Arc::default(),
+                Some(self.retention.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+    }
+
     #[tokio::test]
     async fn verified_natives_are_reused_only_while_their_exact_proof_holds() {
-        use sha1::{Digest, Sha1};
-        use std::io::Write;
-        let root =
-            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
-        let authority =
-            axial_minecraft::managed_path::ManagedLibraryTestAuthority::open(root.path()).unwrap();
-        let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        archive
-            .start_file("fixture-native.bin", zip::write::SimpleFileOptions::default())
-            .unwrap();
-        archive.write_all(b"owned native fixture").unwrap();
-        let archive = archive.finish().unwrap().into_inner();
-        std::fs::create_dir_all(root.path().join("libraries/fixture")).unwrap();
-        std::fs::write(root.path().join("libraries/fixture/native.jar"), &archive).unwrap();
-        let version: VersionJson = serde_json::from_value(serde_json::json!({
-            "id": "fixture", "libraries": [{
-                "name": "fixture:native:1",
-                "natives": {"osx":"fixture-native", "linux":"fixture-native", "windows":"fixture-native"},
-                "downloads": {"classifiers":{"fixture-native":{
-                    "path":"fixture/native.jar", "sha1":format!("{:x}", Sha1::digest(&archive)),
-                    "size":archive.len(), "url":"https://invalid.example/native.jar"
-                }}}
-            }]
-        }))
-        .unwrap();
-        let retention = NativeRetention::default();
-        let prepare = || {
-            let retention = retention.clone();
-            let version = version.clone();
-            let operation = authority.operation().clone();
-            let root = root.path().to_owned();
-            async move {
-                prepare_natives_with_exact_files(
-                    &operation,
-                    &root,
-                    &version,
-                    &axial_minecraft::default_environment(),
-                    Arc::default(),
-                    Some(retention),
-                )
-                .await
-                .unwrap()
-                .unwrap()
-            }
-        };
-        let first = prepare().await;
-        let second = prepare().await;
+        let fixture = NativeFixture::new();
+        let version = fixture.version(0);
+        let retention = &fixture.retention;
+        let first = fixture.prepare(&version).await;
+        let second = fixture.prepare(&version).await;
         assert_eq!(first.path(), second.path(), "the exact inputs reuse one tree");
         assert_eq!(retention.retained(), 1);
         first.settle().unwrap();
         second.settle().unwrap();
         assert!(first.path().exists(), "an unused tree stays retained for reuse");
 
-        // A changed extracted file fails the proof: a fresh tree replaces it
-        // and the failed one is settled, not leaked.
+        // A changed extracted file fails the proof: the failed tree is kept as
+        // an owned, unusable obligation and a fresh tree replaces it.
         let tampered = first.path().join("fixture-native.bin");
         std::fs::write(&tampered, b"changed").unwrap();
-        let fresh = prepare().await;
+        let fresh = fixture.prepare(&version).await;
         assert_ne!(fresh.path(), first.path());
-        // Changed files are preserved as an owned obligation, never reused.
         assert!(tampered.exists());
         assert_eq!(retention.retained(), 2);
-        let again = prepare().await;
+        let again = fixture.prepare(&version).await;
         assert_eq!(again.path(), fresh.path());
         again.settle().unwrap();
 
-        // Owner release settles every unused tree it can; the changed one
-        // stays owned and reported, and one still in use stays too.
-        assert!(retention.settle_idle(None).is_err());
+        // Owner release settles every unused tree it can and reports what
+        // remains: the changed one, and one still in use.
+        assert!(retention.settle_idle().is_err());
         assert!(fresh.path().exists() && tampered.exists());
         fresh.settle().unwrap();
-        assert!(retention.settle_idle(None).is_err());
+        assert!(retention.settle_idle().is_err());
         assert!(!fresh.path().exists());
+        assert!(tampered.exists());
         assert_eq!(retention.retained(), 1);
     }
+
+    #[tokio::test]
+    async fn retention_capacity_counts_every_owned_directory_before_publication() {
+        let fixture = NativeFixture::new();
+        let retention = &fixture.retention;
+        let versions: Vec<_> = (0..7).map(|n| fixture.version(n)).collect();
+        let mut held = Vec::new();
+        for version in &versions[..MAX_RETAINED_NATIVES] {
+            held.push(fixture.prepare(version).await);
+        }
+        assert_eq!(retention.retained(), MAX_RETAINED_NATIVES);
+
+        // Every slot is in use: the next session owns its directory alone.
+        let alone = fixture.prepare(&versions[4]).await;
+        assert_eq!(retention.retained(), MAX_RETAINED_NATIVES);
+        let alone_path = alone.path().to_owned();
+        alone.settle().unwrap();
+        assert!(!alone_path.exists());
+
+        // An idle directory is settled to make room for the next publication.
+        let evicted = held.remove(0);
+        let evicted_path = evicted.path().to_owned();
+        evicted.settle().unwrap();
+        assert!(evicted_path.exists());
+        let admitted = fixture.prepare(&versions[5]).await;
+        assert!(!evicted_path.exists());
+        assert_eq!(retention.retained(), MAX_RETAINED_NATIVES);
+
+        // An idle directory whose settlement fails stays owned and counted.
+        let damaged = held.remove(0);
+        let damaged_path = damaged.path().to_owned();
+        damaged.settle().unwrap();
+        std::fs::write(damaged_path.join("fixture-native.bin"), b"changed").unwrap();
+        let refused = fixture.prepare(&versions[6]).await;
+        assert!(damaged_path.join("fixture-native.bin").exists());
+        assert_eq!(retention.retained(), MAX_RETAINED_NATIVES);
+        let refused_path = refused.path().to_owned();
+        refused.settle().unwrap();
+        assert!(!refused_path.exists(), "the session owned its directory alone");
+
+        // A reservation still publishing blocks release, as does use.
+        held.push(admitted);
+        let reservation = retention.reserve([9; 32], 1);
+        assert!(reservation.is_none(), "every slot is owned");
+        for prepared in held {
+            prepared.settle().unwrap();
+        }
+        let reservation = retention.reserve([9; 32], 1).unwrap();
+        assert!(retention.settle_idle().is_err());
+        assert!(damaged_path.exists(), "unresolved evidence is kept");
+        assert_eq!(retention.retained(), 2);
+        drop(reservation);
+        assert!(retention.settle_idle().is_err());
+        assert_eq!(retention.retained(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reuse_and_eviction_never_exceed_capacity() {
+        let fixture = NativeFixture::new();
+        let versions: Vec<_> = (0..8).map(|n| fixture.version(n)).collect();
+        let mut paths = BTreeSet::new();
+        for round in 0..3 {
+            let prepared = futures_util::future::join_all(
+                versions
+                    .iter()
+                    .chain(&versions[..4])
+                    .map(|version| fixture.prepare(version)),
+            )
+            .await;
+            assert!(fixture.retention.retained() <= MAX_RETAINED_NATIVES, "round {round}");
+            for prepared in &prepared {
+                prepared.revalidate().unwrap();
+                paths.insert(prepared.path().to_owned());
+            }
+            for prepared in prepared {
+                prepared.settle().unwrap();
+            }
+        }
+        fixture.retention.settle_idle().unwrap();
+        assert_eq!(fixture.retention.retained(), 0);
+        assert!(
+            paths.iter().all(|path| !path.exists()),
+            "every native directory was settled"
+        );
+    }
+
     use axial_minecraft::managed_path::ManagedLibraryTestAuthority;
 
     #[test]
