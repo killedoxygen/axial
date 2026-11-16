@@ -7,6 +7,11 @@
 //! SHA-256 match that metadata, and expands it in memory within the managed
 //! runtime tree bounds. The result is an ordinary component manifest: files
 //! are published, verified and later reverified exactly like Mojang's.
+//!
+//! Process scratch is reserved before each fetch and before every expansion
+//! allocation, and the digest and expansion run under a physical work
+//! admission. The expanded bytes keep their reservation for the lifetime of
+//! the archive that holds them.
 
 use super::manifest::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
@@ -17,7 +22,11 @@ use crate::http::{self, FetchError};
 use crate::portable_path::PortableRelativePath;
 use serde::Deserialize;
 use sha1::Digest as _;
-use std::collections::{BTreeSet, HashMap};
+use axial_resource::{
+    PhysicalIoClass, PhysicalScratchPermit, PhysicalWorkOwner, PhysicalWorkRequest,
+    process_physical_work,
+};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -28,9 +37,42 @@ const MAX_METADATA_BYTES: u64 = 512 << 10;
 const MAX_ARCHIVE_BYTES: u64 = 128 << 20;
 const MAX_EXPANDED_BYTES: u64 = 512 << 20;
 const MAX_ENTRIES: usize = 4096;
+/// Archive headers scanned, including the top-level directory and PAX records.
+const MAX_ARCHIVE_ENTRIES: usize = 2 * MAX_ENTRIES;
+/// Scratch is grown in chunks of this size, or exactly what remains.
+const CAPACITY_CHUNK_BYTES: u64 = 8 << 20;
+/// Retained bookkeeping per manifest entry beyond its path and download URL
+/// copies: the manifest record, its digest text and its encoded proof line.
+const ENTRY_OVERHEAD_BYTES: u64 = 512;
 
-/// File bytes keyed by manifest path, already proven by the archive digest.
-pub(crate) type RuntimeArchive = HashMap<String, Arc<[u8]>>;
+/// File bytes keyed by manifest path, already proven by the archive digest,
+/// with the process scratch reserved for them while any holder retains them.
+pub(crate) struct RuntimeArchive {
+    files: HashMap<String, Arc<[u8]>>,
+    _capacity: Vec<PhysicalScratchPermit>,
+}
+
+impl RuntimeArchive {
+    pub(crate) fn get(&self, path: &str) -> Option<&Arc<[u8]>> {
+        self.files.get(path)
+    }
+}
+
+impl PartialEq for RuntimeArchive {
+    fn eq(&self, other: &Self) -> bool {
+        self.files == other.files
+    }
+}
+
+impl Eq for RuntimeArchive {}
+
+impl std::fmt::Debug for RuntimeArchive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeArchive")
+            .field("files", &self.files.len())
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Deserialize)]
 struct Release {
@@ -114,6 +156,11 @@ pub(super) async fn acquire() -> Result<RuntimeSourceReceipt, JavaRuntimeLookupE
             platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         })?;
     let url = format!("{API}?architecture={arch}&image_type=jre&os={os}&vendor=eclipse");
+    let work = process_physical_work();
+    let metadata_scratch = work
+        .reserve_scratch(MAX_METADATA_BYTES)
+        .await
+        .map_err(|_| capacity_failure())?;
     let metadata = http::fetch(
         http::client(),
         &url,
@@ -123,10 +170,15 @@ pub(super) async fn acquire() -> Result<RuntimeSourceReceipt, JavaRuntimeLookupE
     .await
     .map_err(|error| fetch_failure(&error, "Temurin 8 metadata"))?;
     let package = select_package(&metadata.bytes, format)?;
+    drop((metadata, metadata_scratch));
+    let archive_scratch = work
+        .reserve_scratch(package.size)
+        .await
+        .map_err(|_| capacity_failure())?;
     let archive = http::fetch(
         http::client(),
         &package.link,
-        MAX_ARCHIVE_BYTES,
+        package.size,
         http::Expected {
             size: Some(package.size),
             sha1: None,
@@ -134,23 +186,39 @@ pub(super) async fn acquire() -> Result<RuntimeSourceReceipt, JavaRuntimeLookupE
     )
     .await
     .map_err(|error| fetch_failure(&error, "Temurin 8 archive"))?;
-    let digest = hex::encode(sha2::Sha256::digest(&archive.bytes));
-    if !digest.eq_ignore_ascii_case(&package.checksum) {
-        return Err(failure(
-            RuntimeSourceFailureKind::IntegrityMismatch,
-            "Temurin 8 archive did not match its published SHA-256",
-        ));
-    }
-    let link = package.link.clone();
-    let files = tokio::task::spawn_blocking(move || expand(&archive.bytes, format))
+    let admission = work
+        .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, 0))
         .await
-        .map_err(|_| {
-            failure(
-                RuntimeSourceFailureKind::MetadataInvalid,
-                "archive expansion stopped",
-            )
-        })??;
-    receipt(&link, files)
+        .map_err(|_| capacity_failure())?;
+    admission
+        .run(move |_| {
+            let _archive_scratch = archive_scratch;
+            let digest = hex::encode(sha2::Sha256::digest(&archive.bytes));
+            if !digest.eq_ignore_ascii_case(&package.checksum) {
+                return Err(failure(
+                    RuntimeSourceFailureKind::IntegrityMismatch,
+                    "Temurin 8 archive did not match its published SHA-256",
+                ));
+            }
+            let expansion = expand(
+                &archive.bytes,
+                format,
+                LIMITS,
+                Capacity::new(work),
+                &package.link,
+            )?;
+            drop(archive);
+            receipt(&package.link, expansion)
+        })
+        .await
+        .map_err(|_| capacity_failure())?
+}
+
+fn capacity_failure() -> JavaRuntimeLookupError {
+    failure(
+        RuntimeSourceFailureKind::Unavailable,
+        "runtime expansion capacity is unavailable",
+    )
 }
 
 fn select_package(bytes: &[u8], format: Format) -> Result<Package, JavaRuntimeLookupError> {
@@ -213,121 +281,247 @@ fn select_package(bytes: &[u8], format: Format) -> Result<Package, JavaRuntimeLo
 
 enum Entry {
     Directory,
-    File { bytes: Vec<u8>, executable: bool },
+    File { bytes: Arc<[u8]>, executable: bool },
     Link(String),
 }
 
-/// Maps an archive path below its single top-level directory to the managed
-/// layout: macOS bundles live under `jre.bundle`.
-fn managed_path(archive_path: &str) -> Option<String> {
-    let path = archive_path.trim_end_matches('/');
-    let (_top, rest) = path.split_once('/')?;
-    if rest.is_empty() {
-        return None;
+#[derive(Clone, Copy)]
+struct Limits {
+    expanded_bytes: u64,
+    entries: usize,
+    archive_entries: usize,
+}
+
+const LIMITS: Limits = Limits {
+    expanded_bytes: MAX_EXPANDED_BYTES,
+    entries: MAX_ENTRIES,
+    archive_entries: MAX_ARCHIVE_ENTRIES,
+};
+
+/// Process scratch held for retained expansion state, grown before each
+/// allocation it covers.
+struct Capacity {
+    work: PhysicalWorkOwner,
+    reserved: u64,
+    used: u64,
+    permits: Vec<PhysicalScratchPermit>,
+}
+
+impl Capacity {
+    fn new(work: PhysicalWorkOwner) -> Self {
+        Self {
+            work,
+            reserved: 0,
+            used: 0,
+            permits: Vec::new(),
+        }
     }
-    Some(if cfg!(target_os = "macos") {
-        format!("jre.bundle/{rest}")
-    } else {
-        rest.to_owned()
-    })
-}
 
-struct Expansion {
-    entries: HashMap<String, Entry>,
-    bytes: u64,
-}
-
-impl Expansion {
-    fn insert(&mut self, archive_path: &str, entry: Entry) -> Result<(), JavaRuntimeLookupError> {
-        let Some(path) = managed_path(archive_path) else {
-            return Ok(());
-        };
-        let invalid = || {
-            failure(
-                RuntimeSourceFailureKind::PolicyRejected,
-                "Temurin 8 archive has an unsafe path",
-            )
-        };
-        PortableRelativePath::new_exact(&path).map_err(|_| invalid())?;
-        if let Entry::File { bytes, .. } = &entry {
-            self.bytes = self
-                .bytes
-                .checked_add(bytes.len() as u64)
-                .filter(|total| *total <= MAX_EXPANDED_BYTES)
-                .ok_or_else(|| {
-                    failure(
-                        RuntimeSourceFailureKind::PolicyRejected,
-                        "Temurin 8 archive is too large",
-                    )
-                })?;
+    /// Reserves `bytes` more retained state before it is allocated.
+    fn charge(&mut self, bytes: u64) -> Result<(), JavaRuntimeLookupError> {
+        let needed = self
+            .used
+            .checked_add(bytes)
+            .ok_or_else(capacity_failure)?;
+        if needed > self.reserved {
+            let deficit = needed - self.reserved;
+            let permit = self
+                .work
+                .try_reserve_scratch(deficit.max(CAPACITY_CHUNK_BYTES))
+                .map(|permit| (permit, deficit.max(CAPACITY_CHUNK_BYTES)))
+                .or_else(|_| {
+                    self.work
+                        .try_reserve_scratch(deficit)
+                        .map(|permit| (permit, deficit))
+                })
+                .map_err(|_| capacity_failure())?;
+            self.reserved += permit.1;
+            self.permits.extend(permit.0);
         }
-        if self.entries.len() >= MAX_ENTRIES || self.entries.insert(path, entry).is_some() {
-            return Err(failure(
-                RuntimeSourceFailureKind::PolicyRejected,
-                "Temurin 8 archive has too many or duplicate entries",
-            ));
-        }
+        self.used = needed;
         Ok(())
     }
 }
 
-fn read_bounded(reader: impl Read, size: u64) -> Result<Vec<u8>, JavaRuntimeLookupError> {
-    if size > MAX_EXPANDED_BYTES {
-        return Err(failure(
-            RuntimeSourceFailureKind::PolicyRejected,
-            "Temurin 8 entry is too large",
-        ));
+fn policy(detail: &'static str) -> JavaRuntimeLookupError {
+    failure(RuntimeSourceFailureKind::PolicyRejected, detail)
+}
+
+fn unreadable() -> JavaRuntimeLookupError {
+    failure(
+        RuntimeSourceFailureKind::MetadataInvalid,
+        "Temurin 8 archive is unreadable",
+    )
+}
+
+/// The expanded tree below the archive's single top-level directory, with
+/// every parent directory, in the managed layout (macOS bundles live under
+/// `jre.bundle`).
+struct Expansion {
+    limits: Limits,
+    capacity: Capacity,
+    prefix: Option<String>,
+    headers: usize,
+    /// Declared bytes of every scanned entry, kept or skipped.
+    scanned: u64,
+    /// Length of the download URL each file's manifest record repeats.
+    link: usize,
+    entries: BTreeMap<String, Entry>,
+    keys: HashMap<crate::portable_path::PortablePathKey, bool>,
+}
+
+impl Expansion {
+    /// Admits one archive header before any of its data is read.
+    fn scan(&mut self, archive_path: &str, size: u64) -> Result<Option<String>, JavaRuntimeLookupError> {
+        self.headers += 1;
+        if self.headers > self.limits.archive_entries {
+            return Err(policy("Temurin 8 archive has too many entries"));
+        }
+        self.scanned = self
+            .scanned
+            .checked_add(size)
+            .filter(|scanned| *scanned <= self.limits.expanded_bytes)
+            .ok_or_else(|| policy("Temurin 8 archive is too large"))?;
+        let path = archive_path.trim_end_matches('/');
+        let (top, rest) = path.split_once('/').unwrap_or((path, ""));
+        match &self.prefix {
+            Some(prefix) if prefix != top => {
+                return Err(policy("Temurin 8 archive has more than one top-level directory"));
+            }
+            Some(_) => {}
+            None => self.prefix = Some(top.to_owned()),
+        }
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(if cfg!(target_os = "macos") {
+            format!("jre.bundle/{rest}")
+        } else {
+            rest.to_owned()
+        }))
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    reader.take(size + 1).read_to_end(&mut bytes).map_err(|_| {
-        failure(
-            RuntimeSourceFailureKind::MetadataInvalid,
-            "Temurin 8 archive is unreadable",
-        )
-    })?;
-    if bytes.len() as u64 != size {
-        return Err(failure(
-            RuntimeSourceFailureKind::MetadataInvalid,
-            "Temurin 8 entry size changed",
-        ));
+
+    /// Charges and records one entry, its generated parents included, refusing
+    /// portable-key collisions and paths below a file or link.
+    fn insert(&mut self, path: String, entry: Entry) -> Result<(), JavaRuntimeLookupError> {
+        let directory = matches!(entry, Entry::Directory);
+        let mut ancestors = Vec::new();
+        let mut parent = path.as_str();
+        while let Some((above, _)) = parent.rsplit_once('/') {
+            ancestors.push(above);
+            parent = above;
+        }
+        for ancestor in ancestors.into_iter().rev() {
+            let key = PortableRelativePath::new_exact(ancestor)
+                .map_err(|_| policy("Temurin 8 archive has an unsafe path"))?
+                .key();
+            match self.keys.get(&key) {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(policy("Temurin 8 archive has an entry below a file"));
+                }
+                None => self.record(ancestor.to_owned(), key, Entry::Directory)?,
+            }
+        }
+        let key = PortableRelativePath::new_exact(&path)
+            .map_err(|_| policy("Temurin 8 archive has an unsafe path"))?
+            .key();
+        match self.keys.get(&key) {
+            Some(true) if directory => Ok(()),
+            Some(_) => Err(policy("Temurin 8 archive has colliding entries")),
+            None => self.record(path, key, entry),
+        }
     }
-    Ok(bytes)
+
+    fn record(
+        &mut self,
+        path: String,
+        key: crate::portable_path::PortablePathKey,
+        entry: Entry,
+    ) -> Result<(), JavaRuntimeLookupError> {
+        if self.entries.len() >= self.limits.entries {
+            return Err(policy("Temurin 8 archive has too many entries"));
+        }
+        let link = if matches!(entry, Entry::File { .. }) { self.link } else { 0 };
+        let bytes = (path.len() as u64)
+            .checked_mul(3)
+            .and_then(|bytes| bytes.checked_add((link as u64).checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(ENTRY_OVERHEAD_BYTES))
+            .ok_or_else(capacity_failure)?;
+        self.capacity.charge(bytes)?;
+        self.keys.insert(key, matches!(entry, Entry::Directory));
+        self.entries.insert(path, entry);
+        Ok(())
+    }
+
+    /// Reads a file's declared bytes into retained storage reserved first.
+    fn read(&mut self, reader: impl Read, size: u64) -> Result<Arc<[u8]>, JavaRuntimeLookupError> {
+        if self.entries.len() >= self.limits.entries {
+            return Err(policy("Temurin 8 archive has too many entries"));
+        }
+        self.capacity.charge(size)?;
+        let length = usize::try_from(size).map_err(|_| policy("Temurin 8 entry is too large"))?;
+        let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, length).collect();
+        let mut reader = reader.take(size + 1);
+        reader
+            .read_exact(Arc::get_mut(&mut bytes).expect("fresh archive entry"))
+            .map_err(|_| unreadable())?;
+        if reader.read(&mut [0]).map_err(|_| unreadable())? != 0 {
+            return Err(failure(
+                RuntimeSourceFailureKind::MetadataInvalid,
+                "Temurin 8 entry size changed",
+            ));
+        }
+        Ok(bytes)
+    }
 }
 
 fn expand(
     archive: &[u8],
     format: Format,
-) -> Result<HashMap<String, Entry>, JavaRuntimeLookupError> {
-    let unreadable = || {
-        failure(
-            RuntimeSourceFailureKind::MetadataInvalid,
-            "Temurin 8 archive is unreadable",
-        )
-    };
+    limits: Limits,
+    capacity: Capacity,
+    link: &str,
+) -> Result<Expansion, JavaRuntimeLookupError> {
     let mut expansion = Expansion {
-        entries: HashMap::new(),
-        bytes: 0,
+        limits,
+        capacity,
+        prefix: None,
+        headers: 0,
+        scanned: 0,
+        link: link.len(),
+        entries: BTreeMap::new(),
+        keys: HashMap::new(),
     };
     match format {
         Format::Zip => {
             let mut zip =
                 zip::ZipArchive::new(std::io::Cursor::new(archive)).map_err(|_| unreadable())?;
+            if zip.len() > limits.archive_entries {
+                return Err(policy("Temurin 8 archive has too many entries"));
+            }
             for index in 0..zip.len() {
                 let file = zip.by_index(index).map_err(|_| unreadable())?;
                 let name = file.name().map_err(|_| unreadable())?.replace('\\', "/");
+                let size = if file.is_file() { file.size() } else { 0 };
+                let Some(path) = expansion.scan(&name, size)? else {
+                    if !file.is_dir() {
+                        return Err(policy("Temurin 8 archive has a top-level file"));
+                    }
+                    continue;
+                };
                 let entry = if file.is_dir() {
                     Entry::Directory
                 } else if file.is_file() {
                     let executable = file.unix_mode().is_some_and(|mode| mode & 0o111 != 0);
-                    let size = file.size();
                     Entry::File {
-                        bytes: read_bounded(file, size)?,
+                        bytes: expansion.read(file, size)?,
                         executable,
                     }
                 } else {
                     return Err(unreadable());
                 };
-                expansion.insert(&name, entry)?;
+                expansion.insert(path, entry)?;
             }
         }
         Format::TarGz => {
@@ -342,13 +536,19 @@ fn expand(
                     .to_owned();
                 let header = entry.header();
                 let kind = header.entry_type();
+                let size = header.size().map_err(|_| unreadable())?;
+                let Some(path) = expansion.scan(&name, size)? else {
+                    if !kind.is_dir() {
+                        return Err(policy("Temurin 8 archive has a top-level file"));
+                    }
+                    continue;
+                };
                 let value = if kind.is_dir() {
                     Entry::Directory
                 } else if kind.is_file() {
                     let executable = header.mode().is_ok_and(|mode| mode & 0o111 != 0);
-                    let size = header.size().map_err(|_| unreadable())?;
                     Entry::File {
-                        bytes: read_bounded(entry, size)?,
+                        bytes: expansion.read(entry, size)?,
                         executable,
                     }
                 } else if kind.is_symlink() {
@@ -365,33 +565,26 @@ fn expand(
                 } else {
                     return Err(unreadable());
                 };
-                expansion.insert(&name, value)?;
+                expansion.insert(path, value)?;
             }
         }
     }
-    Ok(expansion.entries)
+    Ok(expansion)
 }
 
-/// The component manifest for the expanded tree, including every parent
-/// directory, and the receipt that carries its proven bytes.
-fn receipt(
-    link: &str,
-    entries: HashMap<String, Entry>,
-) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
-    let mut directories = BTreeSet::new();
-    let mut files = HashMap::new();
-    let mut archive = RuntimeArchive::new();
-    for (path, entry) in entries {
-        let mut parent = path.as_str();
-        while let Some((above, _)) = parent.rsplit_once('/') {
-            directories.insert(above.to_owned());
-            parent = above;
-        }
+/// The component manifest for the expanded tree and the receipt that carries
+/// its proven bytes and their reservation.
+fn receipt(link: &str, expansion: Expansion) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let mut files = HashMap::with_capacity(expansion.entries.len());
+    let mut archive = HashMap::new();
+    for (path, entry) in expansion.entries {
         let file = match entry {
-            Entry::Directory => {
-                directories.insert(path);
-                continue;
-            }
+            Entry::Directory => ComponentManifestFile {
+                kind: "directory".into(),
+                executable: false,
+                downloads: None,
+                target: None,
+            },
             Entry::File { bytes, executable } => {
                 let file = ComponentManifestFile {
                     kind: "file".into(),
@@ -406,7 +599,7 @@ fn receipt(
                     }),
                     target: None,
                 };
-                archive.insert(path.clone(), Arc::from(bytes));
+                archive.insert(path.clone(), bytes);
                 file
             }
             Entry::Link(target) => ComponentManifestFile {
@@ -417,16 +610,6 @@ fn receipt(
             },
         };
         files.insert(path, file);
-    }
-    for directory in directories {
-        files
-            .entry(directory)
-            .or_insert_with(|| ComponentManifestFile {
-                kind: "directory".into(),
-                executable: false,
-                downloads: None,
-                target: None,
-            });
     }
     if !files.contains_key(super::layout::runtime_java_relative_path()) {
         return Err(failure(
@@ -450,7 +633,10 @@ fn receipt(
         },
         bytes,
         manifest,
-        Arc::new(archive),
+        Arc::new(RuntimeArchive {
+            files: archive,
+            _capacity: expansion.capacity.permits,
+        }),
     ))
 }
 
@@ -535,8 +721,49 @@ mod tests {
         assert!(select_package(unversioned.to_string().as_bytes(), Format::TarGz).is_err());
     }
 
+    const LINK: &str = "https://example.invalid/jre.tar.gz";
+
+    fn expand_with(
+        archive: &[u8],
+        format: Format,
+        limits: Limits,
+        work: &PhysicalWorkOwner,
+    ) -> Result<Expansion, RuntimeSourceFailureKind> {
+        expand(archive, format, limits, Capacity::new(work.clone()), LINK).map_err(kind)
+    }
+
+    fn kind(error: JavaRuntimeLookupError) -> RuntimeSourceFailureKind {
+        match error {
+            JavaRuntimeLookupError::RuntimeSource(failure) => failure.kind(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn available(work: &PhysicalWorkOwner) -> u64 {
+        work.snapshot(axial_resource::PhysicalWorkClass::Foreground)
+            .available_scratch_bytes
+    }
+
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, bytes) in entries {
+            if path.ends_with('/') {
+                writer
+                    .add_directory(*path, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+            } else {
+                writer
+                    .start_file(*path, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::Write::write_all(&mut writer, bytes).unwrap();
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
     #[test]
     fn expansion_builds_a_complete_manifest_and_refuses_unsafe_paths() {
+        let work = PhysicalWorkOwner::isolated_for_test();
         let java = runtime_java_relative_path_in_archive();
         let archive = tar_gz(
             &[
@@ -545,8 +772,8 @@ mod tests {
             ],
             Some(("jdk8u512-b09-jre/lib/link", "rt.jar")),
         );
-        let entries = expand(&archive, Format::TarGz).unwrap();
-        let source = receipt("https://example.invalid/jre.tar.gz", entries).unwrap();
+        let expansion = expand_with(&archive, Format::TarGz, LIMITS, &work).unwrap();
+        let source = receipt(LINK, expansion).unwrap();
         let manifest = source.manifest();
         let java_path = super::super::layout::runtime_java_relative_path();
         assert!(manifest.files[java_path].executable);
@@ -556,20 +783,103 @@ mod tests {
         );
         assert_eq!(manifest.files[&prefixed("lib/link")].kind, "link");
         assert_eq!(
-            &*source.archive().unwrap()[&prefixed("lib/rt.jar")],
+            &**source.archive().unwrap().get(&prefixed("lib/rt.jar")).unwrap(),
             b"classes"
         );
+        // The receipt's archive holds its reservation until the last holder drops it.
+        let archive = source.archive().unwrap().clone();
+        drop(source);
+        assert!(available(&work) < work.scratch_limit_bytes());
+        drop(archive);
+        assert_eq!(available(&work), work.scratch_limit_bytes());
 
         let unsafe_archive = tar_gz_raw_path("jdk/../../escape", b"x");
-        assert!(expand(&unsafe_archive, Format::TarGz).is_err());
+        assert!(expand_with(&unsafe_archive, Format::TarGz, LIMITS, &work).is_err());
         let missing = tar_gz(&[("jdk8u512-b09-jre/lib/rt.jar", b"classes", 0o644)], None);
-        assert!(
-            receipt(
-                "https://example.invalid/jre.tar.gz",
-                expand(&missing, Format::TarGz).unwrap()
-            )
-            .is_err()
+        let missing = expand_with(&missing, Format::TarGz, LIMITS, &work).unwrap();
+        assert!(receipt(LINK, missing).is_err());
+    }
+
+    #[test]
+    fn expansion_refuses_layout_conflicts_through_real_decoders() {
+        let work = PhysicalWorkOwner::isolated_for_test();
+        for entries in [
+            // Two archive prefixes, and a file beside the single prefix.
+            &[("jre-a/lib/a", &b"a"[..]), ("jre-b/lib/b", b"b")][..],
+            &[("jre/lib/a", b"a"), ("README", b"r")],
+            // Portable keys collide, and an entry below a file.
+            &[("jre/lib/Rt.jar", b"a"), ("jre/lib/rt.jar", b"b")],
+            &[("jre/lib", b"a"), ("jre/lib/rt.jar", b"b")],
+            &[("jre/lib/rt.jar", b"a"), ("jre/lib", b"b")],
+        ] {
+            let tar = tar_gz(&entries.iter().map(|(p, b)| (*p, *b, 0o644)).collect::<Vec<_>>(), None);
+            assert_eq!(
+                expand_with(&tar, Format::TarGz, LIMITS, &work).err(),
+                Some(RuntimeSourceFailureKind::PolicyRejected),
+                "{entries:?}"
+            );
+            assert_eq!(
+                expand_with(&zip(entries), Format::Zip, LIMITS, &work).err(),
+                Some(RuntimeSourceFailureKind::PolicyRejected),
+                "{entries:?}"
+            );
+        }
+        let explicit = zip(&[("jre/", b""), ("jre/lib/", b""), ("jre/lib/rt.jar", b"x")]);
+        let expansion = expand_with(&explicit, Format::Zip, LIMITS, &work).unwrap();
+        // `lib` and `lib/rt.jar`, below `jre.bundle` on macOS.
+        assert_eq!(expansion.entries.len(), if cfg!(target_os = "macos") { 3 } else { 2 });
+        drop(expansion);
+        assert_eq!(available(&work), work.scratch_limit_bytes());
+    }
+
+    #[test]
+    fn expansion_refuses_declared_growth_before_reading_it() {
+        let work = PhysicalWorkOwner::isolated_for_test();
+        let tight = Limits {
+            expanded_bytes: 1024,
+            entries: 3,
+            archive_entries: 4,
+        };
+        let large = vec![7; 2048];
+        // The declared size is refused before its data is decompressed.
+        let tar = tar_gz(&[("jre/lib/large", &large, 0o644)], None);
+        assert_eq!(
+            expand_with(&tar, Format::TarGz, tight, &work).err(),
+            Some(RuntimeSourceFailureKind::PolicyRejected)
         );
+        assert_eq!(
+            expand_with(&zip(&[("jre/lib/large", &large)]), Format::Zip, tight, &work).err(),
+            Some(RuntimeSourceFailureKind::PolicyRejected)
+        );
+        // Generated parents count as entries; skipped headers count as scanned.
+        let deep = tar_gz(&[("jre/a/b/c/d", b"x", 0o644)], None);
+        assert_eq!(
+            expand_with(&deep, Format::TarGz, tight, &work).err(),
+            Some(RuntimeSourceFailureKind::PolicyRejected)
+        );
+        let headers: Vec<_> = ["jre/", "jre/a/", "jre/b/", "jre/c/", "jre/d/"]
+            .into_iter()
+            .map(|path| (path, &b""[..]))
+            .collect();
+        assert_eq!(
+            expand_with(&zip(&headers), Format::Zip, tight, &work).err(),
+            Some(RuntimeSourceFailureKind::PolicyRejected)
+        );
+        assert!(expand_with(&zip(&headers[..3]), Format::Zip, tight, &work).is_ok());
+
+        // Retained bytes need process scratch reserved before allocation.
+        let held = work
+            .try_reserve_scratch(work.scratch_limit_bytes() - (1 << 20))
+            .unwrap();
+        let two_mib = vec![0; 2 << 20];
+        let tar = tar_gz(&[("jre/lib/large", &two_mib, 0o644)], None);
+        assert_eq!(
+            expand_with(&tar, Format::TarGz, LIMITS, &work).err(),
+            Some(RuntimeSourceFailureKind::Unavailable)
+        );
+        drop(held);
+        assert!(expand_with(&tar, Format::TarGz, LIMITS, &work).is_ok());
+        assert_eq!(available(&work), work.scratch_limit_bytes());
     }
 
     fn prefixed(path: &str) -> String {
