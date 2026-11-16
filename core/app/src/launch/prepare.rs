@@ -168,7 +168,7 @@ impl PreparedSession {
         self.installed_versions
             .revalidate_for(self.instance.generation())
             .map_err(|_| LaunchError::PlanRejected)?;
-        if self.installed_versions.is_degraded() {
+        if !self.installed_versions.admits_target(&self.version_id) {
             return Err(LaunchError::InstalledVersionsDegraded);
         }
         let now = std::time::SystemTime::now()

@@ -5178,22 +5178,23 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
             for (row, instance) in degraded_rows.iter().zip(&input) {
                 assert_eq!(row.instance.id, instance.id);
                 assert_eq!(row.version_display.minecraft_label, "1.21.4");
-                assert!(!row.launchable);
-                assert_eq!(row.launch_action.primary_action, LaunchPrimaryAction::Blocked);
+                // An unrelated malformed version no longer blocks this target;
+                // a publication in progress still does.
+                assert_eq!(row.launchable, !publication_starts, "{}", row.status_detail);
                 assert!(row.needs_install.is_empty());
             }
             assert_eq!(degraded["status"], "ready", "{degraded}");
-            assert_eq!(degraded["launchable"], false);
-            let (reason, message) = if publication_starts {
-                ("incomplete_install", "Installation is changing. Wait for it to finish before launching.")
+            assert_eq!(degraded["launchable"], !publication_starts, "{degraded}");
+            if publication_starts {
+                assert_eq!(degraded["readiness"], serde_json::json!({
+                    "launchable":false,"reasons":[{
+                        "id":"incomplete_install","severity":"blocking",
+                        "message":"Installation is changing. Wait for it to finish before launching."
+                    }]
+                }));
             } else {
-                ("installed_versions_degraded", "Could not verify installed versions. Check the library folder and try again.")
-            };
-            assert_eq!(degraded["readiness"], serde_json::json!({
-                "launchable":false,"reasons":[{
-                    "id":reason,"severity":"blocking","message":message
-                }]
-            }));
+                assert_eq!(degraded["readiness"]["launchable"], true, "{degraded}");
+            }
             assert_eq!(rows.len(), input.len());
             for (row, instance) in rows.iter().zip(&input) {
                 assert_eq!(row.instance.id, instance.id);

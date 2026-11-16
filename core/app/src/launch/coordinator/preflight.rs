@@ -870,8 +870,9 @@ impl LaunchCoordinator {
                         refused.diagnostics = Some(facts);
                     }
                 }
+                let target_version = &admitted.record().instance.version_id;
                 if owned_scan.lock().unwrap().as_ref().is_some_and(|scan|
-                    scan.as_ref().is_ok_and(|scan| scan.is_degraded()))
+                    scan.as_ref().is_ok_and(|scan| !scan.admits_target(target_version)))
                     && let Ok(ref mut preflight) = result
                     && (preflight.launchable || preflight.diagnostics.is_some()
                         || preflight.error.as_ref().is_some_and(|error|

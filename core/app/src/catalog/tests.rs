@@ -489,3 +489,61 @@ async fn publication_in_progress_refuses_scan_and_missing_versions_is_empty() {
         "empty"
     );
 }
+
+#[tokio::test]
+async fn target_admission_isolates_unrelated_scan_issues_only() {
+    let root = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let vanilla = |id: &str| json!({ "id":id, "type":"release", "releaseTime":"2026-01-01T00:00:00Z" });
+    version_file(root.path(), "1.21.4", vanilla("1.21.4"), true);
+    version_file(
+        root.path(),
+        "child",
+        json!({ "id":"child", "inheritsFrom":"1.21.4" }),
+        false,
+    );
+    let authority = ManagedLibraryTestAuthority::open(root.path()).unwrap();
+    let scan = || async {
+        super::installed::scan_installed(authority.operation())
+            .await
+            .unwrap()
+            .report
+    };
+    let clean = scan().await;
+    assert!(super::installed::target_admitted(&clean, "1.21.4"));
+
+    // An unrelated malformed version is attributed to itself only.
+    let broken = root.path().join("versions/unrelated");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("unrelated.json"), b"{not json").unwrap();
+    let unrelated = scan().await;
+    assert_eq!(unrelated.state, axial_minecraft::VersionScanState::Degraded);
+    assert!(super::installed::target_admitted(&unrelated, "1.21.4"));
+    assert!(super::installed::target_admitted(&unrelated, "child"));
+    assert!(!super::installed::target_admitted(&unrelated, "unrelated"));
+
+    // A malformed parent refuses every child that inherits from it.
+    fs::write(root.path().join("versions/1.21.4/1.21.4.json"), b"{not json").unwrap();
+    let parent = scan().await;
+    assert!(!super::installed::target_admitted(&parent, "child"));
+    assert!(!super::installed::target_admitted(&parent, "1.21.4"));
+
+    // Unattributed degradation and canonical-key collisions refuse too.
+    let mut unattributed = clean.clone();
+    unattributed.state = axial_minecraft::VersionScanState::Degraded;
+    assert!(!super::installed::target_admitted(&unattributed, "1.21.4"));
+    unattributed.issues.push(axial_minecraft::VersionScanIssue {
+        kind: axial_minecraft::VersionScanIssueKind::VersionJsonMalformed,
+        version_id: None,
+    });
+    assert!(!super::installed::target_admitted(&unattributed, "1.21.4"));
+    let mut collision = clean.clone();
+    let mut twin = collision
+        .versions
+        .iter()
+        .find(|entry| entry.id == "child")
+        .unwrap()
+        .clone();
+    twin.id = "CHILD".into();
+    collision.versions.push(twin);
+    assert!(!super::installed::target_admitted(&collision, "child"));
+}

@@ -30,6 +30,18 @@ impl InstalledSnapshot {
         self.snapshot.report.state == VersionScanState::Degraded
     }
 
+    /// Whether `target` may be used despite this scan's other issues. It is
+    /// refused when any issue is unattributed or concerns the versions root,
+    /// when an issue names the target or any version it inherits from (by
+    /// canonical portable key), when that chain is cyclic, too deep or has
+    /// colliding entries, or when the scan is degraded without saying why.
+    /// The installed-version proof, not this scan, establishes the chain's
+    /// presence and contents.
+    /// Unrelated malformed versions do not block it.
+    pub(crate) fn admits_target(&self, target: &str) -> bool {
+        target_admitted(&self.snapshot.report, target)
+    }
+
     pub(crate) fn generation_matches(&self, pin: &GenerationPin) -> bool {
         self.pin.generation() == pin.generation() && self.pin.library_id() == pin.library_id()
     }
@@ -93,7 +105,48 @@ pub async fn installed_versions(
     Ok(project_installed(snapshot.report, catalog))
 }
 
-async fn scan_installed(
+pub(crate) fn target_admitted(report: &VersionScanReport, target: &str) -> bool {
+    use axial_minecraft::VersionScanIssueKind;
+    use axial_minecraft::portable_path::PortableFileName;
+    const MAX_INHERITANCE: usize = 16;
+    let key = |id: &str| PortableFileName::new(id).ok().map(|name| name.key());
+    if report.state == VersionScanState::Degraded && report.issues.is_empty() {
+        return false;
+    }
+    let mut chain = Vec::new();
+    let mut next = target.to_owned();
+    loop {
+        let Some(current) = key(&next) else {
+            return false;
+        };
+        if chain.contains(&current) || chain.len() >= MAX_INHERITANCE {
+            return false;
+        }
+        let mut entries = report
+            .versions
+            .iter()
+            .filter(|entry| key(&entry.id).as_ref() == Some(&current));
+        let (entry, collision) = (entries.next(), entries.next());
+        if collision.is_some() {
+            return false;
+        }
+        chain.push(current);
+        // The installed-version proof establishes what the scan lacks.
+        match entry {
+            Some(entry) if !entry.inherits_from.is_empty() => {
+                next = entry.inherits_from.clone();
+            }
+            _ => break,
+        }
+    }
+    report.issues.iter().all(|issue| match (&issue.kind, &issue.version_id) {
+        (VersionScanIssueKind::VersionsDirectoryUnreadable, _) | (_, None) => false,
+        (_, Some(id)) => key(id).is_some_and(|issue| !chain.contains(&issue)),
+    })
+}
+
+
+pub(super) async fn scan_installed(
     operation: &ManagedLibraryOperation,
 ) -> Result<VersionScanSnapshot, CatalogError> {
     let operation = operation.clone();

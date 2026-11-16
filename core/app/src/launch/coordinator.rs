@@ -449,7 +449,7 @@ impl LaunchCoordinator {
                     let installed = installed.map_err(install_read_error)?;
                     let installed_versions =
                         installed_versions.map_err(|_| LaunchError::LibraryUnavailable)?;
-                    if installed_versions.is_degraded() {
+                    if !installed_versions.admits_target(&instance.version_id) {
                         return Err(LaunchError::InstalledVersionsDegraded);
                     }
                     Ok((installed, installed_versions))
