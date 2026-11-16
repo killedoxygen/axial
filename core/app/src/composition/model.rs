@@ -1,4 +1,4 @@
-//! Performance wire data and canonical leaf models. Filesystem authorities stay private.
+//! Recorded composition data and canonical leaf models. Filesystem authorities stay private.
 
 pub use crate::public::Tone;
 use serde::{Deserialize, Serialize};

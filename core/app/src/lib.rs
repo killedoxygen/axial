@@ -2,6 +2,7 @@
 
 pub mod accounts;
 pub mod catalog;
+pub mod composition;
 pub mod content;
 pub mod developer;
 pub(crate) mod files;
@@ -12,7 +13,6 @@ pub mod library;
 pub mod media;
 pub mod music;
 pub mod network;
-pub mod performance;
 pub mod profile;
 pub mod public;
 pub mod resources;

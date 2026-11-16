@@ -3,7 +3,7 @@ use super::artifact::{ManagedArtifactStage, state_from_plan};
 use super::storage::TestManagedStorage;
 use super::{ManagedArtifactPin, ManagedCompositionInstallPlan, ManagedDependencyEdge};
 use super::{commit_staged_graph, managed_stage_selection, remove_managed_transaction};
-use crate::performance::model::{
+use crate::composition::model::{
     CompositionPlan, CompositionState, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
     ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource, ManagedMod, ModCondition,
     OwnershipClass, PerformanceMode, VersionFamily,

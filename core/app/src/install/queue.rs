@@ -743,7 +743,7 @@ impl InstallQueue {
             .as_ref()
             .ok_or(InstallError::ContentUnavailable)?;
         if !crate::content::install::has_pending(&self.inner.storage, &instance)?
-            || crate::performance::mutation::has_pending(&self.inner.storage, &instance)?
+            || crate::composition::recovery::has_pending(&self.inner.storage, &instance)?
         {
             return Err(InstallError::SettlementRequired);
         }
@@ -4833,7 +4833,7 @@ pub(crate) mod tests {
                 crate::instances::create::MIGRATION,
                 crate::instances::delete::MIGRATION,
                 crate::content::install::MIGRATION,
-                crate::performance::mutation::MIGRATION,
+                crate::composition::recovery::MIGRATION,
             ])
             .unwrap();
         let directories = InstanceDirectories::new(
@@ -5760,7 +5760,7 @@ pub(crate) mod tests {
                     crate::instances::create::MIGRATION,
                     crate::instances::delete::MIGRATION,
                     crate::content::install::MIGRATION,
-                    crate::performance::mutation::MIGRATION,
+                    crate::composition::recovery::MIGRATION,
                 ])
                 .unwrap();
             let directories = InstanceDirectories::new(

@@ -192,7 +192,7 @@ pub(crate) struct SetupIntent {
 
 pub(crate) struct DuplicateSource {
     pub source: super::directory::RegisteredInstance,
-    pub performance: crate::performance::duplicate::PreparedDuplicate,
+    pub performance: crate::composition::duplicate::PreparedDuplicate,
 }
 
 #[derive(Clone)]
@@ -761,7 +761,7 @@ impl InstanceService {
                 stage
                     .verify_receipt(&receipt)
                     .map_err(|_| InstanceError::SettlementRequired)?;
-                crate::performance::duplicate::verify_recovered(
+                crate::composition::duplicate::verify_recovered(
                     &stage,
                     performance_witness.as_deref(),
                 )
@@ -774,7 +774,7 @@ impl InstanceService {
         canonical
             .verify_receipt(&receipt)
             .map_err(|_| InstanceError::SettlementRequired)?;
-        crate::performance::duplicate::verify_recovered(&canonical, performance_witness.as_deref())
+        crate::composition::duplicate::verify_recovered(&canonical, performance_witness.as_deref())
             .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
         let committed = self
             .registry()
@@ -1035,7 +1035,7 @@ impl InstanceService {
                 .verify_receipt(&receipt)
                 .map_err(|_| InstanceError::DirectoryUnavailable)?;
             if let Some(witness) = &performance_witness {
-                crate::performance::duplicate::verify_recovered(&canonical, Some(witness))
+                crate::composition::duplicate::verify_recovered(&canonical, Some(witness))
                     .map_err(|_| InstanceError::ManagedDuplicateUnavailable)?;
             }
             self.creation_phase(&record, "published", None, None)?;

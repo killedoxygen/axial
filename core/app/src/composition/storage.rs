@@ -1,14 +1,17 @@
 use axial_fs::{
     Directory, DirectoryCreateOutcome, DirectoryCreateResolution, DirectoryEntry,
     DirectoryIdentity, DirectoryListing, DirectoryMoveOutcome, DirectoryMoveReceipt,
-    DirectoryMoveReceiptOutcome, DirectoryParkOutcome, DurableReplaceObligation,
-    DurableReplaceOutcome, EffectOwner, EffectOwnerRetentionError, EntryKind, ExpectedFileContent,
-    FileCapability, FileCreateOutcome, FileCreateResolution, FileMoveOutcome, FileMoveReceipt,
-    FileMoveReceiptOutcome, FileParkOutcome, FileParkRequest, FileParkResolution,
-    FilePromotionReceipt, FilePromotionReceiptOutcome, FileRevision, LeafName, ParkedDirectory,
-    ParkedFile, ReplaceDestination, Resolution, SealedStagedFile, StageDiscardOutcome,
-    StageDiscardResolution, StagedFile, TransientDestination,
+    DirectoryMoveReceiptOutcome, DirectoryParkOutcome, EffectOwner, EffectOwnerRetentionError,
+    EntryKind, ExpectedFileContent, FileCapability, FileCreateOutcome, FileCreateResolution,
+    FileMoveOutcome, FileMoveReceipt, FileMoveReceiptOutcome, FileParkOutcome, FileParkRequest,
+    FileParkResolution, FilePromotionReceipt, FilePromotionReceiptOutcome, FileRevision, LeafName,
+    ParkedDirectory, ParkedFile, Resolution, SealedStagedFile, StageDiscardOutcome,
+    StageDiscardResolution, StagedFile,
 };
+#[cfg(any(test, feature = "test-support"))]
+use axial_fs::{DurableReplaceObligation, DurableReplaceOutcome};
+#[cfg(any(test, feature = "test-support"))]
+use axial_fs::{ReplaceDestination, TransientDestination};
 use axial_minecraft::download::ManagedTransferEffectAuthority;
 use sha2::{Digest, Sha256, Sha512};
 use std::ffi::OsStr;
@@ -38,7 +41,10 @@ enum ManagedEffectContinuation {
     FilePromotion(FilePromotionReceipt),
     FileMove(FileMoveReceipt),
     DirectoryMove(DirectoryMoveReceipt),
+    /// Fixture producers only: production records no state or transfer effects.
+    #[cfg(any(test, feature = "test-support"))]
     StateReplace(DurableReplaceObligation),
+    #[cfg(any(test, feature = "test-support"))]
     ArtifactTransfer(super::ManagedArtifactTransferRecovery),
 }
 
@@ -235,6 +241,7 @@ impl ManagedInstanceEffectAuthority {
                     None
                 }
             },
+            #[cfg(any(test, feature = "test-support"))]
             ManagedEffectContinuation::StateReplace(obligation) => match obligation.reconcile() {
                 DurableReplaceOutcome::Replaced => None,
                 DurableReplaceOutcome::NoEffect(error) => return Err(error),
@@ -242,6 +249,7 @@ impl ManagedInstanceEffectAuthority {
                     Some(ManagedEffectContinuation::StateReplace(obligation))
                 }
             },
+            #[cfg(any(test, feature = "test-support"))]
             ManagedEffectContinuation::ArtifactTransfer(recovery) => match recovery.reconcile() {
                 Ok(None) => None,
                 Ok(Some(recovery)) => Some(ManagedEffectContinuation::ArtifactTransfer(recovery)),
@@ -277,6 +285,7 @@ impl ManagedInstanceEffectAuthority {
         *slot = Some(continuation);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn retain_artifact_transfer(
         &self,
         recovery: super::ManagedArtifactTransferRecovery,
@@ -383,6 +392,7 @@ impl ManagedStorageDirectory {
         self.directory
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn effect_owner(&self) -> &ManagedInstanceEffectAuthority {
         &self.effects
     }
@@ -482,6 +492,7 @@ impl ManagedStorageDirectory {
         self.directory.sync()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn create_file_create_new(
         &self,
         relative: &Path,
@@ -502,6 +513,7 @@ impl ManagedStorageDirectory {
         promote_stage(sealed, &parent, &name, &self.effects)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn admit_transient_destination(
         &self,
         name: &str,
@@ -511,6 +523,7 @@ impl ManagedStorageDirectory {
             .admit_transient_destination(managed_leaf(name)?)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn bind_transient_publication(
         &self,
         name: &str,
@@ -576,6 +589,7 @@ impl ManagedStorageDirectory {
         promote_stage(sealed, &parent, &name, &self.effects)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn replace_state_file_durable(
         &self,
         relative: &Path,
@@ -765,6 +779,7 @@ impl ManagedStorageFile {
         self.file.validate_revision(&self.revision)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn same_file(&self, other: &Self) -> io::Result<bool> {
         self.file.same_file(&other.file)
     }
@@ -789,6 +804,7 @@ impl ManagedStorageFile {
         Ok(hasher.finalize().to_vec())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn sha256(&self, max_bytes: u64) -> io::Result<[u8; 32]> {
         let mut reader = self.file.reader(max_bytes)?;
         let mut hasher = Sha256::new();

@@ -566,7 +566,7 @@ pub struct ContentMutations {
     tasks: TaskOwner,
     pending: Arc<RetainedEffects<HashMap<InstanceId, PendingBatch>>>,
     resuming: Arc<Mutex<HashSet<InstanceId>>>,
-    performance: Option<crate::performance::mutation::PerformanceService>,
+    compositions: Option<crate::composition::recovery::CompositionService>,
     progress: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
     local_packs: LocalPacks,
     #[cfg(test)]
@@ -586,7 +586,7 @@ impl ContentMutations {
             tasks,
             pending: Arc::default(),
             resuming: Arc::new(Mutex::new(HashSet::new())),
-            performance: None,
+            compositions: None,
             progress: None,
             local_packs: LocalPacks::default(),
             #[cfg(test)]
@@ -594,11 +594,11 @@ impl ContentMutations {
         }
     }
 
-    pub fn with_performance(
+    pub fn with_compositions(
         mut self,
-        performance: crate::performance::mutation::PerformanceService,
+        compositions: crate::composition::recovery::CompositionService,
     ) -> Self {
-        self.performance = Some(performance);
+        self.compositions = Some(compositions);
         self
     }
 
@@ -617,7 +617,7 @@ impl ContentMutations {
         filename: &str,
     ) -> Result<(), MutationError> {
         let service = self
-            .performance
+            .compositions
             .as_ref()
             .ok_or(MutationError::Unavailable)?;
         let proofs = service
@@ -3562,16 +3562,13 @@ pub(crate) mod tests {
         tasks: TaskOwner,
     ) -> ContentMutations {
         let client = ProviderClient::new(ClientConfig::default()).unwrap();
-        let performance = crate::performance::PerformanceService::new(
+        let compositions = crate::composition::CompositionService::new(
             storage,
             directories.clone(),
             tasks.clone(),
-            Arc::new(ContentService::new(client.clone()).unwrap()),
-            crate::performance::public_transfer_resolver(),
-            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
-        ContentMutations::new(directories, client, tasks).with_performance(performance)
+        ContentMutations::new(directories, client, tasks).with_compositions(compositions)
     }
 
     fn open_crash_fixture(

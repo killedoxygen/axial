@@ -8,7 +8,7 @@ use crate::{
         session::SessionManager,
     },
     network::{ClientConfig, ProviderClient},
-    performance::PerformanceService,
+    composition::CompositionService,
     runtime::discovery::RuntimeDiscovery,
     skins::{ProfileMedia, library::SavedSkinLibrary, store::SavedSkinStore},
 };
@@ -79,7 +79,6 @@ fn compose_fixture(
         .with_physical_work(crate::install::artifacts::tests::fixture_physical_work()),
     );
     let client = ProviderClient::new(ClientConfig::default()).unwrap();
-    let content = Arc::new(ContentService::new(client.clone()).unwrap());
     let settings = Arc::new(SettingsStore::new(storage.clone()).unwrap());
     let accounts = Arc::new(AccountDirectory::new(storage.clone()).unwrap());
     let auth = Arc::new(AuthService::new(
@@ -87,13 +86,10 @@ fn compose_fixture(
         Arc::new(CredentialStore::isolated_for_tests()),
         tasks.clone(),
     ));
-    let performance = PerformanceService::new(
+    let compositions = CompositionService::new(
         storage.clone(),
         directories.clone(),
         tasks.clone(),
-        content,
-        crate::performance::public_transfer_resolver(),
-        crate::performance::rules::RulesSettings::default(),
     )
     .unwrap();
     let root_pin = library.admit_application_root().unwrap();
@@ -115,7 +111,7 @@ fn compose_fixture(
         queue.as_ref().clone(),
         RuntimeDiscovery::new(runtime, tasks.clone())
             .with_probe_timeout_for_test(std::time::Duration::from_secs(60)),
-        performance,
+        compositions,
         auth,
         skins,
         SessionManager::new(tasks.clone()),

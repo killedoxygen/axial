@@ -1,7 +1,7 @@
 //! Composition health derived from exact admitted leaf inspection.
 
 use super::storage::ManagedStorageDirectory;
-use crate::performance::model::*;
+use crate::composition::model::*;
 use std::collections::BTreeSet;
 
 pub(crate) fn derive_health(

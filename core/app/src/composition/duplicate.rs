@@ -1,7 +1,7 @@
-//! Read-only Performance admission for the instance owner's publication workflow.
+//! Read-only composition admission for the instance owner's duplication workflow.
 
-use super::PerformanceMutationError;
-use crate::performance::composition::{ManagedDuplicateFile, ManagedDuplicatePayload};
+use super::CompositionError;
+use crate::composition::{ManagedDuplicateFile, ManagedDuplicatePayload};
 use crate::{files::ScopedDirectory, instances::directory::RegisteredInstance};
 
 pub(crate) struct PreparedDuplicate {
@@ -10,12 +10,12 @@ pub(crate) struct PreparedDuplicate {
 }
 
 impl PreparedDuplicate {
-    pub(crate) fn admit(source: &RegisteredInstance) -> Result<Self, PerformanceMutationError> {
+    pub(crate) fn admit(source: &RegisteredInstance) -> Result<Self, CompositionError> {
         source
             .validate_current()
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+            .map_err(|_| CompositionError::InstanceUnavailable)?;
         let payload = ManagedDuplicatePayload::admit(source.directory().capability())
-            .map_err(|_| PerformanceMutationError::Failed)?;
+            .map_err(|_| CompositionError::Failed)?;
         Ok(Self {
             source: source.clone(),
             payload,
@@ -33,16 +33,16 @@ impl PreparedDuplicate {
     pub(crate) fn verify_staged(
         &self,
         destination: &ScopedDirectory,
-    ) -> Result<(), PerformanceMutationError> {
+    ) -> Result<(), CompositionError> {
         self.source
             .validate_current()
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+            .map_err(|_| CompositionError::InstanceUnavailable)?;
         destination
             .revalidate()
-            .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+            .map_err(|_| CompositionError::InstanceUnavailable)?;
         self.payload
             .verify_staged(destination.capability())
-            .map_err(|_| PerformanceMutationError::Failed)
+            .map_err(|_| CompositionError::Failed)
     }
 }
 
@@ -53,26 +53,26 @@ pub(crate) fn is_reserved_mod_entry(name: &str) -> bool {
 pub(crate) fn verify_recovered(
     directory: &ScopedDirectory,
     witness: Option<&str>,
-) -> Result<(), PerformanceMutationError> {
+) -> Result<(), CompositionError> {
     directory
         .revalidate()
-        .map_err(|_| PerformanceMutationError::InstanceUnavailable)?;
+        .map_err(|_| CompositionError::InstanceUnavailable)?;
     ManagedDuplicatePayload::verify_recovered(directory.capability(), witness)
-        .map_err(|_| PerformanceMutationError::Failed)
+        .map_err(|_| CompositionError::Failed)
 }
 
 #[cfg(test)]
 pub(crate) async fn seed_managed(
     source: &RegisteredInstance,
-) -> crate::performance::model::CompositionState {
-    use crate::performance::composition::{
-        ManagedArtifactPin, ManagedCompositionAuthority, ManagedCompositionInstallPlan,
-        ManagedRollbackOutcome,
-    };
-    use crate::performance::model::{
+) -> crate::composition::model::CompositionState {
+    use crate::composition::model::{
         CompositionPlan, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
         ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource, ManagedMod,
         ModCondition, OwnershipClass, PerformanceMode,
+    };
+    use crate::composition::{
+        ManagedArtifactPin, ManagedCompositionAuthority, ManagedCompositionInstallPlan,
+        ManagedRollbackOutcome,
     };
     use sha2::{Digest, Sha512};
     let (authority, identity) = ManagedCompositionAuthority::bind(
@@ -87,7 +87,7 @@ pub(crate) async fn seed_managed(
     let plan = ManagedCompositionInstallPlan::seal(
         CompositionPlan {
             composition_id: "duplicate-fixture".into(),
-            family: crate::performance::model::VersionFamily::F,
+            family: crate::composition::model::VersionFamily::F,
             loader: "fabric".into(),
             mode: PerformanceMode::Managed,
             tier: CompositionTier::Core,
@@ -193,12 +193,12 @@ pub(crate) async fn seed_managed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::composition::{
+        ManagedCompositionAuthority, ManagedRollbackOutcome, RollbackSnapshotTarget,
+    };
     use crate::instances::{
         create::tests::{create, fixture, payload_path},
         duplicate::DuplicateRequest,
-    };
-    use crate::performance::composition::{
-        ManagedCompositionAuthority, ManagedRollbackOutcome, RollbackSnapshotTarget,
     };
 
     #[tokio::test]

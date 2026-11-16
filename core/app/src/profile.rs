@@ -5,7 +5,7 @@ use crate::{
     install::queue::InstallQueue,
     instances::create::InstanceService,
     library::{ApplicationRootPin, LibraryLifecycle},
-    performance::PerformanceService,
+    composition::CompositionService,
     public::APPLICATION_ID,
     resources::ResourceService,
 };
@@ -184,7 +184,7 @@ pub struct Recovery {
     pub library: LibraryLifecycle,
     pub instances: Arc<InstanceService>,
     pub installs: Arc<InstallQueue>,
-    pub performance: PerformanceService,
+    pub compositions: CompositionService,
     pub content: Arc<ContentMutations>,
     pub resources: Arc<ResourceService>,
 }
@@ -201,9 +201,9 @@ impl Recovery {
         self.ensure_no_interrupted_launch()?;
         if self.instances.has_pending_intents()
             || self.instances.has_unsettled_effects()
-            || self.performance.has_unsettled_effects()
+            || self.compositions.has_unsettled_effects()
             || !self
-                .performance
+                .compositions
                 .pending_count()
                 .is_ok_and(|count| count == 0)
             || self.content.has_unsettled_effects()

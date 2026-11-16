@@ -196,7 +196,6 @@ mod tests {
             None,
             true,
             None,
-            Default::default(),
         )
         .await
         .unwrap();

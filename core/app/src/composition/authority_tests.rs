@@ -1,14 +1,12 @@
 use super::*;
-use crate::performance::composition::{
+use crate::composition::model::{CompositionPlan, CompositionTier, PerformanceMode};
+use crate::composition::{
     ManagedCompositionAuthority, ManagedCompositionInstallPlan, ManagedRollbackOutcome,
 };
-use crate::performance::model::{CompositionPlan, CompositionTier, PerformanceMode};
 use crate::{
     files::PortableName,
     library::{LibraryLifecycle, LibraryOpenOutcome},
-    storage::MetadataStore,
 };
-use std::sync::Arc;
 
 fn open_library(path: &std::path::Path) -> LibraryLifecycle {
     match LibraryLifecycle::open(path) {
@@ -30,7 +28,7 @@ fn empty_plan() -> ManagedCompositionInstallPlan {
     ManagedCompositionInstallPlan::seal(
         CompositionPlan {
             composition_id: "fixture-managed".into(),
-            family: crate::performance::model::VersionFamily::F,
+            family: crate::composition::model::VersionFamily::F,
             loader: "fabric".into(),
             mode: PerformanceMode::Managed,
             tier: CompositionTier::Core,
@@ -225,33 +223,4 @@ async fn cancelled_target_checkpoint_does_not_publish_managed_state() {
         library.revoke_application_root().unwrap(),
         axial_fs::RootRevokeOutcome::Revoked
     ));
-}
-
-#[tokio::test]
-async fn active_rule_lease_prevents_refresh_from_replacing_a_prepared_plan() {
-    let storage = Arc::new(MetadataStore::in_memory().unwrap());
-    storage.migrate(&[rules::MIGRATION]).unwrap();
-    let rules = rules::PerformanceRules::new(storage, Default::default()).unwrap();
-    let planned = rules
-        .plan(crate::performance::model::ResolutionRequest {
-            game_version: "1.21.1".into(),
-            loader: "fabric".into(),
-            mode: PerformanceMode::Managed,
-            hardware: Default::default(),
-            installed_mods: Vec::new(),
-        })
-        .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(10), rules.refresh())
-            .await
-            .is_err()
-    );
-    planned.ensure_current().unwrap();
-    drop(planned);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), rules.refresh())
-            .await
-            .is_ok()
-    );
 }

@@ -1,9 +1,9 @@
 use super::*;
-use crate::performance::composition::storage::TestManagedStorage;
-use crate::performance::model::{
+use crate::composition::model::{
     ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource,
     ManagedDependencyStateEdge, VersionFamily,
 };
+use crate::composition::storage::TestManagedStorage;
 use std::fs;
 
 #[test]
@@ -388,9 +388,8 @@ fn state_replacement_refuses_competing_recovery_without_residue() {
     };
     let mut replacement = original.clone();
     replacement.composition_id = "replacement".to_string();
-    replacement.graph_sha512 =
-        crate::performance::composition::plan::canonical_state_graph_digest(&replacement)
-            .expect("replacement graph digest");
+    replacement.graph_sha512 = crate::composition::plan::canonical_state_graph_digest(&replacement)
+        .expect("replacement graph digest");
     assert!(save_state(storage.directory(), &replacement).is_err());
     assert_eq!(
         load_state_admitted(storage.directory()).expect("load original state"),
@@ -930,9 +929,8 @@ fn test_state(installed_mods: Vec<InstalledMod>) -> CompositionState {
         installed_mods,
         installed_at: Utc::now().to_rfc3339(),
     };
-    state.graph_sha512 =
-        crate::performance::composition::plan::canonical_state_graph_digest(&state)
-            .expect("canonical test state graph");
+    state.graph_sha512 = crate::composition::plan::canonical_state_graph_digest(&state)
+        .expect("canonical test state graph");
     state
 }
 

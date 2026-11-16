@@ -53,7 +53,7 @@ use crate::{
         model::InstanceError,
     },
     library::{ApplicationRootPin, GenerationPin},
-    performance::{PerformanceMutationError, PerformanceService},
+    composition::{CompositionError, CompositionService},
     runtime::{
         discovery::{RuntimeDiscovery, RuntimeObservation, RuntimeProjection},
         model::JavaDiscoveryError,
@@ -69,7 +69,7 @@ pub struct LaunchCoordinator {
     settings: Arc<SettingsStore>,
     installs: InstallQueue,
     runtimes: RuntimeDiscovery,
-    performance: PerformanceService,
+    compositions: CompositionService,
     auth: Arc<AuthService>,
     skins: Arc<crate::skins::ProfileMedia>,
     sessions: SessionManager,
@@ -89,7 +89,7 @@ impl LaunchCoordinator {
         settings: Arc<SettingsStore>,
         installs: InstallQueue,
         runtimes: RuntimeDiscovery,
-        performance: PerformanceService,
+        compositions: CompositionService,
         auth: Arc<AuthService>,
         skins: Arc<crate::skins::ProfileMedia>,
         sessions: SessionManager,
@@ -101,7 +101,7 @@ impl LaunchCoordinator {
             settings,
             installs,
             runtimes,
-            performance,
+            compositions,
             auth,
             skins,
             sessions,
@@ -471,7 +471,7 @@ impl LaunchCoordinator {
                 .insert("has_custom_resolution".into(), options.resolution.is_some());
             let (composition, runtime, files, natives) = tokio::join!(
                 stages.time("composition", "Managed files", async {
-                    self.performance
+                    self.compositions
                         .settled_for_launch(&admitted)
                         .await
                         .map_err(composition_error)
@@ -733,14 +733,14 @@ fn launch_options(
     })
 }
 
-fn composition_error(error: PerformanceMutationError) -> LaunchError {
+fn composition_error(error: CompositionError) -> LaunchError {
     tracing::warn!(
         stage = "composition",
         cause = error.diagnostic_code(),
         "Launch preparation rejected."
     );
     match error {
-        PerformanceMutationError::InstanceUnavailable => LaunchError::InstanceBusy,
+        CompositionError::InstanceUnavailable => LaunchError::InstanceBusy,
         _ => LaunchError::PerformanceUnsettled,
     }
 }

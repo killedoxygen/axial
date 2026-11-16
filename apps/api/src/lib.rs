@@ -34,7 +34,7 @@ use axial_app::{
     library::{LibraryId, LibraryLifecycle, LibraryOpenOutcome},
     music::MusicService,
     network::{ClientConfig, ProviderClient},
-    performance::{PerformanceService, rules::RulesSettings},
+    composition::CompositionService,
     profile::{Profile, Recovery},
     public::APPLICATION_ID,
     resources::{ResourceService, folders::FolderService},
@@ -174,7 +174,7 @@ pub struct DesktopServices {
     pub installs: Arc<InstallQueue>,
     pub sessions: SessionManager,
     pub skins: Arc<ProfileMedia>,
-    pub performance: PerformanceService,
+    pub compositions: CompositionService,
     pub launch: Arc<LaunchCoordinator>,
     pub reports: LaunchReportStore,
     pub content_mutations: Arc<ContentMutations>,
@@ -196,7 +196,7 @@ pub struct ServerHandle {
     installs: Arc<InstallQueue>,
     sessions: SessionManager,
     skins: Arc<ProfileMedia>,
-    performance: PerformanceService,
+    compositions: CompositionService,
     content_mutations: Arc<ContentMutations>,
     resources: Arc<ResourceService>,
     music: Arc<MusicService>,
@@ -223,7 +223,7 @@ impl ServerHandle {
             library: self.library.clone(),
             instances: self.instances.clone(),
             installs: self.installs.clone(),
-            performance: self.performance.clone(),
+            compositions: self.compositions.clone(),
             content: self.content_mutations.clone(),
             resources: self.resources.clone(),
         }
@@ -328,7 +328,7 @@ impl ServerHandle {
             })?;
             let instances = self.instances.clone();
             let setup = self.setup.clone();
-            let performance = self.performance.clone();
+            let compositions = self.compositions.clone();
             let content = self.content_mutations.clone();
             let resources = self.resources.clone();
             let installs = self.installs.clone();
@@ -337,7 +337,7 @@ impl ServerHandle {
             let library = self.library.clone();
             *pending = Some(tokio::task::spawn_blocking(move || {
                 if instances.has_unsettled_effects()
-                    || performance.has_unsettled_effects()
+                    || compositions.has_unsettled_effects()
                     || resources.has_unsettled_effects()
                 {
                     return Err(
@@ -390,7 +390,6 @@ pub async fn start_desktop(extra_origin: Option<&str>) -> Result<DesktopServices
         extra_origin,
         true,
         configured_telemetry(),
-        RulesSettings::default(),
     )
     .await
 }
@@ -401,7 +400,6 @@ pub async fn start_browser(extra_origin: Option<&str>) -> Result<DesktopServices
         extra_origin,
         false,
         configured_telemetry(),
-        RulesSettings::default(),
     )
     .await
 }
@@ -444,7 +442,6 @@ pub async fn start_in_profile(
         extra_origin,
         false,
         None,
-        RulesSettings::default(),
     )
     .await
 }
@@ -454,7 +451,6 @@ async fn start_profile(
     extra_origin: Option<&str>,
     native_login: bool,
     collector: Option<CollectorConfig>,
-    rules: RulesSettings,
 ) -> Result<DesktopServices, StartupError> {
     let telemetry = Arc::new(Telemetry::new(collector));
     let result = start_profile_inner(
@@ -462,7 +458,6 @@ async fn start_profile(
         extra_origin,
         native_login,
         telemetry.clone(),
-        rules,
         #[cfg(test)]
         TestInputs::default(),
     )
@@ -478,25 +473,19 @@ async fn start_profile(
 #[derive(Default)]
 struct TestInputs {
     endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
-    content: Option<(
-        String,
-        axial_app::performance::composition::ManagedArtifactTransferResolver,
-    )>,
-    rules: RulesSettings,
+    content: Option<String>,
 }
 
 #[cfg(test)]
 async fn start_profile_for_test(
     profile_root: PathBuf,
-    mut inputs: TestInputs,
+    inputs: TestInputs,
 ) -> Result<DesktopServices, StartupError> {
-    let rules = std::mem::take(&mut inputs.rules);
     start_profile_inner(
         profile_root,
         None,
         false,
         Arc::new(Telemetry::new(None)),
-        rules,
         inputs,
     )
     .await
@@ -512,23 +501,6 @@ async fn start_profile_with_test_endpoints(
         profile_root,
         TestInputs {
             endpoints,
-            ..TestInputs::default()
-        },
-    )
-    .await
-}
-
-#[cfg(test)]
-async fn start_profile_with_performance_test_inputs(
-    profile_root: PathBuf,
-    content_base_url: String,
-    transfers: axial_app::performance::composition::ManagedArtifactTransferResolver,
-) -> Result<DesktopServices, StartupError> {
-    let content = Some((content_base_url, transfers));
-    start_profile_for_test(
-        profile_root,
-        TestInputs {
-            content,
             ..TestInputs::default()
         },
     )
@@ -559,13 +531,12 @@ async fn start_profile_inner(
     extra_origin: Option<&str>,
     native_login: bool,
     telemetry: Arc<Telemetry>,
-    rules: RulesSettings,
     #[cfg(test)] inputs: TestInputs,
 ) -> Result<DesktopServices, StartupError> {
     #[cfg(test)]
     let TestInputs {
         endpoints: test_endpoints,
-        content: performance_inputs,
+        content: content_base_url,
         ..
     } = inputs;
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -643,7 +614,7 @@ async fn start_profile_inner(
         installs,
         runtimes,
         catalog,
-        performance,
+        compositions,
         skins,
         reports,
         sessions,
@@ -707,10 +678,9 @@ async fn start_profile_inner(
                 let catalog = Arc::new(Catalog::new(client.clone()));
                 let content =
                     ContentService::new(client.clone()).map_err(|error| error.to_string())?;
-                let transfers = axial_app::performance::public_transfer_resolver();
                 #[cfg(test)]
-                let (content, transfers) = match performance_inputs {
-                    Some((base_url, transfers)) => {
+                let content = match content_base_url {
+                    Some(base_url) => {
                         let origin = url::Url::parse(&base_url)
                             .map_err(|error| error.to_string())?
                             .origin()
@@ -721,23 +691,20 @@ async fn start_profile_inner(
                         let content =
                             ContentService::with_base_url(client.clone(), base_url, origins)
                                 .map_err(|error| error.to_string())?;
-                        (content, transfers)
+                        content
                     }
-                    None => (content, transfers),
+                    None => content,
                 };
                 let content = Arc::new(content);
-                let performance = PerformanceService::new(
+                let compositions = CompositionService::new(
                     metadata.clone(),
                     directories.clone(),
                     tasks.clone(),
-                    content.clone(),
-                    transfers,
-                    rules,
                 )
                 .map_err(|error| error.to_string())?;
                 let content_mutations = Arc::new(
                     ContentMutations::new(directories.clone(), client, tasks.clone())
-                        .with_performance(performance.clone()),
+                        .with_compositions(compositions.clone()),
                 );
                 let installs =
                     Arc::new(installs.with_content(content.clone(), content_mutations.clone()));
@@ -778,7 +745,7 @@ async fn start_profile_inner(
                         settings.clone(),
                         installs.as_ref().clone(),
                         runtimes.clone(),
-                        performance.clone(),
+                        compositions.clone(),
                         auth.clone(),
                         skins.clone(),
                         sessions.clone(),
@@ -802,7 +769,7 @@ async fn start_profile_inner(
                     installs,
                     runtimes,
                     catalog,
-                    performance,
+                    compositions,
                     skins,
                     reports,
                     sessions,
@@ -845,8 +812,8 @@ async fn start_profile_inner(
             "installation startup settlement remains unresolved; affected versions stay unavailable"
         );
     }
-    let recovering = performance.clone();
-    match tasks.try_spawn(performance.clone(), move |_| async move {
+    let recovering = compositions.clone();
+    match tasks.try_spawn(compositions.clone(), move |_| async move {
         recovering.recover_pending().await
     }) {
         Ok(recovery) => {
@@ -935,7 +902,7 @@ async fn start_profile_inner(
         installs: installs.clone(),
         sessions: sessions.clone(),
         skins: skins.clone(),
-        performance: performance.clone(),
+        compositions: compositions.clone(),
         shutdown,
         runtime_cache: installs.runtime_cache().clone(),
         content_mutations: content_mutations.clone(),
@@ -967,7 +934,7 @@ async fn start_profile_inner(
         installs,
         sessions,
         skins,
-        performance,
+        compositions,
         launch,
         reports,
         content_mutations,
@@ -1320,7 +1287,7 @@ mod tests {
         };
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("replacement");
-        let services = start_profile(root.clone(), None, false, collector(), Default::default())
+        let services = start_profile(root.clone(), None, false, collector())
             .await
             .unwrap();
         assert!(!services.telemetry.report_startup_failure());
@@ -1342,7 +1309,7 @@ mod tests {
         let first_batches: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
         // The initial launch occurred without consent. The reopened launch
         // must observe persisted consent before publishing its startup event.
-        let reopened = start_profile(root, None, false, collector(), Default::default())
+        let reopened = start_profile(root, None, false, collector())
             .await
             .unwrap();
         assert_eq!(
@@ -1391,7 +1358,7 @@ mod tests {
                 tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             let root = temporary.path().join("profile");
             let services =
-                start_profile(root.clone(), None, false, collector(), Default::default())
+                start_profile(root.clone(), None, false, collector())
                     .await
                     .unwrap();
             let bootstrap = services.server.bootstrap();
@@ -1425,7 +1392,6 @@ mod tests {
                 None,
                 false,
                 configured.then(collector).flatten(),
-                Default::default(),
             )
             .await
             .err()

@@ -24,7 +24,7 @@ pub(super) struct PreparedSession {
     settings_revision: u64,
     secrets: Vec<String>,
     instance: RegisteredInstance,
-    composition: crate::performance::CompositionSettled,
+    composition: crate::composition::CompositionSettled,
     scenario: super::reports::LaunchProofScenario,
     resource_budget: super::reports::LaunchProofResourceBudget,
     credential_expires_at: Option<u64>,
@@ -50,7 +50,7 @@ impl PreparedSession {
         settings_revision: u64,
         secrets: Vec<String>,
         instance: RegisteredInstance,
-        composition: crate::performance::CompositionSettled,
+        composition: crate::composition::CompositionSettled,
         scenario: super::reports::LaunchProofScenario,
         resource_budget: super::reports::LaunchProofResourceBudget,
         credential_expires_at: Option<u64>,
@@ -236,11 +236,9 @@ impl std::fmt::Debug for PreparedSession {
 pub(super) mod tests {
     use super::*;
     use crate::{
-        content::catalog::ContentService,
         install::artifacts::{ActivatedFile, ActivatedVersion},
         instances::create::{CreateInstanceRequest, CreateTarget, InstanceService},
-        network::{ClientConfig, ProviderClient},
-        performance::PerformanceService,
+        composition::CompositionService,
     };
     use sha1::{Digest, Sha1};
     use std::os::unix::fs::PermissionsExt;
@@ -320,18 +318,13 @@ pub(super) mod tests {
             .unwrap()
             .unwrap();
         let instance = directories.admit(&instance.id).unwrap();
-        let performance = PerformanceService::new(
+        let compositions = CompositionService::new(
             storage.clone(),
             directories,
             tasks,
-            Arc::new(
-                ContentService::new(ProviderClient::new(ClientConfig::default()).unwrap()).unwrap(),
-            ),
-            crate::performance::public_transfer_resolver(),
-            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
-        let composition = performance.settled_for_launch(&instance).await.unwrap();
+        let composition = compositions.settled_for_launch(&instance).await.unwrap();
         let mut files = Vec::new();
         let object = hex::encode(Sha1::digest(b"step"));
         let index = format!(

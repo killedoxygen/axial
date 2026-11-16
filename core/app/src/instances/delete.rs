@@ -166,7 +166,7 @@ impl super::create::InstanceService {
             return Err(InstanceError::Busy.into());
         }
         if existing.is_none()
-            && crate::performance::mutation::has_pending(self.registry().storage(), id)?
+            && crate::composition::recovery::has_pending(self.registry().storage(), id)?
         {
             return Err(InstanceError::Busy.into());
         }
@@ -323,7 +323,7 @@ impl super::create::InstanceService {
         let id = &admitted.record().instance.id;
         if admitted.validate_current().is_err()
             || crate::content::install::has_pending(self.registry().storage(), id)?
-            || crate::performance::mutation::has_pending(self.registry().storage(), id)?
+            || crate::composition::recovery::has_pending(self.registry().storage(), id)?
         {
             return Ok(None);
         }
@@ -1413,7 +1413,7 @@ mod tests {
                 assert!(if content {
                     crate::content::install::has_pending(service.registry().storage(), &id).unwrap()
                 } else {
-                    crate::performance::mutation::has_pending(service.registry().storage(), &id)
+                    crate::composition::recovery::has_pending(service.registry().storage(), &id)
                         .unwrap()
                 });
                 assert!(matches!(

@@ -10,8 +10,8 @@ use axial_app::{
     launch::coordinator::{LaunchError, LaunchErrorResponse},
     media::MediaError,
     music::MusicError,
-    performance::{
-        PerformanceMutationError,
+    composition::{
+        CompositionError,
     },
     public::{ErrorResponse, Retry},
     resources::{ResourceError, folders::FolderError, mods::ModImportError},
@@ -356,7 +356,7 @@ impl PublicError for LaunchError {
     }
 }
 
-impl PublicError for PerformanceMutationError {
+impl PublicError for CompositionError {
     fn status(&self) -> StatusCode {
         match self {
             Self::InstanceNotFound | Self::SnapshotNotFound => StatusCode::NOT_FOUND,

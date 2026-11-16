@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     files::{PortableName, ScopedDirectory},
-    performance::duplicate::{PreparedDuplicate, is_reserved_mod_entry},
+    composition::duplicate::{PreparedDuplicate, is_reserved_mod_entry},
     tasks::{CancellationToken, TaskHandle},
 };
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ impl InstanceService {
         if crate::content::install::has_pending(self.registry().storage(), id)? {
             return Err(InstanceError::Busy);
         }
-        if crate::performance::mutation::has_pending(self.registry().storage(), id)? {
+        if crate::composition::recovery::has_pending(self.registry().storage(), id)? {
             return Err(InstanceError::Busy);
         }
         if super::setup::has_pending(self.registry().storage(), id)? {
@@ -247,7 +247,7 @@ mod tests {
     use super::*;
     use crate::{
         instances::create::tests::{create, fixture, payload_path},
-        performance::duplicate::seed_managed,
+        composition::duplicate::seed_managed,
         storage::rusqlite::params,
         testing::Fixture,
     };
@@ -410,7 +410,7 @@ mod tests {
                     .verify_staged(copied.directory())
                     .unwrap();
                 let (authority, identity) =
-                    crate::performance::composition::ManagedCompositionAuthority::bind(
+                    crate::composition::ManagedCompositionAuthority::bind(
                         id.as_str(),
                         copied.directory().capability().clone(),
                     )
@@ -425,7 +425,7 @@ mod tests {
                         .rollback_managed(&identity, &effects)
                         .await
                         .unwrap(),
-                    crate::performance::composition::ManagedRollbackOutcome::ManagedComposition(_)
+                    crate::composition::ManagedRollbackOutcome::ManagedComposition(_)
                 ));
                 assert_eq!(service.registry().list().unwrap().len(), 2);
             }
@@ -524,7 +524,7 @@ mod tests {
                         )
                         .unwrap();
                     assert!(
-                        crate::performance::composition::ManagedDuplicatePayload::admit(directory.capability())
+                        crate::composition::ManagedDuplicatePayload::admit(directory.capability())
                             .is_ok()
                     );
                 }

@@ -121,7 +121,7 @@ impl InstanceDirectories {
             return Err(InstanceError::Busy);
         }
         if check_performance
-            && crate::performance::mutation::has_pending(self.registry.storage(), id)?
+            && crate::composition::recovery::has_pending(self.registry.storage(), id)?
         {
             return Err(InstanceError::Busy);
         }
@@ -224,7 +224,7 @@ fn validate_live_binding(
         return Err(InstanceError::Conflict);
     }
     if crate::content::install::has_pending(registry.storage(), id)?
-        || crate::performance::mutation::has_pending(registry.storage(), id)?
+        || crate::composition::recovery::has_pending(registry.storage(), id)?
         || super::setup::has_pending(registry.storage(), id)?
     {
         return Err(InstanceError::Busy);

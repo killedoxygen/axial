@@ -13,7 +13,6 @@ async fn preflight_fixture_with_credentials(
     credentials: Arc<crate::accounts::credential_store::CredentialStore>,
 ) -> (tempfile::TempDir, LaunchCoordinator, InstanceId) {
     use crate::{
-        network::{ClientConfig, ProviderClient},
         skins::{ProfileMedia, library::SavedSkinLibrary, store::SavedSkinStore},
     };
     use std::os::unix::fs::PermissionsExt;
@@ -67,19 +66,10 @@ async fn preflight_fixture_with_credentials(
         credentials,
         tasks.clone(),
     ));
-    let content = Arc::new(
-        crate::content::catalog::ContentService::new(
-            ProviderClient::new(ClientConfig::default()).unwrap(),
-        )
-        .unwrap(),
-    );
-    let performance = PerformanceService::new(
+    let compositions = CompositionService::new(
         storage.clone(),
         directories.clone(),
         tasks.clone(),
-        content,
-        crate::performance::public_transfer_resolver(),
-        crate::performance::rules::RulesSettings::default(),
     )
     .unwrap();
     let root_pin = directories.library().admit_application_root().unwrap();
@@ -101,7 +91,7 @@ async fn preflight_fixture_with_credentials(
         installs,
         RuntimeDiscovery::new(cache, tasks.clone())
             .with_probe_timeout_for_test(std::time::Duration::from_secs(60)),
-        performance,
+        compositions,
         auth,
         skins,
         SessionManager::new(tasks.clone()),
@@ -1483,14 +1473,6 @@ async fn preflight_probe_does_not_reserve_the_foreground_launch_target() {
             .is_ok()
     );
     assert!(axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).is_ok());
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            coordinator.performance.rules().refresh(),
-        )
-        .await
-        .is_ok()
-    );
 }
 
 #[cfg(unix)]
@@ -3351,7 +3333,7 @@ async fn play_admits_settled_managed_files_and_refuses_changed_ones_through_the_
     let (root, coordinator, id) = preflight_fixture().await;
     std::fs::write(root.path().join("probe-release"), b"release").unwrap();
     let admitted = coordinator.admit(&id).unwrap();
-    crate::performance::duplicate::seed_managed(&admitted).await;
+    crate::composition::duplicate::seed_managed(&admitted).await;
     let mods = admitted
         .game_directory()
         .read_projection()
@@ -3394,8 +3376,8 @@ async fn play_admits_settled_managed_files_and_refuses_changed_ones_through_the_
     std::fs::write(mods.join("current.jar"), b"externally changed").unwrap();
     let (changed, _) = prepare(coordinator.admit(&id).unwrap()).await;
     std::fs::write(mods.join("current.jar"), original).unwrap();
-    let retained = coordinator.performance.has_unsettled_effects();
-    let recovered = coordinator.performance.recover_pending().await;
+    let retained = coordinator.compositions.has_unsettled_effects();
+    let recovered = coordinator.compositions.recover_pending().await;
     coordinator
         .tasks
         .shutdown(std::time::Duration::from_secs(5))

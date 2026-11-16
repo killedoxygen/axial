@@ -1,5 +1,5 @@
 use super::MANAGED_ARTIFACT_MAX_BYTES;
-use crate::performance::model::{
+use crate::composition::model::{
     CompositionPlan, CompositionState, CompositionTier, ManagedArtifactRole,
     ManagedDependencyStateEdge, PerformanceMode, VersionFamily,
 };
@@ -504,7 +504,7 @@ impl<'a> CanonicalGraphNode<'a> {
         }
     }
 
-    fn from_installed(installed: &'a crate::performance::model::InstalledMod) -> Self {
+    fn from_installed(installed: &'a crate::composition::model::InstalledMod) -> Self {
         Self {
             project_id: &installed.project_id,
             version_id: &installed.version_id,
@@ -780,7 +780,7 @@ fn tier_name(tier: CompositionTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::performance::model::{ManagedMod, ModCondition};
+    use crate::composition::model::{ManagedMod, ModCondition};
 
     const ROOT_A: &str = "AANobbMI";
     const ROOT_B: &str = "gvQqBUqZ";

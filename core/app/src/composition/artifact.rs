@@ -1,35 +1,62 @@
+#[cfg(any(test, feature = "test-support"))]
 use super::InstallError;
+#[cfg(any(test, feature = "test-support"))]
 use super::plan::{ManagedArtifactPin, ManagedCompositionInstallPlan};
+#[cfg(any(test, feature = "test-support"))]
+use super::state::reconcile_managed_candidate_intents;
+#[cfg(any(test, feature = "test-support"))]
 use super::state::{
     ManagedArtifactCandidateIntent, prepare_managed_artifact_addition,
     prepare_managed_artifact_candidate, publish_managed_artifact_addition,
-    reconcile_managed_candidate_intents,
 };
-use super::storage::{ManagedInstanceEffectAuthority, ManagedStorageDirectory, ManagedStorageFile};
-use crate::performance::model::{
+#[cfg(any(test, feature = "test-support"))]
+use super::storage::ManagedStorageDirectory;
+#[cfg(any(test, feature = "test-support"))]
+use super::storage::{ManagedInstanceEffectAuthority, ManagedStorageFile};
+#[cfg(any(test, feature = "test-support"))]
+use crate::composition::model::{
     CompositionState, InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider,
     ManagedArtifactSource, ManagedDependencyStateEdge, OwnershipClass,
 };
+#[cfg(any(test, feature = "test-support"))]
 use axial_minecraft::download::{
-    CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority, RetryPolicy,
-    TransferCleanupObligation, TransferCleanupResolution, TransferClient, TransferContract,
-    TransferFailureReport, TransferOutcome, TransferPublicationObligation,
-    TransferPublicationOutcome, TransferReport, TransferTargetCancelObligation,
-    TransferTargetCancelOutcome, TransferUnsettledObligation, VerifiedCreateOnly,
-    VerifiedTransferDiscardObligation, VerifiedTransferDiscardOutcome, start_create_only_transfer,
+    CreateOnlyTransferTarget, ExpectedTransferDigests, ManagedTransferAuthority, TransferContract,
+    TransferFailureReport, TransferOutcome, TransferReport, start_create_only_transfer,
     transfer_cancellation_channel,
 };
+#[cfg(any(test, feature = "test-support"))]
+use axial_minecraft::download::{
+    RetryPolicy, TransferCleanupObligation, TransferCleanupResolution, TransferClient,
+    TransferPublicationObligation, TransferTargetCancelObligation, TransferTargetCancelOutcome,
+    TransferUnsettledObligation, VerifiedTransferDiscardObligation,
+};
+#[cfg(any(test, feature = "test-support"))]
+use axial_minecraft::download::{
+    TransferPublicationOutcome, VerifiedCreateOnly, VerifiedTransferDiscardOutcome,
+};
+#[cfg(any(test, feature = "test-support"))]
 use chrono::Utc;
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+#[cfg(any(test, feature = "test-support"))]
+use futures_util::FutureExt;
+#[cfg(any(test, feature = "test-support"))]
+use futures_util::{StreamExt, stream::FuturesUnordered};
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
+#[cfg(any(test, feature = "test-support"))]
 use std::fmt;
+#[cfg(any(test, feature = "test-support"))]
 use std::future::Future;
+#[cfg(any(test, feature = "test-support"))]
 use std::io;
+#[cfg(any(test, feature = "test-support"))]
 use std::num::NonZeroU64;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
 const MANAGED_GRAPH_STAGE_CONCURRENCY: usize = 4;
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 pub struct ManagedArtifactTransferResolver {
     resolve: Arc<
@@ -40,6 +67,7 @@ pub struct ManagedArtifactTransferResolver {
     retry: RetryPolicy,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl fmt::Debug for ManagedArtifactTransferResolver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -48,6 +76,7 @@ impl fmt::Debug for ManagedArtifactTransferResolver {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManagedArtifactTransferResolver {
     pub fn new<Resolve, ResolveFuture>(resolve: Resolve, retry: RetryPolicy) -> Self
     where
@@ -60,22 +89,26 @@ impl ManagedArtifactTransferResolver {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn client(&self, url: reqwest::Url) -> io::Result<TransferClient> {
         (self.resolve)(url).await
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) struct StagedManagedArtifact {
     installed: InstalledMod,
     candidate: ManagedStorageFile,
     intent: ManagedArtifactCandidateIntent,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) trait ManagedArtifactStage {
     fn installed(&self) -> &InstalledMod;
     fn publish_create_new(self, destination: &ManagedStorageDirectory) -> Result<(), InstallError>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManagedArtifactStage for StagedManagedArtifact {
     fn installed(&self) -> &InstalledMod {
         &self.installed
@@ -94,6 +127,7 @@ impl ManagedArtifactStage for StagedManagedArtifact {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct PreparedArtifactTransfer {
     installed: InstalledMod,
     intent: ManagedArtifactCandidateIntent,
@@ -103,18 +137,21 @@ struct PreparedArtifactTransfer {
     contract: TransferContract,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct ArtifactTransferSpec {
     installed: InstalledMod,
     url: reqwest::Url,
     contract: TransferContract,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct JoinedArtifactTransfer {
     installed: InstalledMod,
     intent: ManagedArtifactCandidateIntent,
     outcome: TransferOutcome<VerifiedCreateOnly>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 enum TransferRecoveryMember {
     TargetCancel(TransferTargetCancelObligation),
     Cleanup(TransferCleanupObligation),
@@ -123,11 +160,13 @@ enum TransferRecoveryMember {
     Publication(TransferPublicationObligation),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct ManagedArtifactTransferRecovery {
     instance_mods: ManagedStorageDirectory,
     members: Vec<TransferRecoveryMember>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManagedArtifactTransferRecovery {
     pub(crate) fn reconcile(mut self) -> Result<Option<Self>, (io::Error, Self)> {
         let mut pending = Vec::with_capacity(self.members.len());
@@ -172,6 +211,7 @@ impl ManagedArtifactTransferRecovery {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) async fn stage_managed_graph(
     resolver: ManagedArtifactTransferResolver,
     pins: Vec<ManagedArtifactPin>,
@@ -273,6 +313,7 @@ pub(super) async fn stage_managed_graph(
     .map_err(|_| InstallError::Io(io::Error::other("managed candidate publication stopped")))?
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn transfer_failure_report<T>(outcome: &TransferOutcome<T>) -> Option<&TransferFailureReport> {
     match outcome {
         TransferOutcome::Complete(_) => None,
@@ -282,6 +323,7 @@ fn transfer_failure_report<T>(outcome: &TransferOutcome<T>) -> Option<&TransferF
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn prepare_transfer_targets(
     instance_mods: &ManagedStorageDirectory,
     pins: Vec<ManagedArtifactPin>,
@@ -337,8 +379,10 @@ fn prepare_transfer_targets(
     Ok(prepared)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 type ActiveArtifactTransfer = futures_util::future::BoxFuture<'static, JoinedArtifactTransfer>;
 
+#[cfg(any(test, feature = "test-support"))]
 fn start_next_transfer(
     prepared: &mut VecDeque<PreparedArtifactTransfer>,
     active: &mut FuturesUnordered<ActiveArtifactTransfer>,
@@ -373,6 +417,7 @@ fn start_next_transfer(
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn abort_prepared_transfers(
     instance_mods: &ManagedStorageDirectory,
     prepared: VecDeque<PreparedArtifactTransfer>,
@@ -409,6 +454,7 @@ async fn abort_prepared_transfers(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn retain_transfer_outcome(
     outcome: TransferOutcome<VerifiedCreateOnly>,
     members: &mut Vec<TransferRecoveryMember>,
@@ -425,6 +471,7 @@ fn retain_transfer_outcome(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn retain_verified_discard(
     verified: VerifiedCreateOnly,
     members: &mut Vec<TransferRecoveryMember>,
@@ -434,6 +481,7 @@ fn retain_verified_discard(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn reconcile_publication_recovery(
     outcome: TransferPublicationOutcome,
     pending: &mut Vec<TransferRecoveryMember>,
@@ -449,6 +497,7 @@ fn reconcile_publication_recovery(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn publish_transfer_candidates(
     instance_mods: &ManagedStorageDirectory,
     complete: Vec<(
@@ -560,6 +609,7 @@ fn publish_transfer_candidates(
     Ok(staged)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn retain_publication_recovery(
     instance_mods: &ManagedStorageDirectory,
     members: Vec<TransferRecoveryMember>,
@@ -580,6 +630,7 @@ fn retain_publication_recovery(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn report_matches_artifact(report: &TransferReport, installed: &InstalledMod) -> bool {
     report.bytes() == installed.size
         && report
@@ -588,6 +639,7 @@ fn report_matches_artifact(report: &TransferReport, installed: &InstalledMod) ->
             .is_some_and(|digest| hex::encode(digest) == installed.integrity.sha512)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn invalid_transfer_plan() -> InstallError {
     InstallError::Io(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -595,10 +647,12 @@ fn invalid_transfer_plan() -> InstallError {
     ))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn installed_graph_from_plan(plan: &ManagedCompositionInstallPlan) -> Vec<InstalledMod> {
     plan.pins().iter().map(installed_from_pin).collect()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn installed_from_pin(pin: &ManagedArtifactPin) -> InstalledMod {
     InstalledMod {
         project_id: pin.project_id().to_string(),
@@ -616,6 +670,7 @@ fn installed_from_pin(pin: &ManagedArtifactPin) -> InstalledMod {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn state_from_plan(
     plan: &ManagedCompositionInstallPlan,
     installed_mods: Vec<InstalledMod>,

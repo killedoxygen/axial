@@ -3,17 +3,22 @@ use super::storage::{
     ManagedInstanceEffectAuthority, ManagedStorageDirectory, ManagedStorageFile,
     settle_parked_directory_removal, settle_parked_file_removal,
 };
-use crate::performance::model::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
+use crate::composition::model::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use axial_fs::{Directory, DirectoryEntry, DirectoryListingState, EntryKind};
 use axial_minecraft::portable_path::{PortableFileName, PortablePathKey};
+#[cfg(any(test, feature = "test-support"))]
 use axial_resource::{
     PhysicalIoClass, PhysicalWorkError, PhysicalWorkRequest, process_physical_work,
 };
+#[cfg(any(test, feature = "test-support"))]
 use chrono::Utc;
+#[cfg(any(test, feature = "test-support"))]
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
-use std::collections::{HashMap, HashSet};
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -563,6 +568,7 @@ impl RollbackSnapshot {
 }
 
 impl RollbackSnapshotState {
+    #[cfg(any(test, feature = "test-support"))]
     fn state(&self) -> Option<&CompositionState> {
         match self {
             Self::ManagedStateAbsent => None,
@@ -571,6 +577,7 @@ impl RollbackSnapshotState {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn load_state(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<Option<CompositionState>, StateError> {
@@ -591,6 +598,7 @@ pub(crate) fn reconcile_managed_storage(
     reconcile_rollback_metadata(instance_mods)
 }
 
+#[cfg(test)]
 pub(crate) fn managed_effect_reconciliation_required(
     instance_mods: &ManagedStorageDirectory,
 ) -> bool {
@@ -656,6 +664,7 @@ pub(crate) fn load_state_admitted(
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct ManagedInspectionReconciliation {
     state_publication: bool,
     managed_candidate: bool,
@@ -665,11 +674,14 @@ pub(crate) struct ManagedInspectionReconciliation {
     cleanup_quarantine: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManagedInspectionReconciliation {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn state_publication_required(self) -> bool {
         self.state_publication
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn admitted_state_reconciliation_required(self) -> bool {
         self.managed_addition
             || self.managed_candidate
@@ -679,6 +691,7 @@ impl ManagedInspectionReconciliation {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn preflight_managed_inspection_reconciliation(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<ManagedInspectionReconciliation, StateError> {
@@ -692,39 +705,7 @@ pub(crate) fn preflight_managed_inspection_reconciliation(
     })
 }
 
-pub(crate) fn reconcile_managed_inspection_publication(
-    instance_mods: &ManagedStorageDirectory,
-    preflight: ManagedInspectionReconciliation,
-) -> Result<(), StateError> {
-    if preflight.cleanup_quarantine {
-        reconcile_cleanup_quarantine(instance_mods)?;
-    }
-    if preflight.state_publication {
-        reconcile_state_publication(instance_mods)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn reconcile_managed_inspection_obligations(
-    instance_mods: &ManagedStorageDirectory,
-    preflight: ManagedInspectionReconciliation,
-    state: Option<&CompositionState>,
-) -> Result<(), StateError> {
-    if preflight.managed_candidate {
-        reconcile_managed_candidate_intents(instance_mods)?;
-    }
-    if preflight.managed_addition {
-        reconcile_managed_addition_obligations(instance_mods, state)?;
-    }
-    if preflight.managed_removal {
-        reconcile_managed_removal_obligations(instance_mods, state)?;
-    }
-    if preflight.rollback_publication {
-        reconcile_rollback_metadata(instance_mods)?;
-    }
-    Ok(())
-}
-
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn save_state(
     instance_mods: &ManagedStorageDirectory,
     state: &CompositionState,
@@ -747,6 +728,7 @@ pub(crate) fn save_state(
         .map_err(|source| publication(StatePublicationPhase::Publish, source))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn remove_state(instance_mods: &ManagedStorageDirectory) -> Result<(), StateError> {
     require_cleanup_quarantine_empty(instance_mods)?;
     reconcile_state_publication_for_mutation(instance_mods)?;
@@ -769,6 +751,7 @@ pub(crate) fn remove_state(instance_mods: &ManagedStorageDirectory) -> Result<()
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn state_publication_reconciliation_required(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<bool, StateError> {
@@ -783,6 +766,7 @@ fn state_publication_reconciliation_required(
     Ok(false)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn publication(phase: StatePublicationPhase, source: io::Error) -> StateError {
     StateError::Publication { phase, source }
 }
@@ -838,6 +822,7 @@ pub(crate) fn reconcile_state_publication(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn reconcile_state_publication_for_mutation(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<(), StateError> {
@@ -864,6 +849,7 @@ fn read_state_snapshot_if_present(
     }))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn save_rollback_snapshot(
     instance_mods: &ManagedStorageDirectory,
     state: &CompositionState,
@@ -877,12 +863,14 @@ pub(crate) fn save_rollback_snapshot(
     )
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn save_absent_rollback_snapshot(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<RollbackSnapshot, StateError> {
     save_rollback_snapshot_target(instance_mods, RollbackSnapshotState::ManagedStateAbsent)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn save_rollback_snapshot_target(
     instance_mods: &ManagedStorageDirectory,
     target: RollbackSnapshotState,
@@ -964,6 +952,7 @@ fn save_rollback_snapshot_target(
     Ok(snapshot)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn save_rollback_snapshot_async(
     instance_mods: &ManagedStorageDirectory,
     state: &CompositionState,
@@ -977,6 +966,7 @@ pub(crate) async fn save_rollback_snapshot_async(
     .map_err(|_| StateError::Read(io::Error::other("rollback snapshot task stopped")))?
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn save_absent_rollback_snapshot_async(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<RollbackSnapshot, StateError> {
@@ -988,6 +978,7 @@ pub(crate) async fn save_absent_rollback_snapshot_async(
     .map_err(|_| StateError::Read(io::Error::other("rollback snapshot task stopped")))?
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn load_rollback_snapshot(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<Option<RollbackSnapshot>, StateError> {
@@ -995,6 +986,7 @@ pub(crate) fn load_rollback_snapshot(
     load_rollback_snapshot_admitted(instance_mods)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn load_rollback_snapshot_admitted(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<Option<RollbackSnapshot>, StateError> {
@@ -1004,6 +996,7 @@ pub(crate) fn load_rollback_snapshot_admitted(
         .map(|record| record.snapshot))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_rollback_snapshot_async(
     instance_mods: &ManagedStorageDirectory,
 ) -> Result<Option<RollbackSnapshot>, StateError> {
@@ -1015,6 +1008,7 @@ pub(crate) async fn load_rollback_snapshot_async(
     .map_err(|_| StateError::Read(io::Error::other("rollback load task stopped")))?
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn load_rollback_snapshot_by_id(
     instance_mods: &ManagedStorageDirectory,
     snapshot_id: &str,
@@ -1023,6 +1017,7 @@ pub(crate) fn load_rollback_snapshot_by_id(
     load_rollback_snapshot_by_id_admitted(instance_mods, snapshot_id)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn load_rollback_snapshot_by_id_admitted(
     instance_mods: &ManagedStorageDirectory,
     snapshot_id: &str,
@@ -1043,6 +1038,7 @@ pub(crate) fn load_rollback_snapshot_by_id_admitted(
     read_snapshot_directory(&directory, snapshot_id).map(Some)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_rollback_snapshot_by_id_async(
     instance_mods: &ManagedStorageDirectory,
     snapshot_id: &str,
@@ -1081,6 +1077,7 @@ pub(crate) fn list_rollback_snapshots_admitted(
         .collect())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn restore_rollback_snapshot(
     instance_mods: &ManagedStorageDirectory,
     snapshot: &RollbackSnapshot,
@@ -1090,12 +1087,15 @@ pub(crate) fn restore_rollback_snapshot(
 }
 
 #[derive(Debug)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) enum RollbackRestoreError {
     Definite(StateError),
     Indeterminate(StateError),
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl RollbackRestoreError {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn into_state_error(self) -> StateError {
         match self {
             Self::Definite(error) | Self::Indeterminate(error) => error,
@@ -1103,6 +1103,7 @@ impl RollbackRestoreError {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn restore_rollback_snapshot_classified(
     instance_mods: &ManagedStorageDirectory,
     snapshot: &RollbackSnapshot,
@@ -1150,6 +1151,7 @@ pub(crate) fn restore_rollback_snapshot_classified(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn restore_rollback_snapshot_classified_async(
     instance_mods: &ManagedStorageDirectory,
     snapshot: &RollbackSnapshot,
@@ -1167,6 +1169,7 @@ pub(crate) async fn restore_rollback_snapshot_classified_async(
     })?
 }
 
+#[cfg(any(test, feature = "test-support"))]
 async fn run_state_blocking<T, Work>(
     io: PhysicalIoClass,
     work: Work,
@@ -1182,13 +1185,16 @@ where
         .await
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct PreparedSnapshotRestore {
     current_files: HashMap<PortablePathKey, Option<ManagedStorageFile>>,
     retained: HashSet<PortablePathKey>,
     sources: HashMap<PortablePathKey, ManagedStorageFile>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PreparedSnapshotRestore {
+    #[cfg(any(test, feature = "test-support"))]
     fn validate(&self) -> Result<(), StateError> {
         for file in self.current_files.values().flatten() {
             file.validate()?;
@@ -1200,6 +1206,7 @@ impl PreparedSnapshotRestore {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn composition_artifacts_by_key(
     state: Option<&CompositionState>,
 ) -> Result<HashMap<PortablePathKey, &InstalledMod>, StateError> {
@@ -1210,6 +1217,7 @@ fn composition_artifacts_by_key(
         .collect()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn prepare_snapshot_restore(
     instance_mods: &ManagedStorageDirectory,
     snapshot_directory: &ManagedStorageDirectory,
@@ -1293,6 +1301,7 @@ fn prepare_snapshot_restore(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn restore_snapshot_graph(
     instance_mods: &ManagedStorageDirectory,
     snapshot: &RollbackSnapshot,
@@ -1399,6 +1408,7 @@ fn admitted_managed_artifact_matches(
         .eq_ignore_ascii_case(&installed.integrity.sha512))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn stage_prepared_managed_artifact_removal(
     instance_mods: &ManagedStorageDirectory,
     installed: &InstalledMod,
@@ -1447,6 +1457,7 @@ fn stage_prepared_managed_artifact_removal(
         .map_err(Into::into)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn stage_managed_artifact_removal(
     instance_mods: &ManagedStorageDirectory,
     installed: &InstalledMod,
@@ -1495,12 +1506,14 @@ pub(crate) fn stage_managed_artifact_removal(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct ManagedArtifactAdditionObligation {
     marker_name: String,
     marker_sha512: String,
     artifact: InstalledMod,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct ManagedArtifactCandidateIntent {
     marker_name: String,
     marker_sha512: String,
@@ -1510,15 +1523,19 @@ pub(crate) struct ManagedArtifactCandidateIntent {
     candidates: ManagedStorageDirectory,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ManagedArtifactCandidateIntent {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn candidate_name(&self) -> &str {
         &self.candidate_name
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn candidate_parent(&self) -> &ManagedStorageDirectory {
         &self.candidates
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn validate(&self) -> Result<(), StateError> {
         let relative = candidate_intent_relative(&self.marker_name);
         let admitted = read_bounded_file(&self.destination, &relative, STATE_MAX_BYTES)?;
@@ -1535,6 +1552,7 @@ impl ManagedArtifactCandidateIntent {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn prepare_managed_artifact_candidate(
     instance_mods: &ManagedStorageDirectory,
     installed: &InstalledMod,
@@ -1582,6 +1600,7 @@ pub(crate) fn prepare_managed_artifact_candidate(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn prepare_managed_artifact_addition(
     instance_mods: &ManagedStorageDirectory,
     installed: &InstalledMod,
@@ -1622,6 +1641,7 @@ pub(crate) fn prepare_managed_artifact_addition(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn publish_managed_artifact_addition(
     instance_mods: &ManagedStorageDirectory,
     installed: &InstalledMod,
@@ -1799,6 +1819,7 @@ pub(crate) fn reconcile_managed_addition_obligations(
     reconcile_managed_candidate_intents(instance_mods)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn settle_managed_artifact_removal(
     instance_mods: &ManagedStorageDirectory,
     installed: &InstalledMod,
@@ -2915,6 +2936,7 @@ fn validate_addition_marker(name: &str, marker: &AdditionMarker) -> Result<(), S
     validate_sha512_integrity(&marker.artifact.filename, &marker.artifact.integrity.sha512)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn removal_backup_relative(installed: &InstalledMod) -> PathBuf {
     removal_backup_relative_parts(&installed.integrity.sha512, &installed.filename)
 }
@@ -3173,6 +3195,7 @@ fn same_artifact_identity(left: &InstalledMod, right: &InstalledMod) -> bool {
             .eq_ignore_ascii_case(&right.integrity.sha512)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn new_rollback_snapshot_id() -> String {
     let mut nonce = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce);

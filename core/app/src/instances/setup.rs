@@ -1888,7 +1888,7 @@ pub(super) fn release_setup_admissions(
     pending.retain(|id, _| {
         let unsettled = crate::content::install::has_pending(instances.registry().storage(), id)
             .and_then(|content| {
-                crate::performance::mutation::has_pending(instances.registry().storage(), id)
+                crate::composition::recovery::has_pending(instances.registry().storage(), id)
                     .map(|performance| content || performance)
             })
             .unwrap_or(true);

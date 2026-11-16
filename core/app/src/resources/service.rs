@@ -982,25 +982,22 @@ mod tests {
                 crate::instances::create::MIGRATION,
                 crate::instances::delete::MIGRATION,
                 crate::content::install::MIGRATION,
-                crate::performance::mutation::MIGRATION,
-                crate::performance::rules::MIGRATION,
+                crate::composition::recovery::MIGRATION,
+                crate::composition::RULES_MIGRATION,
             ])
             .unwrap();
         let directories =
             InstanceDirectories::new(Registry::new(storage.clone()), library, Exclusions::new());
         let tasks = TaskOwner::new(16).unwrap();
         let client = ProviderClient::new(ClientConfig::default()).unwrap();
-        let performance = crate::performance::PerformanceService::new(
+        let compositions = crate::composition::CompositionService::new(
             storage,
             directories.clone(),
             tasks.clone(),
-            Arc::new(crate::content::catalog::ContentService::new(client.clone()).unwrap()),
-            crate::performance::public_transfer_resolver(),
-            crate::performance::rules::RulesSettings::default(),
         )
         .unwrap();
         let content = ContentMutations::new(directories.clone(), client, tasks.clone())
-            .with_performance(performance);
+            .with_compositions(compositions);
         ResourceService::new(directories, content, tasks)
     }
 

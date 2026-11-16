@@ -6,7 +6,7 @@ Axial is one desktop process: a Tauri shell hosts the Preact interface, which ta
 |---|---|
 | `apps/desktop` | Tauri shell: windows, native sign-in, updater, Discord presence and process lifetime. |
 | `apps/api` | Authenticated loopback HTTP API; thin adapters over `core/app`. Also runs headless (`task dev:api`). |
-| `core/app` | Application features, one module per feature (`install`, `launch`, `instances`, `content`, `performance`, `accounts`, `settings`, ...). Owns SQLite state, OS-keyring credentials, operation recovery and the public wire types. |
+| `core/app` | Application features, one module per feature (`install`, `launch`, `instances`, `content`, `composition`, `accounts`, `settings`, ...). Owns SQLite state, OS-keyring credentials, operation recovery and the public wire types. |
 | `core/minecraft` | Minecraft and loader domain: version metadata, downloads, Java runtimes, loader installers and processors, managed game-file publication. |
 | `core/fs` | Capability-scoped filesystem: root/lease admission, staged writes, atomic promotion, observation windows and crash-recoverable file effects. |
 | `core/resource` | Process-wide physical work admission (worker and I/O budgets). |

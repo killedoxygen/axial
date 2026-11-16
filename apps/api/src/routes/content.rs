@@ -492,10 +492,7 @@ mod tests {
                 axum::serve(listener, provider_app).await.unwrap();
             });
             let profile = Profile::start_with(TestInputs {
-                content: Some((
-                    format!("{origin}/v2"),
-                    axial_app::performance::public_transfer_resolver(),
-                )),
+                content: Some(format!("{origin}/v2")),
                 ..TestInputs::default()
             })
             .await;

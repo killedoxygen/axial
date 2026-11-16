@@ -1,12 +1,10 @@
-//! Exact snapshot selection and restart classification for Performance.
+//! Restart classification of recorded composition operations.
 //!
-//! The retained Performance leaf owns the actual per-file manifests, artifact
-//! copies and publication receipts. A status row is never a substitute for those
+//! The composition leaf owns the actual per-file manifests, artifact copies
+//! and publication receipts. A status row is never a substitute for those
 //! receipts and never grants cleanup authority.
 
-use super::composition::{
-    ManagedCompositionInstallPlan, RollbackSnapshotSummary, RollbackSnapshotTarget,
-};
+use super::RollbackSnapshotTarget;
 use super::model::{CompositionState, OwnershipClass};
 use serde::{Deserialize, Serialize};
 
@@ -51,37 +49,6 @@ pub(crate) struct ExpectedArtifact {
 }
 
 impl ExpectedComposition {
-    pub(crate) fn from_snapshot(snapshot: &RollbackSnapshotSummary) -> Self {
-        Self::Snapshot {
-            snapshot_id: snapshot.id.clone(),
-            prepared: Some(PreparedSnapshot {
-                target: snapshot.target,
-                composition_id: snapshot.composition_id.clone(),
-                artifact_count: snapshot.artifact_count,
-            }),
-        }
-    }
-
-    pub(crate) fn from_plan(plan: &ManagedCompositionInstallPlan) -> Self {
-        Self::Graph {
-            composition_id: plan.composition_id().to_owned(),
-            game_version: plan.game_version().to_owned(),
-            loader: plan.loader().to_owned(),
-            graph_sha512: plan.graph_digest().to_owned(),
-            artifacts: plan
-                .pins()
-                .iter()
-                .map(|pin| ExpectedArtifact {
-                    project_id: pin.project_id().to_owned(),
-                    version_id: pin.version_id().to_owned(),
-                    filename: pin.filename().to_owned(),
-                    size: pin.size(),
-                    sha512: pin.sha512().to_owned(),
-                })
-                .collect(),
-        }
-    }
-
     /// Call only with a state returned by successful leaf recovery: matching
     /// metadata alone does not prove any artifact is present or owned.
     pub(crate) fn matches_verified(&self, state: Option<&CompositionState>) -> bool {
@@ -121,29 +88,6 @@ impl ExpectedComposition {
             _ => false,
         }
     }
-}
-
-pub(crate) fn select_snapshot<'a>(
-    snapshots: &'a [RollbackSnapshotSummary],
-    requested: Option<&str>,
-) -> Result<&'a RollbackSnapshotSummary, super::mutation::PerformanceMutationError> {
-    let snapshot = match requested {
-        Some(id) if !id.is_empty() => snapshots.iter().find(|snapshot| snapshot.id == id),
-        Some(_) => None,
-        None => {
-            let mut latest = snapshots.iter().filter(|snapshot| snapshot.latest);
-            let first = latest.next();
-            if latest.next().is_some() {
-                return Err(super::mutation::PerformanceMutationError::Unsettled);
-            }
-            first
-        }
-    }
-    .ok_or(super::mutation::PerformanceMutationError::SnapshotNotFound)?;
-    if !snapshot.rollback_available {
-        return Err(super::mutation::PerformanceMutationError::SnapshotUnavailable);
-    }
-    Ok(snapshot)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,24 +135,5 @@ mod tests {
             classify_recovered(None, &expected, Some(&None), None),
             RestartDisposition::Applied
         );
-    }
-
-    #[test]
-    fn duplicate_latest_snapshots_do_not_choose_arbitrarily() {
-        let summary = |id: &str| RollbackSnapshotSummary {
-            id: id.into(),
-            created_at: "2026-09-08T00:00:00Z".into(),
-            target: crate::performance::composition::RollbackSnapshotTarget::ManagedStateAbsent,
-            composition_id: None,
-            tier: None,
-            installed_count: 0,
-            artifact_count: 0,
-            ownership_class: crate::performance::model::OwnershipClass::CompositionManaged,
-            rollback_available: true,
-            latest: true,
-        };
-        let snapshots = vec![summary("one"), summary("two")];
-        assert!(select_snapshot(&snapshots, None).is_err());
-        assert_eq!(select_snapshot(&snapshots, Some("two")).unwrap().id, "two");
     }
 }
