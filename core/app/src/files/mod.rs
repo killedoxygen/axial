@@ -126,6 +126,15 @@ impl ScopedDirectory {
         self.directory.entries(limit)
     }
 
+    pub(crate) fn observe_exact_files(
+        &self,
+        names: Vec<LeafName>,
+        entry_limit: usize,
+    ) -> io::Result<Vec<bool>> {
+        self.revalidate()?;
+        self.directory.observe_exact_files(names, entry_limit)
+    }
+
     pub(crate) fn open_directory(&self, name: &PortableName) -> io::Result<Self> {
         Self::from_admitted(
             self.directory.open_directory(&leaf(name))?,

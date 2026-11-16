@@ -10,7 +10,6 @@ use axial_minecraft::LegacyAssetLayout;
 use axial_minecraft::download::{DownloadError, transfer_cancellation_channel};
 use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_resource::{PhysicalIoClass, PhysicalWorkRequest};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -93,33 +92,46 @@ async fn prepare_resources(
             return Err(LaunchError::Cancelled);
         }
         libraries::observe_preparation(&library, &retention.game, || {
-            let mut directories = HashMap::<&str, ScopedDirectory>::new();
             let root = libraries::prepare_directory(
                 &retention,
                 &retention.game,
                 &LeafName::new(RESOURCES).expect("fixed resources directory"),
             )?;
-            directories.insert("", root);
+            let mut directories = vec![("", root)];
             let mut sources = inputs.source_batch();
-            for file in &inputs.assets.files {
-                if cancelled.is_cancelled() {
-                    return Err(LaunchError::Cancelled);
-                }
-                let path = file.path.as_str();
-                let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let mut files: Vec<_> = inputs.assets.files.iter().collect();
+            fn split(path: &str) -> (&str, &str) {
+                path.rsplit_once('/').unwrap_or(("", path))
+            }
+            files.sort_unstable_by_key(|file| split(file.path.as_str()));
+            for group in files.chunk_by(|a, b| {
+                split(a.path.as_str()).0 == split(b.path.as_str()).0
+            }) {
+                let parent = split(group[0].path.as_str()).0;
                 let directory = prepare_parent(&retention, &mut directories, parent)?;
-                let source = inputs
-                    .source(file, &mut sources)
-                    .map_err(super::coordinator::install_read_error)?;
-                libraries::prepare_file(
-                    &source,
-                    &directory,
-                    LeafName::new(name).map_err(|_| LaunchError::InstallUnavailable)?,
-                    file.size,
-                    file.sha1,
-                    &retention,
-                    cancelled.clone(),
-                )?;
+                for chunk in group.chunks(libraries::FILE_CHECK_BATCH) {
+                    let mut proofs = Vec::with_capacity(chunk.len());
+                    for file in chunk {
+                        if cancelled.is_cancelled() {
+                            return Err(LaunchError::Cancelled);
+                        }
+                        let source = inputs
+                            .source(file, &mut sources)
+                            .map_err(super::coordinator::install_read_error)?;
+                        proofs.push(libraries::prepare_file(
+                            &source,
+                            &directory,
+                            LeafName::new(split(file.path.as_str()).1)
+                                .map_err(|_| LaunchError::InstallUnavailable)?,
+                            file.size,
+                            file.sha1,
+                            &retention,
+                            cancelled.clone(),
+                        )?);
+                    }
+                    libraries::check_files(&directory, &proofs)
+                        .map_err(|_| LaunchError::PreparationFailed)?;
+                }
             }
             Ok(())
         })
@@ -136,21 +148,27 @@ async fn prepare_resources(
 
 fn prepare_parent<'a>(
     retention: &Retention,
-    directories: &mut HashMap<&'a str, ScopedDirectory>,
+    directories: &mut Vec<(&'a str, ScopedDirectory)>,
     path: &'a str,
 ) -> Result<ScopedDirectory, LaunchError> {
-    if let Some(directory) = directories.get(path) {
-        return Ok(directory.clone());
+    let mut depth = 1;
+    for name in path.split('/').filter(|name| !name.is_empty()) {
+        if directories
+            .get(depth)
+            .is_none_or(|(cached, _)| *cached != name)
+        {
+            directories.truncate(depth);
+            let directory = libraries::prepare_directory(
+                retention,
+                &directories[depth - 1].1,
+                &LeafName::new(name).map_err(|_| LaunchError::InstallUnavailable)?,
+            )?;
+            directories.push((name, directory));
+        }
+        depth += 1;
     }
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    let parent = prepare_parent(retention, directories, parent)?;
-    let directory = libraries::prepare_directory(
-        retention,
-        &parent,
-        &LeafName::new(name).map_err(|_| LaunchError::InstallUnavailable)?,
-    )?;
-    directories.insert(path, directory.clone());
-    Ok(directory)
+    directories.truncate(depth);
+    Ok(directories[depth - 1].1.clone())
 }
 
 #[cfg(test)]
@@ -160,10 +178,13 @@ mod tests {
     use crate::library::{GenerationPin, LibraryLifecycle, LibraryOpenOutcome};
     use sha1::{Digest, Sha1};
 
-    const OBJECTS: [(&str, &[u8]); 3] = [
+    const OBJECTS: [(&str, &[u8]); 6] = [
         ("sound/step.ogg", b"step"),
         ("newsound/step/grass.ogg", b"grass"),
         ("music/calm.ogg", b"step"),
+        ("sound.ogg", b"step"),
+        ("sound/other/step.ogg", b"grass"),
+        ("sound/z.ogg", b"step"),
     ];
 
     struct Fixture {

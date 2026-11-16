@@ -5,7 +5,7 @@ use crate::library::ApplicationRootPin;
 use crate::tasks::CancellationToken;
 use axial_fs::{
     Directory, DirectoryCreateObligation, DirectoryCreateOutcome, DirectoryCreatePreservation,
-    DirectoryCreateResolution, DirectoryListingState, EntryKind, LeafName, leaf_names_equivalent,
+    DirectoryCreateResolution, LeafName,
 };
 use axial_minecraft::download::{
     TransferCleanupObligation, TransferCleanupResolution, TransferFailureKind, TransferOutcome,
@@ -108,24 +108,7 @@ pub(super) fn prepare_directory(
 }
 
 fn exact_binding(directory: &Directory, name: &LeafName) -> io::Result<bool> {
-    let listing = directory.entries(16)?;
-    if listing.state() != DirectoryListingState::Complete {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    let mut equivalent = listing
-        .entries()
-        .iter()
-        .filter(|entry| leaf_names_equivalent(entry.name(), name.as_os_str()));
-    let Some(entry) = equivalent.next() else {
-        return Ok(false);
-    };
-    if equivalent.next().is_some()
-        || entry.name() != name.as_os_str()
-        || entry.kind() != EntryKind::File
-    {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    Ok(true)
+    Ok(directory.observe_exact_files(vec![name.clone()], 16)?[0])
 }
 
 pub(super) fn finish(

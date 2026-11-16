@@ -869,6 +869,29 @@ impl TransientDestinationCancelObligation {
 impl_error_accessor!(TransientDestinationCancelObligation);
 
 impl Directory {
+    /// Observes exact regular files in one complete, bounded namespace scan.
+    /// False means no equivalent entry exists. Aliases and non-files are refused.
+    /// This observation reserves no names and does not authorize a file effect.
+    pub fn observe_exact_files(
+        &self,
+        names: Vec<LeafName>,
+        entry_limit: usize,
+    ) -> io::Result<Vec<bool>> {
+        if entry_limit == 0 || entry_limit > MAX_DIRECTORY_LIST_ENTRIES {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let plan = DestinationBatchPlan::new(names)?;
+        let authority = self.authority()?;
+        let operation = authority.enter_observation()?;
+        validate_destination_batch_with_operation(
+            self,
+            &plan,
+            DestinationCollisionPolicy::AllowExternalCollision,
+            &operation,
+            entry_limit,
+        )
+    }
+
     pub fn admit_transient_destinations(
         &self,
         names: Vec<LeafName>,
@@ -887,6 +910,7 @@ impl Directory {
             &plan,
             DestinationCollisionPolicy::RequireVacant,
             &operation,
+            MAX_DIRECTORY_LIST_ENTRIES,
         ) {
             let cleanup = TransientEffectToken::settle_no_effect_batch(&mut tokens, &operation);
             return match cleanup {
@@ -1468,6 +1492,7 @@ fn validate_portable_destination_with_operation(
         &plan,
         collision_policy,
         operation,
+        MAX_DIRECTORY_LIST_ENTRIES,
     )?;
     Ok(exact[0])
 }
@@ -1477,6 +1502,7 @@ fn validate_destination_batch_with_operation(
     plan: &DestinationBatchPlan,
     collision_policy: DestinationCollisionPolicy,
     operation: &CapabilityOperation,
+    entry_limit: usize,
 ) -> io::Result<Vec<bool>> {
     let expected_exact = vec![
         collision_policy == DestinationCollisionPolicy::AllowExternalCollision;
@@ -1503,6 +1529,7 @@ fn validate_destination_batch_with_operation(
         normalization: &mut normalization,
         collision_policy,
         directory_buffer: None,
+        entry_limit,
     };
     validate_mixed_destination_batch_with_operation(directory, plan, &mut inventory, operation)?;
     Ok(exact)
@@ -1516,6 +1543,7 @@ struct DestinationBatchInventory<'a> {
     normalization: &'a mut Vec<(u8, char)>,
     collision_policy: DestinationCollisionPolicy,
     directory_buffer: Option<&'a mut [MaybeUninit<u8>]>,
+    entry_limit: usize,
 }
 
 fn validate_mixed_destination_batch_with_operation(
@@ -1549,6 +1577,7 @@ fn observe_destination_inventory(
         normalization,
         collision_policy,
         directory_buffer,
+        entry_limit,
     } = inventory;
     if expected_exact.len() != plan.names.len() || exact.len() != plan.names.len() {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -1611,12 +1640,12 @@ fn observe_destination_inventory(
         Some(buffer) => platform::visit_entries_preallocated(
             directory.inner.handle(),
             buffer,
-            MAX_DIRECTORY_LIST_ENTRIES,
+            *entry_limit,
             &mut visit_entry,
         ),
         None => platform::visit_entries(
             directory.inner.handle(),
-            MAX_DIRECTORY_LIST_ENTRIES,
+            *entry_limit,
             &mut visit_entry,
         ),
     };
@@ -1625,7 +1654,7 @@ fn observe_destination_inventory(
         debug_assert!(directory_buffer.is_none());
         platform::visit_entries(
             directory.inner.handle(),
-            MAX_DIRECTORY_LIST_ENTRIES,
+            *entry_limit,
             &mut visit_entry,
         )
     };
@@ -2070,6 +2099,7 @@ impl TransientPublicationBatch {
             &self.plan,
             DestinationCollisionPolicy::RequireVacant,
             &operation,
+            MAX_DIRECTORY_LIST_ENTRIES,
         ) {
             return TransientPublicationBatchOutcome::NoEffect { error, batch: self };
         }
@@ -2180,6 +2210,7 @@ fn classify_publication_batch(
         normalization: &mut batch.normalization,
         collision_policy: DestinationCollisionPolicy::AllowExternalCollision,
         directory_buffer,
+        entry_limit: MAX_DIRECTORY_LIST_ENTRIES,
     };
     if let Err(proof) = validate_mixed_destination_batch_with_operation(
         &batch.directory,
@@ -2857,6 +2888,60 @@ mod tests {
                 .unwrap(),
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exact_file_observation_checks_presence_kind_and_limits_without_reserving_names() {
+        let (temporary, session, root) = fixture();
+        std::fs::write(temporary.path().join("present.bin"), b"present").unwrap();
+        std::fs::create_dir(temporary.path().join("directory")).unwrap();
+        let present = root.observe_exact_files(leaves(&["absent.bin", "present.bin"]), 16);
+        let non_file = root.observe_exact_files(leaves(&["directory"]), 16);
+        let truncated = root.observe_exact_files(leaves(&["absent.bin"]), 1);
+        let duplicate = root.observe_exact_files(leaves(&["present.bin", "PRESENT.BIN"]), 16);
+        let destination = root.admit_transient_destination(LeafName::new("absent.bin").unwrap());
+        let admitted = destination.is_ok();
+        if let Ok(destination) = destination {
+            cancel(destination);
+        }
+        revoke(session, root);
+        assert_eq!(present.unwrap(), [false, true]);
+        assert_eq!(non_file.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(truncated.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(duplicate.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert!(admitted);
+    }
+
+    #[test]
+    fn exact_file_observation_rescans_and_refuses_a_new_portable_alias() {
+        let (temporary, session, root) = fixture();
+        let alias = temporary.path().join("ARTIFACT.BIN");
+        let sibling = temporary.path().to_path_buf();
+        let observed_root = root.clone();
+        let before = root.revision().unwrap();
+        let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed_change = changed.clone();
+        let mut introduce_alias = Some(alias.clone());
+        let result = with_inventory_hook(
+            move || {
+                if let Some(alias) = introduce_alias.take() {
+                    std::fs::write(alias, b"preserved").unwrap();
+                    for _ in 0..128 {
+                        if observed_root.revision().unwrap() != before {
+                            observed_change.set(true);
+                            break;
+                        }
+                        create_and_remove_sibling(&sibling);
+                    }
+                }
+            },
+            || root.observe_exact_files(leaves(&["artifact.bin"]), 16),
+        );
+        let bytes = std::fs::read(alias).unwrap();
+        revoke(session, root);
+        assert!(changed.get(), "fixture must observe a real namespace revision change");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(bytes, b"preserved");
     }
 
     #[test]

@@ -28,7 +28,9 @@ use std::{
 };
 
 const MAX_DIRECTORY_ENTRIES: usize = 16_384;
-// Complete bounded namespace listings dominate the streamed copy buffers.
+pub(super) const FILE_CHECK_BATCH: usize = 128;
+// Covers bounded namespace listings (16k names), the current directory ancestry
+// (512-byte paths), 200k asset references, 128 target proofs/keys and copy scratch.
 pub(super) const SCRATCH_BYTES: u64 = 64 << 20;
 
 pub(super) struct Prepared {
@@ -53,16 +55,11 @@ impl Prepared {
         for source in &self.sources {
             source.revalidate()?;
         }
-        for file in &self.files {
-            if exact_entry(&self.directory, &file.name)? != Some(EntryKind::File) {
-                return Err(io::ErrorKind::InvalidData.into());
-            }
-            file.file.validate_revision(&file.revision)?;
-        }
-        Ok(())
+        check_files(&self.directory, &self.files)
     }
 }
 
+/// Content proof on the original handle; close each group with `check_files`.
 pub(super) struct FileProof {
     name: LeafName,
     file: FileCapability,
@@ -324,17 +321,15 @@ fn existing_file(
     size: u64,
     digest: [u8; 20],
 ) -> io::Result<Option<FileProof>> {
-    match exact_entry(directory, name)? {
-        None => return Ok(None),
-        Some(EntryKind::File) => {}
-        Some(_) => return Err(io::ErrorKind::InvalidData.into()),
-    }
-    let file = directory.capability().open_file(name)?;
-    file_proof(directory, name, file, size, digest).map(Some)
+    let file = match directory.capability().open_file(name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    file_proof(name, file, size, digest).map(Some)
 }
 
 fn file_proof(
-    directory: &ScopedDirectory,
     name: &LeafName,
     file: FileCapability,
     size: u64,
@@ -355,9 +350,7 @@ fn file_proof(
         hasher.update(&buffer[..read]);
     }
     reader.finish()?;
-    if <[u8; 20]>::from(hasher.finalize()) != digest
-        || exact_entry(directory, name)? != Some(EntryKind::File)
-    {
+    if <[u8; 20]>::from(hasher.finalize()) != digest {
         return Err(io::ErrorKind::InvalidData.into());
     }
     file.validate_revision(&revision)?;
@@ -366,6 +359,31 @@ fn file_proof(
         file,
         revision,
     })
+}
+
+/// Closes the namespace observation after hashing, retaining each original handle.
+pub(super) fn check_files(directory: &ScopedDirectory, files: &[FileProof]) -> io::Result<()> {
+    for chunk in files.chunks(FILE_CHECK_BATCH) {
+        let exact = directory
+            .observe_exact_files(
+                chunk.iter().map(|file| file.name.clone()).collect(),
+                MAX_DIRECTORY_ENTRIES,
+            )
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    io::Error::new(io::ErrorKind::InvalidData, "game-file namespace is unstable")
+                } else {
+                    error
+                }
+            })?;
+        if exact.iter().any(|present| !present) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        for file in chunk {
+            file.file.validate_revision(&file.revision)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn prepare_file(
@@ -414,7 +432,7 @@ pub(super) fn prepare_file(
             };
             match outcome {
                 TransferPublicationOutcome::Published { file, .. } => {
-                    return file_proof(directory, &name, file, size, digest)
+                    return file_proof(&name, file, size, digest)
                         .map_err(|_| LaunchError::PreparationFailed);
                 }
                 TransferPublicationOutcome::NoEffect { verified, .. } => {
@@ -539,6 +557,7 @@ pub(super) mod tests {
             cancellation,
         )
         .unwrap();
+        check_files(&directory, std::slice::from_ref(&file)).unwrap();
         assert!(!retention.has_pending());
         Prepared {
             directory,
@@ -596,7 +615,7 @@ pub(super) mod tests {
 
     fn copy(fixture: &Fixture, directory: &ScopedDirectory) -> Result<FileProof, LaunchError> {
         let (_sender, cancellation) = transfer_cancellation_channel();
-        prepare_file(
+        let file = prepare_file(
             &fixture.source,
             directory,
             LeafName::new("required.jar").unwrap(),
@@ -604,7 +623,47 @@ pub(super) mod tests {
             DIGEST,
             &fixture.retention,
             cancellation,
-        )
+        )?;
+        check_files(directory, std::slice::from_ref(&file))
+            .map_err(|_| LaunchError::PreparationFailed)?;
+        Ok(file)
+    }
+
+    #[test]
+    fn target_alias_after_hashing_is_refused_without_changing_the_file() {
+        let fixture = fixture();
+        let directory = lib_directory(&fixture.retention).unwrap();
+        let file = copy(&fixture, &directory).unwrap();
+        let target = fixture.temporary.path().join("game/lib/required.jar");
+        let alias = fixture.temporary.path().join("game/lib/REQUIRED.JAR");
+        std::fs::rename(&target, &alias).unwrap();
+        let refused = check_files(&directory, &[file]);
+        let bytes = std::fs::read(alias).unwrap();
+        let pending = fixture.retention.has_pending();
+        drop(directory);
+        drop(fixture);
+        assert!(refused.is_err());
+        assert_eq!(bytes, b"abc");
+        assert!(!pending);
+    }
+
+    #[test]
+    fn missing_target_with_a_portable_alias_is_never_created() {
+        let fixture = fixture();
+        let directory = lib_directory(&fixture.retention).unwrap();
+        let alias = fixture.temporary.path().join("game/lib/REQUIRED.JAR");
+        std::fs::write(&alias, b"abc").unwrap();
+        let refused = matches!(copy(&fixture, &directory), Err(LaunchError::PreparationFailed));
+        let listing = directory.entries(16).unwrap();
+        let bytes = std::fs::read(alias).unwrap();
+        let pending = fixture.retention.has_pending();
+        drop(directory);
+        drop(fixture);
+        assert!(refused);
+        assert!(listing.entries().iter().any(|entry| entry.name() == "REQUIRED.JAR"));
+        assert!(!listing.entries().iter().any(|entry| entry.name() == "required.jar"));
+        assert_eq!(bytes, b"abc");
+        assert!(!pending);
     }
 
     #[test]
@@ -823,7 +882,7 @@ pub(super) mod tests {
         let preserved = fixture.temporary.path().join("game/lib/preserved.jar");
         std::fs::rename(&target, &preserved).unwrap();
         std::fs::write(&target, b"abc").unwrap();
-        assert!(file_proof(&directory, &name, file, 3, DIGEST).is_err());
+        assert!(file_proof(&name, file, 3, DIGEST).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"abc");
         assert_eq!(std::fs::read(&preserved).unwrap(), b"abc");
         assert_eq!(
