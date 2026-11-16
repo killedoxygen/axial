@@ -812,6 +812,13 @@ async fn start_profile_inner(
             "installation startup settlement remains unresolved; affected versions stay unavailable"
         );
     }
+    let recovering = installs.clone();
+    if !matches!(
+        tokio::task::spawn_blocking(move || recovering.recover_native_directories()).await,
+        Ok(Ok(_))
+    ) {
+        tracing::warn!("leftover native libraries could not all be settled; they stay preserved");
+    }
     let recovering = compositions.clone();
     match tasks.try_spawn(compositions.clone(), move |_| async move {
         recovering.recover_pending().await

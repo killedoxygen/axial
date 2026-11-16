@@ -4865,6 +4865,104 @@ impl ManagedLibraryOperation {
         }
     }
 
+    /// Native directories an earlier run of this application published under
+    /// `cache/natives` and left behind. Each becomes an exact cleanup receipt
+    /// only when `listed` accepts its manifest bytes and the directory holds
+    /// exactly the files that manifest lists, each with the listed size and
+    /// SHA-1, plus the manifest. Any other entry is left untouched. At most
+    /// `limit` directories are examined. Blocking capability I/O.
+    pub fn recover_native_directories(
+        &self,
+        limit: usize,
+        listed: impl Fn(&[u8]) -> Option<Vec<(String, u64, [u8; 20])>>,
+    ) -> io::Result<Vec<ManagedNativeDirectory>> {
+        const MANIFEST: &str = ".axial-native-manifest.json";
+        const MAX_MANIFEST_BYTES: u64 = 4 << 20;
+        self.revalidate()?;
+        let managed = self.managed_directory().map_err(loader_io)?;
+        let Some(natives) = managed
+            .open_child_if_exists("cache")
+            .map_err(loader_io)?
+            .map(|cache| cache.open_child_if_exists("natives"))
+            .transpose()
+            .map_err(loader_io)?
+            .flatten()
+        else {
+            return Ok(Vec::new());
+        };
+        let mut recovered = Vec::new();
+        for name in natives.entries_bounded(limit).map_err(loader_io)? {
+            let Some(name) = name.to_str().map(str::to_owned) else {
+                continue;
+            };
+            let generated = name.strip_prefix("native-").is_some_and(|id| {
+                id.len() == 32 && id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            });
+            if !generated {
+                continue;
+            }
+            let proven = (|| -> Result<Option<ManagedNativeDirectory>, LoaderError> {
+                let Some(directory) = natives.open_child_if_exists(&name)? else {
+                    return Ok(None);
+                };
+                let Some(manifest_guard) = directory.inspect_regular_file(MANIFEST)? else {
+                    return Ok(None);
+                };
+                let manifest =
+                    directory.read_guarded_file_bounded(MANIFEST, &manifest_guard, MAX_MANIFEST_BYTES)?;
+                let Some(files) = listed(&manifest).filter(|files| files.len() <= 4096) else {
+                    return Ok(None);
+                };
+                let entries = directory.entries_bounded(files.len() + 1)?;
+                if entries.len() != files.len() + 1 {
+                    return Ok(None);
+                }
+                let mut guards = Vec::with_capacity(entries.len());
+                for (file, size, sha1) in &files {
+                    let Ok(portable) = PortableFileName::new_exact(file) else {
+                        return Ok(None);
+                    };
+                    if file == MANIFEST {
+                        return Ok(None);
+                    }
+                    let Some(guard) = directory.inspect_regular_file(file)? else {
+                        return Ok(None);
+                    };
+                    if directory.sha1_guarded_file_bytes(file, &guard, *size)? != *sha1 {
+                        return Ok(None);
+                    }
+                    guards.push((portable, guard));
+                }
+                guards.push((
+                    PortableFileName::new_exact(MANIFEST)
+                        .map_err(|_| LoaderError::Verify("native manifest name".into()))?,
+                    manifest_guard,
+                ));
+                let relative = PortableRelativePath::new_exact(&format!("cache/natives/{name}"))
+                    .map_err(|_| LoaderError::Verify("native directory name".into()))?;
+                let receipt = ManagedNativeDirectory {
+                    operation: self.clone(),
+                    relative,
+                    cleanup: Mutex::new(ManagedNativeCleanup {
+                        parent: natives.clone(),
+                        name: name.clone(),
+                        directory,
+                        guards,
+                        started: false,
+                        complete: false,
+                    }),
+                };
+                // Exactly the listed files and the manifest, still unchanged.
+                Ok(receipt.revalidate().is_ok().then_some(receipt))
+            })();
+            // A directory that cannot be proven is left exactly as found.
+            if let Ok(Some(receipt)) = proven {
+                recovered.push(receipt);
+            }
+        }
+        Ok(recovered)
+    }
+
     /// Publish a fresh native extraction owned by this generation. Every
     /// post-creation failure returns its exact partial cleanup receipt.
     pub async fn publish_native_directory(

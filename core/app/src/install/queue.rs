@@ -2230,6 +2230,25 @@ impl InstallQueue {
         self.inner.natives.clone()
     }
 
+    /// Settles native directories an earlier run left behind, unless an
+    /// interrupted launch may still be running a game from them. Run once at
+    /// startup, before launches are admitted; blocking I/O.
+    pub fn recover_native_directories(&self) -> Result<usize, InstallError> {
+        if self.inner.library.ensure_no_interrupted_launch().is_err() {
+            return Ok(0);
+        }
+        let pin = self
+            .inner
+            .library
+            .admit()
+            .map_err(|_| InstallError::LibraryUnavailable)?;
+        let operation = pin
+            .managed_library()
+            .map_err(|_| InstallError::LibraryUnavailable)?;
+        super::vanilla::recover_native_directories(&operation)
+            .map_err(|_| InstallError::SettlementRequired)
+    }
+
     /// Settles every retained native directory no session uses. Called once
     /// launches have stopped (shutdown); blocking I/O.
     pub fn settle_retained_natives(&self) -> std::io::Result<()> {

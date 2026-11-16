@@ -413,25 +413,63 @@ struct NativeSource {
     name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NativeManifest {
     schema: u32,
     sources: Vec<NativeManifestSource>,
     files: Vec<NativeManifestFile>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NativeManifestSource {
     path: String,
     sha1: String,
     size: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NativeManifestFile {
     name: String,
     sha1: String,
     size: u64,
+}
+
+/// Leftover native directories examined at startup.
+const MAX_RECOVERED_NATIVE_DIRECTORIES: usize = 256;
+
+/// Settles native directories an earlier run of this application published
+/// and left behind (an exit while one was in use or retained). Each is
+/// removed only when its own manifest proves every file it holds; anything
+/// else stays exactly as found. Returns how many were settled. Blocking I/O.
+pub(crate) fn recover_native_directories(
+    library: &ManagedLibraryOperation,
+) -> std::io::Result<usize> {
+    let listed = |bytes: &[u8]| {
+        let manifest: NativeManifest = serde_json::from_slice(bytes).ok()?;
+        (manifest.schema == 1)
+            .then_some(manifest.files)?
+            .into_iter()
+            .map(|file| {
+                let mut sha1 = [0; 20];
+                hex::decode_to_slice(&file.sha1, &mut sha1).ok()?;
+                Some((file.name, file.size, sha1))
+            })
+            .collect()
+    };
+    let mut settled = 0;
+    let mut failure = None;
+    for directory in library.recover_native_directories(MAX_RECOVERED_NATIVE_DIRECTORIES, listed)? {
+        match directory.settle() {
+            Ok(()) => settled += 1,
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    failure.map_or(Ok(settled), Err)
 }
 
 struct NativeExtraction {
@@ -1080,6 +1118,36 @@ mod tests {
         drop(reservation);
         assert!(retention.settle_idle().is_err());
         assert_eq!(retention.retained(), 1);
+    }
+
+    #[tokio::test]
+    async fn leftover_directories_are_settled_only_when_their_manifest_proves_them() {
+        let fixture = NativeFixture::new();
+        let mut paths = Vec::new();
+        for n in 0..3 {
+            let prepared = fixture.prepare(&fixture.version(n)).await;
+            paths.push(prepared.path().to_owned());
+            // An exit while retained: no owner settles these directories.
+            std::mem::forget(prepared);
+        }
+        std::mem::forget(fixture.retention.clone());
+        std::fs::write(paths[1].join("unlisted.bin"), b"user file").unwrap();
+        std::fs::write(paths[2].join("fixture-native.bin"), b"changed").unwrap();
+        let foreign = paths[0].parent().unwrap().join("not-a-native-directory");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("kept.bin"), b"kept").unwrap();
+
+        let operation = fixture.authority.operation().clone();
+        let settled = tokio::task::spawn_blocking(move || recover_native_directories(&operation))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled, 1);
+        assert!(!paths[0].exists(), "a proven directory is settled");
+        assert_eq!(std::fs::read(paths[1].join("unlisted.bin")).unwrap(), b"user file");
+        assert!(paths[1].join("fixture-native.bin").exists());
+        assert_eq!(std::fs::read(paths[2].join("fixture-native.bin")).unwrap(), b"changed");
+        assert_eq!(std::fs::read(foreign.join("kept.bin")).unwrap(), b"kept");
     }
 
     #[tokio::test]
