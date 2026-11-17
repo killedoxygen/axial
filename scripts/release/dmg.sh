@@ -22,8 +22,14 @@ trap 'rm -rf "$staging"' EXIT
 cp "$desktop/platform/install-guide.html" "$staging/$guide"
 rm "$image"
 
+if [[ ${CI:-} == true ]]; then
+  set -- --skip-jenkins
+else
+  set --
+fi
+
 cd "$bundle/macos"
-"$bundle/dmg/bundle_dmg.sh" \
+"$bundle/dmg/bundle_dmg.sh" "$@" \
   --volname "${app%.app}" \
   --volicon "$desktop/icons/macos/icon.icns" \
   --background "$desktop/platform/dmg-background.tiff" \

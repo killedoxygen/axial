@@ -10,5 +10,15 @@
     "MIT",
     "MIT OR Apache-2.0"
   ],
-  "advisory_exceptions": []
+  "advisory_exceptions": [
+    {
+      "ecosystem": "cargo",
+      "package": "chrono",
+      "version": "0.4.45",
+      "finding": "RUSTSEC-2026-0543",
+      "reviewed_at": "2026-11-17",
+      "expires_at": "2026-12-17",
+      "reason": "Temporary rc.6 exception for the unmaintained chrono advisory, which has no patched version. Retain the current time serialization contract for this candidate while planning migration; this exception does not waive vulnerability advisories."
+    }
+  ]
 }

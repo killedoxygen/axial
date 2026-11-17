@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -63,11 +65,11 @@ test("architecture probes reject truncated, unsupported and malformed headers", 
 test("packaging refuses foreign hosts and mismatched binaries before creating output", async (t) => {
   const root = await temporary(t);
   const native = hostPlatform();
-  const foreign = native === "linux-amd64" ? "windows-amd64" : "linux-amd64";
+  const foreign = native === "linux-amd64" ? "macos-arm64" : "linux-amd64";
   const output = path.join(root, "candidate");
   const binary = path.join(root, "synthetic-header");
   const source = { schema: "axial.source.v1", app_id: "com.killedoxygen.axial", tag: "v9.8.7", source_sha: "a".repeat(40) };
-  await assert.rejects(packageArtifacts({ platform: foreign, source, binary, bundleRoot: root, output }), { message: "packaging_requires_matching_native_host" });
+  await assert.rejects(packageArtifacts({ platform: foreign, source, binary, bundleRoot: root, output }), { message: "packaging_requires_supported_host" });
   await assert.rejects(access(output), { code: "ENOENT" });
   if (native) {
     await writeFile(binary, header(foreign));
@@ -90,4 +92,46 @@ test("packaging never merges a retry into an existing candidate directory", asyn
     source: { schema: "axial.source.v1", app_id: "com.killedoxygen.axial", tag: "v9.8.7", source_sha: "a".repeat(40) },
   }), { code: "EEXIST" });
   assert.equal(await readFile(marker, "utf8"), "previous candidate must remain unchanged");
+});
+
+
+test("Windows cross-packaging preserves the executable and installer", async (t) => {
+  if (!hostPlatform() || process.platform === "win32") return t.skip("requires a supported Unix host");
+  const root = await temporary(t);
+  const binary = path.join(root, "synthetic-header");
+  await writeFile(binary, header("windows-amd64"));
+  await mkdir(path.join(root, "nsis"));
+  const installer = Buffer.from("installer fixture only");
+  await writeFile(path.join(root, "nsis", "setup.exe"), installer);
+  const output = path.join(root, "candidate");
+  const manifest = await packageArtifacts({ platform: "windows-amd64", binary, bundleRoot: root, output,
+    source: { schema: "axial.source.v1", app_id: "com.killedoxygen.axial", tag: "v9.8.7", source_sha: "a".repeat(40) },
+  });
+  const portable = manifest.files.find((item) => item.role === "portable");
+  const updater = manifest.files.find((item) => item.role === "updater");
+  assert.deepEqual(await readFile(path.join(output, portable.name)), header("windows-amd64"));
+  assert.deepEqual(await readFile(path.join(output, updater.name)), installer);
+  const archive = manifest.files.find((item) => item.role === "portable-archive");
+  const unpacked = await promisify(execFile)("unzip", ["-p", path.join(output, archive.name), "axial.exe"], { encoding: "buffer" });
+  assert.deepEqual(unpacked.stdout, header("windows-amd64"));
+});
+
+
+test("macOS packaging accepts either supported binary architecture", async (t) => {
+  if (process.platform !== "darwin") return t.skip("requires macOS packaging tools");
+  const root = await temporary(t);
+  const platform = hostPlatform() === "macos-arm64" ? "macos-amd64" : "macos-arm64";
+  const binary = path.join(root, "synthetic-header");
+  await writeFile(binary, header(platform));
+  await mkdir(path.join(root, "dmg"));
+  await writeFile(path.join(root, "dmg", "Axial.dmg"), "disk image fixture only");
+  await mkdir(path.join(root, "macos", "Axial.app"), { recursive: true });
+  await writeFile(path.join(root, "macos", "Axial.app", "fixture"), header(platform));
+  const output = path.join(root, "candidate");
+  const manifest = await packageArtifacts({ platform, binary, bundleRoot: root, output,
+    source: { schema: "axial.source.v1", app_id: "com.killedoxygen.axial", tag: "v9.8.7", source_sha: "a".repeat(40) },
+  });
+  const updater = manifest.files.find((item) => item.role === "updater");
+  const unpacked = await promisify(execFile)("tar", ["-xOzf", path.join(output, updater.name), "Axial.app/fixture"], { encoding: "buffer" });
+  assert.deepEqual(unpacked.stdout, header(platform));
 });

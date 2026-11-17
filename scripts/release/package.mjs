@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { APPLICATION_ID, hostPlatform, payloads } from "./matrix.mjs";
+import { APPLICATION_ID, hostPlatform, payloads, platformInfo } from "./matrix.mjs";
 import { check, digest, jsonFile, main, options, regularFile, writeJson } from "./contract.mjs";
 
 const exec = promisify(execFile);
@@ -47,7 +47,7 @@ async function oneFile(directory, extension) {
 }
 
 export async function packageArtifacts({ platform, source, binary, bundleRoot, output }) {
-  check(hostPlatform() === platform, "packaging_requires_matching_native_host");
+  check(hostPlatform() && (platform === "windows-amd64" || platformInfo(platform).os === process.platform), "packaging_requires_supported_host");
   check(source.schema === "axial.source.v1" && source.app_id === APPLICATION_ID, "invalid_source_receipt");
   check(await executableArchitecture(binary) === platform, "binary_architecture_mismatch");
   const artifacts = payloads(platform, source.tag);
@@ -69,9 +69,13 @@ export async function packageArtifacts({ platform, source, binary, bundleRoot, o
         await chmod(destination, 0o755);
       } else if (item.role === "portable-archive") {
         if (platform.startsWith("windows")) {
-          await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Compress-Archive -LiteralPath $env:AXIAL_PACKAGE_INPUT -DestinationPath $env:AXIAL_PACKAGE_OUTPUT -ErrorAction Stop"], {
-            env: { ...process.env, AXIAL_PACKAGE_INPUT: portable, AXIAL_PACKAGE_OUTPUT: destination }, timeout: 60000, maxBuffer: 8192,
-          });
+          if (process.platform === "win32") {
+            await exec("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Compress-Archive -LiteralPath $env:AXIAL_PACKAGE_INPUT -DestinationPath $env:AXIAL_PACKAGE_OUTPUT -ErrorAction Stop"], {
+              env: { ...process.env, AXIAL_PACKAGE_INPUT: portable, AXIAL_PACKAGE_OUTPUT: destination }, timeout: 60000, maxBuffer: 8192,
+            });
+          } else {
+            await exec("zip", ["-j", destination, portable], { timeout: 60000, maxBuffer: 8192 });
+          }
         } else {
           await exec("tar", ["-czf", destination, "-C", work, executableName], { timeout: 60000, maxBuffer: 8192 });
         }

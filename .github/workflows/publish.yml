@@ -9,8 +9,12 @@ on:
         required: true
         type: string
       run_id:
-        description: Run ID of the "Candidate artifacts" build for that tag
-        required: true
+        description: Run ID of the "Candidate artifacts" build (omit for a locally staged site)
+        required: false
+        type: string
+      site_sha256:
+        description: SHA-256 of site.tar.gz on the verified local release (omit with run_id)
+        required: false
         type: string
 
 permissions:
@@ -34,7 +38,26 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 26.13.0
+      - name: Validate publication inputs
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          SITE_SHA256: ${{ inputs.site_sha256 }}
+        run: |
+          node -e 'const {RUN_ID:r,SITE_SHA256:s}=process.env; if (!((/^[1-9][0-9]*$/.test(r) && !s) || (!r && /^[a-f0-9]{64}$/.test(s)))) process.exit(1)'
+      - name: Download the locally verified site
+        if: inputs.site_sha256 != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.tag }}
+          SITE_SHA256: ${{ inputs.site_sha256 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/publish/site"
+          gh release download "$CANDIDATE_TAG" -R "$GITHUB_REPOSITORY" -p site.tar.gz -D "$RUNNER_TEMP/publish"
+          printf '%s  %s/site.tar.gz\n' "$SITE_SHA256" "$RUNNER_TEMP/publish" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/publish/site.tar.gz" -C "$RUNNER_TEMP/publish/site"
+          node --input-type=module -e 'import {readFile,readdir} from "node:fs/promises"; import {PLATFORMS} from "./scripts/release/matrix.mjs"; const p=process.env.RUNNER_TEMP+"/publish/site"; const files=(await readdir(p)).sort(); if(JSON.stringify(files)!==JSON.stringify(["index.html","latest.json"])) throw Error("unexpected_site_files"); const feed=JSON.parse(await readFile(p+"/latest.json","utf8")); if(feed.version!==process.env.CANDIDATE_TAG.slice(1) || JSON.stringify(Object.keys(feed.platforms).sort())!==JSON.stringify(Object.values(PLATFORMS).map(x=>"axial-"+x.updater).sort())) throw Error("site_release_mismatch");'
       - name: Download the candidate build
+        if: inputs.run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run_id }}
@@ -46,6 +69,7 @@ jobs:
             mv "$RUNNER_TEMP/downloads/candidate-assets-$platform" "$RUNNER_TEMP/assets/$platform"
           done
       - name: Verify signatures and stage the release
+        if: inputs.run_id != ''
         env:
           CANDIDATE_TAG: ${{ inputs.tag }}
         run: |
@@ -56,6 +80,7 @@ jobs:
           node -e 'const s=require(process.argv[1]); if (s.tag !== process.env.CANDIDATE_TAG || s.source_sha !== process.argv[2]) process.exit(1)' "$RUNNER_TEMP/downloads/candidate-source/source.json" "$(git rev-parse HEAD)"
           node scripts/release/publish.mjs --source "$RUNNER_TEMP/downloads/candidate-source/source.json" --assets "$RUNNER_TEMP/assets" --public-key apps/desktop/updater.pub --changelog CHANGELOG.md --guide apps/desktop/platform/install-guide.html --output "$RUNNER_TEMP/publish"
       - name: Create the pre-release
+        if: inputs.run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ inputs.tag }}

@@ -33,7 +33,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM1ODIxQzc3MTcxQ0RCQzIKUldUQzJ4d1hkeHlDeFFWazZQVllJMWlSd1JlUXhGWHNrOTZlNmcxODRDaDZSN01lNzlwMzBuTGsK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhENjUzMTlGM0E1MjAyRjAKUldUd0FsSTZuekZsalRmb3JFZFNGYUNON0NTVG83NXpGbTJIcEdUUzhGZEZtWDN1SEo5T3FwdisK",
       "endpoints": ["https://updates.axial.run/latest.json"],
       "requireSignedVersion": true
     }
