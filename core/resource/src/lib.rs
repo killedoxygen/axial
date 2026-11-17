@@ -504,9 +504,9 @@ impl PhysicalWorkAdmission {
     where
         Work: FnOnce(&PhysicalWorkParallelism) -> T,
     {
-        let _running = RunningWorker::new(&self);
-        let parallelism = self.parallelism();
         let _admission = self;
+        let _running = RunningWorker::new(&_admission);
+        let parallelism = _admission.parallelism();
         work(&parallelism)
     }
 
@@ -543,9 +543,9 @@ impl PhysicalWorkAdmission {
             task_cancelled: cancelled,
         };
         let task = tokio::task::spawn_blocking(move || {
-            let _running = RunningWorker::new(&self);
-            let parallelism = self.parallelism();
             let _admission = self;
+            let _running = RunningWorker::new(&_admission);
+            let parallelism = _admission.parallelism();
             if cancellation.is_cancelled() {
                 PhysicalWorkOutput::Cancelled
             } else {
@@ -595,12 +595,12 @@ impl PhysicalWorkParallelism {
         let extra = if self.class == PhysicalWorkClass::Foreground {
             (1..=wanted - lent).rev().find_map(|count| {
                 let permit = try_acquire_many(&self.owner.workers, count).ok()?;
-                Some((permit, RunningWorker::extra(&self.owner, self.class, count)))
+                Some((RunningWorker::extra(&self.owner, self.class, count), permit))
             })
         } else {
             None
         };
-        let workers = lent + extra.as_ref().map_or(0, |(_, running)| running.count);
+        let workers = lent + extra.as_ref().map_or(0, |(running, _)| running.count);
         if workers <= 1 {
             return vec![job(0..len)];
         }
@@ -1054,8 +1054,10 @@ mod tests {
                 .try_run_inline_parallel(
                     PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
                     |parallelism| {
+                        let gate = std::sync::Barrier::new(width);
                         parallelism.run_ranges(10, 4, |range| {
                             let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+                            gate.wait();
                             (range, std::thread::current().id(), snapshot)
                         })
                     },
@@ -1222,6 +1224,61 @@ mod tests {
             (1, 2, 1, SCRATCH_UNIT_BYTES)
         );
         assert_eq!(idle(&owner), before);
+    }
+
+    #[tokio::test]
+    async fn running_counts_are_settled_before_released_workers_wake_waiters() {
+        use std::{
+            future::Future,
+            task::{Context, Wake, Waker},
+        };
+
+        struct ObserveWake {
+            owner: PhysicalWorkOwner,
+            running: Mutex<Vec<usize>>,
+        }
+
+        impl Wake for ObserveWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                let running = self.owner.snapshot(PhysicalWorkClass::Foreground).running_workers;
+                self.running.lock().unwrap().push(running);
+            }
+        }
+
+        let owner = test_owner();
+        let before = idle(&owner);
+        for inline in [true, false] {
+            let observed = Arc::new(ObserveWake {
+                owner: owner.clone(),
+                running: Mutex::new(Vec::new()),
+            });
+            let pending = {
+                let admission = owner
+                    .try_admit(PhysicalWorkRequest::foreground_parallel(
+                        PhysicalIoClass::Read, 0, 3,
+                    ))
+                    .unwrap();
+                let waiting = owner.admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0));
+                let mut waiting = std::pin::pin!(waiting);
+                let waker = Waker::from(Arc::clone(&observed));
+                let pending = waiting.as_mut().poll(&mut Context::from_waker(&waker)).is_pending();
+                if inline {
+                    admission.run_inline(|_| ());
+                } else {
+                    admission.run_parallel(|_, _| ()).await.unwrap();
+                }
+                pending
+            };
+            let running = observed.running.lock().unwrap().clone();
+            assert!(pending);
+            assert!(!running.is_empty());
+            assert!(running.iter().all(|count| *count == 0), "{running:?}");
+            assert_eq!(idle(&owner), before);
+        }
     }
 
     #[tokio::test]
