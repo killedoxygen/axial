@@ -38,6 +38,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use ts_rs::TS;
 
@@ -1050,11 +1051,14 @@ impl SetupService {
         instances: Vec<Instance>,
         budget: crate::install::artifacts::InventoryBudget,
     ) -> InstanceResult<Vec<EnrichedInstance>> {
+        let measured = tracing::enabled!(tracing::Level::DEBUG);
+        let started = measured.then(Instant::now);
         let scan = match self.installed_snapshot().await {
             Ok(scan) => Some(Arc::new(scan)),
             Err(InstanceError::VersionUnavailable) => None,
             Err(failure) => return Err(failure),
         };
+        let scan_elapsed = started.map(|start| start.elapsed());
         let mut projection = self.launch.preflight_projection(scan, budget);
         projection.inspection = crate::install::artifacts::Inspection::Summary;
         let mut pending = instances.into_iter().enumerate().collect::<Vec<_>>();
@@ -1062,6 +1066,7 @@ impl SetupService {
         // checks the actual generation, library and version before sharing proof.
         pending.sort_by(|(_, left), (_, right)| left.version_id.cmp(&right.version_id));
         let mut enriched = Vec::with_capacity(pending.len());
+        let observation_started = measured.then(Instant::now);
         for (index, instance) in pending {
             let preflight = self
                 .launch
@@ -1069,9 +1074,13 @@ impl SetupService {
                 .await;
             enriched.push((index, instance, preflight));
         }
+        let observation_elapsed = observation_started.map(|start| start.elapsed());
+        let publication_started = measured.then(Instant::now);
         let scan = self.launch.finish_preflight_projection(&projection).await;
+        let publication_elapsed = publication_started.map(|start| start.elapsed());
         enriched.sort_unstable_by_key(|(index, _, _)| *index);
-        Ok(enriched.into_iter().map(|(_, instance, preflight)| {
+        let rows_started = measured.then(Instant::now);
+        let rows: Vec<_> = enriched.into_iter().map(|(_, instance, preflight)| {
             let current = scan.clone().and_then(|_| self.launch
                 .validate_projection_target(&projection, &instance));
             let preflight = match &current {
@@ -1085,7 +1094,29 @@ impl SetupService {
                 Err(_) => preflight,
             };
             self.enrich_preflight(instance, projection.versions(), preflight)
-        }).collect())
+        }).collect();
+        if let (
+            Some(started),
+            Some(scan),
+            Some(observation),
+            Some(publication),
+            Some(rows_started),
+        ) = (
+            started,
+            scan_elapsed,
+            observation_elapsed,
+            publication_elapsed,
+            rows_started,
+        ) {
+            tracing::debug!(
+                stage = "readiness_projection", rows = rows.len(),
+                elapsed_us = %started.elapsed().as_micros(),
+                scan_us = %scan.as_micros(), observation_us = %observation.as_micros(),
+                publication_us = %publication.as_micros(), rows_us = %rows_started.elapsed().as_micros(),
+                "Instance readiness projection completed."
+            );
+        }
+        Ok(rows)
     }
 
     fn enrich_preflight(

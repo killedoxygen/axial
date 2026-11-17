@@ -16,6 +16,7 @@ use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The verification read buffer; the walk itself retains only directory handles.
 const VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
@@ -88,6 +89,7 @@ impl SelectedRuntime {
     /// retained executable binding and the probed executable fingerprint.
     /// This never starts a process.
     pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let selected = self.clone();
         let admission = process_physical_work()
             .admit(PhysicalWorkRequest::foreground(
@@ -112,7 +114,15 @@ impl SelectedRuntime {
                     .map_err(|_| JavaDiscoveryError::Replaced)
             })
             .await
-            .map_err(|_| JavaDiscoveryError::Failed)?
+            .map_err(|_| JavaDiscoveryError::Failed)??;
+        if let Some(started) = started {
+            tracing::debug!(
+                stage = "runtime_revalidation", checks = self.checks(), managed = self.managed.is_some(),
+                elapsed_us = %started.elapsed().as_micros(),
+                "Selected runtime revalidated."
+            );
+        }
+        Ok(())
     }
 }
 
@@ -151,6 +161,7 @@ impl RuntimeProjection {
     }
 
     pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let observed = self
             .observed
             .lock()
@@ -158,9 +169,17 @@ impl RuntimeProjection {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let runtime_count = observed.len();
         for observation in observed {
             self.charge(observation.checks())?;
             observation.revalidate().await?;
+        }
+        if let Some(started) = started {
+            tracing::debug!(
+                stage = "readiness_runtimes", runtimes = runtime_count,
+                elapsed_us = %started.elapsed().as_micros(),
+                "Retained readiness runtimes revalidated."
+            );
         }
         Ok(())
     }
@@ -510,6 +529,7 @@ impl RuntimeDiscovery {
             .try_spawn(admitted.clone(), move |cancel| async move {
                 let mut proven = slot.lock().await;
                 let checked = admitted.clone();
+                let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
                 let verified = process_physical_work()
                     .admit(PhysicalWorkRequest::foreground(
                         PhysicalIoClass::Read,
@@ -522,6 +542,13 @@ impl RuntimeDiscovery {
                     .map_err(|_| JavaDiscoveryError::Failed)?
                     // A marker alone is insufficient: the manifest's complete tree must match.
                     .ok_or(JavaDiscoveryError::Replaced)?;
+                if let Some(started) = started {
+                    tracing::debug!(
+                        stage = "runtime_observation", entries = verified.1,
+                        elapsed_us = %started.elapsed().as_micros(),
+                        "Managed runtime tree observation completed."
+                    );
+                }
                 let manifest = verified.0;
                 let receipt = admitted
                     .launch_receipt()

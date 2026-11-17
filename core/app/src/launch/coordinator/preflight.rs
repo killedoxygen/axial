@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 pub(crate) struct PreflightProjection {
     pub(super) current: Option<Arc<PreflightArtifacts>>,
@@ -326,6 +327,8 @@ impl LaunchCoordinator {
         self.tasks
             .try_spawn((scan.clone(), inventories.clone()), move |_| async move {
                 coordinator.revalidate_scan(scan).await?;
+                let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+                let inventory_count = inventories.len();
                 axial_resource::process_physical_work()
                     .admit(axial_resource::PhysicalWorkRequest::foreground(
                         axial_resource::PhysicalIoClass::Metadata,
@@ -342,7 +345,15 @@ impl LaunchCoordinator {
                         Ok::<_, LaunchError>(())
                     })
                     .await
-                    .map_err(|_| LaunchError::PreparationFailed)?
+                    .map_err(|_| LaunchError::PreparationFailed)??;
+                if let Some(started) = started {
+                    tracing::debug!(
+                        stage = "readiness_inventories", inventories = inventory_count,
+                        elapsed_us = %started.elapsed().as_micros(),
+                        "Retained readiness inventories revalidated."
+                    );
+                }
+                Ok::<_, LaunchError>(())
             })
             .map_err(|cause| {
                 tracing::debug!(stage = "readiness_finalization_task", ?cause, "Launch readiness admission refused.");
@@ -356,6 +367,7 @@ impl LaunchCoordinator {
             .revalidate()
             .await
             .map_err(LaunchError::RuntimeFailure)?;
+        let context_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let verified = projection.credentials.lock().unwrap().clone();
         for account in &verified {
             self.auth
@@ -370,6 +382,13 @@ impl LaunchCoordinator {
         self.settings
             .validate_revision(*revision)
             .map_err(|_| LaunchError::SettingsChanged)?;
+        if let Some(started) = context_started {
+            tracing::debug!(
+                stage = "readiness_context", credentials = verified.len(),
+                elapsed_us = %started.elapsed().as_micros(),
+                "Readiness credentials, account selection and settings revalidated."
+            );
+        }
         Ok(())
     }
 
@@ -443,6 +462,7 @@ impl LaunchCoordinator {
         &self,
         scan: Arc<crate::catalog::InstalledSnapshot>,
     ) -> Result<(), LaunchError> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let pin = self
             .instances
             .library()
@@ -460,6 +480,13 @@ impl LaunchCoordinator {
             .map_err(|_| LaunchError::LibraryUnavailable)?;
         if !scan.generation_matches(&current) {
             return Err(LaunchError::LibraryUnavailable);
+        }
+        if let Some(started) = started {
+            tracing::debug!(
+                stage = "readiness_scan", entries = scan.entry_count(),
+                elapsed_us = %started.elapsed().as_micros(),
+                "Installed-version scan revalidated."
+            );
         }
         Ok(())
     }
