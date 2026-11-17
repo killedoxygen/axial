@@ -171,7 +171,10 @@ pub struct PhysicalWorkAdmission {
     parallelism: usize,
 }
 
+/// The workers one admission lends to the calling thread's scoped jobs.
 pub struct PhysicalWorkParallelism {
+    owner: Arc<PhysicalWorkOwnerInner>,
+    class: PhysicalWorkClass,
     workers: usize,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
@@ -427,14 +430,7 @@ impl PhysicalWorkOwner {
     where
         Work: FnOnce(&PhysicalWorkParallelism) -> T,
     {
-        let admission = self.try_admit(request)?;
-        let _running = RunningWorker::new(&admission);
-        let parallelism = PhysicalWorkParallelism {
-            workers: admission.parallelism,
-            _not_send: std::marker::PhantomData,
-        };
-        let _admission = admission;
-        Ok(work(&parallelism))
+        Ok(self.try_admit(request)?.run_inline(work))
     }
 
     /// Runs `job` over contiguous ranges covering `0..len` on up to
@@ -546,6 +542,27 @@ impl PhysicalWorkOwner {
 }
 
 impl PhysicalWorkAdmission {
+    /// Runs `work` on the calling thread with this admission's workers lent
+    /// to its scoped jobs; the admission is released when `work` returns.
+    pub fn run_inline<T, Work>(self, work: Work) -> T
+    where
+        Work: FnOnce(&PhysicalWorkParallelism) -> T,
+    {
+        let _running = RunningWorker::new(&self);
+        let parallelism = self.parallelism();
+        let _admission = self;
+        work(&parallelism)
+    }
+
+    fn parallelism(&self) -> PhysicalWorkParallelism {
+        PhysicalWorkParallelism {
+            owner: Arc::clone(&self.owner),
+            class: self.class,
+            workers: self.parallelism,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
     pub async fn run<T, Work>(self, work: Work) -> Result<T, PhysicalWorkError>
     where
         T: Send + 'static,
@@ -571,10 +588,7 @@ impl PhysicalWorkAdmission {
         };
         let task = tokio::task::spawn_blocking(move || {
             let _running = RunningWorker::new(&self);
-            let parallelism = PhysicalWorkParallelism {
-                workers: self.parallelism,
-                _not_send: std::marker::PhantomData,
-            };
+            let parallelism = self.parallelism();
             let _admission = self;
             if cancellation.is_cancelled() {
                 PhysicalWorkOutput::Cancelled
@@ -593,6 +607,8 @@ impl PhysicalWorkParallelism {
         self.workers
     }
 
+    /// Runs the first job on the calling thread and every other job on its
+    /// own lent worker, returning the results in job order.
     pub fn run_scoped<T, Work>(&self, jobs: Vec<Work>) -> Result<Vec<T>, PhysicalWorkError>
     where
         T: Send,
@@ -601,38 +617,103 @@ impl PhysicalWorkParallelism {
         if jobs.len() > self.workers {
             return Err(PhysicalWorkError::WorkerLimit);
         }
-        let job_count = jobs.len();
-        std::thread::scope(|scope| {
-            let mut failed = false;
-            let mut workers = Vec::with_capacity(jobs.len());
-            for (index, job) in jobs.into_iter().enumerate() {
-                match std::thread::Builder::new()
-                    .name(format!("axial-physical-{index}"))
-                    .spawn_scoped(scope, job)
-                {
-                    Ok(worker) => workers.push((index, worker)),
-                    Err(_) => failed = true,
-                }
-            }
-            let mut results = std::iter::repeat_with(|| None)
-                .take(job_count)
-                .collect::<Vec<_>>();
-            for (index, worker) in workers {
-                match worker.join() {
-                    Ok(result) => results[index] = Some(result),
-                    Err(_) => failed = true,
-                }
-            }
-            if failed {
-                Err(PhysicalWorkError::TaskStopped)
-            } else {
-                results
-                    .into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or(PhysicalWorkError::TaskStopped)
-            }
-        })
+        run_jobs(jobs)
     }
+
+    /// Runs read-only `job` over contiguous ranges covering `0..len` and
+    /// returns the results in range order. This admission's workers are lent
+    /// first; foreground work may also take idle process workers without
+    /// waiting, while background work never grows beyond its admission. With
+    /// one worker, or when a lent worker stops, the whole pass runs on the
+    /// calling thread, so a job may run again and must not apply effects.
+    pub fn run_ranges<T, Job>(&self, len: usize, max_workers: usize, job: Job) -> Vec<T>
+    where
+        T: Send,
+        Job: Fn(std::ops::Range<usize>) -> T + Sync,
+    {
+        let wanted = len.min(max_workers).min(self.owner.worker_limit);
+        if wanted <= 1 {
+            return vec![job(0..len)];
+        }
+        let lent = self.workers.min(wanted);
+        let extra = if self.class == PhysicalWorkClass::Foreground {
+            (1..=wanted - lent).rev().find_map(|count| {
+                let permit = try_acquire_many(&self.owner.workers, count).ok()?;
+                Some((permit, RunningWorker::extra(&self.owner, self.class, count)))
+            })
+        } else {
+            None
+        };
+        let workers = lent + extra.as_ref().map_or(0, |(_, running)| running.count);
+        if workers <= 1 {
+            return vec![job(0..len)];
+        }
+        let span = len.div_ceil(workers);
+        let job = &job;
+        let jobs = (0..len.div_ceil(span))
+            .map(|index| move || job(index * span..((index + 1) * span).min(len)))
+            .collect();
+        match run_jobs(jobs) {
+            Ok(results) => results,
+            Err(_) => {
+                drop(extra);
+                vec![job(0..len)]
+            }
+        }
+    }
+}
+
+/// Spawns every job after the first, runs the first on the calling thread
+/// and joins every spawned worker before returning or resuming a panic.
+fn run_jobs<T, Work>(jobs: Vec<Work>) -> Result<Vec<T>, PhysicalWorkError>
+where
+    T: Send,
+    Work: FnOnce() -> T + Send,
+{
+    let count = jobs.len();
+    let mut jobs = jobs.into_iter();
+    let Some(first) = jobs.next() else {
+        return Ok(Vec::new());
+    };
+    std::thread::scope(|scope| {
+        let mut failed = false;
+        let mut workers = Vec::with_capacity(count - 1);
+        for (index, job) in (1..).zip(jobs) {
+            match std::thread::Builder::new()
+                .name(format!("axial-physical-{index}"))
+                .spawn_scoped(scope, job)
+            {
+                Ok(worker) => workers.push(worker),
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        let first =
+            (!failed).then(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(first)));
+        let joined = workers
+            .into_iter()
+            .map(std::thread::ScopedJoinHandle::join)
+            .collect::<Vec<_>>();
+        let mut results = Vec::with_capacity(count);
+        match first {
+            Some(Ok(result)) => results.push(result),
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            None => {}
+        }
+        for result in joined {
+            match result {
+                Ok(result) => results.push(result),
+                Err(_) => failed = true,
+            }
+        }
+        if failed {
+            Err(PhysicalWorkError::TaskStopped)
+        } else {
+            Ok(results)
+        }
+    })
 }
 
 impl PhysicalWorkGroup {
@@ -738,12 +819,16 @@ impl PhysicalWorkCancellation {
 
 impl RunningWorker {
     fn new(admission: &PhysicalWorkAdmission) -> Self {
-        admission.owner.running[admission.class.index()]
-            .fetch_add(admission.parallelism, Ordering::AcqRel);
+        Self::extra(&admission.owner, admission.class, admission.parallelism)
+    }
+
+    /// Workers that run for an existing admission without adding another.
+    fn extra(owner: &Arc<PhysicalWorkOwnerInner>, class: PhysicalWorkClass, count: usize) -> Self {
+        owner.running[class.index()].fetch_add(count, Ordering::AcqRel);
         Self {
-            owner: Arc::clone(&admission.owner),
-            class: admission.class,
-            count: admission.parallelism,
+            owner: Arc::clone(owner),
+            class,
+            count,
         }
     }
 }
@@ -983,24 +1068,260 @@ mod tests {
         assert_eq!(snapshot.available_workers, 3);
     }
 
+    fn idle(owner: &PhysicalWorkOwner) -> [PhysicalWorkSnapshot; 2] {
+        [PhysicalWorkClass::Foreground, PhysicalWorkClass::Background]
+            .map(|class| owner.snapshot(class))
+    }
+
     #[test]
-    fn ranges_cover_inputs_in_order_and_fall_back_inline_without_workers() {
+    #[allow(clippy::single_range_in_vec_init)]
+    fn ranges_lend_the_caller_then_take_only_idle_foreground_workers() {
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let before = idle(&owner);
+        let caller = std::thread::current().id();
+        for (holding, width, ranges) in [
+            (0, 4, vec![0..3, 3..6, 6..9, 9..10]),
+            (1, 3, vec![0..4, 4..8, 8..10]),
+            (2, 2, vec![0..5, 5..10]),
+            (3, 1, vec![0..10]),
+        ] {
+            let held = (holding > 0).then(|| {
+                owner
+                    .try_admit(PhysicalWorkRequest::foreground_parallel(
+                        PhysicalIoClass::Read,
+                        0,
+                        holding,
+                    ))
+                    .unwrap()
+            });
+            let observed = owner
+                .try_run_inline_parallel(
+                    PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                    |parallelism| {
+                        parallelism.run_ranges(10, 4, |range| {
+                            let snapshot = owner.snapshot(PhysicalWorkClass::Foreground);
+                            (range, std::thread::current().id(), snapshot)
+                        })
+                    },
+                )
+                .unwrap();
+            drop(held);
+            assert_eq!(
+                observed
+                    .iter()
+                    .map(|(range, ..)| range.clone())
+                    .collect::<Vec<_>>(),
+                ranges
+            );
+            assert_eq!(observed[0].1, caller, "the caller runs the first range");
+            let threads = observed
+                .iter()
+                .map(|(_, thread, _)| *thread)
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(threads.len(), width);
+            for (_, _, snapshot) in &observed {
+                // Extra workers run for the one admission without adding another.
+                assert_eq!(
+                    (
+                        snapshot.active_admissions,
+                        snapshot.running_workers,
+                        snapshot.available_workers
+                    ),
+                    (1 + usize::from(holding > 0), width, 0)
+                );
+            }
+            assert_eq!(idle(&owner), before);
+        }
+
+        for (len, max_workers, ranges) in [
+            (5, 4, vec![0..2, 2..4, 4..5]),
+            (0, 4, vec![0..0]),
+            (1, 4, vec![0..1]),
+            (10, 1, vec![0..10]),
+        ] {
+            let observed = owner
+                .try_run_inline_parallel(
+                    PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                    |parallelism| parallelism.run_ranges(len, max_workers, |range| range),
+                )
+                .unwrap();
+            assert_eq!(observed, ranges, "{len} entries on {max_workers} workers");
+            assert_eq!(idle(&owner), before);
+        }
+    }
+
+    #[test]
+    fn background_ranges_never_grow_beyond_their_admission() {
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let before = idle(&owner);
+        let caller = std::thread::current().id();
+        let observed = owner
+            .try_run_inline_parallel(
+                PhysicalWorkRequest::background(PhysicalIoClass::Read, 0),
+                |parallelism| {
+                    parallelism.run_ranges(10, 4, |range| {
+                        (
+                            range,
+                            std::thread::current().id(),
+                            owner.snapshot(PhysicalWorkClass::Background),
+                        )
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(observed.len(), 1);
+        let (range, thread, snapshot) = &observed[0];
+        assert_eq!((range.clone(), *thread), (0..10, caller));
+        assert_eq!(
+            (
+                snapshot.active_admissions,
+                snapshot.running_workers,
+                snapshot.available_workers
+            ),
+            (1, 1, PROCESS_WORKER_LIMIT - 1)
+        );
+        assert_eq!(idle(&owner), before);
+    }
+
+    #[test]
+    fn a_stopped_range_worker_is_joined_then_the_pass_repeats_inline() {
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let before = idle(&owner);
+        let caller = std::thread::current().id();
+        let stopped = AtomicBool::new(false);
+        let completed = AtomicUsize::new(0);
+        let observed = owner
+            .try_run_inline_parallel(
+                PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                |parallelism| {
+                    parallelism.run_ranges(8, 4, |range| {
+                        if range.start == 2 && !stopped.swap(true, Ordering::AcqRel) {
+                            panic!("fixture worker stops once");
+                        }
+                        completed.fetch_add(1, Ordering::AcqRel);
+                        (range, std::thread::current().id())
+                    })
+                },
+            )
+            .unwrap();
+        // Three other ranges completed before the inline repetition.
+        assert_eq!(completed.load(Ordering::Acquire), 4);
+        assert_eq!(observed, vec![(0..8, caller)]);
+        assert_eq!(idle(&owner), before);
+    }
+
+    #[test]
+    fn a_caller_range_panic_resumes_only_after_lent_workers_join() {
+        let owner = PhysicalWorkOwner::new(PROCESS_LIMITS);
+        let before = idle(&owner);
+        let gate: Gate = Arc::default();
+        let joined = AtomicUsize::new(0);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.try_run_inline_parallel(
+                PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                |parallelism| {
+                    parallelism.run_ranges(4, 4, |range| {
+                        if range.start == 0 {
+                            open(&gate);
+                            panic!("fixture caller range stops");
+                        }
+                        wait(&gate);
+                        joined.fetch_add(1, Ordering::AcqRel);
+                    })
+                },
+            )
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(joined.load(Ordering::Acquire), 3);
+        assert_eq!(idle(&owner), before);
+    }
+
+    #[test]
+    fn inline_admission_runs_on_the_calling_thread_and_releases_on_return() {
         let owner = test_owner();
-        let ranges = owner.run_ranges(PhysicalIoClass::Read, 10, 4, |range| range);
-        assert_eq!(ranges, vec![0..4, 4..8, 8..10]);
+        let before = idle(&owner);
+        let caller = std::thread::current().id();
+        let admission = owner
+            .try_admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Read,
+                SCRATCH_UNIT_BYTES,
+                2,
+            ))
+            .unwrap();
+        let (thread, workers, snapshot) = admission.run_inline(|parallelism| {
+            (
+                std::thread::current().id(),
+                parallelism.workers(),
+                owner.snapshot(PhysicalWorkClass::Foreground),
+            )
+        });
+        assert_eq!((thread, workers), (caller, 2));
+        assert_eq!(
+            (
+                snapshot.active_admissions,
+                snapshot.running_workers,
+                snapshot.available_workers,
+                snapshot.available_scratch_bytes
+            ),
+            (1, 2, 1, SCRATCH_UNIT_BYTES)
+        );
+        assert_eq!(idle(&owner), before);
+    }
+
+    #[tokio::test]
+    async fn dropped_and_cancelled_waiting_admissions_restore_capacity() {
+        use std::future::Future;
+        let owner = test_owner();
+        let before = idle(&owner);
         let held = owner
             .try_admit(PhysicalWorkRequest::foreground_parallel(
                 PhysicalIoClass::Read,
-                0,
-                2,
+                2 * SCRATCH_UNIT_BYTES,
+                3,
             ))
-            .expect("held workers");
-        let inline = std::thread::current().id();
-        let ranges = owner.run_ranges(PhysicalIoClass::Read, 10, 4, |range| {
-            (range, std::thread::current().id() == inline)
+            .unwrap();
+        for request in [
+            PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+            PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, SCRATCH_UNIT_BYTES),
+        ] {
+            let waiting = owner.admit(request);
+            tokio::pin!(waiting);
+            let pending = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(waiting.as_mut().poll(context).is_pending())
+            })
+            .await;
+            assert!(pending, "exhausted capacity keeps the admission waiting");
+        }
+        let group = owner.group();
+        let queued = tokio::spawn({
+            let group = group.clone();
+            async move {
+                group
+                    .run(
+                        PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
+                        |_| (),
+                    )
+                    .await
+            }
         });
+        while group.active() == 0 {
+            tokio::task::yield_now().await;
+        }
+        group.cancel();
+        assert_eq!(queued.await.unwrap(), Err(PhysicalWorkError::Cancelled));
+        group.drain().await;
         drop(held);
-        assert_eq!(ranges, vec![(0..10, true)]);
+        assert_eq!(idle(&owner), before);
+        owner
+            .admit(PhysicalWorkRequest::foreground_parallel(
+                PhysicalIoClass::Heavy,
+                2 * SCRATCH_UNIT_BYTES,
+                3,
+            ))
+            .await
+            .unwrap()
+            .run_inline(|parallelism| assert_eq!(parallelism.workers(), 3));
+        assert_eq!(idle(&owner), before);
     }
 
     #[tokio::test]
