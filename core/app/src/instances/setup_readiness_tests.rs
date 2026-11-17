@@ -4931,115 +4931,253 @@ async fn grouped_readiness_scans_empty_and_busy_lists_without_erasing_rows() {
     assert!(unavailable.unwrap().is_empty());
 }
 
-#[tokio::test]
+#[test]
 #[cfg(unix)]
-async fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe() {
+fn grouped_readiness_refuses_earlier_inventory_drift_during_a_later_probe() {
+    check_grouped_inventory_drift(true);
+}
+
+#[test]
+#[cfg(unix)]
+fn grouped_readiness_single_instance_refuses_inventory_drift_during_its_own_probe() {
+    // Detail uses the same single-record enrich_all path as this projection.
+    check_grouped_inventory_drift(false);
+}
+
+#[cfg(unix)]
+fn check_grouped_inventory_drift(later_probe: bool) {
+    use futures_util::FutureExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let (root, service, accounts) = fixture();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (root, service, accounts) = runtime.block_on(async { fixture() });
     let service = Arc::new(service);
-    for version in ["1.20.1", "1.21.4"] {
-        crate::install::queue::tests::install_ready_fixture(&service.installs, version).await;
-    }
-    accounts
-        .create_offline_with_preconditions(
-            "GroupedPlayer",
-            crate::accounts::model::AccountPreconditions::default(),
+    let mut waiter = None;
+    let journey = async {
+        let versions: &[&str] = if later_probe {
+            &["1.20.1", "1.21.4"]
+        } else {
+            &["1.21.4"]
+        };
+        for version in versions {
+            crate::install::queue::tests::install_ready_fixture(&service.installs, version).await;
+        }
+        accounts
+            .create_offline_with_preconditions(
+                "GroupedPlayer",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
+        let java = root.path().join("java");
+        std::fs::write(
+            &java,
+            format!(
+                r#"#!/bin/sh
+probe_dir=${{0%/*}}
+printf 'probe\n' >> "$probe_dir/probes"
+if [ -s "$probe_dir/probe-first" ]; then
+  while [ ! -s "$probe_dir/probe-release" ]; do sleep 0.01; done
+  major=21
+else
+  printf 'first' > "$probe_dir/probe-first"
+  major=17
+fi
+printf 'java.version = %s.0.3\nos.arch = {}\njava.vendor = Eclipse Adoptium\n' "$major" >&2
+"#,
+                std::env::consts::ARCH
+            ),
         )
         .unwrap();
-    let java = root.path().join("java");
-    std::fs::write(&java, format!(
-        "#!/bin/sh\nprobe_dir=${{0%/*}}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\n  major=21\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\n  major=17\nfi\nprintf 'java.version = %s.0.3\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' \"$major\" >&2\n",
-        std::env::consts::ARCH,
-    )).unwrap();
-    std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-    service
-        .settings
-        .update(
-            serde_json::from_value(serde_json::json!({
-                "expected_revision":service.settings.current().unwrap().revision,
-                "java_path_override":java.to_str().unwrap(),
-            }))
-            .unwrap(),
+        std::fs::set_permissions(&java, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        service
+            .settings
+            .update(
+                serde_json::from_value(serde_json::json!({
+                    "expected_revision":service.settings.current().unwrap().revision,
+                    "java_path_override":java.to_str().unwrap(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let first = if later_probe {
+            Some(
+                service
+                    .instances
+                    .create(
+                        CreateInstanceRequest {
+                            name: "Earlier version".into(),
+                            selection_id: "vanilla|1.20.1".into(),
+                            ..Default::default()
+                        },
+                        CreateTarget {
+                            selection_id: "vanilla|1.20.1".into(),
+                            version_id: "1.20.1".into(),
+                            minecraft_version: "1.20.1".into(),
+                            loader_key: "vanilla".into(),
+                        },
+                        service
+                            .instances
+                            .creation_admission_for_tests()
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap()
+                    .join()
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let last = super::super::create::tests::create(&service.instances, "Later version").await;
+        let input: Vec<_> = first.into_iter().chain([last]).collect();
+        if !later_probe {
+            std::fs::write(root.path().join("probe-first"), b"hold").unwrap();
+        }
+        let healthy = service.enrich_all(input.clone()).await.unwrap();
+        let healthy = serde_json::to_value(healthy).unwrap();
+        let asset = root
+            .path()
+            .join("assets/log_configs/guardian-version-bundle.xml");
+        let original = std::fs::read(&asset).unwrap();
+        std::fs::write(root.path().join("probes"), b"").unwrap();
+        std::fs::write(
+            root.path().join("probe-first"),
+            if later_probe {
+                b"".as_slice()
+            } else {
+                b"hold".as_slice()
+            },
         )
         .unwrap();
-    let first = service
-        .instances
-        .create(
-            CreateInstanceRequest {
-                name: "Earlier version".into(),
-                selection_id: "vanilla|1.20.1".into(),
-                ..Default::default()
+        std::fs::write(root.path().join("probe-release"), b"").unwrap();
+        waiter = Some(tokio::spawn({
+            let service = service.clone();
+            let input = input.clone();
+            async move { service.enrich_all(input).await.unwrap() }
+        }));
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read_to_string(root.path().join("probes"))?
+                .lines()
+                .count()
+                < if later_probe { 2 } else { 1 }
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await;
+        let pending = !waiter.as_ref().unwrap().is_finished();
+        let mut changed_bytes = original.clone();
+        changed_bytes.extend_from_slice(b"external change");
+        let changed = std::fs::write(&asset, &changed_bytes);
+        let sampled = std::fs::read(&asset).unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let rows = waiter.take().unwrap().await.unwrap();
+        let rows = serde_json::to_value(rows).unwrap();
+        // A blocked mutation proves only the unchanged binding. Repeat the same write
+        // after the projection releases its capabilities as the positive control.
+        let released_control = if changed.is_err() {
+            Some(std::fs::write(&asset, &changed_bytes))
+        } else {
+            None
+        };
+        std::fs::write(&asset, &original).unwrap();
+        std::fs::write(
+            root.path().join("probe-first"),
+            if later_probe {
+                b"".as_slice()
+            } else {
+                b"hold".as_slice()
             },
-            CreateTarget {
-                selection_id: "vanilla|1.20.1".into(),
-                version_id: "1.20.1".into(),
-                minecraft_version: "1.20.1".into(),
-                loader_key: "vanilla".into(),
-            },
+        )
+        .unwrap();
+        let restored =
+            serde_json::to_value(service.enrich_all(input.clone()).await.unwrap()).unwrap();
+        move || {
+            assert!(
+                matches!(paused, Ok(Ok(()))) && pending,
+                "the probe did not remain pending: {paused:?}"
+            );
+            assert_eq!(healthy, restored);
+            assert_eq!(rows.as_array().unwrap().len(), input.len());
+            for (ready, instance) in healthy.as_array().unwrap().iter().zip(&input) {
+                assert_eq!(ready["id"], instance.id.to_string());
+                assert_eq!(ready["launchable"], true, "{ready}");
+            }
+            if let Err(error) = changed {
+                eprintln!("Inventory drift fixture mutation blocked: {error}");
+                assert_eq!(sampled, original);
+                assert!(released_control.unwrap().is_ok());
+                assert_eq!(rows, healthy);
+            } else {
+                assert_eq!(sampled, changed_bytes);
+                assert_ne!(sampled.len(), original.len());
+                for row in rows.as_array().unwrap() {
+                    assert_eq!(row["launchable"], false, "{row}");
+                    assert_eq!(row["launch_action"]["launchable"], false, "{row}");
+                    assert_eq!(row["launch_action"]["state_id"], "blocked", "{row}");
+                    assert_eq!(
+                        row["status_detail"],
+                        "The selected library is unavailable. Reconnect it before launching.",
+                        "{row}"
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(&asset).unwrap(), original);
+        }
+    };
+    let journey = runtime.block_on(std::panic::AssertUnwindSafe(journey).catch_unwind());
+    let released = std::fs::write(root.path().join("probe-release"), b"release");
+    let remaining = runtime.block_on(async {
+        match waiter.take() {
+            Some(waiter) => Some(waiter.await),
+            None => None,
+        }
+    });
+    let shutdown = runtime.block_on(
+        std::panic::AssertUnwindSafe(
             service
                 .instances
-                .creation_admission_for_tests()
-                .await
-                .unwrap(),
+                .tasks
+                .shutdown(std::time::Duration::from_secs(5)),
         )
-        .unwrap()
-        .join()
-        .await
-        .unwrap()
-        .unwrap();
-    let last = super::super::create::tests::create(&service.instances, "Later version").await;
-    let input = vec![first, last];
-    let healthy = service.enrich_all(input.clone()).await.unwrap();
-    assert!(healthy.iter().all(|row| row.launchable), "{healthy:?}");
-    let asset = root
-        .path()
-        .join("assets/log_configs/guardian-version-bundle.xml");
-    let original = std::fs::read(&asset).unwrap();
-    std::fs::write(root.path().join("probes"), b"").unwrap();
-    std::fs::write(root.path().join("probe-first"), b"").unwrap();
-    std::fs::write(root.path().join("probe-release"), b"").unwrap();
-    let waiter = tokio::spawn({
-        let service = service.clone();
-        let input = input.clone();
-        async move { service.enrich_all(input).await.unwrap() }
-    });
-    let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while std::fs::read_to_string(root.path().join("probes"))?
-            .lines()
-            .count()
-            < 2
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        Ok::<_, std::io::Error>(())
-    })
-    .await;
-    let pending = !waiter.is_finished();
-    let changed = std::fs::write(&asset, b"external change");
-    let released = std::fs::write(root.path().join("probe-release"), b"release");
-    let rows = waiter.await;
-    let stopped = service
-        .instances
-        .tasks
-        .shutdown(std::time::Duration::from_secs(5))
-        .await;
-    assert!(
-        matches!(paused, Ok(Ok(()))) && pending,
-        "second probe did not remain pending: {paused:?}"
+        .catch_unwind(),
     );
-    changed.unwrap();
-    released.unwrap();
-    stopped.unwrap();
-    let rows = rows.unwrap();
-    assert_eq!(std::fs::read(&asset).unwrap(), b"external change");
-    assert_ne!(original, b"external change");
-    assert_eq!(rows.len(), input.len());
-    for (row, instance) in rows.iter().zip(&input) {
-        assert_eq!(row.instance.id, instance.id);
-        assert!(!row.launchable, "{} retained stale Launch", instance.name);
-        assert!(!row.launch_action.launchable);
+    let settled = matches!(&shutdown, Ok(Ok(()))) && service.instances.tasks.status().is_idle();
+    if !settled {
+        std::mem::forget((service, accounts, runtime));
+    }
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let verify = match journey {
+            Ok(verify) => verify,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert!(released.is_ok());
+        if let Some(result) = remaining {
+            assert!(result.is_ok(), "enrichment waiter did not join");
+        }
+        match shutdown {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        assert!(settled);
+        verify();
+    }));
+    if let Err(panic) = verification {
+        use std::io::Write;
+        let retained = root.keep();
+        let _ = writeln!(
+            std::io::stderr(),
+            "Retained inventory drift fixture: {}",
+            retained.display()
+        );
+        std::panic::resume_unwind(panic);
     }
 }
 

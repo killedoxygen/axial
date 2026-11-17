@@ -46,6 +46,7 @@ pub(crate) fn inspection_capacity(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Inspection {
+    /// Observes display inputs; the projection revalidates them before publication.
     Summary,
     /// Hashes every file in full.
     Integrity,
@@ -716,7 +717,6 @@ impl ActivatedVersion {
             })
         } else if inspection == Inspection::Summary {
             let version = version.ok_or(InstallError::NotReady)?;
-            evidence.revalidate(workers)?;
             VersionInspection::Summary(VersionSummary {
                 evidence: Arc::new(evidence),
                 version,
@@ -932,6 +932,8 @@ impl VersionInspection {
     }
 }
 
+/// Observed display inputs awaiting the projection's final evidence check.
+/// This is not launch authority.
 pub(crate) struct VersionSummary {
     pub(crate) version: VersionJson,
     pub(crate) evidence: Arc<InventoryEvidence>,
