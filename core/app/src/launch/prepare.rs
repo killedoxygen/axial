@@ -136,11 +136,12 @@ impl PreparedSession {
         std::mem::take(&mut self.secrets)
     }
 
-    /// Repeats the composition owner's complete settled proof; the process
-    /// actor awaits it before waiting for its spawn admission, and the
-    /// owner's current records are checked again beside the spawn.
-    pub(super) async fn revalidate_composition(&self) -> Result<(), PrepareError> {
-        self.composition.revalidate().await.map_err(|error| {
+    /// Repeats the complete composition proof inside the spawn admission.
+    pub(super) fn revalidate_composition(
+        &self,
+        workers: &axial_resource::PhysicalWorkParallelism,
+    ) -> Result<(), PrepareError> {
+        self.composition.revalidate_admitted(workers).map_err(|error| {
             tracing::warn!(
                 stage = "composition_revalidate",
                 cause = error.diagnostic_code(),
@@ -159,6 +160,7 @@ impl PreparedSession {
         workers: &axial_resource::PhysicalWorkParallelism,
     ) -> Result<(), PrepareError> {
         self.validate_context()?;
+        self.revalidate_composition(workers)?;
         self.command.revalidate(workers).map_err(|error| {
             tracing::warn!(
                 ?error,
@@ -283,7 +285,7 @@ pub(super) mod tests {
         PreparedSession,
         crate::library::ApplicationRootPin,
     ) {
-        fixture_with_legacy_arguments(false).await
+        fixture_with_options(false, false).await
     }
 
     pub(in crate::launch) async fn legacy_fixture() -> (
@@ -291,18 +293,27 @@ pub(super) mod tests {
         PreparedSession,
         crate::library::ApplicationRootPin,
     ) {
-        fixture_with_legacy_arguments(true).await
+        fixture_with_options(true, false).await
     }
 
-    async fn fixture_with_legacy_arguments(
+    pub(in crate::launch) async fn managed_fixture() -> (
+        tempfile::TempDir,
+        PreparedSession,
+        crate::library::ApplicationRootPin,
+    ) {
+        fixture_with_options(false, true).await
+    }
+
+    async fn fixture_with_options(
         legacy: bool,
+        managed: bool,
     ) -> (
         tempfile::TempDir,
         PreparedSession,
         crate::library::ApplicationRootPin,
     ) {
         let (root, prepared, application) =
-            fixture_with_plan(legacy, async |request| {
+            fixture_with_plan(legacy, managed, async |request| {
                 super::super::plan::build_admitted(
                     request,
                     &axial_resource::process_physical_work(),
@@ -318,6 +329,7 @@ pub(super) mod tests {
     /// verified request.
     async fn fixture_with_plan(
         legacy: bool,
+        managed: bool,
         plan: impl AsyncFnOnce(
             super::super::model::LaunchPlanRequest,
         ) -> Result<ValidatedLaunchCommand, LaunchError>,
@@ -371,6 +383,9 @@ pub(super) mod tests {
             .unwrap()
             .unwrap();
         let instance = directories.admit(&instance.id).unwrap();
+        if managed {
+            crate::composition::duplicate::seed_managed(&instance).await;
+        }
         let compositions = CompositionService::new(
             storage.clone(),
             directories,
@@ -554,7 +569,7 @@ pub(super) mod tests {
         let idle = work.snapshot(PhysicalWorkClass::Foreground);
         let saturated = PhysicalWorkRequest::foreground_parallel(PhysicalIoClass::Read, 0, 4);
         let cancellation = crate::tasks::CancellationToken::new();
-        let (_cancelled_root, cancelled, _application) = fixture_with_plan(false, async |request| {
+        let (_cancelled_root, cancelled, _application) = fixture_with_plan(false, false, async |request| {
             let held = work.admit(saturated).await.unwrap();
             let build = super::super::plan::build_admitted(request, &work, &cancellation);
             tokio::pin!(build);
@@ -568,7 +583,7 @@ pub(super) mod tests {
         let after_cancel = work.snapshot(PhysicalWorkClass::Foreground);
 
         let mut waited = None;
-        let (root, prepared, _application) = fixture_with_plan(false, async |request| {
+        let (root, prepared, _application) = fixture_with_plan(false, false, async |request| {
             let held = work.admit(saturated).await.unwrap();
             let uncancelled = crate::tasks::CancellationToken::new();
             let build = super::super::plan::build_admitted(request, &work, &uncancelled);

@@ -257,14 +257,23 @@ impl ManagedCompositionAuthority {
         &self,
         identity: &ManagedInstanceIdentity,
     ) -> Result<ManagedInstanceEffectAuthority, ManagedMutationError> {
-        let instance = self.open_instance_directory(identity).await?;
-        let anchor_instance = instance.clone();
-        let instance_anchor = run_managed_blocking(PhysicalIoClass::Metadata, move || {
-            anchor_instance.identity()
+        let authority = self.clone();
+        let identity = identity.clone();
+        run_managed_blocking(PhysicalIoClass::Metadata, move || {
+            authority.bind_effects(&identity)
         })
         .await
         .map_err(|_| ManagedMutationError::task_stopped("bind_effect_authority"))?
-        .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+    }
+
+    fn bind_effects(
+        &self,
+        identity: &ManagedInstanceIdentity,
+    ) -> Result<ManagedInstanceEffectAuthority, ManagedMutationError> {
+        let instance = self.open_instance_directory(identity)?;
+        let instance_anchor = instance
+            .identity()
+            .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
         {
             let mut authorities = self
                 .instance_effect_authorities
@@ -278,12 +287,8 @@ impl ManagedCompositionAuthority {
                 return require_effect_anchor(effects, instance_anchor);
             }
         }
-        let candidate = run_managed_blocking(PhysicalIoClass::Metadata, move || {
-            ManagedInstanceEffectAuthority::bind(&instance)
-        })
-        .await
-        .map_err(|_| ManagedMutationError::task_stopped("bind_effect_authority"))?
-        .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
+        let candidate = ManagedInstanceEffectAuthority::bind(&instance)
+            .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?;
         let mut authorities = self
             .instance_effect_authorities
             .lock()
@@ -304,7 +309,7 @@ impl ManagedCompositionAuthority {
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
     ) -> Result<Vec<ManagedArtifactWitnessProof>, ManagedMutationError> {
-        let instance = self.validate_identity(identity, effects).await?;
+        let instance = self.validate_identity(identity, effects)?;
         let Some(mods) =
             open_mods_if_present(instance, "composition_managed_witness_proofs").await?
         else {
@@ -335,7 +340,7 @@ impl ManagedCompositionAuthority {
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
     ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
-        let instance = self.validate_identity(identity, effects).await?;
+        let instance = self.validate_identity(identity, effects)?;
         let settle_effects = effects.clone();
         run_managed_blocking(PhysicalIoClass::Heavy, move || {
             settle_effects.settle()?;
@@ -379,19 +384,31 @@ impl ManagedCompositionAuthority {
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
     ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
-        let instance = self.validate_identity(identity, effects).await?;
-        let settled = effects.clone();
-        run_managed_blocking(PhysicalIoClass::Metadata, move || settled.require_settled())
-            .await
-            .map_err(|_| ManagedMutationError::task_stopped("prove_settled"))?
+        let authority = self.clone();
+        let identity = identity.clone();
+        let effects = effects.clone();
+        run_managed_blocking(PhysicalIoClass::Read, move || {
+            authority.prove_settled_now(&identity, &effects)
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("prove_settled"))?
+    }
+
+    fn prove_settled_now(
+        &self,
+        identity: &ManagedInstanceIdentity,
+        effects: &ManagedInstanceEffectAuthority,
+    ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
+        let instance = self.validate_identity(identity, effects)?;
+        effects
+            .require_settled()
             .map_err(|error| ManagedMutationError::indeterminate("prove_settled", error))?;
-        match open_mods_if_present(instance, "prove_settled").await? {
+        match instance
+            .open_child("mods")
+            .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))?
+        {
             None => Ok(absent_inspection(None, None)),
-            Some(mods) => {
-                run_managed_blocking(PhysicalIoClass::Read, move || recovered_inspection(mods))
-                    .await
-                    .map_err(|_| ManagedMutationError::task_stopped("prove_settled"))?
-            }
+            Some(mods) => recovered_inspection(mods),
         }
     }
 
@@ -413,7 +430,7 @@ impl ManagedCompositionAuthority {
         BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
         BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
     {
-        let instance = self.validate_identity(identity, effects).await?;
+        let instance = self.validate_identity(identity, effects)?;
         install_graph(plan, resolver, &instance, before_target_effect).await
     }
 
@@ -424,7 +441,7 @@ impl ManagedCompositionAuthority {
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
     ) -> Result<(), ManagedMutationError> {
-        let instance = self.validate_identity(identity, effects).await?;
+        let instance = self.validate_identity(identity, effects)?;
         let Some(mods) = open_mods_if_present(instance, "remove").await? else {
             return Ok(());
         };
@@ -442,7 +459,7 @@ impl ManagedCompositionAuthority {
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
     ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
-        let instance = self.validate_identity(identity, effects).await?;
+        let instance = self.validate_identity(identity, effects)?;
         let Some(mods) = open_mods_if_present(instance, "rollback_preflight").await? else {
             return Err(ManagedMutationError::definite(
                 InstallError::NoRollbackSnapshot,
@@ -465,7 +482,7 @@ impl ManagedCompositionAuthority {
         effects: &ManagedInstanceEffectAuthority,
         snapshot_id: &str,
     ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
-        let instance = self.validate_identity(identity, effects).await?;
+        let instance = self.validate_identity(identity, effects)?;
         let Some(mods) = open_mods_if_present(instance, "rollback_preflight").await? else {
             return Err(ManagedMutationError::definite(
                 InstallError::RollbackSnapshotNotFound,
@@ -484,17 +501,17 @@ impl ManagedCompositionAuthority {
             .map_err(classify_rollback_restore_error)
     }
 
-    async fn validate_identity(
+    fn validate_identity(
         &self,
         identity: &ManagedInstanceIdentity,
         effects: &ManagedInstanceEffectAuthority,
     ) -> Result<ManagedStorageDirectory, ManagedMutationError> {
-        let instance = self.open_instance_directory(identity).await?;
+        let instance = self.open_instance_directory(identity)?;
         ManagedStorageDirectory::bind_instance_root(instance, effects.clone())
             .map_err(|error| ManagedMutationError::definite(InstallError::Io(error)))
     }
 
-    async fn open_instance_directory(
+    fn open_instance_directory(
         &self,
         identity: &ManagedInstanceIdentity,
     ) -> Result<Directory, ManagedMutationError> {

@@ -365,6 +365,7 @@ pub struct CompositionService {
 /// effect, and the instance's managed files proven against their recorded
 /// state. Launch holds the instance lease, which excludes new composition
 /// work; `revalidate` repeats the whole proof immediately before spawn.
+#[derive(Clone)]
 pub struct CompositionSettled {
     service: CompositionService,
     instance: RegisteredInstance,
@@ -383,14 +384,31 @@ impl CompositionSettled {
 
     /// Repeats the complete proof and requires the same recorded state.
     pub async fn revalidate(&self) -> Result<(), CompositionError> {
+        let proof = self.clone();
+        axial_resource::process_physical_work()
+            .admit(axial_resource::PhysicalWorkRequest::foreground(
+                axial_resource::PhysicalIoClass::Read,
+                0,
+            ))
+            .await
+            .map_err(|_| CompositionError::Unsettled)?
+            .run_parallel(move |_, workers| proof.revalidate_admitted(&workers))
+            .await
+            .map_err(|_| CompositionError::Unsettled)?
+    }
+
+    /// The spawn admission includes this proof; it never admits nested work.
+    pub(crate) fn revalidate_admitted(
+        &self,
+        workers: &axial_resource::PhysicalWorkParallelism,
+    ) -> Result<(), CompositionError> {
         self.validate_current()?;
         // Effect authority is bound only for the proof, never retained by
         // the prepared session.
-        let bound = self.service.bind(self.instance.clone()).await?;
+        let bound = self.service.bind_admitted(self.instance.clone(), workers)?;
         let inspection = bound
             .authority
-            .prove_settled(&bound.identity, &bound.effects)
-            .await
+            .prove_settled_now(&bound.identity, &bound.effects)
             .map_err(|_| CompositionError::Unsettled)?;
         drop(bound);
         if inspection.health == BundleHealth::Invalid || inspection.state != self.state {
@@ -700,6 +718,24 @@ impl CompositionService {
     }
 
     async fn bind(&self, instance: RegisteredInstance) -> Result<BoundInstance, CompositionError> {
+        let service = self.clone();
+        axial_resource::process_physical_work()
+            .admit(axial_resource::PhysicalWorkRequest::foreground(
+                axial_resource::PhysicalIoClass::Metadata,
+                0,
+            ))
+            .await
+            .map_err(|_| CompositionError::Unsettled)?
+            .run_parallel(move |_, workers| service.bind_admitted(instance, &workers))
+            .await
+            .map_err(|_| CompositionError::Unsettled)?
+    }
+
+    fn bind_admitted(
+        &self,
+        instance: RegisteredInstance,
+        _workers: &axial_resource::PhysicalWorkParallelism,
+    ) -> Result<BoundInstance, CompositionError> {
         instance
             .validate_current()
             .map_err(|_| CompositionError::InstanceUnavailable)?;
@@ -718,8 +754,7 @@ impl CompositionService {
         )
         .map_err(|_| CompositionError::InstanceUnavailable)?;
         let effects = authority
-            .bind_instance_effect_authority(&identity)
-            .await
+            .bind_effects(&identity)
             .map_err(|_| CompositionError::Unsettled)?;
         Ok(BoundInstance {
             instance,

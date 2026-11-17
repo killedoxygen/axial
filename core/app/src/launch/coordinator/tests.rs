@@ -1956,7 +1956,7 @@ async fn replaced_game_library_settles_accepted_session_without_spawning() {
 async fn pre_spawn_proof_waits_for_library_scratch_without_spawning() {
     use super::super::{
         libraries,
-        prepare::tests::{attach_game_libraries, fixture},
+        prepare::tests::{attach_game_libraries, fixture, managed_fixture},
         session::{SessionPhase, SessionSnapshot},
     };
     use axial_minecraft::portable_path::PortableRelativePath;
@@ -1973,8 +1973,19 @@ async fn pre_spawn_proof_waits_for_library_scratch_without_spawning() {
     let work = process_physical_work();
     let idle = work.snapshot(PhysicalWorkClass::Foreground);
     let mut outcomes = Vec::new();
-    for release in [false, true] {
-        let (root, mut prepared, application) = fixture().await;
+    let mut fixtures = Vec::new();
+    for (release, change_managed) in [(false, false), (true, false), (true, true)] {
+        let (root, mut prepared, application) = if change_managed {
+            managed_fixture().await
+        } else {
+            fixture().await
+        };
+        let managed = prepared
+            .instance()
+            .game_directory()
+            .read_projection()
+            .unwrap()
+            .join("mods/current.jar");
         let source_path = root.path().join("libraries/fml/source.jar");
         std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         std::fs::write(&source_path, b"abc").unwrap();
@@ -2049,9 +2060,18 @@ async fn pre_spawn_proof_waits_for_library_scratch_without_spawning() {
         )
         .await;
         let current = sessions.snapshot_by_session_id(&session_id).unwrap();
+        let managed_change = if change_managed {
+            std::fs::write(&managed, b"changed while spawn admission waited")
+        } else {
+            Ok(())
+        };
         let spawned = if release {
             drop(scratch.take());
-            until(|snapshot| snapshot.pid.is_some(), &mut changes).await
+            until(
+                |snapshot| snapshot.pid.is_some() || snapshot.phase == SessionPhase::Exited,
+                &mut changes,
+            )
+            .await
         } else {
             sessions.stop_by_session_id(&session_id).unwrap();
             None
@@ -2094,15 +2114,17 @@ async fn pre_spawn_proof_waits_for_library_scratch_without_spawning() {
             observation["process"]["stopped"].clone(),
             session_shutdown.is_ok() && task_shutdown.is_ok(),
             terminal_ack(&storage, &key),
+            managed_change,
         ));
-        drop(root);
+        fixtures.push(root.keep());
     }
     let settled = work.snapshot(PhysicalWorkClass::Foreground);
+    eprintln!("pre-spawn diagnostic fixtures: {fixtures:?}");
 
     // Held scratch keeps the accepted session waiting with no process: Stop
     // settles it without a child, and releasing the scratch spawns the game,
     // whose owner then stops it and joins its tree and output.
-    let (stopped, released) = (&outcomes[0], &outcomes[1]);
+    let (stopped, released, changed) = (&outcomes[0], &outcomes[1], &outcomes[2]);
     assert!(stopped.1, "no process appears while proof scratch is held");
     assert_eq!(stopped.2, (SessionPhase::Starting, None));
     assert_eq!(stopped.4, Some((false, false, true, true)));
@@ -2115,7 +2137,18 @@ async fn pre_spawn_proof_waits_for_library_scratch_without_spawning() {
     assert_eq!(released.4, Some((true, false, true, true)));
     assert_ne!(released.5, serde_json::json!("no_child"));
     assert!(released.7 && released.8);
+    assert!(changed.1, "the managed fixture reaches the admission wait");
+    assert_eq!(changed.2, (SessionPhase::Starting, None));
+    assert_eq!(changed.3, Some(false));
+    assert_eq!(changed.4, Some((false, false, true, true)));
+    assert_eq!(changed.5, serde_json::json!("no_child"));
+    assert_eq!(changed.6, serde_json::json!(false));
+    assert!(changed.7 && changed.8);
+    assert!(changed.9.is_ok());
     assert_eq!(settled, idle);
+    for fixture in fixtures {
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
 }
 
 fn refuse_reports(storage: &MetadataStore) {
@@ -3530,7 +3563,13 @@ async fn play_admits_settled_managed_files_and_refuses_changed_ones_through_the_
                 )
                 .await;
             let composition = match &prepared {
-                Ok(prepared) => Some(prepared.revalidate_composition().await),
+                Ok(prepared) => Some(
+                    axial_resource::process_physical_work()
+                        .admit(prepared.validated_command().revalidation_request())
+                        .await
+                        .unwrap()
+                        .run_inline(|workers| prepared.revalidate_composition(workers)),
+                ),
                 Err(_) => None,
             };
             if let Ok(prepared) = prepared.as_ref() {

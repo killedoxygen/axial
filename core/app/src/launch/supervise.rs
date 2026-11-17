@@ -63,10 +63,7 @@ pub(super) async fn run(
         sentinel.settled = true;
         return;
     }
-    if let Err(error) = prepared.revalidate_composition().await {
-        return refuse_input(&entry, &mut sentinel, &prepared, error).await;
-    }
-    // Waits only after the composition proof, so no worker is held across it.
+    // The composition and command proofs share this admission beside spawn.
     let work = axial_resource::process_physical_work();
     let mut stopping = stop.clone();
     let admission = tokio::select! {
