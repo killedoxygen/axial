@@ -639,6 +639,11 @@ impl InstallQueue {
         self
     }
 
+    /// The physical work owner that admits this queue's inventory passes.
+    pub(crate) fn physical_work(&self) -> &PhysicalWorkOwner {
+        &self.work
+    }
+
     pub fn runtime_cache(&self) -> &ManagedRuntimeCache {
         &self.inner.runtime
     }
@@ -2023,11 +2028,13 @@ impl InstallQueue {
             };
         let storage = self.inner.storage.clone();
         let install_id = id.to_owned();
+        let work = self.work.clone();
         let activation_pin = pin.clone();
         let activation_checkpoint = checkpoint.clone();
         let activate = move |source| {
             persist_activation(
                 storage,
+                work,
                 activation_pin,
                 install_id,
                 Arc::new(source),
@@ -2313,13 +2320,13 @@ impl InstallQueue {
             })?;
             let (record, scratch) = record.ok_or(InstallError::NotReady)?;
             if record.len() > 128 << 20 { return Err(InstallError::NotReady); }
-            work.try_run_inline(
+            work.try_run_inline_parallel(
                 axial_resource::PhysicalWorkRequest::foreground(axial_resource::PhysicalIoClass::Read, 0),
-                move || {
+                move |workers| {
                     let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(record.as_bytes()).into();
                     if let Some(receipt) = retention
                         .as_ref()
-                        .and_then(|retention| retention.reuse(&pin, &version_id, &digest))
+                        .and_then(|retention| retention.reuse(&pin, &version_id, &digest, workers))
                     {
                         return Ok(artifacts::VersionInspection::Ready(receipt));
                     }
@@ -2328,7 +2335,7 @@ impl InstallQueue {
                     drop(record);
                     drop(scratch);
                     let inspected =
-                        activated.inspect(pin.clone(), &version_id, inspection, diagnostics, budget)?;
+                        activated.inspect(pin.clone(), &version_id, inspection, diagnostics, budget, workers)?;
                     if let (Some(retention), artifacts::VersionInspection::Ready(receipt)) =
                         (&retention, &inspected)
                     {
@@ -3024,12 +3031,14 @@ impl InstallQueue {
                 };
                 let storage = self.inner.storage.clone();
                 let install_id = id.to_owned();
+                let work = self.work.clone();
                 let activation_pin = pin.clone();
                 let activation_checkpoint = checkpoint.clone();
                 let ack = verified
                     .activate_with(move |source| {
                         persist_activation(
                             storage,
+                            work,
                             activation_pin,
                             install_id,
                             Arc::new(source),
@@ -3083,12 +3092,14 @@ impl InstallQueue {
                 };
                 let storage = self.inner.storage.clone();
                 let install_id = id.to_owned();
+                let work = self.work.clone();
                 let activation_pin = pin.clone();
                 let activation_checkpoint = checkpoint.clone();
                 let (continuation, ack) = verified
                     .activate_with(move |source| {
                         persist_activation(
                             storage,
+                            work,
                             activation_pin,
                             install_id,
                             Arc::new(source),
@@ -3501,16 +3512,29 @@ impl PublicationCheckpoint {
     }
 }
 
+/// The inventory proof and its metadata transaction run in one admitted
+/// worker; no caller holds physical work while this admission waits.
 async fn persist_activation(
     storage: Arc<MetadataStore>,
+    work: PhysicalWorkOwner,
     pin: GenerationPin,
     install_id: String,
     source: Arc<KnownGoodActivationSource>,
     checkpoint: PublicationCheckpoint,
 ) -> Result<(), KnownGoodActivationRejected> {
     let activated = ActivatedVersion::from_source(&source);
-    tokio::task::spawn_blocking(move || {
-        activated.clone().verify(pin.clone()).map_err(|error| {
+    let admission = work
+        .admit(axial_resource::PhysicalWorkRequest::foreground(
+            axial_resource::PhysicalIoClass::Read,
+            0,
+        ))
+        .await
+        .map_err(|error| {
+            tracing::warn!(stage = "activation_admission", cause = ?error, "Installation activation rejected.");
+            KnownGoodActivationRejected
+        })?;
+    admission.run_parallel(move |_, workers| {
+        activated.clone().verify(pin.clone(), &workers).map_err(|error| {
             tracing::warn!(stage = "inventory", ?error, "Installation activation rejected.");
             error
         })?;
@@ -5269,7 +5293,7 @@ pub(crate) mod tests {
         assert!(queue.complete(&id, InstallOutcome::Succeeded, None));
         let ready = queue.ready_version(&pin, version).await.unwrap();
         assert_eq!(ready.version().id, version);
-        ready.revalidate().unwrap();
+        crate::install::artifacts::tests::admitted(|workers| ready.revalidate(workers)).unwrap();
     }
 
     pub(crate) async fn interrupted_setup_fixture(
@@ -6110,10 +6134,12 @@ pub(crate) mod tests {
         let storage = queue.inner.storage.clone();
         let activation_pin = pin.clone();
         let install_id = id.to_owned();
+        let work = queue.work.clone();
         let acknowledgement = verified
             .activate_with(move |source| {
                 persist_activation(
                     storage,
+                    work,
                     activation_pin,
                     install_id,
                     Arc::new(source),
@@ -7504,7 +7530,10 @@ pub(crate) mod tests {
         let reused = queue.ready_version(&pin, version).await.unwrap();
         assert_eq!(reused.version(), first.version());
         assert_eq!(reused.client_jar(), first.client_jar());
-        assert!(reused.revalidate().is_ok());
+        assert!(
+            crate::install::artifacts::tests::admitted(|workers| reused.revalidate(workers))
+                .is_ok()
+        );
         drop((first, reused));
         std::fs::write(
             root.path()
@@ -7525,6 +7554,80 @@ pub(crate) mod tests {
             matches!(observed, Err(InstallError::ClientJarCorrupt)),
             "{observed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_ready_inventory_reports_the_earliest_sorted_refusal() {
+        use axial_resource::PhysicalWorkClass;
+        use sha1::Digest;
+        if !super::super::artifacts::tests::preparation_child(
+            "install::queue::tests::parallel_ready_inventory_reports_the_earliest_sorted_refusal",
+        )
+        .await
+        {
+            return;
+        }
+        let (root, storage, library, _exclusions, owner, queue) = fixture();
+        let version = "parallel-inventory-fixture";
+        install_ready_fixture(&queue, version).await;
+        let pin = library.admit().unwrap();
+        let index = "assets/indexes/parallel-ranges.json";
+        let mut files = vec![(index.to_owned(), b"{}".to_vec())];
+        files.extend((0..600).map(|entry| {
+            (
+                format!("assets/objects/{:02x}/object-{entry:04}", entry % 256),
+                b"x".to_vec(),
+            )
+        }));
+        storage.transaction(|db| {
+            let encoded: String = db.query_row(
+                "SELECT inventory_json FROM installed_versions WHERE library_id=?1 AND version_id=?2 AND state='ready'",
+                params![pin.library_id().to_string(), version], |row| row.get(0),
+            )?;
+            let mut inventory: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            for (path, bytes) in &files {
+                let target = root.path().join(path);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(target, bytes).unwrap();
+                inventory["files"].as_array_mut().unwrap().push(serde_json::json!({
+                    "path": path, "sha1": format!("{:x}", sha1::Sha1::digest(bytes)), "size": bytes.len(),
+                }));
+            }
+            assert_eq!(db.execute(
+                "UPDATE installed_versions SET inventory_json=?1 WHERE library_id=?2 AND version_id=?3 AND state='ready'",
+                params![inventory.to_string(), pin.library_id().to_string(), version],
+            )?, 1);
+            Ok::<_, InstallError>(())
+        }).unwrap();
+        let idle = queue.work.snapshot(PhysicalWorkClass::Foreground);
+        let warm = queue.ready_version(&pin, version).await.map(drop);
+        let retained = queue.inner.inventories.len();
+
+        // The index sorts into the first range and the client into the last.
+        let client = root.path().join(format!("versions/{version}/{version}.jar"));
+        let client_bytes = std::fs::read(&client).unwrap();
+        let moved_index = root.path().join("parallel-ranges.json");
+        std::fs::rename(root.path().join(index), &moved_index).unwrap();
+        std::fs::write(&client, b"changed client payload").unwrap();
+        let earliest = queue.ready_version(&pin, version).await.map(drop);
+        let forgotten = queue.inner.inventories.len();
+        std::fs::rename(&moved_index, root.path().join(index)).unwrap();
+        let last = queue.ready_version(&pin, version).await.map(drop);
+        std::fs::write(&client, &client_bytes).unwrap();
+        let restored = queue.ready_version(&pin, version).await.map(drop);
+        let settled = queue.work.snapshot(PhysicalWorkClass::Foreground);
+        queue.shutdown_queued().unwrap();
+        owner
+            .shutdown(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!((warm, retained), (Ok(()), 1));
+        assert_eq!(earliest, Err(InstallError::AssetIndexMissing));
+        assert_eq!(forgotten, 0, "a failed warm recheck forgets the retained inventory");
+        assert_eq!(last, Err(InstallError::ClientJarCorrupt));
+        assert_eq!(restored, Ok(()));
+        assert_eq!(settled, idle);
     }
 
     #[tokio::test]
@@ -7566,7 +7669,9 @@ pub(crate) mod tests {
         );
         let ready = queue.ready_version(&pin, version_id).await.unwrap();
         assert_eq!(ready.version().id, version_id);
-        assert!(ready.revalidate().is_ok());
+        assert!(
+            crate::install::artifacts::tests::admitted(|workers| ready.revalidate(workers)).is_ok()
+        );
         assert!(matches!(
             axial_minecraft::classify_managed_install_publication(operation, version_id).await,
             axial_minecraft::ManagedInstallDurableOutcome::NoEffect
@@ -7586,7 +7691,10 @@ pub(crate) mod tests {
             b"changed",
         )
         .unwrap();
-        assert!(ready.revalidate().is_err());
+        assert!(
+            crate::install::artifacts::tests::admitted(|workers| ready.revalidate(workers))
+                .is_err()
+        );
         assert!(matches!(
             restarted.ready_version(&pin, version_id).await,
             Err(InstallError::ClientJarCorrupt)
@@ -7841,10 +7949,10 @@ pub(crate) mod tests {
                     size: 1,
                 });
         }
-        let receipt = projection
-            .verify(pin)
-            .expect("512 observed assets below 128 descriptor limit");
-        receipt.revalidate().unwrap();
+        let receipt =
+            crate::install::artifacts::tests::admitted(|workers| projection.verify(pin, workers))
+                .expect("512 observed assets below 128 descriptor limit");
+        crate::install::artifacts::tests::admitted(|workers| receipt.revalidate(workers)).unwrap();
     }
     fn mark_running(storage: &MetadataStore, id: &str) {
         storage

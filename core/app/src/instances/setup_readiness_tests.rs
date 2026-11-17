@@ -308,13 +308,8 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             drop(slots_pressure);
             let unchanged = read_inventory().unwrap();
             assert_eq!(write_inventory(&encoded).unwrap(), 1);
-            service
-                .installs
-                .ready_version(&pin, "1.21.4")
-                .await
-                .unwrap()
-                .revalidate()
-                .unwrap();
+            let ready = service.installs.ready_version(&pin, "1.21.4").await.unwrap();
+            crate::install::artifacts::tests::admitted(|workers| ready.revalidate(workers)).unwrap();
             assert_eq!(
                 service.resolve(selection).await.unwrap().0.version_id,
                 "1.21.4"
@@ -376,7 +371,7 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                     ));
                     let restored = service.installs.ready_version(&pin, version).await.unwrap();
                     assert_eq!(restored.version().id, version);
-                    restored.revalidate().unwrap();
+                    crate::install::artifacts::tests::admitted(|workers| restored.revalidate(workers)).unwrap();
                     drop(restored);
                     assert_eq!(
                         service.resolve(selection).await.unwrap().0.version_id,
@@ -537,13 +532,8 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
                     std::fs::read(&canary).unwrap(),
                     b"preserve publication under pressure"
                 );
-                service
-                    .installs
-                    .ready_version(&pin, "1.21.4")
-                    .await
-                    .unwrap()
-                    .revalidate()
-                    .unwrap();
+                let ready = service.installs.ready_version(&pin, "1.21.4").await.unwrap();
+                crate::install::artifacts::tests::admitted(|workers| ready.revalidate(workers)).unwrap();
             }
             accounts.create_offline_with_preconditions("PressurePlayer", crate::accounts::model::AccountPreconditions::default()).unwrap();
             let instance =
@@ -821,12 +811,12 @@ fn installed_verification_pressure_does_not_trigger_install_fallback() {
             );
             let pin = library.admit().unwrap();
             for version in ["1.21.4", installed.version_id.as_str()] {
-                reopened
+                let ready = reopened
                     .installs
                     .ready_version(&pin, version)
                     .await
-                    .unwrap()
-                    .revalidate()
+                    .unwrap();
+                crate::install::artifacts::tests::admitted(|workers| ready.revalidate(workers))
                     .unwrap();
             }
         })
@@ -1190,7 +1180,7 @@ async fn loader_picker_refuses_a_degraded_library_and_recovers_after_restoration
         let queue_after = service.installs.snapshot();
         let instances_after = service.instances.registry().list().unwrap();
         let pending_after = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
-        receipt.revalidate().unwrap();
+        crate::install::artifacts::tests::admitted(|workers| receipt.revalidate(workers)).unwrap();
         std::fs::remove_file(&metadata).unwrap();
         std::fs::remove_dir(&external).unwrap();
         let restored = service
@@ -3541,7 +3531,8 @@ async fn creation_rejects_a_restored_library_with_an_old_admission() {
             .ready_version(&pin, "1.21.4")
             .await
             .unwrap();
-        let initially_valid = receipt.revalidate();
+        let initially_valid =
+            crate::install::artifacts::tests::admitted(|workers| receipt.revalidate(workers));
         let protected: Vec<_> = ["json", "jar"]
             .into_iter()
             .map(|extension| {
@@ -3591,11 +3582,13 @@ async fn creation_rejects_a_restored_library_with_an_old_admission() {
         let metadata = external.join("external-degraded-entry.json");
         std::fs::write(&metadata, b"{not valid external version metadata\n").unwrap();
         let changed_revision = observe_changed_revision().await;
-        let selected_after_change = receipt.revalidate();
+        let selected_after_change =
+            crate::install::artifacts::tests::admitted(|workers| receipt.revalidate(workers));
         std::fs::remove_file(&metadata).unwrap();
         std::fs::remove_dir(&external).unwrap();
         let restored_revision = observe_changed_revision().await;
-        let selected_after_restore = receipt.revalidate();
+        let selected_after_restore =
+            crate::install::artifacts::tests::admitted(|workers| receipt.revalidate(workers));
         let restored_bytes: Vec<_> = protected
             .iter()
             .map(|(path, _)| std::fs::read(path).unwrap())
@@ -3636,7 +3629,8 @@ async fn creation_rejects_a_restored_library_with_an_old_admission() {
         let fresh_instances = service.instances.registry().list().unwrap();
         let fresh_pending = serde_json::to_value(service.instances.pending().unwrap()).unwrap();
         let fresh_queue = service.installs.snapshot();
-        let selected_final = receipt.revalidate();
+        let selected_final =
+            crate::install::artifacts::tests::admitted(|workers| receipt.revalidate(workers));
         drop(receipt);
         drop(versions);
         drop(pin);

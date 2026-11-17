@@ -149,12 +149,16 @@ impl PreparedSession {
         })
     }
 
-    /// Repeated by the process actor immediately before spawning. Refreshes,
-    /// profile changes and account switches cannot substitute a new identity
-    /// into an already prepared command.
-    pub(super) fn validate_before_spawn(&self) -> Result<(), PrepareError> {
+    /// Repeated by the process actor immediately before spawning, under the
+    /// command's `revalidation_request` admission. Refreshes, profile changes
+    /// and account switches cannot substitute a new identity into an already
+    /// prepared command.
+    pub(super) fn validate_before_spawn(
+        &self,
+        workers: &axial_resource::PhysicalWorkParallelism,
+    ) -> Result<(), PrepareError> {
         self.validate_context()?;
-        self.command.revalidate().map_err(|error| {
+        self.command.revalidate(workers).map_err(|error| {
             tracing::warn!(
                 ?error,
                 stage = "command_revalidate",
@@ -243,6 +247,29 @@ pub(super) mod tests {
     use sha1::{Digest, Sha1};
     use std::os::unix::fs::PermissionsExt;
 
+    /// The process actor's pre-spawn proof under the command's own admission.
+    pub(in crate::launch) async fn validate_before_spawn(
+        prepared: &PreparedSession,
+    ) -> Result<(), PrepareError> {
+        axial_resource::process_physical_work()
+            .admit(prepared.validated_command().revalidation_request())
+            .await
+            .unwrap()
+            .run_inline(|workers| prepared.validate_before_spawn(workers))
+    }
+
+    /// The retained command's own proof under its admission.
+    pub(in crate::launch) async fn revalidate_command(
+        prepared: &PreparedSession,
+    ) -> Result<(), super::super::model::LaunchPlanError> {
+        let command = prepared.validated_command();
+        axial_resource::process_physical_work()
+            .admit(command.revalidation_request())
+            .await
+            .unwrap()
+            .run_inline(|workers| command.revalidate(workers))
+    }
+
     pub(in crate::launch) fn attach_game_libraries(
         prepared: &mut PreparedSession,
         libraries: super::super::libraries::Prepared,
@@ -271,6 +298,31 @@ pub(super) mod tests {
     ) -> (
         tempfile::TempDir,
         PreparedSession,
+        crate::library::ApplicationRootPin,
+    ) {
+        let (root, prepared, application) =
+            fixture_with_plan(legacy, async |request| {
+                super::super::plan::build_admitted(
+                    request,
+                    &axial_resource::process_physical_work(),
+                    &crate::tasks::CancellationToken::new(),
+                )
+                .await
+            })
+            .await;
+        (root, prepared.unwrap(), application)
+    }
+
+    /// A prepared session whose command `plan` builds from the fixture's
+    /// verified request.
+    async fn fixture_with_plan(
+        legacy: bool,
+        plan: impl AsyncFnOnce(
+            super::super::model::LaunchPlanRequest,
+        ) -> Result<ValidatedLaunchCommand, LaunchError>,
+    ) -> (
+        tempfile::TempDir,
+        Result<PreparedSession, LaunchError>,
         crate::library::ApplicationRootPin,
     ) {
         let crate::testing::Fixture {
@@ -356,13 +408,23 @@ pub(super) mod tests {
                 size: bytes.len() as u64,
             });
         }
-        let installed = ActivatedVersion {
+        let activated = ActivatedVersion {
             version_id: version_id.into(),
             contract_id: format!("managed-install-activation-v1.{}", "A".repeat(43)),
             files,
-        }
-        .verify(instance.generation().clone())
-        .unwrap();
+        };
+        let pin = instance.generation().clone();
+        let installed = axial_resource::process_physical_work()
+            .admit(axial_resource::PhysicalWorkRequest::foreground(
+                axial_resource::PhysicalIoClass::Read,
+                0,
+            ))
+            .await
+            .unwrap()
+            .run_parallel(move |_, workers| activated.verify(pin, &workers))
+            .await
+            .unwrap()
+            .unwrap();
         let java = root.path().join("java");
         std::fs::write(&java, format!(
             "#!/bin/sh\nprintf 'java.version = {java_version}\\nos.arch = {}\\njava.vendor = Eclipse Adoptium\\n' >&2\n",
@@ -395,7 +457,7 @@ pub(super) mod tests {
         )
         .await
         .unwrap();
-        let command = super::super::plan::build(super::super::model::LaunchPlanRequest {
+        let command = plan(super::super::model::LaunchPlanRequest {
             version_guard: axial_minecraft::VersionBundleReadGuard::acquire(&operation).unwrap(),
             library_operation: operation,
             library_dir,
@@ -409,7 +471,12 @@ pub(super) mod tests {
             prepared_natives: None,
             game_assets,
         })
-        .unwrap();
+        .await;
+        let application = library.admit_application_root().unwrap();
+        let command = match command {
+            Ok(command) => command,
+            Err(error) => return (root, Err(error), application),
+        };
         let installed_versions = crate::catalog::installed_snapshot(instance.generation())
             .await
             .unwrap();
@@ -443,7 +510,7 @@ pub(super) mod tests {
                 .begin_activity(|_| Ok::<_, ()>(0), ())
                 .unwrap(),
         };
-        (root, prepared, library.admit_application_root().unwrap())
+        (root, Ok(prepared), application)
     }
 
     fn construct(prepared: PreparedSession) -> Result<PreparedSession, PrepareError> {
@@ -469,17 +536,81 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_plan_waits_for_workers_ends_on_cancellation_and_proves_its_command() {
+        use axial_resource::{
+            PhysicalIoClass, PhysicalWorkClass, PhysicalWorkRequest, process_physical_work,
+        };
+        use futures_util::FutureExt;
+
+        if !crate::install::artifacts::tests::preparation_child(
+            "launch::prepare::tests::admitted_plan_waits_for_workers_ends_on_cancellation_and_proves_its_command",
+        )
+        .await
+        {
+            return;
+        }
+        let work = process_physical_work();
+        let idle = work.snapshot(PhysicalWorkClass::Foreground);
+        let saturated = PhysicalWorkRequest::foreground_parallel(PhysicalIoClass::Read, 0, 4);
+        let cancellation = crate::tasks::CancellationToken::new();
+        let (_cancelled_root, cancelled, _application) = fixture_with_plan(false, async |request| {
+            let held = work.admit(saturated).await.unwrap();
+            let build = super::super::plan::build_admitted(request, &work, &cancellation);
+            tokio::pin!(build);
+            assert!(build.as_mut().now_or_never().is_none());
+            cancellation.cancel();
+            let result = build.await;
+            drop(held);
+            result
+        })
+        .await;
+        let after_cancel = work.snapshot(PhysicalWorkClass::Foreground);
+
+        let mut waited = None;
+        let (root, prepared, _application) = fixture_with_plan(false, async |request| {
+            let held = work.admit(saturated).await.unwrap();
+            let uncancelled = crate::tasks::CancellationToken::new();
+            let build = super::super::plan::build_admitted(request, &work, &uncancelled);
+            tokio::pin!(build);
+            waited = Some(build.as_mut().now_or_never().is_none());
+            drop(held);
+            build.await
+        })
+        .await;
+        let prepared = prepared.unwrap();
+        let built = revalidate_command(&prepared).await;
+        std::fs::write(
+            root.path().join("versions/1.20.1/1.20.1.jar"),
+            b"changed client payload",
+        )
+        .unwrap();
+        let changed = revalidate_command(&prepared).await;
+        drop(prepared);
+        let settled = work.snapshot(PhysicalWorkClass::Foreground);
+
+        assert!(matches!(cancelled, Err(LaunchError::Cancelled)));
+        assert_eq!(after_cancel, idle);
+        assert_eq!(waited, Some(true));
+        assert_eq!(built, Ok(()));
+        assert_eq!(
+            changed,
+            Err(super::super::model::LaunchPlanError::ArtifactChanged)
+        );
+        assert_eq!(settled, idle);
+    }
+
+    #[tokio::test]
     async fn changed_installation_is_rejected_at_the_actual_pre_spawn_boundary() {
         let (root, prepared, _application) = fixture().await;
         let prepared = construct(prepared).unwrap();
-        prepared.validate_before_spawn().unwrap();
+        validate_before_spawn(&prepared).await.unwrap();
         std::fs::write(
             root.path().join("versions/1.20.1/1.20.1.jar"),
             b"changed client payload",
         )
         .unwrap();
         assert!(matches!(
-            prepared.validate_before_spawn(),
+            validate_before_spawn(&prepared).await,
             Err(LaunchError::PlanRejected)
         ));
     }
@@ -526,7 +657,7 @@ pub(super) mod tests {
             prepared.accounts.remove(selected.account_id()).unwrap();
             prepared.account = CapturedSelection::capture(&prepared.accounts).unwrap();
             let prepared = construct(prepared).unwrap();
-            prepared.validate_before_spawn().unwrap();
+            validate_before_spawn(&prepared).await.unwrap();
 
             let expected = if change_account {
                 let changed = prepared
@@ -561,7 +692,10 @@ pub(super) mod tests {
                     .unwrap();
                 LaunchError::SettingsChanged
             };
-            assert_eq!(prepared.validate_before_spawn().unwrap_err(), expected);
+            assert_eq!(
+                validate_before_spawn(&prepared).await.unwrap_err(),
+                expected
+            );
         }
     }
 

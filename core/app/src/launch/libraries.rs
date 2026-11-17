@@ -18,7 +18,8 @@ use axial_minecraft::{
     managed_path::{ManagedLibraryFile, ManagedLibraryOperation},
 };
 use axial_resource::{
-    PhysicalIoClass, PhysicalWorkOwner, PhysicalWorkRequest, process_physical_work,
+    PhysicalIoClass, PhysicalWorkOwner, PhysicalWorkParallelism, PhysicalWorkRequest,
+    process_physical_work,
 };
 use sha1::{Digest, Sha1};
 use std::{
@@ -33,22 +34,21 @@ pub(super) const FILE_CHECK_BATCH: usize = 128;
 // Covers bounded namespace listings (16k names), the current directory ancestry
 // (512-byte paths), 200k asset references, 128 target proofs/keys and copy scratch.
 pub(super) const SCRATCH_BYTES: u64 = 64 << 20;
+/// A proof of prepared game libraries reserves their whole scratch before it
+/// starts any worker.
+pub(super) const REVALIDATION: PhysicalWorkRequest =
+    PhysicalWorkRequest::foreground(PhysicalIoClass::Read, SCRATCH_BYTES);
 
 pub(super) struct Prepared {
     directory: ScopedDirectory,
     sources: Vec<ManagedLibraryFile>,
     files: Vec<FileProof>,
-    work: PhysicalWorkOwner,
 }
 
 impl Prepared {
-    pub(super) fn revalidate(&self) -> io::Result<()> {
-        self.work
-            .try_run_inline(
-                PhysicalWorkRequest::foreground(PhysicalIoClass::Read, SCRATCH_BYTES),
-                || self.check(),
-            )
-            .map_err(|error| io::Error::new(io::ErrorKind::WouldBlock, error))?
+    /// Runs under the caller's `REVALIDATION` admission.
+    pub(super) fn revalidate(&self, _admitted: &PhysicalWorkParallelism) -> io::Result<()> {
+        self.check()
     }
 
     fn check(&self) -> io::Result<()> {
@@ -214,7 +214,6 @@ pub(super) async fn prepare(
                 directory,
                 sources: inputs.sources,
                 files,
-                work: retention.work.clone(),
             };
             prepared
                 .check()
@@ -572,7 +571,6 @@ pub(super) mod tests {
             directory,
             sources: vec![source],
             files: vec![file],
-            work: retention.work.clone(),
         }
     }
 
@@ -618,6 +616,13 @@ pub(super) mod tests {
         }
     }
 
+    fn revalidate(retention: &Retention, prepared: &Prepared) -> io::Result<()> {
+        retention
+            .work
+            .try_run_inline_parallel(REVALIDATION, |workers| prepared.revalidate(workers))
+            .unwrap()
+    }
+
     fn lib_directory(retention: &Retention) -> Result<ScopedDirectory, LaunchError> {
         prepare_directory(retention, &retention.game, &LeafName::new("lib").unwrap())
     }
@@ -653,9 +658,8 @@ pub(super) mod tests {
             directory,
             sources: vec![source],
             files: vec![warm],
-            work: retention.work.clone(),
         };
-        let refused = prepared.revalidate();
+        let refused = revalidate(&retention, &prepared);
         let bytes = [
             std::fs::read(temporary.path().join("libraries/fml/source.jar")).unwrap(),
             std::fs::read(preserved).unwrap(),
@@ -942,21 +946,23 @@ pub(super) mod tests {
             directory,
             sources: vec![fixture.source],
             files: vec![file],
-            work: fixture.retention.work.clone(),
         };
-        prepared.revalidate().unwrap();
+        revalidate(&fixture.retention, &prepared).unwrap();
         let target = fixture.temporary.path().join("game/lib/required.jar");
         let preserved = fixture.temporary.path().join("game/lib/preserved.jar");
         std::fs::rename(&target, &preserved).unwrap();
         std::fs::write(&target, b"abc").unwrap();
-        assert!(prepared.revalidate().is_err());
+        assert!(revalidate(&fixture.retention, &prepared).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"abc");
         assert_eq!(std::fs::read(&preserved).unwrap(), b"abc");
         assert!(!fixture.retention.has_pending());
     }
 
     #[tokio::test]
-    async fn prepared_copy_refuses_its_exhausted_worker_pool_and_recovers() {
+    async fn prepared_copy_proof_reserves_its_scratch_before_workers_and_waits() {
+        use axial_resource::PhysicalWorkClass;
+        use futures_util::FutureExt;
+
         let fixture = fixture();
         let directory = lib_directory(&fixture.retention).unwrap();
         let file = copy(&fixture, &directory).unwrap();
@@ -964,12 +970,13 @@ pub(super) mod tests {
             directory,
             sources: vec![fixture.source],
             files: vec![file],
-            work: fixture.retention.work.clone(),
         };
-        prepared.revalidate().unwrap();
-        let held = fixture
-            .retention
-            .work
+        let work = &fixture.retention.work;
+        let idle = work.snapshot(PhysicalWorkClass::Foreground);
+        let scratch = work
+            .try_reserve_scratch(idle.available_scratch_bytes - SCRATCH_BYTES + 1)
+            .unwrap();
+        let workers = work
             .admit(PhysicalWorkRequest::foreground_parallel(
                 PhysicalIoClass::Read,
                 0,
@@ -977,27 +984,29 @@ pub(super) mod tests {
             ))
             .await
             .unwrap();
-        let refused = prepared.revalidate();
-        drop(held);
-        let recovered = prepared.revalidate();
-        let released = fixture
-            .retention
-            .work
-            .snapshot(axial_resource::PhysicalWorkClass::Foreground);
-        let pending = fixture.retention.has_pending();
-        let error = refused.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(
-            error
-                .get_ref()
-                .and_then(|cause| cause.downcast_ref::<axial_resource::PhysicalWorkError>()),
-            Some(&axial_resource::PhysicalWorkError::Unavailable),
-        );
-        recovered.unwrap();
-        assert_eq!(
-            (released.available_workers, released.active_admissions),
-            (4, 0)
-        );
-        assert!(!pending);
+        let mut observed = Vec::new();
+        {
+            let waiting = work.admit(REVALIDATION);
+            tokio::pin!(waiting);
+            observed.push(waiting.as_mut().now_or_never().is_none());
+            // Without its scratch the proof holds no worker.
+            drop(workers);
+            observed.push(waiting.as_mut().now_or_never().is_none());
+            observed.push(
+                work.snapshot(PhysicalWorkClass::Foreground)
+                    .available_workers
+                    == 4,
+            );
+            drop(scratch);
+            let admitted = waiting.as_mut().now_or_never().unwrap().unwrap();
+            observed.push(
+                admitted
+                    .run_inline(|workers| prepared.revalidate(workers))
+                    .is_ok(),
+            );
+        }
+        assert_eq!(observed, [true, true, true, true]);
+        assert_eq!(work.snapshot(PhysicalWorkClass::Foreground), idle);
+        assert!(!fixture.retention.has_pending());
     }
 }

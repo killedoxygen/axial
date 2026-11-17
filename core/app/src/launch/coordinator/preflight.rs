@@ -50,10 +50,42 @@ pub(super) struct PreflightInventory {
 }
 
 impl PreflightInventory {
-    pub(super) fn revalidate(&self) -> Result<(), LaunchError> {
+    pub(super) fn revalidate(
+        &self,
+        workers: &axial_resource::PhysicalWorkParallelism,
+    ) -> Result<(), LaunchError> {
         self.bundle.revalidate().map_err(bundle_read_error)?;
-        self.evidence.revalidate().map_err(install_read_error)
+        self.evidence
+            .revalidate(workers)
+            .map_err(install_read_error)
     }
+}
+
+/// Runs a readiness proof on a blocking thread under the install queue's
+/// owner without waiting; unavailable capacity refuses as `AtCapacity`.
+async fn try_readiness_proof<T: Send + 'static>(
+    work: axial_resource::PhysicalWorkOwner,
+    stage: &'static str,
+    proof: impl FnOnce(&axial_resource::PhysicalWorkParallelism) -> Result<T, LaunchError>
+    + Send
+    + 'static,
+) -> Result<T, LaunchError> {
+    tokio::task::spawn_blocking(move || {
+        work.try_run_inline_parallel(
+            axial_resource::PhysicalWorkRequest::foreground(
+                axial_resource::PhysicalIoClass::Read,
+                0,
+            ),
+            proof,
+        )
+        .map_err(|error| {
+            install_read_error(crate::install::artifacts::inspection_capacity(
+                &work, error, stage,
+            ))
+        })?
+    })
+    .await
+    .map_err(|_| LaunchError::PreparationFailed)?
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -301,10 +333,10 @@ impl LaunchCoordinator {
                     ))
                     .await
                     .map_err(|_| LaunchError::AtCapacity)?
-                    .run(move |_| {
+                    .run_parallel(move |_, workers| {
                         for inventory in inventories {
                             inventory
-                                .revalidate()
+                                .revalidate(&workers)
                                 .map_err(|_| LaunchError::LibraryUnavailable)?;
                         }
                         Ok::<_, LaunchError>(())
@@ -752,13 +784,15 @@ impl LaunchCoordinator {
                             .reserve_checks(damage.entry_count())
                             .map_err(install_read_error);
                         let checked = match reserved {
-                            Ok(()) => tokio::task::spawn_blocking(move || {
-                                damage.revalidate()?;
-                                Ok::<_, InstallError>(damage)
-                            })
-                            .await
-                            .map_err(|_| LaunchError::PreparationFailed)
-                            .and_then(|result| result.map_err(install_read_error)),
+                            Ok(()) => try_readiness_proof(
+                                coordinator.installs.physical_work().clone(),
+                                "readiness_damage",
+                                move |workers| {
+                                    damage.revalidate(workers).map_err(install_read_error)?;
+                                    Ok(damage)
+                                },
+                            )
+                            .await,
                             Err(error) => Err(error),
                         };
                         match checked {
@@ -792,10 +826,12 @@ impl LaunchCoordinator {
                     let checked = match reserved {
                         Ok(()) => {
                             let proof = proof.inventory.clone();
-                            tokio::task::spawn_blocking(move || proof.revalidate())
-                                .await
-                                .map_err(|_| LaunchError::PreparationFailed)
-                                .and_then(|result| result)
+                            try_readiness_proof(
+                                coordinator.installs.physical_work().clone(),
+                                "readiness_inventory",
+                                move |workers| proof.revalidate(workers),
+                            )
+                            .await
                         }
                         Err(error) => Err(error),
                     };

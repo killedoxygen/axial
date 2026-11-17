@@ -224,7 +224,7 @@ async fn assert_runtime_failure_keeps_safe_cause(missing: bool, launch: bool) {
     );
     assert_eq!(game_names(), names_before);
     assert_eq!(std::fs::read(canary).unwrap(), b"preserve instance files");
-    installed.revalidate().unwrap();
+    crate::install::artifacts::tests::admitted(|workers| installed.revalidate(workers)).unwrap();
     let pending: i64 = storage
         .read(|db| -> Result<_, StorageError> {
             Ok(db.query_row(
@@ -561,7 +561,7 @@ async fn historical_fml_client_requires_install_before_launch() {
         .ready_version(&pin, &version_id)
         .await
         .unwrap();
-    installed.revalidate().unwrap();
+    crate::install::artifacts::tests::admitted(|workers| installed.revalidate(workers)).unwrap();
     assert!(installed.version().libraries.is_empty());
     let operation = pin.managed_library().unwrap();
     assert!(
@@ -674,7 +674,7 @@ async fn historical_fml_client_requires_install_before_launch() {
             .unwrap(),
         record
     );
-    installed.revalidate().unwrap();
+    crate::install::artifacts::tests::admitted(|workers| installed.revalidate(workers)).unwrap();
 }
 
 #[cfg(unix)]
@@ -1197,7 +1197,7 @@ async fn prepared_launch_does_not_refresh_a_changed_library_scan() {
             .unwrap();
         assert_eq!(prepared.scenario().requested_memory_mb, Some(xmx));
         assert_eq!(prepared.reserved_heap_mib(), xmx as u64);
-        let initial = prepared.validate_before_spawn();
+        let initial = super::super::prepare::tests::validate_before_spawn(&prepared).await;
         let revision_before = versions.revision().unwrap();
         let observe_changed_revision = || async {
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -1231,15 +1231,15 @@ async fn prepared_launch_does_not_refresh_a_changed_library_scan() {
         std::fs::write(&metadata, b"{not valid external version metadata\n").unwrap();
         let revision_changed = observe_changed_revision().await;
         let target_changed = read_target();
-        let command_changed = prepared.validated_command().revalidate();
-        let changed = prepared.validate_before_spawn();
+        let command_changed = super::super::prepare::tests::revalidate_command(&prepared).await;
+        let changed = super::super::prepare::tests::validate_before_spawn(&prepared).await;
 
         std::fs::remove_file(&metadata).unwrap();
         std::fs::remove_dir(&external).unwrap();
         let revision_restored = observe_changed_revision().await;
         let target_restored = read_target();
-        let command_restored = prepared.validated_command().revalidate();
-        let restored_old = prepared.validate_before_spawn();
+        let command_restored = super::super::prepare::tests::revalidate_command(&prepared).await;
+        let restored_old = super::super::prepare::tests::validate_before_spawn(&prepared).await;
         let natives = native_retention.lock().unwrap().clone();
         if !super::super::prepare::try_settle_natives(natives).await {
             return Err("original native preparation did not settle");
@@ -1261,7 +1261,7 @@ async fn prepared_launch_does_not_refresh_a_changed_library_scan() {
             )
             .await
             .unwrap();
-        let restored_fresh = fresh.validate_before_spawn();
+        let restored_fresh = super::super::prepare::tests::validate_before_spawn(&fresh).await;
         let target_fresh = read_target();
         drop(fresh);
         Ok(move || {
@@ -1864,7 +1864,9 @@ async fn replaced_game_library_settles_accepted_session_without_spawning() {
         &mut prepared,
         libraries::tests::prepare_abc_copy(game, source),
     );
-    prepared.validate_before_spawn().unwrap();
+    super::super::prepare::tests::validate_before_spawn(&prepared)
+        .await
+        .unwrap();
 
     let storage = Arc::new(MetadataStore::in_memory().unwrap());
     let intents = durable_intents(storage.clone());
@@ -1885,7 +1887,7 @@ async fn replaced_game_library_settles_accepted_session_without_spawning() {
     std::fs::rename(&target, &preserved).unwrap();
     std::fs::write(&target, b"abc").unwrap();
     assert!(matches!(
-        prepared.validated_command().revalidate(),
+        super::super::prepare::tests::revalidate_command(&prepared).await,
         Err(super::super::model::LaunchPlanError::ArtifactChanged)
     ));
 

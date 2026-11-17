@@ -64,7 +64,12 @@ pub(super) async fn run(
         return;
     }
     let validated = match prepared.revalidate_composition().await {
-        Ok(()) => prepared.validate_before_spawn(),
+        Ok(()) => axial_resource::process_physical_work()
+            .try_run_inline_parallel(
+                prepared.validated_command().revalidation_request(),
+                |workers| prepared.validate_before_spawn(workers),
+            )
+            .unwrap_or_else(|error| Err(super::coordinator::physical_work_error(error))),
         Err(error) => Err(error),
     };
     if let Err(error) = validated {

@@ -579,24 +579,25 @@ let (
         );
         let mut command = stages
             .time("plan", "Launch command", async {
-                super::plan::build(LaunchPlanRequest {
-                    library_operation,
-                    library_dir,
-                    target_version_id: instance.minecraft_version.clone(),
-                    game_dir,
-                    auth,
-                    runtime: runtime.probe,
-                    managed_launch: runtime.managed,
-                    installed,
-                    version_guard,
-                    prepared_natives,
-                    game_assets,
-                    settings: options,
-                })
-                .map_err(|error| {
-                    tracing::warn!(?error, stage = "build", "Launch plan rejected.");
-                    LaunchError::PlanRejected
-                })
+                super::plan::build_admitted(
+                    LaunchPlanRequest {
+                        library_operation,
+                        library_dir,
+                        target_version_id: instance.minecraft_version.clone(),
+                        game_dir,
+                        auth,
+                        runtime: runtime.probe,
+                        managed_launch: runtime.managed,
+                        installed,
+                        version_guard,
+                        prepared_natives,
+                        game_assets,
+                        settings: options,
+                    },
+                    &axial_resource::process_physical_work(),
+                    cancellation,
+                )
+                .await
             })
             .await?;
         command.game_libraries = game_libraries;

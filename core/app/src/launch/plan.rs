@@ -5,17 +5,49 @@
 mod classpath_fixture;
 
 use super::{
+    coordinator::{LaunchError, physical_work_error},
     jvm,
     model::{LaunchOptions, LaunchPlanError, LaunchPlanRequest, ValidatedLaunchCommand},
 };
-use crate::runtime::model::JavaRequirement;
+use crate::{runtime::model::JavaRequirement, tasks::CancellationToken};
 use axial_minecraft::{
     LaunchVars, build_classpath, default_environment, effective_java_version_for,
     launch::java_path_argument, resolve_arguments, resolve_libraries,
 };
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkOwner, PhysicalWorkParallelism, PhysicalWorkRequest,
+};
 use std::{collections::BTreeMap, path::Path};
 
-pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand, LaunchPlanError> {
+/// Builds the command in one admitted worker, off the async executor. Waiting
+/// for admission ends on cancellation; an admitted build is always joined.
+pub(crate) async fn build_admitted(
+    request: LaunchPlanRequest,
+    work: &PhysicalWorkOwner,
+    cancellation: &CancellationToken,
+) -> Result<ValidatedLaunchCommand, LaunchError> {
+    // A built command has no game libraries attached yet.
+    let admission = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(LaunchError::Cancelled),
+        admission = work.admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0)) => {
+            admission.map_err(physical_work_error)?
+        }
+    };
+    admission
+        .run_parallel(move |_, workers| build(request, &workers))
+        .await
+        .map_err(physical_work_error)?
+        .map_err(|error| {
+            tracing::warn!(?error, stage = "build", "Launch plan rejected.");
+            LaunchError::PlanRejected
+        })
+}
+
+pub(crate) fn build(
+    request: LaunchPlanRequest,
+    workers: &PhysicalWorkParallelism,
+) -> Result<ValidatedLaunchCommand, LaunchPlanError> {
     request
         .library_operation
         .validate_read_projection(&request.library_dir)
@@ -151,7 +183,7 @@ pub(crate) fn build(request: LaunchPlanRequest) -> Result<ValidatedLaunchCommand
         runtime: request.runtime,
         managed_launch: request.managed_launch,
     };
-    command.revalidate()?;
+    command.revalidate(workers)?;
     Ok(command)
 }
 
@@ -347,7 +379,9 @@ mod tests {
     #[tokio::test]
     async fn legacy_command_binds_applet_home_to_the_admitted_game_directory() {
         let (_root, prepared, _application) = super::super::prepare::tests::legacy_fixture().await;
-        prepared.validate_before_spawn().unwrap();
+        super::super::prepare::tests::validate_before_spawn(&prepared)
+            .await
+            .unwrap();
         let command = prepared.validated_command();
         assert!(command.installed.version().is_legacy_version());
         assert_eq!(command.runtime.info().major, 8);

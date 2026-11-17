@@ -3,6 +3,7 @@
 use crate::install::{queue::InstalledVersionReceipt, vanilla::PreparedNatives};
 use axial_minecraft::managed_path::ManagedLibraryOperation;
 use axial_minecraft::{JavaProbeReceipt, ManagedRuntimeLaunchReceipt, VersionBundleReadGuard};
+use axial_resource::{PhysicalIoClass, PhysicalWorkParallelism, PhysicalWorkRequest};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
@@ -131,8 +132,22 @@ impl ValidatedLaunchCommand {
         &self.cwd
     }
 
-    /// Fingerprints and retained capabilities only. Never starts Java.
-    pub(crate) fn revalidate(&self) -> Result<(), LaunchPlanError> {
+    /// The admission `revalidate` runs under: attached game libraries need
+    /// their whole proof scratch before any worker starts.
+    pub(crate) fn revalidation_request(&self) -> PhysicalWorkRequest {
+        if self.game_libraries.is_some() {
+            super::libraries::REVALIDATION
+        } else {
+            PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0)
+        }
+    }
+
+    /// Fingerprints and retained capabilities only, under the caller's
+    /// `revalidation_request` admission. Never starts Java.
+    pub(crate) fn revalidate(
+        &self,
+        workers: &PhysicalWorkParallelism,
+    ) -> Result<(), LaunchPlanError> {
         self.library_operation
             .validate_read_projection(&self.library_dir)
             .map_err(|_| LaunchPlanError::LibraryChanged)?;
@@ -148,7 +163,7 @@ impl ValidatedLaunchCommand {
                 .map_err(|_| LaunchPlanError::RuntimeChanged)?;
         }
         self.installed
-            .revalidate()
+            .revalidate(workers)
             .map_err(|_| LaunchPlanError::ArtifactChanged)?;
         if let Some(natives) = &self.prepared_natives {
             natives
@@ -156,10 +171,9 @@ impl ValidatedLaunchCommand {
                 .map_err(|_| LaunchPlanError::ArtifactChanged)?;
         }
         if let Some(libraries) = &self.game_libraries {
-            libraries.revalidate().map_err(|error| match error.kind() {
-                std::io::ErrorKind::WouldBlock => LaunchPlanError::InspectionLimit,
-                _ => LaunchPlanError::ArtifactChanged,
-            })?;
+            libraries
+                .revalidate(workers)
+                .map_err(|_| LaunchPlanError::ArtifactChanged)?;
         }
         Ok(())
     }
@@ -208,6 +222,4 @@ pub enum LaunchPlanError {
     IncompatiblePreset,
     #[error("The installed launch command is invalid or contains unresolved variables.")]
     InvalidCommand,
-    #[error("The installed version exceeds launch inspection limits.")]
-    InspectionLimit,
 }

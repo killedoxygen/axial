@@ -267,12 +267,14 @@ mod tests {
             panic!("isolated library admission");
         };
         let pin = library.admit().unwrap();
-        let installed = ActivatedVersion {
+        let activated = ActivatedVersion {
             version_id: "1.6.4".into(),
             contract_id: format!("managed-install-activation-v1.{}", "A".repeat(43)),
             files,
-        }
-        .verify(pin.clone())
+        };
+        let installed = crate::install::artifacts::tests::admitted(|workers| {
+            activated.verify(pin.clone(), workers)
+        })
         .unwrap();
         let game = ScopedDirectory::from_admitted(
             pin.directory()
@@ -310,7 +312,8 @@ mod tests {
         std::fs::remove_file(tree.join("newsound/step/grass.ogg")).unwrap();
         assert_eq!(fixture.prepare().await.unwrap(), Some(tree.clone()));
         assert_tree(&tree);
-        fixture.installed.revalidate().unwrap();
+        crate::install::artifacts::tests::admitted(|workers| fixture.installed.revalidate(workers))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -335,7 +338,8 @@ mod tests {
             b"changed"
         );
         assert_eq!(std::fs::read(tree.join("sound/user.ogg")).unwrap(), b"user");
-        fixture.installed.revalidate().unwrap();
+        crate::install::artifacts::tests::admitted(|workers| fixture.installed.revalidate(workers))
+            .unwrap();
     }
 
     #[tokio::test]

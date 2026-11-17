@@ -15,6 +15,7 @@ use axial_minecraft::{
     KnownGoodInstallReceipt, ManagedInstallDurableOutcome, VerifiedManagedInstallReceipt,
 };
 use axial_minecraft::{VersionJson, rules::Environment};
+use axial_resource::PhysicalWorkParallelism;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -25,7 +26,7 @@ use std::{
 
 pub(crate) const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
 
-pub(super) fn inspection_capacity(
+pub(crate) fn inspection_capacity(
     work: &axial_resource::PhysicalWorkOwner,
     error: axial_resource::PhysicalWorkError,
     stage: &'static str,
@@ -221,6 +222,7 @@ impl DecodedVersion {
         inspection: Inspection,
         diagnostics: bool,
         budget: Option<Arc<std::sync::Mutex<InventoryBudget>>>,
+        workers: &PhysicalWorkParallelism,
     ) -> Result<VersionInspection, super::queue::InstallError> {
         if self.activated.version_id != version_id {
             return Err(super::queue::InstallError::NotReady);
@@ -231,7 +233,9 @@ impl DecodedVersion {
                 .unwrap()
                 .reserve_inventory(&self.activated, inspection)?;
         }
-        let result = self.activated.inspect(pin, inspection, diagnostics);
+        let result = self
+            .activated
+            .inspect(pin, inspection, diagnostics, workers);
         drop(self.slots);
         result
     }
@@ -452,8 +456,9 @@ impl ActivatedVersion {
     pub(crate) fn verify(
         self,
         pin: GenerationPin,
+        workers: &PhysicalWorkParallelism,
     ) -> Result<InstalledVersionReceipt, super::queue::InstallError> {
-        self.inspect(pin, Inspection::Integrity, false)?
+        self.inspect(pin, Inspection::Integrity, false, workers)?
             .into_ready()
     }
 
@@ -462,6 +467,7 @@ impl ActivatedVersion {
         pin: GenerationPin,
         inspection: Inspection,
         diagnostics: bool,
+        workers: &PhysicalWorkParallelism,
     ) -> Result<VersionInspection, super::queue::InstallError> {
         use super::queue::InstallError;
         let measured = tracing::enabled!(tracing::Level::DEBUG);
@@ -648,7 +654,7 @@ impl ActivatedVersion {
             .iter()
             .filter(|file| inspection.observes(&file.path))
             .count();
-        let ranges = inventory_ranges(files.len(), observed_entries, inspect_range)?;
+        let ranges = inventory_ranges(workers, files.len(), observed_entries, inspect_range)?;
         let completed_ranges = ranges.len();
         let entries = files.len();
         let mut guards = Vec::with_capacity(ranges.iter().map(|range| range.guards.len()).sum());
@@ -703,14 +709,14 @@ impl ActivatedVersion {
             scratch: None,
         };
         let inspected = if !reasons.is_empty() {
-            evidence.revalidate()?;
+            evidence.revalidate(workers)?;
             VersionInspection::Damaged(ObservedDamage {
                 evidence,
                 reasons,
             })
         } else if inspection == Inspection::Summary {
             let version = version.ok_or(InstallError::NotReady)?;
-            evidence.revalidate()?;
+            evidence.revalidate(workers)?;
             VersionInspection::Summary(VersionSummary {
                 evidence: Arc::new(evidence),
                 version,
@@ -734,7 +740,7 @@ impl ActivatedVersion {
                 ),
                 client_jar,
             };
-            receipt.revalidate()?;
+            receipt.revalidate(workers)?;
             VersionInspection::Ready(receipt)
         };
         if let Some(started) = started {
@@ -798,6 +804,7 @@ impl InventoryRetention {
         pin: &GenerationPin,
         version_id: &str,
         record: &[u8; 32],
+        workers: &PhysicalWorkParallelism,
     ) -> Option<InstalledVersionReceipt> {
         let retained = self
             .entries
@@ -820,7 +827,7 @@ impl InventoryRetention {
                 exact: retained.exact.clone(),
                 client_jar: retained.client.join_under(&projection),
             };
-            receipt.revalidate().ok()?;
+            receipt.revalidate(workers).ok()?;
             Some(receipt)
         })();
         if receipt.is_none() {
@@ -951,8 +958,11 @@ impl ObservedDamage {
         self.evidence.entry_count()
     }
 
-    pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
-        self.evidence.revalidate()
+    pub(crate) fn revalidate(
+        &self,
+        workers: &PhysicalWorkParallelism,
+    ) -> Result<(), super::queue::InstallError> {
+        self.evidence.revalidate(workers)
     }
 }
 
@@ -1038,7 +1048,10 @@ impl InventoryEvidence {
         Ok(file)
     }
 
-    pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
+    pub(crate) fn revalidate(
+        &self,
+        workers: &PhysicalWorkParallelism,
+    ) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
         let measured = tracing::enabled!(tracing::Level::DEBUG);
         let started = measured.then(Instant::now);
@@ -1049,7 +1062,7 @@ impl InventoryEvidence {
             }
             Ok(())
         })?;
-        let completed = inventory_ranges(self.guards.len(), self.guards.len(), |range| {
+        let completed = inventory_ranges(workers, self.guards.len(), self.guards.len(), |range| {
             let started = measured.then(Instant::now);
             let (first, end) = (range.start, range.end);
             observe_inventory(&self.operation, || {
@@ -1086,19 +1099,21 @@ const PARALLEL_INVENTORY_ENTRIES: usize = 512;
 const MAX_INVENTORY_WORKERS: usize = 4;
 
 /// Runs read-only `job` over contiguous ranges of `len` sorted inventory
-/// entries. The earliest range's refusal is returned, as a single pass would.
+/// entries on the caller's admitted workers. The earliest range's refusal is
+/// returned, as a single pass would.
 fn inventory_ranges<T: Send>(
+    workers: &PhysicalWorkParallelism,
     len: usize,
     observed_entries: usize,
     job: impl Fn(std::ops::Range<usize>) -> Result<T, super::queue::InstallError> + Sync,
 ) -> Result<Vec<T>, super::queue::InstallError> {
-    let workers = if observed_entries >= PARALLEL_INVENTORY_ENTRIES {
+    let max_workers = if observed_entries >= PARALLEL_INVENTORY_ENTRIES {
         MAX_INVENTORY_WORKERS
     } else {
         1
     };
-    axial_resource::process_physical_work()
-        .run_ranges(axial_resource::PhysicalIoClass::Read, len, workers, job)
+    workers
+        .run_ranges(len, max_workers, job)
         .into_iter()
         .collect()
 }
@@ -1185,8 +1200,11 @@ impl InstalledVersionReceipt {
         &self.client_jar
     }
 
-    pub fn revalidate(&self) -> Result<(), super::queue::InstallError> {
-        self.evidence.revalidate()
+    pub fn revalidate(
+        &self,
+        workers: &PhysicalWorkParallelism,
+    ) -> Result<(), super::queue::InstallError> {
+        self.evidence.revalidate(workers)
     }
 
     pub(crate) async fn prepare_game_libraries(
@@ -1231,7 +1249,7 @@ impl InstalledVersionReceipt {
         ))
         .await
         .map_err(GameLibrariesError::Physical)?
-        .run(move |_| {
+        .run_parallel(move |_, workers| {
             let _scratch = retained_scratch;
             let client = self.evidence.exact_file(&client_path)?;
             let bytes = client
@@ -1261,7 +1279,7 @@ impl InstalledVersionReceipt {
                     sources.push(self.evidence.exact_file(&path)?);
                 }
             }
-            self.revalidate()?;
+            self.revalidate(&workers)?;
             Ok((
                 self,
                 requirements.map(|requirements| GameLibraries {
@@ -1304,7 +1322,7 @@ impl InstalledVersionReceipt {
             ))
             .await
             .map_err(|_| InstallError::AtCapacity)?
-            .run(move |_| {
+            .run_parallel(move |_, workers| {
                 let bytes = evidence
                     .exact_file(&index_path)?
                     .read_bounded(size)
@@ -1323,7 +1341,7 @@ impl InstalledVersionReceipt {
                         return Err(InstallError::NotReady);
                     }
                 }
-                evidence.revalidate()?;
+                evidence.revalidate(&workers)?;
                 Ok(Some(LegacyAssetInputs {
                     index_id,
                     assets,
@@ -1459,6 +1477,20 @@ pub(crate) mod tests {
         } else {
             axial_resource::PhysicalWorkOwner::isolated_for_test()
         }
+    }
+
+    /// Runs `work` under one non-waiting foreground read admission of the
+    /// fixture's physical work owner.
+    pub(crate) fn admitted<T>(work: impl FnOnce(&PhysicalWorkParallelism) -> T) -> T {
+        fixture_physical_work()
+            .try_run_inline_parallel(
+                axial_resource::PhysicalWorkRequest::foreground(
+                    axial_resource::PhysicalIoClass::Read,
+                    0,
+                ),
+                work,
+            )
+            .expect("fixture inventory worker")
     }
 
     pub(crate) async fn preparation_child(selector: &str) -> bool {
@@ -1638,8 +1670,9 @@ pub(crate) mod tests {
         budget
             .reserve_inventory(&activated, Inspection::Integrity)
             .unwrap();
-        let receipt = activated.verify(library.admit().unwrap()).unwrap();
-        receipt.revalidate().unwrap();
+        let receipt =
+            admitted(|workers| activated.verify(library.admit().unwrap(), workers)).unwrap();
+        admitted(|workers| receipt.revalidate(workers)).unwrap();
         drop(receipt);
         assert!(matches!(
             budget.reserve_record(1),
@@ -1673,11 +1706,11 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap()
-            .run(move |_| {
+            .run_parallel(move |_, workers| {
                 let observed = activated.files.iter()
                     .filter(|file| Inspection::Summary.observes(&file.path))
                     .count();
-                inventory_ranges(activated.files.len(), observed, |range| {
+                inventory_ranges(&workers, activated.files.len(), observed, |range| {
                     observe_inventory(&operation, || {
                         let mut batch = operation.file_batch();
                         for file in &activated.files[range] {
@@ -1727,9 +1760,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         let pin = library.admit().unwrap();
-        let mut receipt = activated.clone().verify(pin.clone()).unwrap();
+        let mut receipt =
+            admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
         let evidence = receipt.retain_inventory().unwrap();
-        let original_valid = evidence.revalidate().is_ok();
+        let original_valid = admitted(|workers| evidence.revalidate(workers)).is_ok();
         let work = process_physical_work();
         let remaining = work
             .snapshot(PhysicalWorkClass::Foreground)
@@ -1752,8 +1786,8 @@ pub(crate) mod tests {
         drop(result);
         let before_release = work.snapshot(PhysicalWorkClass::Foreground);
         drop(occupied);
-        let preserved = evidence.revalidate().is_ok();
-        let positive = match activated.verify(pin.clone()) {
+        let preserved = admitted(|workers| evidence.revalidate(workers)).is_ok();
+        let positive = match admitted(|workers| activated.verify(pin.clone(), workers)) {
             Ok(receipt) => receipt.prepare_game_libraries(None).await,
             Err(error) => Err(GameLibrariesError::Install(error)),
         };
@@ -1833,8 +1867,8 @@ pub(crate) mod tests {
         ];
         let before = paths.each_ref().map(|path| std::fs::read(path).unwrap());
         let pin = library.admit().unwrap();
-        let original = activated.clone().verify(pin.clone()).unwrap();
-        let positive = match activated.clone().verify(pin.clone()) {
+        let original = admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
+        let positive = match admitted(|workers| activated.clone().verify(pin.clone(), workers)) {
             Ok(receipt) => {
                 receipt
                     .prepare_game_libraries(Some(Arc::new(std::sync::Mutex::new(
@@ -1857,7 +1891,7 @@ pub(crate) mod tests {
             let mut budget = InventoryBudget::projection();
             budget.reserve_checks(1_000_000 - checks).unwrap();
             budget.reserve_record((16_u64 << 30) - bytes).unwrap();
-            let result = match activated.clone().verify(pin.clone()) {
+            let result = match admitted(|workers| activated.clone().verify(pin.clone(), workers)) {
                 Ok(receipt) => {
                     receipt
                         .prepare_game_libraries(Some(Arc::new(std::sync::Mutex::new(budget))))
@@ -1875,7 +1909,7 @@ pub(crate) mod tests {
             ));
             drop(result);
         }
-        let preserved = original.revalidate().is_ok();
+        let preserved = admitted(|workers| original.revalidate(workers)).is_ok();
         let unchanged = paths
             .iter()
             .zip(&before)
@@ -1925,7 +1959,8 @@ pub(crate) mod tests {
             .join(format!("versions/{0}/{0}.jar", activated.version_id,));
         let original_bytes = std::fs::read(&client).unwrap();
         let pin = library.admit().unwrap();
-        let mut receipt = activated.clone().verify(pin.clone()).unwrap();
+        let mut receipt =
+            admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
         let work = process_physical_work();
         let before = work
             .snapshot(PhysicalWorkClass::Foreground)
@@ -1938,7 +1973,8 @@ pub(crate) mod tests {
         let twice = work
             .snapshot(PhysicalWorkClass::Foreground)
             .available_scratch_bytes;
-        let valid = first.revalidate().is_ok() && second.revalidate().is_ok();
+        let valid = admitted(|workers| first.revalidate(workers)).is_ok()
+            && admitted(|workers| second.revalidate(workers)).is_ok();
         drop(receipt);
         let receipt_dropped = work
             .snapshot(PhysicalWorkClass::Foreground)
@@ -1951,11 +1987,14 @@ pub(crate) mod tests {
         let previous = client.with_file_name("previous-client.jar");
         let replacement = std::fs::rename(&client, &previous)
             .and_then(|()| std::fs::write(&client, &original_bytes));
-        let refused = matches!(second.revalidate(), Err(InstallError::NotReady));
-        let fresh = activated.verify(pin.clone());
+        let refused = matches!(
+            admitted(|workers| second.revalidate(workers)),
+            Err(InstallError::NotReady)
+        );
+        let fresh = admitted(|workers| activated.verify(pin.clone(), workers));
         let fresh_valid = fresh
             .as_ref()
-            .is_ok_and(|receipt| receipt.revalidate().is_ok());
+            .is_ok_and(|receipt| admitted(|workers| receipt.revalidate(workers)).is_ok());
         drop(fresh);
         let restored = if replacement.is_ok() {
             std::fs::remove_file(&client).and_then(|()| std::fs::rename(&previous, &client))
@@ -2014,7 +2053,8 @@ pub(crate) mod tests {
                 .iter()
                 .map(|file| (file.path.clone(), file.path.as_ptr(), file.sha1.as_ptr()))
                 .collect();
-            let receipt = activated.verify(library.admit().unwrap()).unwrap();
+            let receipt =
+                admitted(|workers| activated.verify(library.admit().unwrap(), workers)).unwrap();
             let transferred = strings.iter().all(|(path, path_ptr, sha1_ptr)| {
                 receipt
                     .exact
@@ -2023,7 +2063,10 @@ pub(crate) mod tests {
                         key.as_ptr() == *path_ptr && value.0.as_ptr() == *sha1_ptr
                     })
             });
-            (transferred, receipt.revalidate().is_ok())
+            (
+                transferred,
+                admitted(|workers| receipt.revalidate(workers)).is_ok(),
+            )
         }));
         let settled = library.try_preserve();
         if settled.is_err() {
@@ -2110,7 +2153,10 @@ pub(crate) mod tests {
                         (path, bytes)
                     })
                     .collect::<Vec<_>>();
-                receipt = Some(activated.verify(library.admit().unwrap()).unwrap());
+                receipt = Some(
+                    admitted(|workers| activated.verify(library.admit().unwrap(), workers))
+                        .unwrap(),
+                );
                 let verified = receipt.as_ref().unwrap();
                 let pin = library.admit().unwrap();
                 natives = Some(
@@ -2131,7 +2177,7 @@ pub(crate) mod tests {
                     b"owned native fixture"
                 );
                 prepared.revalidate().unwrap();
-                verified.revalidate().unwrap();
+                admitted(|workers| verified.revalidate(workers)).unwrap();
                 for (path, bytes) in inputs {
                     assert_eq!(std::fs::read(path).unwrap(), bytes);
                 }
@@ -2219,12 +2265,12 @@ pub(crate) mod tests {
     fn file_batch_inventory_keeps_hash_duplicate_and_final_revision_checks() {
         let (temporary, library, activated) = fixture();
         let pin = library.admit().unwrap();
-        let receipt = activated.clone().verify(pin.clone()).unwrap();
-        receipt.revalidate().unwrap();
+        let receipt = admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
+        admitted(|workers| receipt.revalidate(workers)).unwrap();
         let mut duplicate = activated.clone();
         duplicate.files.push(duplicate.files[1].clone());
         assert!(matches!(
-            duplicate.verify(pin.clone()),
+            admitted(|workers| duplicate.verify(pin.clone(), workers)),
             Err(super::super::queue::InstallError::NotReady)
         ));
         std::fs::write(
@@ -2232,8 +2278,8 @@ pub(crate) mod tests {
             b"other payload",
         )
         .unwrap();
-        assert!(receipt.revalidate().is_err());
-        assert!(activated.verify(pin).is_err());
+        assert!(admitted(|workers| receipt.revalidate(workers)).is_err());
+        assert!(admitted(|workers| activated.verify(pin, workers)).is_err());
     }
 
     #[test]
@@ -2253,14 +2299,17 @@ pub(crate) mod tests {
             });
         }
         let pin = library.admit().unwrap();
-        activated.clone().verify(pin.clone()).unwrap();
+        admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
         assert!(
-            activated
-                .clone()
-                .inspect(pin.clone(), Inspection::Summary, true)
-                .unwrap()
-                .into_ready()
-                .is_err()
+            admitted(|workers| activated.clone().inspect(
+                pin.clone(),
+                Inspection::Summary,
+                true,
+                workers
+            ))
+            .unwrap()
+            .into_ready()
+            .is_err()
         );
         for (path, missing, ready) in [
             ("versions/1.21.4/1.21.4.jar", false, true),
@@ -2277,24 +2326,27 @@ pub(crate) mod tests {
             } else {
                 std::fs::write(&target, vec![b'x'; original.len()]).unwrap();
             }
-            let observed = activated
-                .clone()
-                .inspect(pin.clone(), Inspection::Summary, true)
-                .unwrap();
-            let strict_refused = activated.clone().verify(pin.clone()).is_err();
+            let observed = admitted(|workers| {
+                activated
+                    .clone()
+                    .inspect(pin.clone(), Inspection::Summary, true, workers)
+            })
+            .unwrap();
+            let strict_refused =
+                admitted(|workers| activated.clone().verify(pin.clone(), workers)).is_err();
             let summary_ready = match &observed {
                 VersionInspection::Summary(summary) => {
-                    summary.evidence.revalidate().unwrap();
+                    admitted(|workers| summary.evidence.revalidate(workers)).unwrap();
                     true
                 }
                 VersionInspection::Damaged(damage) => {
-                    damage.revalidate().unwrap();
+                    admitted(|workers| damage.revalidate(workers)).unwrap();
                     false
                 }
                 VersionInspection::Ready(_) => panic!("summary produced launch authority"),
             };
             std::fs::write(&target, original).unwrap();
-            activated.clone().verify(pin.clone()).unwrap();
+            admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
             assert_eq!(summary_ready, ready, "{path}, missing={missing}");
             assert!(strict_refused, "{path}, missing={missing}");
         }
@@ -2329,9 +2381,13 @@ pub(crate) mod tests {
                 }
             }
             assert!(
-                changed
-                    .inspect(pin.clone(), Inspection::Summary, true)
-                    .is_err(),
+                admitted(|workers| changed.inspect(
+                    pin.clone(),
+                    Inspection::Summary,
+                    true,
+                    workers
+                ))
+                .is_err(),
                 "{malformed}"
             );
         }
@@ -2354,10 +2410,10 @@ pub(crate) mod tests {
                 size: 1,
             });
         }
-        let VersionInspection::Damaged(damage) = activated
-            .inspect(library.admit().unwrap(), Inspection::Summary, true)
-            .unwrap()
-        else {
+        let VersionInspection::Damaged(damage) = admitted(|workers| {
+            activated.inspect(library.admit().unwrap(), Inspection::Summary, true, workers)
+        })
+        .unwrap() else {
             panic!("missing libraries must retain their observation");
         };
         let work = axial_resource::process_physical_work();
@@ -2365,7 +2421,7 @@ pub(crate) mod tests {
         let before = work.snapshot(class).available_scratch_bytes;
         let evidence = damage.retain_inventory().unwrap();
         let charge = before - work.snapshot(class).available_scratch_bytes;
-        let observed = evidence.revalidate();
+        let observed = admitted(|workers| evidence.revalidate(workers));
         let minimum = 66
             * std::mem::size_of::<(PortableRelativePath, axial_fs::FileRevisionObservation)>()
                 as u64
@@ -2392,28 +2448,33 @@ pub(crate) mod tests {
     fn missing_client_observation_refuses_restored_file() {
         let (temporary, library, activated) = fixture();
         let pin = library.admit().unwrap();
-        activated.clone().verify(pin.clone()).unwrap();
+        admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
         let client = temporary.path().join("versions/1.21.4/1.21.4.jar");
         let original = std::fs::read(&client).unwrap();
         std::fs::remove_file(&client).unwrap();
-        let VersionInspection::Damaged(damage) = activated
-            .clone()
-            .inspect(pin.clone(), Inspection::Integrity, true)
-            .unwrap()
-        else {
+        let VersionInspection::Damaged(damage) = admitted(|workers| {
+            activated
+                .clone()
+                .inspect(pin.clone(), Inspection::Integrity, true, workers)
+        })
+        .unwrap() else {
             panic!("missing client must retain observed damage");
         };
         assert_eq!(damage.reasons(), &[InstallError::ClientJarMissing]);
-        damage.revalidate().unwrap();
+        admitted(|workers| damage.revalidate(workers)).unwrap();
 
         std::fs::write(&client, &original).unwrap();
-        assert!(matches!(damage.revalidate(), Err(InstallError::NotReady)));
+        assert!(matches!(
+            admitted(|workers| damage.revalidate(workers)),
+            Err(InstallError::NotReady)
+        ));
         let VersionInspection::Ready(receipt) =
-            activated.inspect(pin, Inspection::Integrity, true).unwrap()
+            admitted(|workers| activated.inspect(pin, Inspection::Integrity, true, workers))
+                .unwrap()
         else {
             panic!("fresh inspection must admit the restored client");
         };
-        receipt.revalidate().unwrap();
+        admitted(|workers| receipt.revalidate(workers)).unwrap();
         assert_eq!(std::fs::read(client).unwrap(), original);
     }
 
@@ -2421,32 +2482,37 @@ pub(crate) mod tests {
     fn corrupt_client_observation_refuses_same_byte_replacement() {
         let (temporary, library, activated) = fixture();
         let pin = library.admit().unwrap();
-        activated.clone().verify(pin.clone()).unwrap();
+        admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
         let client = temporary.path().join("versions/1.21.4/1.21.4.jar");
         let corrupt = b"corrupt client";
         assert_eq!(std::fs::read(&client).unwrap().len(), corrupt.len());
         std::fs::write(&client, corrupt).unwrap();
-        let VersionInspection::Damaged(damage) = activated
-            .clone()
-            .inspect(pin.clone(), Inspection::Integrity, true)
-            .unwrap()
-        else {
+        let VersionInspection::Damaged(damage) = admitted(|workers| {
+            activated
+                .clone()
+                .inspect(pin.clone(), Inspection::Integrity, true, workers)
+        })
+        .unwrap() else {
             panic!("corrupt client must retain observed damage");
         };
         assert_eq!(damage.reasons(), &[InstallError::ClientJarCorrupt]);
-        damage.revalidate().unwrap();
+        admitted(|workers| damage.revalidate(workers)).unwrap();
 
         let previous = client.with_file_name("previous-client.jar");
         std::fs::rename(&client, &previous).unwrap();
         std::fs::write(&client, corrupt).unwrap();
-        assert!(matches!(damage.revalidate(), Err(InstallError::NotReady)));
+        assert!(matches!(
+            admitted(|workers| damage.revalidate(workers)),
+            Err(InstallError::NotReady)
+        ));
         let VersionInspection::Damaged(fresh) =
-            activated.inspect(pin, Inspection::Integrity, true).unwrap()
+            admitted(|workers| activated.inspect(pin, Inspection::Integrity, true, workers))
+                .unwrap()
         else {
             panic!("replacement client must remain corrupt");
         };
         assert_eq!(fresh.reasons(), &[InstallError::ClientJarCorrupt]);
-        fresh.revalidate().unwrap();
+        admitted(|workers| fresh.revalidate(workers)).unwrap();
         assert_eq!(std::fs::read(previous).unwrap(), corrupt);
         assert_eq!(std::fs::read(client).unwrap(), corrupt);
     }
@@ -2455,7 +2521,7 @@ pub(crate) mod tests {
     fn diagnostic_inspection_refuses_later_malformed_inventory() {
         let (temporary, library, mut activated) = fixture();
         let pin = library.admit().unwrap();
-        activated.clone().verify(pin.clone()).unwrap();
+        admitted(|workers| activated.clone().verify(pin.clone(), workers)).unwrap();
         std::fs::remove_file(temporary.path().join("versions/1.21.4/1.21.4.jar")).unwrap();
         activated.files.push(ActivatedFile {
             path: "versions/z/z.jar".into(),
@@ -2463,13 +2529,16 @@ pub(crate) mod tests {
             size: 0,
         });
         assert!(matches!(
-            activated
-                .clone()
-                .inspect(pin.clone(), Inspection::Integrity, false),
+            admitted(|workers| activated.clone().inspect(
+                pin.clone(),
+                Inspection::Integrity,
+                false,
+                workers
+            )),
             Err(InstallError::ClientJarMissing)
         ));
         assert!(matches!(
-            activated.inspect(pin, Inspection::Integrity, true),
+            admitted(|workers| activated.inspect(pin, Inspection::Integrity, true, workers)),
             Err(InstallError::NotReady)
         ));
     }
