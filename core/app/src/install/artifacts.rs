@@ -1233,24 +1233,7 @@ impl InstalledVersionReceipt {
         .map_err(GameLibrariesError::Physical)?
         .run(move |_| {
             let _scratch = retained_scratch;
-            let path = PortableRelativePath::new_exact(&client_path)
-                .map_err(|_| InstallError::NotReady)?;
-            let expected = self
-                .evidence
-                .guards
-                .iter()
-                .find(|(recorded, _)| recorded == &path)
-                .map(|(_, revision)| revision)
-                .ok_or(InstallError::NotReady)?;
-            let client = self
-                .evidence
-                .operation
-                .observe_file(&path)
-                .map_err(|_| InstallError::NotReady)?
-                .ok_or(InstallError::NotReady)?;
-            if client.revision_observation() != *expected {
-                return Err(InstallError::NotReady);
-            }
+            let client = self.evidence.exact_file(&client_path)?;
             let bytes = client
                 .read_bounded(size)
                 .map_err(|_| InstallError::NotReady)?;
@@ -1275,25 +1258,7 @@ impl InstalledVersionReceipt {
                     {
                         return Err(InstallError::NotReady);
                     }
-                    let path = PortableRelativePath::new_exact(&path)
-                        .map_err(|_| InstallError::NotReady)?;
-                    let expected = self
-                        .evidence
-                        .guards
-                        .iter()
-                        .find(|(recorded, _)| recorded == &path)
-                        .map(|(_, revision)| revision)
-                        .ok_or(InstallError::NotReady)?;
-                    let source = self
-                        .evidence
-                        .operation
-                        .observe_file(&path)
-                        .map_err(|_| InstallError::NotReady)?
-                        .ok_or(InstallError::NotReady)?;
-                    if source.revision_observation() != *expected {
-                        return Err(InstallError::NotReady);
-                    }
-                    sources.push(source);
+                    sources.push(self.evidence.exact_file(&path)?);
                 }
             }
             self.revalidate()?;
