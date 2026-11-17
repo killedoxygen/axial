@@ -967,11 +967,27 @@ async fn serve(
         tokio::select! {
             biased;
             _ = shutdown.changed() => break,
-            Some(_) = connections.join_next(), if !connections.is_empty() => {},
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    tracing::debug!(
+                        stage = "http_connection_task",
+                        panicked = error.is_panic(),
+                        cancelled = error.is_cancelled(),
+                        "Local API connection task stopped."
+                    );
+                }
+            },
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 if !peer.ip().is_loopback() { continue; }
-                if connections.len() >= 128 { continue; }
+                if connections.len() >= 128 {
+                    tracing::debug!(
+                        stage = "http_connection_limit",
+                        active_connections = connections.len(),
+                        "Local API connection admission refused."
+                    );
+                    continue;
+                }
                 let service = TowerToHyperService::new(router.clone());
                 let mut stopped = shutdown.clone();
                 connections.spawn(async move {
@@ -980,7 +996,21 @@ async fn serve(
                     tokio::pin!(connection);
                     if !*stopped.borrow() {
                         tokio::select! {
-                            _ = &mut connection => return,
+                            result = &mut connection => {
+                                if let Err(error) = result {
+                                    let source: &(dyn std::error::Error + 'static) = error.as_ref();
+                                    let io_error = std::iter::successors(Some(source), |error| error.source())
+                                        .take(8)
+                                        .find_map(|error| error.downcast_ref::<io::Error>());
+                                    tracing::debug!(
+                                        stage = "http_connection",
+                                        io_error_kind = ?io_error.map(io::Error::kind),
+                                        native_code = ?io_error.and_then(io::Error::raw_os_error),
+                                        "Local API connection ended with an error."
+                                    );
+                                }
+                                return;
+                            },
                             _ = stopped.changed() => {},
                         }
                     }
