@@ -21,7 +21,8 @@ pub mod managed_path {
     #[cfg(feature = "test-support")]
     pub use crate::managed::fs::ManagedLibraryTestAuthority;
     pub use crate::managed::fs::{
-        FileAbsence, FileObservation, ManagedContentCancelReceipt, ManagedContentCheckpointError,
+        FileAbsence, FileHashSample, FileObservation, ManagedContentCancelReceipt,
+        ManagedContentCheckpointError,
         ManagedContentCommitReceipt, ManagedContentCompleteTransfers,
         ManagedContentEncodedManifest, ManagedContentIssuedTransfer,
         ManagedContentManifestObservationFailure, ManagedContentMutationPlan,

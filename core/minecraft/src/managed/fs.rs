@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 mod content_transaction;
 
@@ -2548,7 +2549,18 @@ impl ManagedDir {
         name: &str,
         guard: &ManagedFileGuard,
         max_size: u64,
+        check: impl FnMut() -> Result<(), LoaderError>,
+    ) -> Result<[u8; 20], LoaderError> {
+        self.sha1_guarded_file_bytes_sampled(name, guard, max_size, check, None)
+    }
+
+    fn sha1_guarded_file_bytes_sampled(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
         mut check: impl FnMut() -> Result<(), LoaderError>,
+        mut sample: Option<&mut FileHashSample>,
     ) -> Result<[u8; 20], LoaderError> {
         self.observe(|| {
             check()?;
@@ -2578,14 +2590,22 @@ impl ManagedDir {
                 let mut chunk = [0_u8; 64 * 1024];
                 loop {
                     check()?;
+                    let started = sample.as_ref().map(|_| Instant::now());
                     let read = reader.read(&mut chunk)?;
+                    if let (Some(sample), Some(started)) = (sample.as_deref_mut(), started) {
+                        sample.read_time += started.elapsed();
+                    }
                     if read == 0 {
                         break;
                     }
                     observed = observed.checked_add(read as u64).ok_or_else(|| {
                         LoaderError::Verify("managed guarded hash size overflowed".to_string())
                     })?;
+                    let started = sample.as_ref().map(|_| Instant::now());
                     hasher.update(&chunk[..read]);
+                    if let (Some(sample), Some(started)) = (sample.as_deref_mut(), started) {
+                        sample.hash_time += started.elapsed();
+                    }
                 }
                 reader.finish()?;
                 file.validate_revision(&guard.revision)?;
@@ -2594,7 +2614,13 @@ impl ManagedDir {
                         "managed guarded hash source changed size".to_string(),
                     ));
                 }
-                <[u8; 20]>::from(hasher.finalize())
+                let started = sample.as_ref().map(|_| Instant::now());
+                let digest = <[u8; 20]>::from(hasher.finalize());
+                if let (Some(sample), Some(started)) = (sample.as_deref_mut(), started) {
+                    sample.hash_time += started.elapsed();
+                    sample.bytes_hashed = observed;
+                }
+                digest
             };
             check()?;
             self.revalidate()?;
@@ -2640,8 +2666,19 @@ impl ManagedDir {
         max_size: u64,
         check: impl FnMut() -> Result<(), LoaderError>,
     ) -> Result<[u8; 20], LoaderError> {
+        self.sha1_reverified_file_bytes_sampled(name, guard, max_size, check, None)
+    }
+
+    fn sha1_reverified_file_bytes_sampled(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+        check: impl FnMut() -> Result<(), LoaderError>,
+        sample: Option<&mut FileHashSample>,
+    ) -> Result<[u8; 20], LoaderError> {
         let Some(digest) = self.inner.root.verified_sha1(&guard.revision) else {
-            return self.sha1_guarded_file_bytes_with_check(name, guard, max_size, check);
+            return self.sha1_guarded_file_bytes_sampled(name, guard, max_size, check, sample);
         };
         self.observe(|| {
             if guard.size > max_size {
@@ -2653,6 +2690,9 @@ impl ManagedDir {
                 return Err(LoaderError::Verify(
                     "managed guarded hash source changed before hashing".to_string(),
                 ));
+            }
+            if let Some(sample) = sample {
+                sample.cache_hit = true;
             }
             Ok(digest)
         })
@@ -5280,6 +5320,15 @@ pub struct ManagedLibraryFile {
     guard: ManagedFileGuard,
 }
 
+/// Timings of a successfully guarded digest, excluding namespace/open checks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileHashSample {
+    pub bytes_hashed: u64,
+    pub read_time: Duration,
+    pub hash_time: Duration,
+    pub cache_hit: bool,
+}
+
 /// A per-call observation cursor, not a readiness cache. Only the most recent
 /// parent chain is retained; portable path bounds limit its depth independently
 /// of the number of files. Namespace drift refreshes its exact-name proofs
@@ -5970,6 +6019,37 @@ impl ManagedLibraryFile {
             .map_err(loader_io)?;
         self.operation.revalidate()?;
         Ok(digest)
+    }
+
+    /// Samples the guarded hash; optional reuse has `sha1_reverified` semantics.
+    /// Failed validation returns no digest or measurements.
+    pub fn sample_sha1(
+        &self,
+        max_size: u64,
+        reuse_verified: bool,
+    ) -> io::Result<([u8; 20], FileHashSample)> {
+        let mut sample = FileHashSample::default();
+        let check = || self.operation.revalidate().map_err(LoaderError::Io);
+        let digest = if reuse_verified {
+            self.directory.sha1_reverified_file_bytes_sampled(
+                &self.name,
+                &self.guard,
+                max_size,
+                check,
+                Some(&mut sample),
+            )
+        } else {
+            self.directory.sha1_guarded_file_bytes_sampled(
+                &self.name,
+                &self.guard,
+                max_size,
+                check,
+                Some(&mut sample),
+            )
+        }
+        .map_err(loader_io)?;
+        self.operation.revalidate()?;
+        Ok((digest, sample))
     }
 }
 
@@ -7709,6 +7789,39 @@ mod library_lifecycle_tests {
         let changed = batch.observe_file(&batch_path("first")).unwrap().unwrap();
         assert_ne!(changed.revision_observation(), revision);
         assert_eq!(changed.read_bounded(32).unwrap(), b"other payload");
+    }
+
+    #[test]
+    fn sampled_hash_distinguishes_full_reads_from_verified_hits_and_refuses_replacements() {
+        let (temporary, root, operation) = file_batch_fixture();
+        let file = operation.observe_file(&batch_path("first")).unwrap().unwrap();
+        let (digest, first) = file.sample_sha1(32, true).unwrap();
+        let (reused, hit) = file.sample_sha1(32, true).unwrap();
+        let (strict, reread) = file.sample_sha1(32, false).unwrap();
+        let source = temporary.path().join("assets/objects/aa/first");
+        let preserved = temporary.path().join("assets/objects/aa/preserved");
+        std::fs::rename(&source, &preserved).unwrap();
+        std::fs::write(&source, b"first payload").unwrap();
+        let cached_refused = file.sample_sha1(32, true).is_err();
+        let strict_refused = file.sample_sha1(32, false).is_err();
+        let bytes = [std::fs::read(source).unwrap(), std::fs::read(preserved).unwrap()];
+        drop(file);
+        drop(operation);
+        drop(root);
+        drop(temporary);
+        assert_eq!(digest, <[u8; 20]>::from(Sha1::digest(b"first payload")));
+        assert_eq!(digest, reused);
+        assert_eq!(digest, strict);
+        assert_eq!(first.bytes_hashed, 13);
+        assert!(!first.cache_hit);
+        assert!(hit.cache_hit);
+        assert_eq!(hit.bytes_hashed, 0);
+        assert_eq!(hit.read_time, Duration::ZERO);
+        assert_eq!(hit.hash_time, Duration::ZERO);
+        assert_eq!(reread.bytes_hashed, 13);
+        assert!(!reread.cache_hit);
+        assert!(cached_refused && strict_refused);
+        assert!(bytes.iter().all(|bytes| bytes == b"first payload"));
     }
 
     #[test]

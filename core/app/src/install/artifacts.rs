@@ -20,6 +20,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 pub(crate) const MAX_INVENTORY_ENTRIES: usize = 1_000_000;
@@ -42,7 +43,7 @@ pub(super) fn inspection_capacity(
     super::queue::InstallError::AtCapacity
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Inspection {
     Summary,
     /// Hashes every file in full.
@@ -463,6 +464,8 @@ impl ActivatedVersion {
         diagnostics: bool,
     ) -> Result<VersionInspection, super::queue::InstallError> {
         use super::queue::InstallError;
+        let measured = tracing::enabled!(tracing::Level::DEBUG);
+        let started = measured.then(Instant::now);
         axial_minecraft::ManagedInstallActivationContractId::parse(&self.contract_id)
             .map_err(|_| InstallError::NotReady)?;
         if self.files.is_empty() || self.files.len() > MAX_INVENTORY_ENTRIES {
@@ -486,6 +489,15 @@ impl ActivatedVersion {
         }
         let files = &self.files;
         let inspect_range = |range: std::ops::Range<usize>| {
+            let range_started = measured.then(Instant::now);
+            let (first, end) = (range.start, range.end);
+            let mut observations = 0_u64;
+            let mut observation_time = Duration::ZERO;
+            let mut digest_time = Duration::ZERO;
+            let mut read_time = Duration::ZERO;
+            let mut hash_time = Duration::ZERO;
+            let mut bytes_hashed = 0_u64;
+            let mut digest_hits = 0_u64;
             let mut inspected = InspectedRange {
                 guards: Vec::with_capacity(
                     files[range.clone()]
@@ -525,10 +537,15 @@ impl ActivatedVersion {
                     if !inspection.observes(&expected.path) {
                         continue;
                     }
-                    let file = match batch
+                    let observing = measured.then(Instant::now);
+                    let observation = batch
                         .observe_file_with_absence(&path)
-                        .map_err(|_| InstallError::NotReady)?
-                    {
+                        .map_err(|_| InstallError::NotReady)?;
+                    if let Some(observing) = observing {
+                        observation_time += observing.elapsed();
+                        observations += 1;
+                    }
+                    let file = match observation {
                         FileObservation::Present(file) => file,
                         FileObservation::Missing(absence) => {
                             let reason = if path == client_path {
@@ -551,16 +568,35 @@ impl ActivatedVersion {
                             continue;
                         }
                     };
-                    if file.size() != expected.size
-                        || ((inspection.hashes() || expected.path == metadata_path)
-                            && if inspection == Inspection::Reverified {
-                                file.sha1_reverified(expected.size)
-                            } else {
-                                file.sha1_bounded(expected.size)
-                            }
-                            .map_err(|_| InstallError::NotReady)?
-                                != expected_digest)
+                    let size_matches = file.size() == expected.size;
+                    let digest_matches = if size_matches
+                        && (inspection.hashes() || expected.path == metadata_path)
                     {
+                        let hashing = measured.then(Instant::now);
+                        let digest = if measured {
+                            let (digest, sample) = file
+                                .sample_sha1(expected.size, inspection == Inspection::Reverified)
+                                .map_err(|_| InstallError::NotReady)?;
+                            read_time += sample.read_time;
+                            hash_time += sample.hash_time;
+                            bytes_hashed += sample.bytes_hashed;
+                            digest_hits += u64::from(sample.cache_hit);
+                            digest
+                        } else if inspection == Inspection::Reverified {
+                            file.sha1_reverified(expected.size)
+                                .map_err(|_| InstallError::NotReady)?
+                        } else {
+                            file.sha1_bounded(expected.size)
+                                .map_err(|_| InstallError::NotReady)?
+                        };
+                        if let Some(hashing) = hashing {
+                            digest_time += hashing.elapsed();
+                        }
+                        digest == expected_digest
+                    } else {
+                        true
+                    };
+                    if !size_matches || !digest_matches {
                         let reason = if path == client_path {
                             InstallError::ClientJarCorrupt
                         } else if is_required_library {
@@ -594,9 +630,27 @@ impl ActivatedVersion {
                 }
                 Ok(())
             })?;
+            if let Some(started) = range_started {
+                tracing::debug!(
+                    stage = "inventory_inspection_range",
+                    ?inspection, first, end, observations, bytes_hashed, digest_hits,
+                    elapsed_us = %started.elapsed().as_micros(),
+                    observation_us = %observation_time.as_micros(),
+                    digest_us = %digest_time.as_micros(),
+                    reader_us = %read_time.as_micros(),
+                    hasher_us = %hash_time.as_micros(),
+                    "Inventory range observation completed."
+                );
+            }
             Ok(inspected)
         };
-        let ranges = inventory_ranges(files.len(), inspect_range)?;
+        let observed_entries = files
+            .iter()
+            .filter(|file| inspection.observes(&file.path))
+            .count();
+        let ranges = inventory_ranges(files.len(), observed_entries, inspect_range)?;
+        let completed_ranges = ranges.len();
+        let entries = files.len();
         let mut guards = Vec::with_capacity(ranges.iter().map(|range| range.guards.len()).sum());
         let mut missing = Vec::new();
         let mut reasons = Vec::new();
@@ -648,40 +702,54 @@ impl ActivatedVersion {
             missing,
             scratch: None,
         };
-        if !reasons.is_empty() {
+        let inspected = if !reasons.is_empty() {
             evidence.revalidate()?;
-            return Ok(VersionInspection::Damaged(ObservedDamage {
+            VersionInspection::Damaged(ObservedDamage {
                 evidence,
                 reasons,
-            }));
-        }
-        let version = version.ok_or(InstallError::NotReady)?;
-        if inspection == Inspection::Summary {
+            })
+        } else if inspection == Inspection::Summary {
+            let version = version.ok_or(InstallError::NotReady)?;
             evidence.revalidate()?;
-            return Ok(VersionInspection::Summary(VersionSummary {
+            VersionInspection::Summary(VersionSummary {
                 evidence: Arc::new(evidence),
                 version,
-            }));
-        }
-        let client_jar = client_path.join_under(
-            &evidence
-                .pin
-                .read_projection()
-                .map_err(|_| InstallError::LibraryUnavailable)?,
-        );
-        let receipt = InstalledVersionReceipt {
-            evidence: Arc::new(evidence),
-            version,
-            exact: Arc::new(
-                self.files
-                    .into_iter()
-                    .map(|file| (file.path, (file.sha1, file.size)))
-                    .collect(),
-            ),
-            client_jar,
+            })
+        } else {
+            let version = version.ok_or(InstallError::NotReady)?;
+            let client_jar = client_path.join_under(
+                &evidence
+                    .pin
+                    .read_projection()
+                    .map_err(|_| InstallError::LibraryUnavailable)?,
+            );
+            let receipt = InstalledVersionReceipt {
+                evidence: Arc::new(evidence),
+                version,
+                exact: Arc::new(
+                    self.files
+                        .into_iter()
+                        .map(|file| (file.path, (file.sha1, file.size)))
+                        .collect(),
+                ),
+                client_jar,
+            };
+            receipt.revalidate()?;
+            VersionInspection::Ready(receipt)
         };
-        receipt.revalidate()?;
-        Ok(VersionInspection::Ready(receipt))
+        if let Some(started) = started {
+            let outcome = match &inspected {
+                VersionInspection::Ready(_) => "ready",
+                VersionInspection::Summary(_) => "summary",
+                VersionInspection::Damaged(_) => "damaged",
+            };
+            tracing::debug!(
+                stage = "inventory_inspection", ?inspection, outcome, entries, observed_entries,
+                completed_ranges, elapsed_us = %started.elapsed().as_micros(),
+                "Inventory inspection completed."
+            );
+        }
+        Ok(inspected)
     }
 }
 
@@ -972,6 +1040,8 @@ impl InventoryEvidence {
 
     pub(crate) fn revalidate(&self) -> Result<(), super::queue::InstallError> {
         use super::queue::InstallError;
+        let measured = tracing::enabled!(tracing::Level::DEBUG);
+        let started = measured.then(Instant::now);
         observe_inventory(&self.operation, || {
             self.pin.revalidate().map_err(|_| InstallError::NotReady)?;
             for absence in &self.missing {
@@ -979,7 +1049,9 @@ impl InventoryEvidence {
             }
             Ok(())
         })?;
-        inventory_ranges(self.guards.len(), |range| {
+        let completed = inventory_ranges(self.guards.len(), self.guards.len(), |range| {
+            let started = measured.then(Instant::now);
+            let (first, end) = (range.start, range.end);
             observe_inventory(&self.operation, || {
                 let mut batch = self.operation.file_batch();
                 for (path, expected) in &self.guards[range] {
@@ -988,13 +1060,28 @@ impl InventoryEvidence {
                         .map_err(|_| InstallError::NotReady)?;
                 }
                 Ok(())
-            })
+            })?;
+            if let Some(started) = started {
+                tracing::debug!(
+                    stage = "inventory_revalidation_range", first, end,
+                    elapsed_us = %started.elapsed().as_micros(),
+                    "Inventory range revalidation completed."
+                );
+            }
+            Ok(())
         })?;
+        if let Some(started) = started {
+            tracing::debug!(
+                stage = "inventory_revalidation", entries = self.guards.len(),
+                completed_ranges = completed.len(), elapsed_us = %started.elapsed().as_micros(),
+                "Inventory revalidation completed."
+            );
+        }
         Ok(())
     }
 }
 
-/// Inventories at least this large are split across available physical workers.
+/// Passes observing at least this many files can use parallel workers.
 const PARALLEL_INVENTORY_ENTRIES: usize = 512;
 const MAX_INVENTORY_WORKERS: usize = 4;
 
@@ -1002,9 +1089,10 @@ const MAX_INVENTORY_WORKERS: usize = 4;
 /// entries. The earliest range's refusal is returned, as a single pass would.
 fn inventory_ranges<T: Send>(
     len: usize,
+    observed_entries: usize,
     job: impl Fn(std::ops::Range<usize>) -> Result<T, super::queue::InstallError> + Sync,
 ) -> Result<Vec<T>, super::queue::InstallError> {
-    let workers = if len >= PARALLEL_INVENTORY_ENTRIES {
+    let workers = if observed_entries >= PARALLEL_INVENTORY_ENTRIES {
         MAX_INVENTORY_WORKERS
     } else {
         1
@@ -1592,6 +1680,63 @@ pub(crate) mod tests {
             budget.reserve_record(1),
             Err(InstallError::AtCapacity)
         ));
+    }
+
+    #[tokio::test]
+    async fn summary_ranges_leave_workers_available_when_asset_objects_are_skipped() {
+        use super::super::queue::InstallError;
+        use axial_resource::{PhysicalIoClass, PhysicalWorkClass, PhysicalWorkRequest};
+        if !preparation_child("install::artifacts::tests::summary_ranges_leave_workers_available_when_asset_objects_are_skipped").await {
+            return;
+        }
+        let (temporary, library, mut activated) = fixture();
+        for index in 0..PARALLEL_INVENTORY_ENTRIES {
+            activated.files.push(ActivatedFile {
+                path: format!("assets/objects/skipped-{index}"),
+                sha1: hex::encode(Sha1::digest(b"skipped")),
+                size: 7,
+            });
+        }
+        let operation = library.admit().unwrap().managed_library().unwrap();
+        let work = axial_resource::process_physical_work();
+        let before = work.snapshot(PhysicalWorkClass::Foreground);
+        let observed_work = work.clone();
+        let result = work
+            .admit(PhysicalWorkRequest::foreground(
+                PhysicalIoClass::Read,
+                64 << 10,
+            ))
+            .await
+            .unwrap()
+            .run(move |_| {
+                let observed = activated.files.iter()
+                    .filter(|file| Inspection::Summary.observes(&file.path))
+                    .count();
+                inventory_ranges(activated.files.len(), observed, |range| {
+                    observe_inventory(&operation, || {
+                        let mut batch = operation.file_batch();
+                        for file in &activated.files[range] {
+                            if Inspection::Summary.observes(&file.path) {
+                                let path = PortableRelativePath::new_exact(&file.path).unwrap();
+                                batch.observe_file(&path)
+                                    .map_err(|_| InstallError::NotReady)?
+                                    .ok_or(InstallError::NotReady)?;
+                            }
+                        }
+                        Ok(observed_work.snapshot(PhysicalWorkClass::Foreground))
+                    })
+                })
+            })
+            .await;
+        let after = work.snapshot(PhysicalWorkClass::Foreground);
+        drop(library);
+        drop(temporary);
+        let snapshots = result.unwrap().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].active_admissions, 1);
+        assert_eq!(snapshots[0].running_workers, 1);
+        assert_eq!(snapshots[0].available_workers, 3);
+        assert_eq!(before, after);
     }
 
     #[tokio::test]
