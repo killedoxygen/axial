@@ -8,6 +8,8 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 
 ## [Unreleased]
 
+## [0.4.0-rc.6] - 2026-11-17
+
 ### Discover
 - Resource packs and shaders load again: a project published as more than one kind no longer fails the whole page, and says which kind it installs as
 - Anything can be picked before an instance exists, modpacks included. A modpack becomes its own instance and takes the mods, resource packs and shaders picked with it; several modpacks become an instance each
@@ -20,6 +22,17 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 - Vanilla, Fabric, Forge, NeoForge and Quilt marks redrawn as one set
 - On an instance's cover, the select box and the play mark are drawn in the cover's own colours, and an unselected box is empty
 - Covers no longer slide into place the first time one is selected
+
+### Launch and runtime
+- Launch preparation reuses verified game files, native libraries and Java runtimes, while rechecking changes before starting Minecraft
+- Automatic memory allocation accounts for other active work, and historical Minecraft versions use the appropriate Java and JVM settings
+- Java 8 can be provisioned from Eclipse Temurin, and Forge installers that use SRG processors are supported
+- Interrupted stops and native-library cleanup retain recovery ownership, and startup failures preserve more useful diagnostic causes
+
+### Fixes
+- Account reads avoid repeated credential lookups and protect concurrent credential changes
+- Startup distinguishes recovery still in progress from connection failures
+- The update feed uses the platform identifiers requested by the current app
 
 ## [0.4.0-rc.5] - 2026-11-02
 
