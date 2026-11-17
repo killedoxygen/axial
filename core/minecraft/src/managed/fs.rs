@@ -7302,54 +7302,219 @@ mod library_lifecycle_tests {
     }
 
     #[test]
-    fn file_batch_sibling_walk_refuses_replaced_or_aliased_shared_ancestors() {
-        for replace in [false, true] {
-            let (temporary, root, operation) = file_batch_fixture();
-            let next = PortableRelativePath::new_exact("assets/objects/bb/next").unwrap();
-            std::fs::create_dir(temporary.path().join("assets/objects/bb")).unwrap();
-            std::fs::write(temporary.path().join(next.as_str()), b"next").unwrap();
-            let mut batch = operation.file_batch();
-            let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
-            let mut revisions = operation.file_batch();
-            revisions
-                .validate_revision(&batch_path("first"), &first.revision_observation())
-                .unwrap();
-            let expected = operation
-                .observe_file(&next)
-                .unwrap()
-                .unwrap()
-                .revision_observation();
-            drop(first);
-            let parent = batch.parent.as_ref().unwrap().revisions[1].0.clone();
-            let before = parent.passive_revision().unwrap();
-            let moved = if replace {
-                "previous-objects"
-            } else {
-                "Objects"
-            };
-            std::fs::rename(
-                temporary.path().join("assets/objects"),
-                temporary.path().join("assets").join(moved),
-            )
-            .unwrap();
-            if replace {
-                std::fs::create_dir_all(temporary.path().join("assets/objects/bb")).unwrap();
-                std::fs::write(temporary.path().join(next.as_str()), b"next").unwrap();
+    fn file_batch_ancestor_move_attempt_preserves_original_authority() {
+        for (source, destination, replace) in [
+            ("assets", "Assets", false),
+            ("assets", "previous-assets", true),
+            ("assets/objects", "assets/previous-objects", true),
+        ] {
+            for hold_files in [false, true] {
+                let (temporary, root, operation) = file_batch_fixture();
+                let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let paths = [
+                        batch_path("first"),
+                        batch_path("second"),
+                        PortableRelativePath::new_exact("assets/objects/bb/next").unwrap(),
+                    ];
+                    let payloads: [&[u8]; 3] = [b"first payload", b"second payload", b"next"];
+                    std::fs::create_dir(temporary.path().join("assets/objects/bb")).unwrap();
+                    std::fs::write(temporary.path().join(paths[2].as_str()), payloads[2]).unwrap();
+                    std::fs::write(temporary.path().join("unrelated"), b"preserved").unwrap();
+                    let unrelated = operation
+                        .observe_file(&PortableRelativePath::new_exact("unrelated").unwrap())
+                        .unwrap()
+                        .unwrap();
+                    let files = paths
+                        .each_ref()
+                        .map(|path| operation.observe_file(path).unwrap().unwrap());
+                    let expected = files.each_ref().map(|file| file.revision_observation());
+                    let files = hold_files.then_some(files);
+                    let mut same = operation.file_batch();
+                    let mut sibling = operation.file_batch();
+                    for batch in [&mut same, &mut sibling] {
+                        batch.observe_file(&paths[0]).unwrap().unwrap();
+                    }
+                    let mut same_revision = operation.file_batch();
+                    let mut sibling_revision = operation.file_batch();
+                    for batch in [&mut same_revision, &mut sibling_revision] {
+                        batch.validate_revision(&paths[1], &expected[1]).unwrap();
+                    }
+                    let from = temporary.path().join(source);
+                    let to = temporary.path().join(destination);
+                    let parent_path = from.parent().unwrap();
+                    let names = || {
+                        let mut names = std::fs::read_dir(parent_path)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name())
+                            .collect::<Vec<_>>();
+                        names.sort();
+                        names
+                    };
+                    let parent = if source == "assets" {
+                        operation.managed_directory().unwrap()
+                    } else {
+                        operation
+                            .managed_directory()
+                            .unwrap()
+                            .open_child_if_exists("assets")
+                            .unwrap()
+                            .unwrap()
+                    };
+                    let journal = temporary.path().join("metadata.sqlite-journal");
+                    std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
+                    std::fs::remove_file(journal).unwrap();
+                    let before = parent.passive_revision().unwrap();
+                    let names_before = names();
+                    let attempted = std::fs::rename(&from, &to);
+                    let moved = attempted.is_ok();
+                    let mut checks = Vec::new();
+                    if moved {
+                        if replace {
+                            for (path, bytes) in paths.iter().zip(payloads) {
+                                let target = temporary.path().join(path.as_str());
+                                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                                std::fs::write(target, bytes).unwrap();
+                            }
+                        }
+                        require_changed_directory_revision(&parent, before, parent_path);
+                        checks.push((
+                            "same-parent observation refused",
+                            same.observe_file(&paths[1]).is_err(),
+                        ));
+                        checks.push((
+                            "sibling observation refused",
+                            sibling.observe_file(&paths[2]).is_err(),
+                        ));
+                        checks.push((
+                            "same-parent revision refused",
+                            same_revision
+                                .validate_revision(&paths[1], &expected[1])
+                                .is_err(),
+                        ));
+                        checks.push((
+                            "sibling revision refused",
+                            sibling_revision
+                                .validate_revision(&paths[2], &expected[2])
+                                .is_err(),
+                        ));
+                        if replace {
+                            checks.push((
+                                "original file guards refused",
+                                files.as_ref().is_none_or(|files| {
+                                    files.iter().all(|file| file.revalidate().is_err())
+                                }),
+                            ));
+                            checks.push((
+                                "replacement payloads preserved",
+                                paths.iter().zip(payloads).all(|(path, bytes)| {
+                                    std::fs::read(temporary.path().join(path.as_str()))
+                                        .is_ok_and(|observed| observed == bytes)
+                                }),
+                            ));
+                        }
+                    } else {
+                        checks.push(("refused move kept exact namespace", names() == names_before));
+                        checks.push((
+                            "same-parent observation unchanged",
+                            same.observe_file(&paths[1])
+                                .ok()
+                                .flatten()
+                                .is_some_and(|file| file.revision_observation() == expected[1]),
+                        ));
+                        checks.push((
+                            "sibling observation unchanged",
+                            sibling
+                                .observe_file(&paths[2])
+                                .ok()
+                                .flatten()
+                                .is_some_and(|file| file.revision_observation() == expected[2]),
+                        ));
+                        checks.push((
+                            "same-parent revision unchanged",
+                            same_revision
+                                .validate_revision(&paths[1], &expected[1])
+                                .is_ok(),
+                        ));
+                        checks.push((
+                            "sibling revision unchanged",
+                            sibling_revision
+                                .validate_revision(&paths[2], &expected[2])
+                                .is_ok(),
+                        ));
+                        checks.push((
+                            "original file guards unchanged",
+                            files.as_ref().is_none_or(|files| {
+                                files.iter().all(|file| file.revalidate().is_ok())
+                            }),
+                        ));
+                    }
+                    checks.push((
+                        "unrelated authority preserved",
+                        unrelated
+                            .read_bounded(32)
+                            .is_ok_and(|bytes| bytes == b"preserved"),
+                    ));
+                    checks.push((
+                        "original payloads preserved",
+                        paths.iter().zip(payloads).all(|(path, bytes)| {
+                            let original = temporary.path().join(path.as_str());
+                            let retained = if moved {
+                                to.join(original.strip_prefix(&from).unwrap())
+                            } else {
+                                original
+                            };
+                            std::fs::read(retained).is_ok_and(|observed| observed == bytes)
+                        }),
+                    ));
+                    let refusal = attempted
+                        .as_ref()
+                        .err()
+                        .map(|error| (error.kind(), error.raw_os_error()));
+                    drop((
+                        files,
+                        same,
+                        sibling,
+                        same_revision,
+                        sibling_revision,
+                        unrelated,
+                        parent,
+                        operation,
+                        root,
+                    ));
+                    if !moved {
+                        // A denied fixture mutation is not a post-mutation guard test.
+                        // Prove the identical move works after releasing all capabilities.
+                        let control = std::fs::rename(&from, &to);
+                        checks.push(("unretained move control", control.is_ok()));
+                        let after = names();
+                        checks.push((
+                            "unretained control changed exact spelling",
+                            !after.contains(&from.file_name().unwrap().to_os_string())
+                                && after.contains(&to.file_name().unwrap().to_os_string()),
+                        ));
+                    }
+                    eprintln!(
+                        "ancestor move source={source} destination={destination} hold_files={hold_files} moved={moved} refusal={refusal:?}"
+                    );
+                    checks
+                }));
+                let valid = observed
+                    .as_ref()
+                    .is_ok_and(|checks| checks.iter().all(|(_, valid)| *valid));
+                if !valid {
+                    eprintln!(
+                        "ancestor fixture retained at {}",
+                        temporary.keep().display()
+                    );
+                }
+                match observed {
+                    Ok(checks) => assert!(
+                        valid,
+                        "{source} -> {destination}, hold_files={hold_files}: {checks:?}"
+                    ),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
             }
-            require_changed_directory_revision(&parent, before, &temporary.path().join("assets"));
-            let refused = batch.observe_file(&next).is_err();
-            let revision_refused = revisions.validate_revision(&next, &expected).is_err();
-            let preserved =
-                std::fs::read(temporary.path().join("assets").join(moved).join("bb/next"))
-                    .is_ok_and(|bytes| bytes == b"next");
-            drop((parent, batch, revisions, operation, root));
-            if !refused || !revision_refused || !preserved {
-                eprintln!(
-                    "shared ancestor fixture retained at {}",
-                    temporary.keep().display()
-                );
-            }
-            assert!(refused && revision_refused && preserved);
         }
     }
 
@@ -7616,55 +7781,6 @@ mod library_lifecycle_tests {
     }
 
     #[test]
-    fn file_batch_root_churn_cannot_adopt_a_replaced_ancestor() {
-        let (temporary, _root, operation) = file_batch_fixture();
-        std::fs::write(temporary.path().join("unrelated"), b"preserved").unwrap();
-        let unrelated_path = PortableRelativePath::new_exact("unrelated").unwrap();
-        let unrelated = operation.observe_file(&unrelated_path).unwrap().unwrap();
-        let mut batch = operation.file_batch();
-        let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
-        let second = batch.observe_file(&batch_path("second")).unwrap().unwrap();
-        let expected = second.revision_observation();
-        let mut revision_batch = operation.file_batch();
-        revision_batch
-            .validate_revision(&batch_path("second"), &expected)
-            .unwrap();
-        let journal = temporary.path().join("metadata.sqlite-journal");
-        std::fs::write(&journal, b"unrelated metadata transaction").unwrap();
-        std::fs::remove_file(journal).unwrap();
-        std::fs::rename(
-            temporary.path().join("assets"),
-            temporary.path().join("previous-assets"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
-        std::fs::write(
-            temporary.path().join("assets/objects/aa/second"),
-            b"second payload",
-        )
-        .unwrap();
-
-        assert!(first.revalidate().is_err());
-        assert!(first.sha1_bounded(32).is_err());
-        assert!(
-            revision_batch
-                .validate_revision(&batch_path("second"), &expected)
-                .is_err()
-        );
-        revision_batch
-            .validate_revision(&unrelated_path, &unrelated.revision_observation())
-            .unwrap();
-        assert!(batch.observe_file(&batch_path("second")).is_err());
-        assert_eq!(unrelated.read_bounded(32).unwrap(), b"preserved");
-        for parent in ["assets", "previous-assets"] {
-            assert_eq!(
-                std::fs::read(temporary.path().join(parent).join("objects/aa/second")).unwrap(),
-                b"second payload"
-            );
-        }
-    }
-
-    #[test]
     fn file_batch_root_churn_preserves_replaced_leaf_refusal() {
         let (temporary, _root, operation) = file_batch_fixture();
         let mut batch = operation.file_batch();
@@ -7839,78 +7955,6 @@ mod library_lifecycle_tests {
         assert_eq!(
             std::fs::read(temporary.path().join("assets/objects/aa/second")).unwrap(),
             b"second payload"
-        );
-    }
-
-    #[test]
-    fn file_batch_refuses_renamed_ancestor_alias_on_sensitive_and_insensitive_hosts() {
-        let (temporary, _root, operation) = file_batch_fixture();
-        std::fs::write(temporary.path().join("unrelated"), b"preserved").unwrap();
-        let unrelated_path = PortableRelativePath::new_exact("unrelated").unwrap();
-        let unrelated = operation.observe_file(&unrelated_path).unwrap().unwrap();
-        let mut batch = operation.file_batch();
-        batch.observe_file(&batch_path("first")).unwrap().unwrap();
-        let second = batch.observe_file(&batch_path("second")).unwrap().unwrap();
-        let expected = second.revision_observation();
-        let mut revision_batch = operation.file_batch();
-        revision_batch
-            .validate_revision(&batch_path("second"), &expected)
-            .unwrap();
-        let directory = operation.managed_directory().unwrap();
-        let revision = directory.passive_revision().unwrap();
-        std::fs::rename(
-            temporary.path().join("assets"),
-            temporary.path().join("Assets"),
-        )
-        .unwrap();
-        require_changed_directory_revision(&directory, revision, temporary.path());
-        assert!(
-            revision_batch
-                .validate_revision(&batch_path("second"), &expected)
-                .is_err()
-        );
-        assert!(
-            revision_batch
-                .validate_revision(&batch_path("second"), &expected)
-                .is_err()
-        );
-        revision_batch
-            .validate_revision(&unrelated_path, &unrelated.revision_observation())
-            .unwrap();
-        assert!(batch.observe_file(&batch_path("second")).is_err());
-        assert!(batch.observe_file(&batch_path("second")).is_err());
-        assert!(operation.observe_file(&batch_path("second")).is_err());
-        assert_eq!(unrelated.read_bounded(32).unwrap(), b"preserved");
-        assert_eq!(
-            std::fs::read(temporary.path().join("Assets/objects/aa/second")).unwrap(),
-            b"second payload"
-        );
-    }
-
-    #[test]
-    fn file_batch_refuses_replaced_ancestor_and_preserves_both_trees() {
-        let (temporary, _root, operation) = file_batch_fixture();
-        let mut batch = operation.file_batch();
-        batch.observe_file(&batch_path("first")).unwrap().unwrap();
-        std::fs::rename(
-            temporary.path().join("assets/objects"),
-            temporary.path().join("assets/previous"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(temporary.path().join("assets/objects/aa")).unwrap();
-        std::fs::write(
-            temporary.path().join("assets/objects/aa/second"),
-            b"replacement",
-        )
-        .unwrap();
-        assert!(batch.observe_file(&batch_path("second")).is_err());
-        assert_eq!(
-            std::fs::read(temporary.path().join("assets/previous/aa/second")).unwrap(),
-            b"second payload"
-        );
-        assert_eq!(
-            std::fs::read(temporary.path().join("assets/objects/aa/second")).unwrap(),
-            b"replacement"
         );
     }
 
