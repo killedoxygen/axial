@@ -2044,47 +2044,71 @@ impl ManagedDir {
         ))
     }
 
-    /// Verifies `relative` beneath this directory against its manifest digest.
-    /// `Full` always rehashes; `Reverified` accepts this process's earlier full
-    /// hash only while the name still binds that exact file revision. `parents`
-    /// reuses the directories opened for the previous path from this directory.
-    pub(crate) fn verify_relative_file_sha1(
+    /// Verifies a file through the directory that admitted its exact listing.
+    pub(crate) fn verify_file_sha1(
         &self,
-        parents: &mut ManagedRelativeParents,
-        relative: &PortableRelativePath,
+        name: &str,
         expected_size: u64,
         expected_sha1: &[u8; 20],
+        executable: bool,
         proof: DigestProof,
         mut check: impl FnMut() -> Result<(), LoaderError>,
-    ) -> Result<(), LoaderError> {
-        let (parent_path, name) = relative
-            .as_str()
-            .rsplit_once('/')
-            .unwrap_or(("", relative.as_str()));
-        let directory = parents.open(self, parent_path)?;
-        let guard = directory
-            .inspect_regular_file(name)?
-            .ok_or_else(|| LoaderError::Verify("managed runtime file is absent".to_string()))?;
-        let digest = match proof {
-            DigestProof::Full => directory.sha1_guarded_file_bytes_with_check(
-                name,
-                &guard,
-                expected_size,
-                &mut check,
-            ),
-            DigestProof::Reverified => directory.sha1_reverified_file_bytes_with_check(
-                name,
-                &guard,
-                expected_size,
-                &mut check,
-            ),
-        };
-        if guard.size != expected_size || digest? != *expected_sha1 {
-            return Err(LoaderError::Verify(
-                "managed runtime file failed integrity verification".to_string(),
-            ));
-        }
-        Ok(())
+    ) -> Result<FileHashSample, LoaderError> {
+        self.observe(|| {
+            check()?;
+            self.revalidate()?;
+            let guard = self
+                .inspect_regular_file_after_revalidation(name)?
+                .ok_or_else(|| LoaderError::Verify("managed runtime file is absent".into()))?;
+            if guard.size != expected_size {
+                return Err(LoaderError::Verify(
+                    "managed runtime file has the wrong size".into(),
+                ));
+            }
+            let mut sample = FileHashSample::default();
+            let cached = match proof {
+                DigestProof::Full => None,
+                DigestProof::Reverified => self.inner.root.verified_sha1(&guard.revision),
+            };
+            let digest = if let Some(digest) = cached {
+                // Admission just checked this revision on the original capability;
+                // the observation window still confirms its exact name binding.
+                check()?;
+                sample.cache_hit = true;
+                digest
+            } else {
+                self.sha1_guarded_file_bytes_sampled(
+                    name,
+                    &guard,
+                    expected_size,
+                    &mut check,
+                    Some(&mut sample),
+                )?
+            };
+            if digest != *expected_sha1 {
+                return Err(LoaderError::Verify(
+                    "managed runtime file failed integrity verification".into(),
+                ));
+            }
+            #[cfg(unix)]
+            if executable
+                && !guard
+                    .identity
+                    .with_capability(|file| Ok(file.is_executable()?))?
+            {
+                return Err(LoaderError::Verify(
+                    "managed runtime file is not executable".into(),
+                ));
+            }
+            #[cfg(not(unix))]
+            let _ = executable;
+            check()?;
+            guard.identity.with_capability(|file| {
+                file.validate_revision(&guard.revision)?;
+                Ok(())
+            })?;
+            Ok(sample)
+        })
     }
 
     fn listing(&self, limit: usize) -> Result<Vec<DirectoryEntry>, LoaderError> {
@@ -5275,39 +5299,6 @@ impl ManagedLibraryOperation {
             .with_operation_pin(Arc::clone(&self.pin));
         directory.revalidate()?;
         Ok(directory)
-    }
-}
-
-/// Directories opened along the previous relative path, so sorted walks from
-/// one directory reopen only the segments that differ.
-#[derive(Default)]
-pub(crate) struct ManagedRelativeParents {
-    opened: Vec<(String, ManagedDir)>,
-}
-
-impl ManagedRelativeParents {
-    fn open(&mut self, base: &ManagedDir, parent_path: &str) -> Result<ManagedDir, LoaderError> {
-        let segments = parent_path
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        let common = self
-            .opened
-            .iter()
-            .zip(&segments)
-            .take_while(|((opened, _), segment)| opened == *segment)
-            .count();
-        self.opened.truncate(common);
-        for segment in &segments[common..] {
-            let parent = self.opened.last().map_or(base, |(_, directory)| directory);
-            let child = parent.open_child(segment)?;
-            self.opened.push(((*segment).to_owned(), child));
-        }
-        Ok(self
-            .opened
-            .last()
-            .map_or(base, |(_, directory)| directory)
-            .clone())
     }
 }
 

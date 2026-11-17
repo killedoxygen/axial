@@ -293,24 +293,37 @@ impl ManagedRuntimeComponent {
         self.verified_manifest().is_some()
     }
 
+    /// Reserve before reading or cloning a manifest for a complete tree proof.
+    /// The tree walk allowance includes input-sized buffers and nested paths.
+    /// Decoding/contract checks additionally hold up to six folded-key copies
+    /// per node (up to 3 KiB with growth), four path copies and map overhead.
+    /// Source proofs already have validated input and reserve only their walk.
+    pub const VERIFICATION_SCRATCH_BYTES: u64 = super::install::verification_scratch_bytes(
+        MAX_RUNTIME_MANIFEST_BYTES, super::install::MAX_RUNTIME_TREE_ENTRIES,
+    ) + super::install::MAX_RUNTIME_TREE_ENTRIES as u64 * (24 << 10);
+
+    /// A walk can reach every expected member before refusing one additional
+    /// full directory listing. Include proof, marker and executable bindings.
+    pub const VERIFICATION_CHECKS: u64 = 2 * super::install::MAX_RUNTIME_TREE_ENTRIES as u64 + 4;
+
     /// `contents_verified`, returning the SHA-256 of the verified manifest
     /// proof (the identity of the exact runtime build these contents are)
     /// and the number of tree entries the verification walked.
     pub fn verified_manifest(&self) -> Option<([u8; 32], u64)> {
         let (manifest, digest) = self.persisted_manifest()?;
-        let entries = manifest.files.len() as u64 + 2;
         if !self.executable_ready() {
             return None;
         }
         let (_sender, cancellation) = crate::cancellation::channel();
-        (super::install::managed_runtime_tree_matches_manifest(
+        let sample = super::install::managed_runtime_tree_matches_manifest(
             &RuntimeId::from(self.component.clone()),
             &self.root,
             &manifest,
             crate::managed::fs::DigestProof::Reverified,
             &cancellation.thread(),
-        ) && self.validate_projection().is_ok())
-        .then_some((digest, entries))
+        )?;
+        self.validate_projection().ok()?;
+        Some((digest, sample.entries as u64))
     }
 }
 

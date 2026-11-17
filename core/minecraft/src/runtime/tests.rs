@@ -664,7 +664,7 @@ async fn missing_runtime_source_preserves_canonical_and_sidecar_conflicts() {
         .await
         .expect("initial runtime publication")
         .expect("published runtime receipt");
-        assert!(receipt.revalidate(&cache, &component).await);
+        assert!(receipt.revalidate(&cache, &component).await.unwrap());
         drop(receipt);
 
         let preserved = if conflict == "canonical" {
@@ -751,7 +751,7 @@ async fn missing_runtime_source_concurrent_producers_publish_once_and_reuse() {
             .await
             .expect("concurrent runtime materialization")
             .expect("published or reused receipt");
-            let valid = receipt.revalidate(cache, component).await;
+            let valid = receipt.revalidate(cache, component).await.unwrap();
             drop(receipt);
             (valid, downloads)
         }
@@ -952,7 +952,7 @@ fn missing_runtime_source_cancellation_after_claim_requires_publication_settleme
             assert_eq!(receipt_component.as_str(), "jre-legacy");
             assert!(receipt_matches_cache);
             assert!(!receipt_has_quarantine);
-            assert!(revalidated.expect("receipt revalidation completes"));
+            assert!(revalidated.expect("receipt revalidation completes").expect("receipt proof has capacity"));
             assert!(held_by_receipt);
             let (bytes, length) = canonical_bytes.expect("published canonical Java is readable");
             assert_eq!(&bytes[..length], b"committed java");
@@ -1665,6 +1665,645 @@ fn explicit_full_runtime_verifier_detects_same_root_content_drift() {
     assert!(!admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
 }
 
+#[tokio::test]
+async fn tree_verification_refuses_extra_members_in_a_replaced_subtree() {
+    use super::cancellation::{RuntimeTestHookPoint, arm_runtime_test_hook};
+    use std::time::Duration;
+
+    for replace in [false, true] {
+        let (cache, root) = ready_runtime();
+        let proof = root.join(".axial-runtime-manifest.json");
+        let mut manifest: ComponentManifest =
+            serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
+        // More directories than one observation window can retain.
+        for index in 0..64 {
+            let relative = format!("z{index:03}/member");
+            fs::create_dir_all(root.join(&relative).parent().unwrap()).unwrap();
+            fs::write(root.join(&relative), b"member").unwrap();
+            manifest
+                .files
+                .insert(relative, runtime_file_fixture(b"member"));
+        }
+        #[cfg(windows)]
+        manifest
+            .files
+            .insert("lib/jvm.cfg".into(), runtime_file_fixture(b"jvm"));
+        fs::write(&proof, component_manifest_proof_bytes(&manifest).unwrap()).unwrap();
+        let component = admit_runtime_component(&cache, "java-runtime-delta");
+        assert!(component.contents_verified(), "unmodified runtime control");
+        let original = root.join("z063");
+        let parked = cache.root().join("retained-subtree");
+        let original_identity = component
+            .root
+            .open_child("z063")
+            .unwrap()
+            .identity()
+            .unwrap();
+        let mut gate =
+            arm_runtime_test_hook(RuntimeTestHookPoint::TreeMember, &original.join("member"));
+        let checked = component.clone();
+        let mut task = tokio::task::spawn_blocking(move || checked.contents_verified());
+        let reached =
+            tokio::time::timeout(Duration::from_secs(10), gate.wait_until_reached()).await;
+        let moved = if replace && reached.is_ok() {
+            fs::rename(&original, &parked)
+        } else {
+            Ok(())
+        };
+        let replacement = if replace && reached.is_ok() && moved.is_ok() {
+            fs::create_dir(&original)
+                .and_then(|()| fs::write(original.join("member"), b"member"))
+                .and_then(|()| fs::write(original.join("unlisted"), b"unexpected"))
+        } else {
+            Ok(())
+        };
+        gate.release();
+        let joined = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+        let verified = match joined {
+            Ok(result) => result,
+            Err(error) => {
+                std::mem::forget((cache, component, task));
+                panic!("runtime verifier has not joined; fixture retained: {error}");
+            }
+        };
+        drop((component, gate));
+        let unchanged = fs::read(original.join("member"));
+        let unchanged_identity = admit_runtime_component(&cache, "java-runtime-delta")
+            .root
+            .open_child("z063")
+            .and_then(|directory| directory.identity());
+        let restored = if replace && moved.is_ok() {
+            fs::remove_dir_all(&original).and_then(|()| fs::rename(&parked, &original))
+        } else if replace {
+            // The released control must permit the exact operation blocked by the OS.
+            fs::rename(&original, &parked).and_then(|()| fs::rename(&parked, &original))
+        } else {
+            Ok(())
+        };
+        let control = admit_runtime_component(&cache, "java-runtime-delta").contents_verified();
+        let assertions = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reached.expect("verification reached the original member");
+            replacement.expect("replacement tree prepared");
+            assert_eq!(unchanged.unwrap(), b"member");
+            restored.expect("original subtree restored after the verifier joined");
+            assert!(control, "restored runtime verifies");
+            let verified = verified.expect("original verification task joined");
+            eprintln!(
+                "runtime subtree replacement requested={replace} moved={} result={verified}",
+                replace && moved.is_ok()
+            );
+            if replace && moved.is_ok() {
+                assert!(
+                    !verified,
+                    "membership must bind the subtree used for contents"
+                );
+            } else {
+                assert!(
+                    unchanged_identity.unwrap() == original_identity,
+                    "unchanged directory binding"
+                );
+                assert!(
+                    verified,
+                    "unchanged binding verifies, including an OS-blocked move"
+                );
+            }
+        }));
+        if let Err(error) = assertions {
+            std::mem::forget(cache);
+            std::panic::resume_unwind(error);
+        }
+    }
+}
+
+fn runtime_file_fixture(bytes: &[u8]) -> ComponentManifestFile {
+    ComponentManifestFile {
+        kind: "file".into(),
+        executable: false,
+        target: None,
+        downloads: Some(ComponentManifestDownloads {
+            raw: Some(ComponentManifestDownload {
+                url: "https://example.invalid/runtime-member".into(),
+                size: Some(bytes.len() as u64),
+                sha1: Some(format!("{:x}", Sha1::digest(bytes))),
+            }),
+            lzma: None,
+        }),
+    }
+}
+
+fn runtime_tree_fixture() -> (ManagedRuntimeCache, PathBuf, ComponentManifest) {
+    let (cache, root) = ready_runtime();
+    let proof = root.join(".axial-runtime-manifest.json");
+    let mut manifest: ComponentManifest =
+        serde_json::from_slice(&fs::read(&proof).unwrap()).unwrap();
+    manifest
+        .files
+        .get_mut(super::layout::runtime_java_relative_path())
+        .unwrap()
+        .executable = true;
+    for (path, bytes) in [
+        ("release", &b"test"[..]),
+        ("lib/data/member", &b"member"[..]),
+        ("lib/peer/other", &b"other"[..]),
+        #[cfg(windows)]
+        ("lib/jvm.cfg", &b"jvm"[..]),
+    ] {
+        fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        fs::write(root.join(path), bytes).unwrap();
+        manifest
+            .files
+            .insert(path.into(), runtime_file_fixture(bytes));
+    }
+    fs::create_dir(root.join("lib/empty")).unwrap();
+    manifest.files.insert(
+        "lib/empty".into(),
+        ComponentManifestFile {
+            kind: "directory".into(),
+            executable: false,
+            downloads: None,
+            target: None,
+        },
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("member", root.join("lib/data/link")).unwrap();
+        manifest.files.insert(
+            "lib/data/link".into(),
+            ComponentManifestFile {
+                kind: "link".into(),
+                executable: false,
+                downloads: None,
+                target: Some("member".into()),
+            },
+        );
+    }
+    fs::write(proof, component_manifest_proof_bytes(&manifest).unwrap()).unwrap();
+    (cache, root, manifest)
+}
+
+#[test]
+fn tree_verification_reuses_only_unchanged_file_digests() {
+    use crate::managed::fs::DigestProof;
+    let (cache, root, manifest) = runtime_tree_fixture();
+    let component = admit_runtime_component(&cache, "java-runtime-delta");
+    let (_sender, cancellation) = crate::cancellation::channel();
+    let sample = |proof| {
+        super::install::managed_runtime_tree_matches_manifest(
+            &RuntimeId::from("java-runtime-delta"),
+            &component.root,
+            &manifest,
+            proof,
+            &cancellation.thread(),
+        )
+        .expect("complete production tree proof")
+    };
+    let files = manifest
+        .files
+        .values()
+        .filter(|file| file.kind == "file")
+        .count() as u64;
+    let bytes = manifest
+        .files
+        .values()
+        .filter_map(|file| file.downloads.as_ref()?.raw.as_ref()?.size)
+        .sum::<u64>();
+    let first = sample(DigestProof::Full);
+    let warm = sample(DigestProof::Reverified);
+    let revision = || {
+        component
+            .root
+            .open_child("lib")
+            .unwrap()
+            .open_child("data")
+            .unwrap()
+            .inspect_regular_file("member")
+            .unwrap()
+            .unwrap()
+            .passive_revision()
+    };
+    let original_revision = revision();
+    let retained = cache.root().join("retained-member");
+    let moved = fs::rename(root.join("lib/data/member"), &retained);
+    if moved.is_err() {
+        let unchanged = revision() == original_revision
+            && fs::read(root.join("lib/data/member")).unwrap() == b"member";
+        drop(component);
+        fs::rename(root.join("lib/data/member"), &retained).unwrap();
+        fs::rename(&retained, root.join("lib/data/member")).unwrap();
+        assert!(
+            unchanged,
+            "OS-blocked replacement preserves the original binding"
+        );
+        assert!(admit_runtime_component(&cache, "java-runtime-delta").contents_verified());
+        eprintln!(
+            "runtime member move blocked; released control passed, no replacement invalidation claimed"
+        );
+        return;
+    }
+    fs::write(root.join("lib/data/member"), b"member").unwrap();
+    assert!(
+        revision() != original_revision,
+        "replacement revision was actually observed"
+    );
+    let replaced = sample(DigestProof::Reverified);
+    assert_eq!(
+        (first.hashed_files, first.hashed_bytes, first.digest_hits),
+        (files, bytes, 0)
+    );
+    assert_eq!(
+        (warm.hashed_files, warm.hashed_bytes, warm.digest_hits),
+        (0, 0, files)
+    );
+    // Same-byte non-program replacements are allowed, but must be fully rehashed.
+    assert_eq!(
+        (
+            replaced.hashed_files,
+            replaced.hashed_bytes,
+            replaced.digest_hits
+        ),
+        (1, 6, files - 1)
+    );
+}
+
+#[test]
+fn tree_verification_digest_hit_keeps_the_original_revision() {
+    let (cache, root, _) = runtime_tree_fixture();
+    let component = admit_runtime_component(&cache, "java-runtime-delta");
+    assert!(component.contents_verified());
+    let directory = component
+        .root
+        .open_child("lib")
+        .unwrap()
+        .open_child("data")
+        .unwrap();
+    let digest = Sha1::digest(b"member").into();
+    let primed = directory
+        .verify_file_sha1(
+            "member",
+            6,
+            &digest,
+            false,
+            crate::managed::fs::DigestProof::Reverified,
+            || Ok(()),
+        )
+        .unwrap();
+    assert!(primed.cache_hit, "the fixture reaches the digest-hit path");
+    let mut checks = 0;
+    let result = directory.verify_file_sha1(
+        "member",
+        6,
+        &digest,
+        false,
+        crate::managed::fs::DigestProof::Reverified,
+        || {
+            checks += 1;
+            if checks == 2 {
+                fs::write(root.join("lib/data/member"), b"change")?;
+            }
+            Ok(())
+        },
+    );
+    drop((directory, component));
+    assert!(checks >= 2, "the cache-hit check executed");
+    assert_eq!(fs::read(root.join("lib/data/member")).unwrap(), b"change");
+    assert!(
+        result.is_err(),
+        "a cache hit must retain its captured revision"
+    );
+}
+
+#[test]
+fn tree_verification_refuses_membership_kind_and_link_drift() {
+    type Mutation = (&'static str, fn(&Path) -> std::io::Result<()>);
+    let cases: &[Mutation] = &[
+        ("missing root file", |root| {
+            fs::remove_file(root.join("release"))
+        }),
+        ("extra root file", |root| {
+            fs::write(root.join("extra"), b"extra")
+        }),
+        ("missing nested file", |root| {
+            fs::remove_file(root.join("lib/data/member"))
+        }),
+        ("extra nested file", |root| {
+            fs::write(root.join("lib/data/extra"), b"extra")
+        }),
+        ("missing empty directory", |root| {
+            fs::remove_dir(root.join("lib/empty"))
+        }),
+        ("extra empty directory", |root| {
+            fs::create_dir(root.join("lib/data/extra"))
+        }),
+        ("file became a directory", |root| {
+            fs::remove_file(root.join("lib/data/member"))?;
+            fs::create_dir(root.join("lib/data/member"))
+        }),
+        ("directory became a file", |root| {
+            fs::remove_dir(root.join("lib/empty"))?;
+            fs::write(root.join("lib/empty"), b"file")
+        }),
+        ("hard-linked member", |root| {
+            fs::hard_link(
+                root.join("lib/data/member"),
+                root.parent().unwrap().join("external-hardlink"),
+            )
+        }),
+        #[cfg(unix)]
+        ("file became a link", |root| {
+            fs::remove_file(root.join("lib/data/member"))?;
+            std::os::unix::fs::symlink("../peer/other", root.join("lib/data/member"))
+        }),
+        #[cfg(unix)]
+        ("directory became a link", |root| {
+            fs::remove_dir(root.join("lib/empty"))?;
+            std::os::unix::fs::symlink("data", root.join("lib/empty"))
+        }),
+        #[cfg(unix)]
+        ("executable bit removed", |root| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(java_executable(root), fs::Permissions::from_mode(0o644))
+        }),
+        #[cfg(unix)]
+        ("link target changed", |root| {
+            fs::remove_file(root.join("lib/data/link"))?;
+            std::os::unix::fs::symlink("../peer/other", root.join("lib/data/link"))
+        }),
+    ];
+    for (case, mutate) in cases {
+        let (cache, root, manifest) = runtime_tree_fixture();
+        let component = admit_runtime_component(&cache, "java-runtime-delta");
+        assert!(component.contents_verified(), "healthy control: {case}");
+        let before = runtime_tree_bindings(&component, &manifest).unwrap();
+        let mutation = mutate(&root);
+        let accepted = component.contents_verified();
+        let unchanged = if mutation.is_err() {
+            runtime_tree_bindings(&component, &manifest).is_some_and(|after| after == before)
+                && accepted
+        } else {
+            false
+        };
+        drop(component);
+        if let Err(error) = mutation {
+            if !unchanged {
+                let retained = cache.root().to_owned();
+                std::mem::forget(cache);
+                panic!(
+                    "blocked mutation changed bindings: {case}: {error}; fixture retained at {retained:?}"
+                );
+            }
+            let released = mutate(&root);
+            let refused =
+                !admit_runtime_component(&cache, "java-runtime-delta").contents_verified();
+            if released.is_err() || !refused {
+                std::mem::forget(cache);
+            }
+            released
+                .unwrap_or_else(|error| panic!("released fixture control failed: {case}: {error}"));
+            assert!(
+                refused,
+                "released control reaches the intended refusal: {case}"
+            );
+            eprintln!(
+                "runtime fixture mutation blocked: {case}; unchanged bindings and released control verified"
+            );
+            continue;
+        }
+        if accepted {
+            std::mem::forget(cache);
+        }
+        assert!(!accepted, "changed runtime must be refused: {case}");
+    }
+}
+
+fn runtime_tree_bindings(
+    component: &ManagedRuntimeComponent,
+    manifest: &ComponentManifest,
+) -> Option<(
+    Vec<(
+        String,
+        crate::managed::fs::ManagedPassiveFileRevision,
+        Vec<u8>,
+    )>,
+    Vec<(String, crate::managed::fs::ManagedDirectoryIdentity)>,
+)> {
+    let mut files = Vec::new();
+    let mut parents = std::collections::BTreeSet::from([String::new()]);
+    for (path, member) in &manifest.files {
+        if member.kind == "directory" {
+            parents.insert(path.clone());
+        }
+        for (offset, _) in path.match_indices('/') {
+            parents.insert(path[..offset].to_owned());
+        }
+        if member.kind == "file" {
+            let relative = crate::portable_path::PortableRelativePath::new_exact(path).ok()?;
+            let guard = component
+                .root
+                .inspect_relative_regular_file(&relative)
+                .ok()??;
+            if guard.size() > 4096 {
+                return None;
+            }
+            files.push((
+                path.clone(),
+                guard.passive_revision(),
+                fs::read(component.root.path().join(path)).ok()?,
+            ));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let directories = parents
+        .into_iter()
+        .map(|path| {
+            let mut directory = component.root.clone();
+            if !path.is_empty() {
+                for segment in path.split('/') {
+                    directory = directory.open_child(segment).ok()?;
+                }
+            }
+            Some((path, directory.identity().ok()?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((files, directories))
+}
+
+#[test]
+fn tree_verification_refuses_wrong_case_and_restored_mtime_drift() {
+    use std::io::Write;
+    let (cache, root, _) = runtime_tree_fixture();
+    let component = admit_runtime_component(&cache, "java-runtime-delta");
+    assert!(component.contents_verified());
+    let path = root.join("lib/data/member");
+    let alias = root.join("lib/data/Member");
+    let moved = fs::rename(&path, &alias);
+    let accepted = component.contents_verified();
+    drop(component);
+    if moved.is_ok() {
+        fs::rename(&alias, &path).unwrap();
+        assert!(!accepted, "wrong-case spelling is never exact");
+    } else {
+        assert!(accepted);
+        assert_eq!(fs::read(&path).unwrap(), b"member");
+        fs::rename(&path, &alias).unwrap();
+        fs::rename(&alias, &path).unwrap();
+        eprintln!(
+            "runtime case-rename blocked while capabilities were held; released control passed"
+        );
+    }
+    let component = admit_runtime_component(&cache, "java-runtime-delta");
+    assert!(component.contents_verified());
+    let directory = component
+        .root
+        .open_child("lib")
+        .unwrap()
+        .open_child("data")
+        .unwrap();
+    let before = directory
+        .inspect_regular_file("member")
+        .unwrap()
+        .unwrap()
+        .passive_revision();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.write_all(b"change").unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    drop(file);
+    let changed = before
+        != directory
+            .inspect_regular_file("member")
+            .unwrap()
+            .unwrap()
+            .passive_revision();
+    let accepted = component.contents_verified();
+    drop((directory, component));
+    if changed {
+        assert!(
+            !accepted,
+            "a changed revision cannot reuse an earlier digest"
+        );
+    } else {
+        eprintln!(
+            "runtime restored-mtime change was not observed by this filesystem; no invalidation coverage claimed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tree_verification_cancels_mid_walk_and_can_run_again() {
+    use super::cancellation::{RuntimeTestHookPoint, arm_runtime_test_hook};
+    use std::time::Duration;
+    let (cache, root, manifest) = runtime_tree_fixture();
+    let component = admit_runtime_component(&cache, "java-runtime-delta");
+    let mut gate = arm_runtime_test_hook(
+        RuntimeTestHookPoint::TreeMember,
+        &root.join("lib/data/member"),
+    );
+    let (cancel, cancellation) = crate::cancellation::channel();
+    let mut task = tokio::task::spawn_blocking(move || {
+        super::install::managed_runtime_tree_matches_manifest(
+            &RuntimeId::from("java-runtime-delta"),
+            &component.root,
+            &manifest,
+            crate::managed::fs::DigestProof::Full,
+            &cancellation.thread(),
+        )
+        .is_some()
+    });
+    let reached = tokio::time::timeout(Duration::from_secs(10), gate.wait_until_reached()).await;
+    cancel.cancel();
+    gate.release();
+    let joined = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+    let result = match joined {
+        Ok(result) => result,
+        Err(error) => {
+            std::mem::forget((cache, task));
+            panic!("runtime verifier has not joined; fixture retained: {error}");
+        }
+    };
+    drop(gate);
+    let control = admit_runtime_component(&cache, "java-runtime-delta").contents_verified();
+    reached.expect("actual member verification reached");
+    assert!(!result.expect("original verifier task joined"));
+    assert!(control, "a fresh verification succeeds after cancellation");
+}
+
+#[test]
+fn runtime_manifest_decoder_bounds_members_before_reading_the_next_value() {
+    let mut bytes = String::from("{\"files\":{");
+    for index in 0..super::install::MAX_RUNTIME_TREE_ENTRIES {
+        if index != 0 {
+            bytes.push(',');
+        }
+        bytes.push_str(&format!("\"d{index}\":{{\"type\":\"directory\"}}"));
+    }
+    let control = format!("{bytes}}}}}");
+    assert!(serde_json::from_str::<ComponentManifest>(&control).is_ok());
+    // Invalid JSON here must not be consumed once the member bound is reached.
+    bytes.push_str(",\"overflow\":invalid");
+    let refused = serde_json::from_str::<ComponentManifest>(&bytes).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .starts_with("runtime manifest member bound or uniqueness refused")
+    );
+    let duplicate = r#"{"files":{"bin":{"type":"directory"},"bin":invalid"#;
+    let refused = serde_json::from_str::<ComponentManifest>(duplicate).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .starts_with("runtime manifest member bound or uniqueness refused")
+    );
+}
+
+#[tokio::test]
+async fn committed_runtime_revalidation_preserves_temporary_capacity_errors() {
+    let (cache, _, manifest) = runtime_tree_fixture();
+    let component = RuntimeId::from("java-runtime-delta");
+    let source =
+        authenticated_runtime_source_from_manifest_for_test(component.clone(), manifest).unwrap();
+    let (_cancel, mut control) = runtime_materialization_control();
+    let receipt = materialize_missing_runtime_source(
+        &cache,
+        &JavaVersion {
+            component: component.0.clone(),
+            major_version: 17,
+        },
+        source,
+        &mut |_| {},
+        &mut control,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let work = axial_resource::PhysicalWorkOwner::isolated_for_test();
+    let held = work
+        .try_reserve_scratch(work.scratch_limit_bytes())
+        .unwrap();
+    let refusal = receipt
+        .revalidate_with_work(&cache, &component, work.clone())
+        .await;
+    drop(held);
+    let recovered = receipt
+        .revalidate_with_work(&cache, &component, work.clone())
+        .await;
+    drop(receipt);
+    let released = runtime_publication_lock_available_for_test(&cache, &component);
+    assert!(control.finish());
+    assert!(
+        matches!(refusal,Err(JavaRuntimeLookupError::RuntimeSource(failure))
+        if failure.kind()==RuntimeSourceFailureKind::Unavailable),
+        "temporary runtime capacity must remain a typed error"
+    );
+    assert!(recovered.unwrap());
+    assert!(released);
+    assert_eq!(
+        work.snapshot(axial_resource::PhysicalWorkClass::Foreground)
+            .available_scratch_bytes,
+        work.scratch_limit_bytes()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn explicit_full_runtime_verifier_detects_manifest_link_drift() {
@@ -2088,7 +2727,7 @@ async fn ordinary_managed_runtime_publish_finalizes_displaced_quarantine() {
         .expect("ordinary managed runtime publish");
 
     assert!(receipt.quarantine_obligation().is_none());
-    assert!(receipt.revalidate(&cache, &component).await);
+    assert!(receipt.revalidate(&cache, &component).await.unwrap());
     assert!(!root.with_file_name("jre-legacy.quarantine").exists());
 }
 
@@ -2295,7 +2934,7 @@ async fn managed_runtime_publication_receipt_holds_the_component_lease() {
     let second_receipt = publish_staged_managed_runtime(second_stage)
         .await
         .expect("second managed runtime publish");
-    assert!(second_receipt.revalidate(&cache, &component).await);
+    assert!(second_receipt.revalidate(&cache, &component).await.unwrap());
 }
 
 #[tokio::test]
@@ -2322,7 +2961,8 @@ async fn managed_runtime_admission_rejects_unsafe_manifests_before_effects() {
             vec![(runtime_java_manifest_path(), java)]
         }),
         ("over-entry tree", |url| {
-            let mut tree = (0..4096)
+            // Declared members fit the decoder; implicit parents and markers exceed the tree bound.
+            let mut tree = (0..4095)
                 .map(|index| (format!("entry-{index}"), manifest_file("directory")))
                 .collect::<Entries>();
             tree.push((runtime_java_manifest_path(), file(url)));
@@ -2408,11 +3048,11 @@ async fn managed_runtime_commit_revalidation_rejects_ready_marker_tampering() {
     let receipt = publish_staged_managed_runtime(staged)
         .await
         .expect("managed runtime publish");
-    assert!(receipt.revalidate(&cache, &component).await);
+    assert!(receipt.revalidate(&cache, &component).await.unwrap());
 
     fs::write(root.join(".axial-ready"), b"nope").expect("tamper ready marker");
 
-    assert!(!receipt.revalidate(&cache, &component).await);
+    assert!(!receipt.revalidate(&cache, &component).await.unwrap());
 }
 
 /// An isolated cache whose canonical `jre-legacy` root holds an `original` sentinel.
@@ -3097,7 +3737,7 @@ async fn real_temurin_java8_source_publishes_a_verified_legacy_runtime() {
     .expect("published Temurin runtime")
     .expect("publication receipt");
     let component = RuntimeId::from("jre-legacy".to_string());
-    assert!(receipt.revalidate(&cache, &component).await);
+    assert!(receipt.revalidate(&cache, &component).await.unwrap());
     drop(receipt);
     let admitted = cache
         .admit_component("jre-legacy")

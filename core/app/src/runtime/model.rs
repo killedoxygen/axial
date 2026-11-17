@@ -39,6 +39,8 @@ pub enum JavaDiscoveryError {
     UnknownArchitecture,
     #[error("The selected Java executable could not run.")]
     Failed,
+    #[error("Java verification capacity is full. Wait for active work to finish.")]
+    AtCapacity,
     #[error("The Java probe was cancelled.")]
     Cancelled,
     #[error("Java {required} is required; the selected executable provides Java {actual}.")]

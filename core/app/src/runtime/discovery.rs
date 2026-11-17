@@ -10,16 +10,14 @@
 use super::model::{JavaDiscoveryError, JavaRequirement, JavaRuntimesResponse};
 use crate::tasks::{CancellationToken, TaskOwner};
 use axial_minecraft::{
-    JavaProbeReceipt, JavaVersion, ManagedRuntimeCache, ManagedRuntimeLaunchReceipt, probe_java,
+    JavaProbeReceipt, JavaVersion, ManagedRuntimeCache, ManagedRuntimeComponent,
+    ManagedRuntimeLaunchReceipt, probe_java,
 };
-use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
+use axial_resource::{PhysicalIoClass, PhysicalScratchPermit, PhysicalWorkRequest, process_physical_work};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-/// The verification read buffer; the walk itself retains only directory handles.
-const VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
 #[derive(Clone)]
 pub struct RuntimeDiscovery {
@@ -27,7 +25,7 @@ pub struct RuntimeDiscovery {
     tasks: TaskOwner,
     /// One slot per known managed component; bounded by that vocabulary.
     proven: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<ProvenProbe>>>>>>,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     test_endpoints: Option<axial_minecraft::download::InstallTestEndpoints>,
     #[cfg(test)]
     pub(crate) probes: Arc<std::sync::atomic::AtomicUsize>,
@@ -82,7 +80,11 @@ impl Default for RuntimeProjection {
 
 impl SelectedRuntime {
     fn checks(&self) -> u64 {
-        self.manifest.map_or(1, |(_, entries)| entries)
+        if self.managed.is_some() {
+            ManagedRuntimeComponent::VERIFICATION_CHECKS
+        } else {
+            1
+        }
     }
 
     /// Rechecks the complete managed tree against the same manifest, the
@@ -91,15 +93,21 @@ impl SelectedRuntime {
     pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
         let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let selected = self.clone();
-        let admission = process_physical_work()
-            .admit(PhysicalWorkRequest::foreground(
-                PhysicalIoClass::Read,
-                VERIFY_SCRATCH_BYTES,
-            ))
+        let work = process_physical_work();
+        let scratch = work
+            .try_reserve_scratch(if self.managed.is_some() {
+                ManagedRuntimeComponent::VERIFICATION_SCRATCH_BYTES
+            } else {
+                JavaProbeReceipt::REVALIDATION_SCRATCH_BYTES
+            })
+            .map_err(inspection_work_error)?;
+        let admission = work
+            .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0))
             .await
             .map_err(|_| JavaDiscoveryError::Failed)?;
         admission
             .run(move |_| {
+                let _scratch = scratch;
                 if let Some(receipt) = &selected.managed {
                     if receipt.component().verified_manifest() != selected.manifest {
                         return Err(JavaDiscoveryError::Replaced);
@@ -157,7 +165,7 @@ impl RuntimeProjection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reserve_checks(checks)
-            .map_err(|_| JavaDiscoveryError::Failed)
+            .map_err(|_| JavaDiscoveryError::AtCapacity)
     }
 
     pub(crate) async fn revalidate(&self) -> Result<(), JavaDiscoveryError> {
@@ -191,7 +199,7 @@ impl RuntimeDiscovery {
             cache,
             tasks,
             proven: Arc::default(),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             test_endpoints: None,
             #[cfg(test)]
             probes: Arc::default(),
@@ -222,7 +230,7 @@ impl RuntimeDiscovery {
         probe_java(path, id_hint, cancellation).await
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_test_endpoints(
         mut self,
         endpoints: axial_minecraft::download::InstallTestEndpoints,
@@ -281,7 +289,7 @@ impl RuntimeDiscovery {
             biased;
             () = cancellation.cancelled() => return Err(JavaDiscoveryError::Cancelled),
             source = async {
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(endpoints) = &self.test_endpoints {
                     return axial_minecraft::runtime::acquire_preferred_runtime_source_at_test_endpoint(java, endpoints).await;
                 }
@@ -321,12 +329,15 @@ impl RuntimeDiscovery {
             Ok(Some(receipt)) if finished => receipt,
             Ok(_) => return Err(JavaDiscoveryError::Cancelled),
         };
-        let selected = self.select(java, override_value, cancellation).await?;
-        if !receipt.revalidate(&self.cache, &component.into()).await {
+        if !receipt
+            .revalidate(&self.cache, &component.into())
+            .await
+            .map_err(provision_error)?
+        {
             return Err(JavaDiscoveryError::Replaced);
         }
         drop(receipt);
-        Ok(selected)
+        self.select(java, override_value, cancellation).await
     }
 
     /// Replaces the preferred managed component when it does not match the
@@ -340,7 +351,7 @@ impl RuntimeDiscovery {
             biased;
             () = cancellation.cancelled() => return Err(JavaDiscoveryError::Cancelled),
             source = async {
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 if let Some(endpoints) = &self.test_endpoints {
                     return axial_minecraft::runtime::acquire_preferred_runtime_source_at_test_endpoint(java, endpoints).await;
                 }
@@ -400,12 +411,25 @@ impl RuntimeDiscovery {
                 return Ok(observation.clone());
             }
             if observed.len() >= MAX_PROJECTION_RUNTIMES {
-                return Err(JavaDiscoveryError::Failed);
+                return Err(JavaDiscoveryError::AtCapacity);
             }
         }
-        projection.charge(1)?;
-        let observation = self.observe(java, override_value, cancellation).await?;
-        projection.charge(observation.checks().saturating_sub(1))?;
+        let managed = managed_component(java, override_value).is_some();
+        projection.charge(if managed {
+            ManagedRuntimeComponent::VERIFICATION_CHECKS
+        } else {
+            1
+        })?;
+        let scratch = process_physical_work()
+            .try_reserve_scratch(if managed {
+                ManagedRuntimeComponent::VERIFICATION_SCRATCH_BYTES
+            } else {
+                0
+            })
+            .map_err(inspection_work_error)?;
+        let observation = self
+            .observe(java, override_value, cancellation, scratch)
+            .await?;
         projection
             .observed
             .lock()
@@ -419,6 +443,7 @@ impl RuntimeDiscovery {
         java: &JavaVersion,
         override_value: &str,
         cancellation: &CancellationToken,
+        scratch: Option<PhysicalScratchPermit>,
     ) -> Result<RuntimeObservation, JavaDiscoveryError> {
         if override_value.trim().is_empty() {
             let component = axial_minecraft::runtime::preferred_runtime_component(java);
@@ -433,7 +458,9 @@ impl RuntimeDiscovery {
                 return Ok(RuntimeObservation::Missing(Arc::new(absence)));
             }
         }
-        let (selected, admitted) = self.select_with_admission(java, override_value, cancellation).await?;
+        let (selected, admitted) = self
+            .select_with_admission(java, override_value, cancellation, scratch)
+            .await?;
         match admitted {
             Ok(()) => Ok(RuntimeObservation::Ready(selected)),
             // Launch replaces an outdated app-managed runtime before spawning.
@@ -453,7 +480,7 @@ impl RuntimeDiscovery {
         cancellation: &CancellationToken,
     ) -> Result<SelectedRuntime, JavaDiscoveryError> {
         let (selected, admitted) = self
-            .select_with_admission(java, override_value, cancellation)
+            .select_with_admission(java, override_value, cancellation, None)
             .await?;
         admitted.map(|()| selected)
     }
@@ -465,20 +492,15 @@ impl RuntimeDiscovery {
         java: &JavaVersion,
         override_value: &str,
         cancellation: &CancellationToken,
+        scratch: Option<PhysicalScratchPermit>,
     ) -> Result<(SelectedRuntime, Result<(), JavaDiscoveryError>), JavaDiscoveryError> {
         let requirement = JavaRequirement::for_current_host(
             u32::try_from(java.major_version).map_err(|_| JavaDiscoveryError::InvalidVersion)?,
         );
         let requested = override_value.trim();
-        let component = if requested.is_empty() {
-            Some(axial_minecraft::runtime::preferred_runtime_component(java))
-        } else if axial_minecraft::runtime::is_known_runtime_component(requested) {
-            Some(requested.to_owned())
-        } else {
-            None
-        };
-        let selected = if let Some(component) = component {
-            self.select_managed(component, cancellation).await?
+        let selected = if let Some(component) = managed_component(java, requested) {
+            self.select_managed(component, cancellation, scratch)
+                .await?
         } else {
             let path = Path::new(requested);
             if !path.is_absolute() {
@@ -508,6 +530,7 @@ impl RuntimeDiscovery {
         &self,
         component: String,
         cancellation: &CancellationToken,
+        scratch: Option<PhysicalScratchPermit>,
     ) -> Result<SelectedRuntime, JavaDiscoveryError> {
         let admitted = self
             .cache
@@ -533,11 +556,18 @@ impl RuntimeDiscovery {
                 let verified = process_physical_work()
                     .admit(PhysicalWorkRequest::foreground(
                         PhysicalIoClass::Read,
-                        VERIFY_SCRATCH_BYTES,
+                        if scratch.is_some() {
+                            0
+                        } else {
+                            ManagedRuntimeComponent::VERIFICATION_SCRATCH_BYTES
+                        },
                     ))
                     .await
                     .map_err(|_| JavaDiscoveryError::Failed)?
-                    .run(move |_| checked.verified_manifest())
+                    .run(move |_| {
+                        let _scratch = scratch;
+                        checked.verified_manifest()
+                    })
                     .await
                     .map_err(|_| JavaDiscoveryError::Failed)?
                     // A marker alone is insufficient: the manifest's complete tree must match.
@@ -590,6 +620,26 @@ impl RuntimeDiscovery {
             () = cancellation.cancelled() => Err(JavaDiscoveryError::Cancelled),
             result = task.join() => result.map_err(|_| JavaDiscoveryError::Failed)?,
         }
+    }
+}
+
+fn managed_component(java: &JavaVersion, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Some(axial_minecraft::runtime::preferred_runtime_component(java))
+    } else if axial_minecraft::runtime::is_known_runtime_component(value) {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn inspection_work_error(error: axial_resource::PhysicalWorkError) -> JavaDiscoveryError {
+    match error {
+        axial_resource::PhysicalWorkError::Unavailable
+        | axial_resource::PhysicalWorkError::ScratchLimit => JavaDiscoveryError::AtCapacity,
+        axial_resource::PhysicalWorkError::Cancelled => JavaDiscoveryError::Cancelled,
+        _ => JavaDiscoveryError::Failed,
     }
 }
 
@@ -807,6 +857,182 @@ mod proof_tests {
     }
 
     #[tokio::test]
+    async fn missing_runtime_releases_publication_before_selection() {
+        if !crate::install::artifacts::tests::preparation_child(
+            "runtime::discovery::proof_tests::missing_runtime_releases_publication_before_selection",
+        ).await { return; }
+        use sha1::{Digest as _, Sha1};
+        let (scratch, cache, tasks, discovery) = fixture().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let program = java(scratch.path(), 3, true);
+        let path = if cfg!(target_os = "macos") {
+            "jre.bundle/Contents/Home/bin/java"
+        } else {
+            "bin/java"
+        };
+        let manifest = serde_json::to_vec(&serde_json::json!({"files":{(path):{
+            "type":"file", "executable":true,
+            "downloads":{"raw":{"url":format!("{base}/java"),
+                "sha1":format!("{:x}", Sha1::digest(&program)),"size":program.len()}}
+        }}}))
+        .unwrap();
+        let descriptor = serde_json::json!({"manifest":{"url":format!("{base}/manifest"),
+            "sha1":format!("{:x}",Sha1::digest(&manifest)),"size":manifest.len()}});
+        let catalog = ["mac-os-arm64", "mac-os", "linux", "linux-i386"]
+            .into_iter()
+            .map(|platform| {
+                (
+                    platform,
+                    serde_json::json!({(COMPONENT):[descriptor.clone()]}),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let bodies = Arc::new(HashMap::from([
+            (
+                "/java-runtime/all.json".to_owned(),
+                serde_json::to_vec(&catalog).unwrap(),
+            ),
+            ("/manifest".to_owned(), manifest),
+            ("/java".to_owned(), program),
+        ]));
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let body = bodies.get(uri.path()).cloned();
+            async move {
+                match body {
+                    Some(body) => (axum::http::StatusCode::OK, body),
+                    None => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                }
+            }
+        });
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let discovery = discovery.with_test_endpoints(
+            axial_minecraft::download::InstallTestEndpoints::from_loopback_base_url(&base).unwrap(),
+        );
+        let cancel = CancellationToken::new();
+        let mut preparation = tokio::spawn({
+            let discovery = discovery.clone();
+            let cancel = cancel.clone();
+            async move { discovery.prepare_for_launch(&required(), "", &cancel).await }
+        });
+        let reached = tokio::time::timeout(Duration::from_secs(5), async {
+            while !scratch.path().join("probe-started").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let publication_released =
+            axial_minecraft::runtime::runtime_publication_lock_available_for_test(
+                &cache,
+                &axial_minecraft::runtime::RuntimeId::from(COMPONENT),
+            );
+        let released = std::fs::write(scratch.path().join("probe-release"), b"release");
+        if reached.is_err() {
+            cancel.cancel();
+        }
+        let joined = tokio::time::timeout(Duration::from_secs(10), &mut preparation).await;
+        let shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+        let _ = stop.send(());
+        let server_joined = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+        if joined.is_err()
+            || shutdown.is_err()
+            || !tasks.status().is_idle()
+            || !matches!(&server_joined, Ok(Ok(Ok(()))))
+        {
+            std::mem::forget((scratch, cache, tasks, discovery, preparation, server));
+            panic!("missing-runtime fixture has an unsettled owner; fixture retained");
+        }
+        reached.expect("real installed executable reached the selection probe");
+        released.expect("probe released");
+        assert!(
+            publication_released,
+            "selection must release the commit receipt and publication lease first"
+        );
+        assert_eq!(joined.unwrap().unwrap().unwrap().probe.info().major, 17);
+    }
+
+    #[tokio::test]
+    async fn budgeted_runtime_proofs_refuse_pressure_and_custom_checks_stay_small() {
+        if !crate::install::artifacts::tests::preparation_child(
+            "runtime::discovery::proof_tests::budgeted_runtime_proofs_refuse_pressure_and_custom_checks_stay_small",
+        ).await { return; }
+        use std::os::unix::fs::PermissionsExt;
+        let (scratch, cache, tasks, discovery) = fixture().await;
+        cache
+            .write_ready_component_for_test(COMPONENT, &java(scratch.path(), 3, false))
+            .unwrap();
+        let path = scratch.path().join("custom-java");
+        std::fs::write(&path, java(scratch.path(), 3, false)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cancel = CancellationToken::new();
+        let projection = RuntimeProjection::default();
+        let ready = discovery
+            .observe_for_preflight(&projection, &required(), "", &cancel)
+            .await;
+        let custom = discovery
+            .select(&required(), path.to_str().unwrap(), &cancel)
+            .await
+            .unwrap();
+        let work = process_physical_work();
+        let held = work
+            .try_reserve_scratch(work.scratch_limit_bytes() - (1 << 20))
+            .unwrap();
+        let custom_check =
+            tokio::time::timeout(Duration::from_millis(100), custom.revalidate()).await;
+        let refused = tokio::time::timeout(
+            Duration::from_millis(100),
+            discovery.observe_for_preflight(
+                &RuntimeProjection::default(),
+                &required(),
+                "",
+                &cancel,
+            ),
+        )
+        .await;
+        let publication =
+            tokio::time::timeout(Duration::from_millis(100), projection.revalidate()).await;
+        drop(held);
+        let recovered = projection.revalidate().await;
+        drop(custom);
+        let shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+        if shutdown.is_err() || !tasks.status().is_idle() {
+            std::mem::forget((scratch, cache, tasks, discovery));
+            panic!("runtime capacity fixture has an unsettled owner; fixture retained");
+        }
+        assert!(matches!(ready, Ok(RuntimeObservation::Ready(_))));
+        assert_eq!(
+            custom_check.expect("custom executable revalidation fits its fingerprint reservation"),
+            Ok(())
+        );
+        let refused = refused
+            .expect("budgeted observation must not wait for scratch")
+            .err()
+            .unwrap();
+        assert_eq!(refused, JavaDiscoveryError::AtCapacity);
+        assert_eq!(
+            serde_json::to_value(refused).unwrap(),
+            serde_json::json!("at_capacity")
+        );
+        assert_eq!(
+            publication.expect("publication must not wait for scratch"),
+            Err(JavaDiscoveryError::AtCapacity)
+        );
+        assert_eq!(recovered, Ok(()));
+        assert_eq!(
+            work.snapshot(axial_resource::PhysicalWorkClass::Foreground)
+                .available_scratch_bytes,
+            work.scratch_limit_bytes()
+        );
+    }
+
+    #[tokio::test]
     async fn one_verified_build_is_probed_once_and_a_new_build_is_probed_again() {
         let (scratch, cache, tasks, discovery) = fixture().await;
         cache
@@ -837,6 +1063,39 @@ mod proof_tests {
         assert_eq!(tampered, Some(JavaDiscoveryError::Replaced));
         assert_eq!(rebuilt.probe.info().update, 4);
         assert_eq!(discovery.probes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn projection_reserves_a_managed_walk_before_verification_and_probe() {
+        let (scratch, cache, tasks, discovery) = fixture().await;
+        cache
+            .write_ready_component_for_test(COMPONENT, &java(scratch.path(), 3, false))
+            .unwrap();
+        let projection = RuntimeProjection::default();
+        projection
+            .budget
+            .lock()
+            .unwrap()
+            .reserve_checks(
+                crate::install::artifacts::MAX_INVENTORY_ENTRIES as u64
+                    - (ManagedRuntimeComponent::VERIFICATION_CHECKS - 1),
+            )
+            .unwrap();
+        let result = discovery
+            .observe_for_preflight(&projection, &required(), "", &CancellationToken::new())
+            .await
+            .err();
+        let probes = discovery.probes.load(Ordering::Relaxed);
+        let retained = projection.observed.lock().unwrap().len();
+        let shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+        let idle = tasks.status().is_idle();
+        if shutdown.is_err() || !idle {
+            std::mem::forget((scratch, cache, tasks, discovery));
+            panic!("runtime task owner has not settled; fixture retained: {shutdown:?}");
+        }
+        assert_eq!(result, Some(JavaDiscoveryError::AtCapacity));
+        assert_eq!(probes, 0, "a refused budget must not start Java");
+        assert_eq!(retained, 0);
     }
 
     #[tokio::test]
@@ -922,7 +1181,7 @@ mod proof_tests {
         assert_eq!(selected, Some(JavaDiscoveryError::OutdatedJava8));
         assert_eq!(unchanged, Ok(()));
         assert_eq!(replaced, Err(JavaDiscoveryError::Replaced));
-        assert_eq!(refused, Some(JavaDiscoveryError::Failed));
+        assert_eq!(refused, Some(JavaDiscoveryError::AtCapacity));
     }
 
     #[tokio::test]

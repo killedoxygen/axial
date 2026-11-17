@@ -373,7 +373,40 @@ pub(super) fn validate_runtime_file_source_urls_for_test(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ComponentManifest {
+    #[serde(deserialize_with = "deserialize_manifest_files")]
     pub(crate) files: HashMap<String, ComponentManifestFile>,
+}
+
+fn deserialize_manifest_files<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<String, ComponentManifestFile>, D::Error> {
+    struct Files;
+    impl<'de> serde::de::Visitor<'de> for Files {
+        type Value = HashMap<String, ComponentManifestFile>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded map of unique runtime members")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut files = HashMap::new();
+            while let Some(name) = map.next_key::<String>()? {
+                if files.len() >= super::install::MAX_RUNTIME_TREE_ENTRIES
+                    || files.contains_key(&name)
+                {
+                    return Err(serde::de::Error::custom(
+                        "runtime manifest member bound or uniqueness refused",
+                    ));
+                }
+                files.insert(name, map.next_value()?);
+            }
+            Ok(files)
+        }
+    }
+    deserializer.deserialize_map(Files)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

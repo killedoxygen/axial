@@ -665,6 +665,107 @@ mod tests {
         gz.finish().unwrap()
     }
 
+    #[tokio::test]
+    async fn tree_verification_refuses_retained_source_capacity_without_waiting_for_itself() {
+        use super::super::layout::ManagedRuntimeCache;
+        use axial_resource::PhysicalWorkClass;
+        use std::time::Duration;
+        let work = PhysicalWorkOwner::isolated_for_test();
+        let java = runtime_java_relative_path_in_archive();
+        let archive = tar_gz(
+            &[
+                (&java, b"java", 0o755),
+                ("jdk8u512-b09-jre/lib/jvm.cfg", b"jvm", 0o644),
+            ],
+            None,
+        );
+        let source = receipt(
+            LINK,
+            expand_with(&archive, Format::TarGz, LIMITS, &work).unwrap(),
+        )
+        .unwrap();
+        let retained_before = available(&work);
+        let cache = ManagedRuntimeCache::isolated_for_test().unwrap();
+        let root = cache.component_root(COMPONENT).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        for (relative, member) in &source.manifest().files {
+            let path = root.join(relative);
+            if member.kind == "directory" {
+                std::fs::create_dir_all(path).unwrap();
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, &**source.archive().unwrap().get(relative).unwrap()).unwrap();
+                #[cfg(unix)]
+                if member.executable {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+        }
+        std::fs::write(
+            root.join(super::super::manifest::COMPONENT_MANIFEST_PROOF_FILE),
+            source.bytes(),
+        )
+        .unwrap();
+        std::fs::write(root.join(".axial-ready"), b"ready").unwrap();
+        let component = cache.admit_component(COMPONENT).unwrap().unwrap();
+        let held = work
+            .try_reserve_scratch(retained_before - (8 << 20))
+            .unwrap();
+        let (_sender, cancellation) = crate::cancellation::channel();
+        let under_contention = super::super::install::runtime_tree_matches_source_inner(
+            &component.root,
+            &source,
+            cancellation.thread(),
+            work.clone(),
+        )
+        .await;
+        let exhausted = work.try_reserve_scratch(8 << 20).unwrap();
+        let refusal = tokio::time::timeout(
+            Duration::from_secs(1),
+            super::super::install::runtime_tree_matches_source_inner(
+                &component.root,
+                &source,
+                cancellation.thread(),
+                work.clone(),
+            ),
+        )
+        .await;
+        drop(exhausted);
+        drop(held);
+        let restored = work.snapshot(PhysicalWorkClass::Foreground);
+        let control = super::super::install::runtime_tree_matches_source_inner(
+            &component.root,
+            &source,
+            cancellation.thread(),
+            work.clone(),
+        )
+        .await;
+        let settled = work.snapshot(PhysicalWorkClass::Foreground);
+        drop((component, source));
+        let released = available(&work);
+        assert!(
+            retained_before < work.scratch_limit_bytes(),
+            "real expansion retains scratch"
+        );
+        assert_eq!(restored.available_scratch_bytes, retained_before);
+        assert_eq!(settled.available_scratch_bytes, retained_before);
+        assert_eq!(released, work.scratch_limit_bytes());
+        assert!(
+            under_contention.expect("source-sized verification fits under retained-source contention"),
+            "small real source verifies with 8 MiB available"
+        );
+        let failure = refusal
+            .expect("retained source cannot wait for its own scratch")
+            .unwrap_err();
+        assert!(
+            matches!(failure, JavaRuntimeLookupError::RuntimeSource(failure)
+            if failure.kind() == RuntimeSourceFailureKind::Unavailable
+                && failure.detail() == "runtime verification capacity is unavailable")
+        );
+        assert!(control.unwrap());
+    }
+
     #[test]
     fn metadata_admits_only_one_digest_bound_temurin_package() {
         let package = |link: &str, checksum: &str, size: u64| {

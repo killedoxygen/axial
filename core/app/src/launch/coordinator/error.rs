@@ -25,6 +25,13 @@ pub(in crate::launch) fn install_read_error(error: InstallError) -> LaunchError 
     }
 }
 
+pub(super) fn runtime_error(error: crate::runtime::model::JavaDiscoveryError) -> LaunchError {
+    match error {
+        crate::runtime::model::JavaDiscoveryError::AtCapacity => LaunchError::AtCapacity,
+        error => LaunchError::RuntimeFailure(error),
+    }
+}
+
 pub(super) fn game_libraries_error(
     error: crate::install::artifacts::GameLibrariesError,
 ) -> LaunchError {
@@ -161,5 +168,24 @@ impl From<LaunchError> for LaunchErrorResponse {
             error: code.to_string(),
             code,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_capacity_preserves_the_public_launch_capacity_code() {
+        let response = LaunchErrorResponse::from(runtime_error(
+            crate::runtime::model::JavaDiscoveryError::AtCapacity,
+        ));
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({
+                "code":"at_capacity",
+                "error":"The launch request capacity is full. Wait for accepted work to finish."
+            })
+        );
     }
 }

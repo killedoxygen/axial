@@ -21,6 +21,7 @@ pub(super) struct RuntimeCancellationSet {
 pub(super) enum RuntimeTestHookPoint {
     BeforePublicationClaim,
     Publication,
+    TreeMember,
 }
 
 #[cfg(test)]
@@ -121,6 +122,19 @@ pub(super) async fn wait_for_runtime_test_hook(point: RuntimeTestHookPoint, path
     hook.claimed.store(true, Ordering::Release);
     let _ = hook.reached.send(());
     let _ = hook.release.await;
+}
+
+#[cfg(test)]
+pub(super) fn wait_for_runtime_test_hook_blocking(point: RuntimeTestHookPoint, path: &Path) {
+    let hook = runtime_test_hooks()
+        .lock()
+        .expect("runtime test hook registry")
+        .remove(&(point, path.to_path_buf()));
+    if let Some(hook) = hook {
+        hook.claimed.store(true, Ordering::Release);
+        let _ = hook.reached.send(());
+        let _ = hook.release.blocking_recv();
+    }
 }
 
 impl RuntimeCancellationSet {

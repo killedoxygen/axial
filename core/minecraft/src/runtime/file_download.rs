@@ -502,30 +502,6 @@ pub(super) fn bounded_manifest_file_label(relative_path: &str) -> String {
 }
 
 #[cfg(test)]
-pub(super) fn runtime_filesystem_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    #[cfg(windows)]
-    {
-        return windows_runtime_filesystem_path(path);
-    }
-    #[cfg(not(windows))]
-    {
-        std::borrow::Cow::Borrowed(path)
-    }
-}
-
-#[cfg(all(windows, test))]
-fn windows_runtime_filesystem_path(path: &Path) -> std::borrow::Cow<'_, Path> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-    };
-    std::borrow::Cow::Owned(PathBuf::from(runtime_windows_verbatim_path_string(
-        absolute.to_string_lossy().as_ref(),
-    )))
-}
-
-#[cfg(test)]
 pub(super) fn runtime_windows_verbatim_path_string(path: &str) -> String {
     let normalized = path.replace('/', "\\");
     if normalized.starts_with(r"\\?\")

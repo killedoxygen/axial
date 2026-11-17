@@ -3,8 +3,6 @@ use super::cancellation::RuntimeCancellationSet;
 use super::cancellation::{
     RuntimeTestGate, RuntimeTestHookPoint, arm_runtime_test_hook, wait_for_runtime_test_hook,
 };
-#[cfg(test)]
-use super::file_download::runtime_filesystem_path;
 use super::file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeVerifiedSource,
     bounded_manifest_file_label, component_manifest_destination,
@@ -24,17 +22,19 @@ use super::model::{
 };
 use crate::cancellation::{Cancellation, ThreadCancellation};
 use crate::managed::fs::{
-    DigestProof, ManagedDir, ManagedDirectoryMoveFailure, ManagedRelativeParents,
+    DigestProof, ManagedDir, ManagedDirectoryMoveFailure,
 };
 use crate::portable_path::{PortableFileName, PortablePathKey, PortableRelativePath};
-use axial_resource::{PhysicalIoClass, PhysicalWorkRequest, process_physical_work};
+use axial_resource::{
+    PhysicalIoClass, PhysicalWorkOwner, PhysicalWorkRequest, process_physical_work,
+};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-const MAX_RUNTIME_TREE_ENTRIES: usize = 4096;
+pub(super) const MAX_RUNTIME_TREE_ENTRIES: usize = 4096;
 const MAX_RUNTIME_TREE_DEPTH: usize = 16;
 const MAX_RUNTIME_LINK_TARGET_BYTES: usize = 4096;
 const MAX_RUNTIME_FILE_BYTES: u64 = 128 << 20;
@@ -44,7 +44,6 @@ const RUNTIME_LZMA_DICTIONARY_BYTES: usize = 128 << 20;
 const RUNTIME_LZMA_INPUT_BYTES: usize = 256 << 10;
 const RUNTIME_LZMA_SCRATCH_BYTES: u64 =
     MAX_RUNTIME_FILE_BYTES + RUNTIME_LZMA_DICTIONARY_BYTES as u64 + RUNTIME_LZMA_INPUT_BYTES as u64;
-const RUNTIME_TREE_VERIFY_SCRATCH_BYTES: u64 = 64 << 10;
 
 pub(super) fn runtime_source_failure(
     component: &RuntimeId,
@@ -204,7 +203,17 @@ impl ManagedRuntimeCommitReceipt {
         &self,
         cache: &ManagedRuntimeCache,
         expected_component: &RuntimeId,
-    ) -> bool {
+    ) -> Result<bool, JavaRuntimeLookupError> {
+        self.revalidate_with_work(cache, expected_component, process_physical_work())
+            .await
+    }
+
+    pub(super) async fn revalidate_with_work(
+        &self,
+        cache: &ManagedRuntimeCache,
+        expected_component: &RuntimeId,
+        work: PhysicalWorkOwner,
+    ) -> Result<bool, JavaRuntimeLookupError> {
         if !self.matches_cache(cache)
             || &self.component != expected_component
             || self
@@ -212,25 +221,29 @@ impl ManagedRuntimeCommitReceipt {
                 .as_ref()
                 .is_none_or(|source| source.component() != expected_component)
         {
-            return false;
+            return Ok(false);
         }
         if cache.component_root(expected_component.as_str()).is_none() {
-            return false;
+            return Ok(false);
         }
         let Some(source) = self.source.as_ref() else {
-            return false;
+            return Ok(false);
         };
         let Ok(canonical) = cache
             .authority()
             .and_then(|root| root.open_child(expected_component.as_str()))
         else {
-            return false;
+            return Ok(false);
         };
-        runtime_tree_matches_source(&canonical, source).await
-            && self
-                .quarantine
-                .as_ref()
-                .is_none_or(|obligation| obligation.path_observation().is_present())
+        let (_sender, cancellation) = crate::cancellation::channel();
+        Ok(
+            runtime_tree_matches_source_inner(&canonical, source, cancellation.thread(), work)
+                .await?
+                && self
+                    .quarantine
+                    .as_ref()
+                    .is_none_or(|obligation| obligation.path_observation().is_present()),
+        )
     }
 
     pub(super) fn into_verified_runtime(
@@ -418,7 +431,7 @@ pub(super) async fn verify_cached_managed_runtime_until_cancelled(
         .and_then(|root| root.open_child(component.as_str()))
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let matches_source =
-        runtime_tree_matches_source_until_cancelled(&canonical, &source, cancellation).await;
+        runtime_tree_matches_source_until_cancelled(&canonical, &source, cancellation).await?;
     if cancellation.is_cancelled() {
         return Ok(CachedManagedRuntimeVerification::Cancelled);
     }
@@ -526,7 +539,7 @@ pub(super) async fn prepare_missing_runtime_until_cancelled(
             .component_root(component.as_str())
             .ok_or(JavaRuntimeLookupError::ManagedMutationRefused)?;
         let matches =
-            runtime_tree_matches_source_until_cancelled(&canonical, &source, cancellation).await;
+            runtime_tree_matches_source_until_cancelled(&canonical, &source, cancellation).await?;
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -636,6 +649,13 @@ async fn stage_with_publication_lease(
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
         return Ok(None);
     }
+    let tree_matches = match tree_matches {
+        Ok(matches) => matches,
+        Err(error) => {
+            let _ = stage.cleanup().await;
+            return Err(error);
+        }
+    };
     if !tree_matches {
         let _ = stage.cleanup().await;
         return Err(JavaRuntimeLookupError::Install(
@@ -796,14 +816,21 @@ async fn publish_staged_managed_runtime_inner(
         .expect("staged managed runtime retains its authenticated source");
     #[cfg(test)]
     wait_for_runtime_test_hook(RuntimeTestHookPoint::Publication, &staged.install_root).await;
-    if source.component() != &staged.component
-        || !runtime_tree_matches_source(staged.stage.root(), &source).await
-    {
+    let verified = if source.component() == &staged.component {
+        runtime_tree_matches_source(staged.stage.root(), &source).await
+    } else {
+        Ok(false)
+    };
+    if !matches!(&verified, Ok(true)) {
         let _ = staged.stage.cleanup().await;
-        return Err(JavaRuntimeLookupError::Install(
-            "staged runtime failed exact pre-promotion verification".to_string(),
-        )
-        .into());
+        return Err(verified
+            .err()
+            .unwrap_or_else(|| {
+                JavaRuntimeLookupError::Install(
+                    "staged runtime failed exact pre-promotion verification".to_string(),
+                )
+            })
+            .into());
     }
 
     let cache_root = staged
@@ -825,9 +852,18 @@ async fn publish_staged_managed_runtime_inner(
         return Err(JavaRuntimeLookupError::ManagedMutationRefused.into());
     }
 
-    if let Some(retained) = canonical.as_ref()
-        && runtime_tree_matches_source(retained, &source).await
-    {
+    let existing_matches = match canonical.as_ref() {
+        Some(retained) => runtime_tree_matches_source(retained, &source).await,
+        None => Ok(false),
+    };
+    let existing_matches = match existing_matches {
+        Ok(matches) => matches,
+        Err(error) => {
+            let _ = staged.stage.cleanup().await;
+            return Err(error.into());
+        }
+    };
+    if existing_matches {
         staged
             .stage
             .cleanup()
@@ -980,7 +1016,17 @@ async fn publish_staged_managed_runtime_inner(
     };
     publication_effect_started = true;
 
-    if !runtime_tree_matches_source(&canonical, &source).await {
+    let canonical_matches = match runtime_tree_matches_source(&canonical, &source).await {
+        Ok(matches) => matches,
+        Err(error) => {
+            return Err(classify_managed_runtime_publish_failure(
+                &mut staged,
+                publication_effect_started,
+                error,
+            ));
+        }
+    };
+    if !canonical_matches {
         let failed_tree_result = cache_root.move_child_guarded_no_replace(
             canonical_name,
             canonical,
@@ -1127,12 +1173,13 @@ fn managed_runtime_commit_receipt(
 pub(super) async fn runtime_tree_matches_source(
     root: &ManagedDir,
     source: &RuntimeSourceReceipt,
-) -> bool {
+) -> Result<bool, JavaRuntimeLookupError> {
     let (_cancellation_sender, cancellation) = crate::cancellation::channel();
     Box::pin(runtime_tree_matches_source_inner(
         root,
         source,
         cancellation.thread(),
+        process_physical_work(),
     ))
     .await
 }
@@ -1141,38 +1188,49 @@ pub(super) async fn runtime_tree_matches_source_until_cancelled(
     root: &ManagedDir,
     source: &RuntimeSourceReceipt,
     cancellation: &Cancellation,
-) -> bool {
+) -> Result<bool, JavaRuntimeLookupError> {
     Box::pin(runtime_tree_matches_source_inner(
         root,
         source,
         cancellation.thread(),
+        process_physical_work(),
     ))
     .await
 }
 
-async fn runtime_tree_matches_source_inner(
+pub(super) async fn runtime_tree_matches_source_inner(
     root: &ManagedDir,
     source: &RuntimeSourceReceipt,
     cancellation: ThreadCancellation,
-) -> bool {
+    work: PhysicalWorkOwner,
+) -> Result<bool, JavaRuntimeLookupError> {
     if cancellation.is_cancelled() {
-        return false;
+        return Ok(false);
     }
     let root = root.clone();
     let component = source.component().clone();
-    let source_manifest = source.manifest().clone();
     let worker_cancellation = cancellation.clone();
-    let Ok(admission) = process_physical_work()
-        .admit(PhysicalWorkRequest::foreground(
-            PhysicalIoClass::Heavy,
-            RUNTIME_TREE_VERIFY_SCRATCH_BYTES,
-        ))
-        .await
-    else {
-        return false;
+    // Source checks can hold publication leases and retained archive bytes.
+    // Reserve scratch without waiting; a memory holder may need this lease
+    // to finish and release its own reservation. Worker admission may wait.
+    let capacity_error = || {
+        runtime_source_failure(
+            &component,
+            RuntimeSourceFailureKind::Unavailable,
+            "runtime verification capacity is unavailable",
+        )
     };
+    let scratch = work
+        .try_reserve_scratch(source_verification_scratch_bytes(source))
+        .map_err(|_| capacity_error())?;
+    let admission = work
+        .admit(PhysicalWorkRequest::foreground(PhysicalIoClass::Heavy, 0))
+        .await
+        .map_err(|_| capacity_error())?;
+    let source_manifest = source.manifest().clone();
     admission
         .run(move |_| {
+            let _scratch = scratch;
             if worker_cancellation.is_cancelled() {
                 return false;
             }
@@ -1183,9 +1241,49 @@ async fn runtime_tree_matches_source_inner(
                 DigestProof::Full,
                 &worker_cancellation,
             )
+            .is_some()
         })
         .await
-        .unwrap_or(false)
+        .map_err(|_| {
+            runtime_source_failure(
+                source.component(),
+                RuntimeSourceFailureKind::Unavailable,
+                "runtime verification worker stopped",
+            )
+        })
+}
+
+pub(super) const fn verification_scratch_bytes(manifest_bytes: u64, members: usize) -> u64 {
+    // Input-sized clone/canonical/read buffers, two path maps, pending entries
+    // and both native and cloned listings. Include nested capacity and wide names.
+    manifest_bytes
+        .saturating_mul(6)
+        .saturating_add((members as u64).saturating_mul(8 << 10))
+        .saturating_add(64 << 10)
+}
+
+fn source_verification_scratch_bytes(source: &RuntimeSourceReceipt) -> u64 {
+    let files = &source.manifest().files;
+    let mut members = files.len().saturating_add(2);
+    for path in files.keys() {
+        if path.len() > crate::portable_path::MAX_PORTABLE_RELATIVE_PATH_BYTES
+            || path.split('/').take(MAX_RUNTIME_TREE_DEPTH + 1).count() > MAX_RUNTIME_TREE_DEPTH
+        {
+            members = MAX_RUNTIME_TREE_ENTRIES;
+            break;
+        }
+        for (offset, _) in path.match_indices('/') {
+            // Declared directories already have their own entry. Duplicated
+            // implicit prefixes only over-reserve; this pass allocates nothing.
+            if !files.contains_key(&path[..offset]) {
+                members = members.saturating_add(1);
+            }
+        }
+    }
+    verification_scratch_bytes(
+        source.bytes().len() as u64,
+        members.min(MAX_RUNTIME_TREE_ENTRIES),
+    )
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1201,34 +1299,54 @@ pub(super) fn managed_runtime_tree_matches_manifest(
     manifest: &ComponentManifest,
     proof: DigestProof,
     cancellation: &ThreadCancellation,
-) -> bool {
-    // One validation window for the whole tree; a failed close refuses it.
-    matches!(
-        root.observe_validated(
-            || {
-                Ok::<_, crate::loaders::types::LoaderError>(managed_runtime_tree_matches(
-                    component,
-                    root,
-                    manifest,
-                    proof,
-                    cancellation,
-                ))
-            },
-            |error| error,
-        ),
-        Ok(true)
-    )
+) -> Option<RuntimeTreeSample> {
+    let sample = root.observe_validated(
+        || {
+            Ok::<_, crate::loaders::types::LoaderError>(managed_runtime_tree_sample(
+                component,
+                root,
+                manifest,
+                proof,
+                cancellation,
+            ))
+        },
+        |error| error,
+    );
+    match sample {
+        Ok(Some(sample)) => {
+            tracing::debug!(
+                stage = "runtime_tree",
+                entries = sample.entries,
+                directories = sample.directories,
+                hashed_files = sample.hashed_files,
+                hashed_bytes = sample.hashed_bytes,
+                digest_hits = sample.digest_hits,
+                "Managed runtime tree verified."
+            );
+            Some(sample)
+        }
+        _ => None,
+    }
 }
 
-fn managed_runtime_tree_matches(
+#[derive(Default)]
+pub(super) struct RuntimeTreeSample {
+    pub(super) entries: usize,
+    pub(super) directories: u64,
+    pub(super) hashed_files: u64,
+    pub(super) hashed_bytes: u64,
+    pub(super) digest_hits: u64,
+}
+
+fn managed_runtime_tree_sample(
     component: &RuntimeId,
     root: &ManagedDir,
     manifest: &ComponentManifest,
     proof: DigestProof,
     cancellation: &ThreadCancellation,
-) -> bool {
+) -> Option<RuntimeTreeSample> {
     let Ok(expected_proof) = component_manifest_proof_bytes(manifest) else {
-        return false;
+        return None;
     };
     if !matches!(
         root.read_authenticated(
@@ -1238,13 +1356,13 @@ fn managed_runtime_tree_matches(
         ),
         Ok(actual) if actual == expected_proof
     ) {
-        return false;
+        return None;
     }
     if !matches!(
         root.read_authenticated(".axial-ready", Some(5), None),
         Ok(actual) if actual == b"ready"
     ) {
-        return false;
+        return None;
     }
 
     let mut expected = HashMap::new();
@@ -1253,300 +1371,182 @@ fn managed_runtime_tree_matches(
         PathBuf::from(COMPONENT_MANIFEST_PROOF_FILE),
         RuntimeTreeNodeKind::File,
     ) {
-        return false;
+        return None;
     }
     if !insert_runtime_tree_node(
         &mut expected,
         PathBuf::from(".axial-ready"),
         RuntimeTreeNodeKind::File,
     ) {
-        return false;
+        return None;
     }
     for (relative, file) in &manifest.files {
         let Ok(path) = component_manifest_destination(component, Path::new(""), relative) else {
-            return false;
+            return None;
         };
         let kind = match file.kind.as_str() {
             "directory" => RuntimeTreeNodeKind::Directory,
             "file" => RuntimeTreeNodeKind::File,
             "link" => RuntimeTreeNodeKind::Link,
-            _ => return false,
+            _ => return None,
         };
-        if !insert_runtime_tree_node(&mut expected, path, kind) {
-            return false;
+        if !insert_runtime_tree_node(&mut expected, path, kind)
+            || expected.len() > MAX_RUNTIME_TREE_ENTRIES
+        {
+            return None;
         }
     }
 
     let expected_node_count = expected.len();
+    let mut child_counts = HashMap::<PathBuf, usize>::new();
+    for relative in expected.keys() {
+        *child_counts
+            .entry(relative.parent().unwrap_or(Path::new("")).to_owned())
+            .or_default() += 1;
+    }
     let mut observed_node_count = 0_usize;
-    let mut directories = vec![(root.clone(), PathBuf::new())];
-    while let Some((directory, prefix)) = directories.pop() {
+    let mut hashed_files = 0_u64;
+    let mut hashed_bytes = 0_u64;
+    let mut digest_hits = 0_u64;
+    let mut directory_count = 0_u64;
+    // Pending siblings share their parent's handle. Open a child only when
+    // visiting it, so distinct live directory handles follow the walk's depth.
+    let mut directories = vec![(root.clone(), None, PathBuf::new())];
+    while let Some((parent, entry, prefix)) = directories.pop() {
         if cancellation.is_cancelled() {
-            return false;
+            return None;
         }
-        let Ok(entries) = directory.guarded_entries_bounded(MAX_RUNTIME_TREE_ENTRIES) else {
-            return false;
+        let directory = match entry {
+            Some(entry) => match parent.open_observed_child(&entry) {
+                Ok(directory) => directory,
+                Err(_) => return None,
+            },
+            None => parent,
         };
-        for entry in entries {
+        let Ok(entries) = directory.guarded_entries_bounded(MAX_RUNTIME_TREE_ENTRIES) else {
+            return None;
+        };
+        if entries.len() != child_counts.get(&prefix).copied().unwrap_or(0) {
+            return None;
+        }
+        directory_count += 1;
+        // Prove this directory's complete membership before reading any member.
+        for entry in &entries {
             let Some(name) = entry.utf8_name() else {
-                return false;
+                return None;
             };
             if PortableFileName::new_exact(name).is_err() {
-                return false;
+                return None;
             }
-            observed_node_count = observed_node_count.saturating_add(1);
+            observed_node_count += 1;
             if observed_node_count > expected_node_count {
-                return false;
+                return None;
             }
-            let relative = prefix.join(name);
             let actual = match entry.kind() {
                 axial_fs::EntryKind::Directory => RuntimeTreeNodeKind::Directory,
                 axial_fs::EntryKind::File => RuntimeTreeNodeKind::File,
                 axial_fs::EntryKind::Link => RuntimeTreeNodeKind::Link,
-                axial_fs::EntryKind::Other => return false,
+                axial_fs::EntryKind::Other => return None,
             };
-            if expected.remove(&relative) != Some(actual) {
-                return false;
-            }
-            if actual == RuntimeTreeNodeKind::Directory {
-                let Ok(child) = directory.open_observed_child(&entry) else {
-                    return false;
-                };
-                directories.push((child, relative));
+            if expected.remove(&prefix.join(name)) != Some(actual) {
+                return None;
             }
         }
-    }
-    if !expected.is_empty() {
-        return false;
-    }
-
-    let mut files = manifest.files.iter().collect::<Vec<_>>();
-    files.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    let mut parents = ManagedRelativeParents::default();
-    for (relative, file) in files {
-        if cancellation.is_cancelled() {
-            return false;
-        }
-        let Ok(relative_path) = PortableRelativePath::new_exact(relative) else {
-            return false;
-        };
-        match file.kind.as_str() {
-            "directory" => {}
-            "file" => {
-                let Some(raw) = file
-                    .downloads
-                    .as_ref()
-                    .and_then(|downloads| downloads.raw.as_ref())
-                else {
-                    return false;
-                };
-                let (Some(size), Some(sha1)) = (raw.size, raw.sha1.as_deref()) else {
-                    return false;
-                };
-                let Some(sha1) = runtime_sha1_bytes(sha1) else {
-                    return false;
-                };
-                if root
-                    .verify_relative_file_sha1(
-                        &mut parents,
-                        &relative_path,
+        for entry in entries {
+            let name = entry
+                .utf8_name()
+                .expect("membership checked its portable name");
+            let relative = prefix.join(name);
+            if entry.kind() == axial_fs::EntryKind::Directory {
+                directories.push((directory.clone(), Some(entry), relative));
+                continue;
+            }
+            // The proof and ready marker were authenticated above.
+            if prefix.as_os_str().is_empty()
+                && matches!(name, COMPONENT_MANIFEST_PROOF_FILE | ".axial-ready")
+            {
+                continue;
+            }
+            let Ok(relative_path) = PortableRelativePath::from_path(&relative) else {
+                return None;
+            };
+            let Some(file) = manifest.files.get(relative_path.as_str()) else {
+                return None;
+            };
+            #[cfg(test)]
+            super::cancellation::wait_for_runtime_test_hook_blocking(
+                RuntimeTestHookPoint::TreeMember,
+                &root.path().join(&relative),
+            );
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            match file.kind.as_str() {
+                "file" => {
+                    let Some(raw) = file
+                        .downloads
+                        .as_ref()
+                        .and_then(|downloads| downloads.raw.as_ref())
+                    else {
+                        return None;
+                    };
+                    let (Some(size), Some(sha1)) =
+                        (raw.size, raw.sha1.as_deref().and_then(runtime_sha1_bytes))
+                    else {
+                        return None;
+                    };
+                    let Ok(sample) = directory.verify_file_sha1(
+                        name,
                         size,
                         &sha1,
+                        file.executable,
                         proof,
                         || {
                             if cancellation.is_cancelled() {
                                 Err(crate::loaders::types::LoaderError::Verify(
-                                    "runtime verification was cancelled".to_string(),
+                                    "runtime verification was cancelled".into(),
                                 ))
                             } else {
                                 Ok(())
                             }
                         },
-                    )
-                    .is_err()
-                {
-                    return false;
-                }
-                #[cfg(unix)]
-                if file.executable
-                    && !matches!(root.relative_file_is_executable(&relative_path), Ok(true))
-                {
-                    return false;
-                }
-            }
-            "link" => {
-                #[cfg(unix)]
-                {
-                    let Some(target) = file.target.as_deref() else {
-                        return false;
+                    ) else {
+                        return None;
                     };
-                    if !matches!(
-                        root.read_symlink_relative(&relative_path),
-                        Ok(actual) if actual == std::ffi::OsStr::new(target)
-                    ) {
-                        return false;
-                    }
+                    hashed_files += u64::from(!sample.cache_hit);
+                    hashed_bytes += sample.bytes_hashed;
+                    digest_hits += u64::from(sample.cache_hit);
                 }
-                #[cfg(not(unix))]
-                return false;
-            }
-            _ => return false,
-        }
-    }
-    root.revalidate().is_ok() && !cancellation.is_cancelled()
-}
-
-#[cfg(test)]
-fn runtime_tree_shape_matches_manifest(
-    component: &RuntimeId,
-    root: &Path,
-    manifest: &ComponentManifest,
-) -> bool {
-    runtime_tree_shape_matches_manifest_inner(component, root, manifest, None)
-}
-
-#[cfg(test)]
-fn runtime_tree_shape_matches_manifest_inner(
-    component: &RuntimeId,
-    root: &Path,
-    manifest: &ComponentManifest,
-    cancellation: Option<&ThreadCancellation>,
-) -> bool {
-    if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
-        return false;
-    }
-    let filesystem_root = runtime_filesystem_path(root).into_owned();
-    let Ok(root_metadata) = std::fs::symlink_metadata(&filesystem_root) else {
-        return false;
-    };
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return false;
-    }
-
-    let mut expected = HashMap::new();
-    if !insert_runtime_tree_node(
-        &mut expected,
-        PathBuf::from(COMPONENT_MANIFEST_PROOF_FILE),
-        RuntimeTreeNodeKind::File,
-    ) || !insert_runtime_tree_node(
-        &mut expected,
-        PathBuf::from(".axial-ready"),
-        RuntimeTreeNodeKind::File,
-    ) {
-        return false;
-    }
-    for (relative, file) in &manifest.files {
-        if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
-            return false;
-        }
-        let Ok(path) = component_manifest_destination(component, Path::new(""), relative) else {
-            return false;
-        };
-        let kind = match file.kind.as_str() {
-            "directory" => RuntimeTreeNodeKind::Directory,
-            "file" => RuntimeTreeNodeKind::File,
-            "link" => RuntimeTreeNodeKind::Link,
-            _ => return false,
-        };
-        if !insert_runtime_tree_node(&mut expected, path, kind) {
-            return false;
-        }
-    }
-
-    let expected_node_count = expected.len();
-    let mut observed_node_count = 0_usize;
-    let mut directories = vec![filesystem_root.clone()];
-    while let Some(directory) = directories.pop() {
-        if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
-            return false;
-        }
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            return false;
-        };
-        for entry in entries {
-            if cancellation.is_some_and(ThreadCancellation::is_cancelled) {
-                return false;
-            }
-            observed_node_count = observed_node_count.saturating_add(1);
-            if observed_node_count > expected_node_count {
-                return false;
-            }
-            let Ok(entry) = entry else {
-                return false;
-            };
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(&filesystem_root) else {
-                return false;
-            };
-            let Ok(metadata) = std::fs::symlink_metadata(runtime_filesystem_path(&path).as_ref())
-            else {
-                return false;
-            };
-            let actual = if metadata.file_type().is_symlink() {
-                RuntimeTreeNodeKind::Link
-            } else if metadata.is_dir() {
-                RuntimeTreeNodeKind::Directory
-            } else if metadata.is_file() {
-                RuntimeTreeNodeKind::File
-            } else {
-                return false;
-            };
-            if expected.remove(relative) != Some(actual) {
-                return false;
-            }
-            if actual == RuntimeTreeNodeKind::Directory {
-                directories.push(path);
+                "link" => {
+                    #[cfg(unix)]
+                    {
+                        let Some(target) = file.target.as_deref() else {
+                            return None;
+                        };
+                        let Ok(leaf_path) = PortableRelativePath::new_exact(name) else {
+                            return None;
+                        };
+                        if !matches!(directory.read_symlink_relative(&leaf_path), Ok(actual) if actual == std::ffi::OsStr::new(target))
+                        {
+                            return None;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    return None;
+                }
+                _ => return None,
             }
         }
     }
-    expected.is_empty()
-}
-
-#[cfg(test)]
-mod runtime_tree_shape_tests {
-    use super::{ComponentManifest, ComponentManifestFile, runtime_tree_shape_matches_manifest};
-    use std::collections::HashMap;
-
-    #[test]
-    fn accepts_entries_returned_from_the_platform_filesystem_root() {
-        let root = tempfile::tempdir_in(crate::test_temp_root()).expect("runtime tree root");
-        std::fs::create_dir(root.path().join("bin")).expect("runtime bin directory");
-        std::fs::write(root.path().join("bin/java.exe"), b"java").expect("runtime executable");
-        std::fs::write(
-            root.path().join(".axial-runtime-manifest.json"),
-            b"manifest",
-        )
-        .expect("runtime manifest proof");
-        std::fs::write(root.path().join(".axial-ready"), b"ready").expect("runtime ready marker");
-        let manifest = ComponentManifest {
-            files: HashMap::from([
-                (
-                    "bin".to_string(),
-                    ComponentManifestFile {
-                        kind: "directory".to_string(),
-                        executable: false,
-                        downloads: None,
-                        target: None,
-                    },
-                ),
-                (
-                    "bin/java.exe".to_string(),
-                    ComponentManifestFile {
-                        kind: "file".to_string(),
-                        executable: true,
-                        downloads: None,
-                        target: None,
-                    },
-                ),
-            ]),
-        };
-
-        assert!(runtime_tree_shape_matches_manifest(
-            &super::RuntimeId::from("java-runtime-gamma"),
-            root.path(),
-            &manifest,
-        ));
-    }
+    (expected.is_empty() && root.revalidate().is_ok() && !cancellation.is_cancelled()).then_some(
+        RuntimeTreeSample {
+            entries: observed_node_count,
+            directories: directory_count,
+            hashed_files,
+            hashed_bytes,
+            digest_hits,
+        },
+    )
 }
 
 fn insert_runtime_tree_node(
@@ -2022,6 +2022,13 @@ fn validate_runtime_manifest_contract(
                 "runtime manifest contains aliased path-prefix spellings",
             ));
         }
+        if canonical_prefixes.len() > max_entries {
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest exceeds the tree entry bound",
+            ));
+        }
         if !declared_paths.insert(filesystem_key.clone()) {
             return Err(runtime_source_failure(
                 component,
@@ -2197,6 +2204,13 @@ fn validate_runtime_manifest_contract(
                 component,
                 RuntimeSourceFailureKind::PolicyRejected,
                 "runtime manifest contains an invalid path topology",
+            ));
+        }
+        if filesystem_entries.len() > max_entries {
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest exceeds the tree entry bound",
             ));
         }
         if !insert_runtime_tree_node(

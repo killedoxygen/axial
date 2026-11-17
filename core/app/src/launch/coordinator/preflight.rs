@@ -366,7 +366,7 @@ impl LaunchCoordinator {
             .runtimes
             .revalidate()
             .await
-            .map_err(LaunchError::RuntimeFailure)?;
+            .map_err(runtime_error)?;
         let context_started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         let verified = projection.credentials.lock().unwrap().clone();
         for account in &verified {
@@ -736,7 +736,7 @@ impl LaunchCoordinator {
                                     .ok();
                                 return Ok(refused);
                             }
-                            Err(error) => return Err(LaunchError::RuntimeFailure(error)),
+                            Err(error) => return Err(runtime_error(error)),
                         };
                         let heap = crate::launch::resources::decide_heap(
                             settings.heap,
@@ -854,7 +854,7 @@ impl LaunchCoordinator {
                     }
                 }
                 if finalize_scan && let Err(error) = runtimes.revalidate().await {
-                    result = Err(LaunchError::RuntimeFailure(error));
+                    result = Err(runtime_error(error));
                 }
                 let final_proof = owned_proof.lock().unwrap().clone();
                 if finalize_scan && let Some(proof) = &final_proof {

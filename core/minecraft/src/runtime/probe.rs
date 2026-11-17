@@ -105,6 +105,8 @@ pub struct JavaProbeReceipt {
 }
 
 impl JavaProbeReceipt {
+    /// The file fingerprint buffer; no Java process is started by revalidation.
+    pub const REVALIDATION_SCRATCH_BYTES: u64 = 16 << 10;
     pub fn info(&self) -> &JavaRuntimeInfo {
         &self.info
     }
@@ -442,7 +444,7 @@ fn fingerprint_file(path: &Path) -> Result<FileIdentity, JavaProbeError> {
         return Err(JavaProbeError::Replaced);
     }
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 16 << 10];
+    let mut buffer = [0_u8; JavaProbeReceipt::REVALIDATION_SCRATCH_BYTES as usize];
     let mut size = 0_u64;
     loop {
         let count = file.read(&mut buffer).map_err(file_error)?;
