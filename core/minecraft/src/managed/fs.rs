@@ -5616,48 +5616,74 @@ impl ManagedLibraryFileBatch {
         if self
             .parent
             .as_ref()
-            .is_none_or(|parent| parent.relative != parent_path)
+            .is_some_and(|parent| parent.relative == parent_path)
         {
-            self.parent = None;
-            let mut directory = self.operation.managed_directory().map_err(loader_io)?;
-            let mut revisions = Vec::new();
-            if !parent_path.is_empty() {
-                for segment in parent_path.split('/') {
-                    // Capture before the alias-checked listing. A later stamp
-                    // must never bless a namespace change during that walk.
-                    let mut revision = directory.passive_revision().map_err(loader_io)?;
-                    let child = directory.open_child_if_exists(segment).map_err(loader_io)?;
-                    let Some(child) = child else {
-                        let absence = FileAbsence {
-                            operation: self.operation.clone(),
-                            parent: FileBatchParent {
-                                relative: parent_path
-                                    .split('/')
-                                    .take(revisions.len())
-                                    .collect::<Vec<_>>()
-                                    .join("/"),
-                                directory,
-                                revisions,
-                            },
-                            name: segment.to_owned(),
-                            revision,
-                        };
-                        absence.revalidate()?;
-                        return Ok(Some(absence));
-                    };
-                    revalidate_batch_child(&directory, &child, segment, &mut revision)?;
-                    revisions.push((directory, revision));
-                    directory = child;
-                }
-            }
-            self.parent = Some(FileBatchParent {
-                relative: parent_path.to_owned(),
-                directory,
-                revisions,
-            });
-        } else {
             self.operation.revalidate()?;
+            return Ok(None);
         }
+        let mut parent = match self.parent.take() {
+            Some(mut parent) => {
+                let shared = parent
+                    .relative
+                    .split('/')
+                    .filter(|name| !name.is_empty())
+                    .zip(parent_path.split('/').filter(|name| !name.is_empty()))
+                    .take_while(|(retained, requested)| retained == requested)
+                    .count();
+                if shared < parent.revisions.len() {
+                    parent.directory = parent.revisions[shared].0.clone();
+                    parent.revisions.truncate(shared);
+                }
+                let prefix_bytes = parent_path
+                    .split('/')
+                    .take(shared)
+                    .map(str::len)
+                    .sum::<usize>()
+                    + shared.saturating_sub(1);
+                parent.relative.truncate(prefix_bytes);
+                // Keep the shared capabilities, not a new binding to the same
+                // names. The discarded branch need no longer exist.
+                parent.revalidate()?;
+                parent
+            }
+            None => FileBatchParent {
+                relative: String::new(),
+                directory: self.operation.managed_directory().map_err(loader_io)?,
+                revisions: Vec::new(),
+            },
+        };
+        let shared = parent.revisions.len();
+        for segment in parent_path
+            .split('/')
+            .filter(|name| !name.is_empty())
+            .skip(shared)
+        {
+            // Capture before the alias-checked listing. A later stamp must
+            // never bless a namespace change during that walk.
+            let mut revision = parent.directory.passive_revision().map_err(loader_io)?;
+            let child = parent
+                .directory
+                .open_child_if_exists(segment)
+                .map_err(loader_io)?;
+            let Some(child) = child else {
+                let absence = FileAbsence {
+                    operation: self.operation.clone(),
+                    parent,
+                    name: segment.to_owned(),
+                    revision,
+                };
+                absence.revalidate()?;
+                return Ok(Some(absence));
+            };
+            revalidate_batch_child(&parent.directory, &child, segment, &mut revision)?;
+            parent.revisions.push((parent.directory, revision));
+            parent.directory = child;
+            if !parent.relative.is_empty() {
+                parent.relative.push('/');
+            }
+            parent.relative.push_str(segment);
+        }
+        self.parent = Some(parent);
         Ok(None)
     }
 }
@@ -7236,6 +7262,121 @@ mod library_lifecycle_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn file_batch_walks_siblings_after_the_previous_branch_disappears() {
+        let (temporary, root, operation) = file_batch_fixture();
+        std::fs::create_dir(temporary.path().join("assets/objects/bb")).unwrap();
+        std::fs::write(temporary.path().join("assets/objects/bb/next"), b"next").unwrap();
+        std::fs::write(temporary.path().join("assets/direct"), b"direct").unwrap();
+        std::fs::write(temporary.path().join("top"), b"top").unwrap();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        std::fs::rename(
+            temporary.path().join("assets/objects/aa"),
+            temporary.path().join("assets/objects/previous-aa"),
+        )
+        .unwrap();
+        let observations = [
+            ("assets/objects/bb/next", &b"next"[..]),
+            ("assets/direct", &b"direct"[..]),
+            ("top", &b"top"[..]),
+            ("assets/objects/bb/next", &b"next"[..]),
+        ]
+        .map(|(path, expected)| {
+            batch
+                .observe_file(&PortableRelativePath::new_exact(path).unwrap())
+                .ok()
+                .flatten()
+                .is_some_and(|file| file.read_bounded(32).is_ok_and(|bytes| bytes == expected))
+        });
+        let preserved = std::fs::read(temporary.path().join("assets/objects/previous-aa/first"))
+            .is_ok_and(|bytes| bytes == b"first payload");
+        drop((batch, operation, root));
+        if observations != [true; 4] || !preserved {
+            eprintln!("sibling fixture retained at {}", temporary.keep().display());
+        }
+        assert_eq!(observations, [true; 4]);
+        assert!(preserved);
+    }
+
+    #[test]
+    fn file_batch_sibling_walk_refuses_replaced_or_aliased_shared_ancestors() {
+        for replace in [false, true] {
+            let (temporary, root, operation) = file_batch_fixture();
+            let next = PortableRelativePath::new_exact("assets/objects/bb/next").unwrap();
+            std::fs::create_dir(temporary.path().join("assets/objects/bb")).unwrap();
+            std::fs::write(temporary.path().join(next.as_str()), b"next").unwrap();
+            let mut batch = operation.file_batch();
+            let first = batch.observe_file(&batch_path("first")).unwrap().unwrap();
+            let mut revisions = operation.file_batch();
+            revisions
+                .validate_revision(&batch_path("first"), &first.revision_observation())
+                .unwrap();
+            let expected = operation
+                .observe_file(&next)
+                .unwrap()
+                .unwrap()
+                .revision_observation();
+            drop(first);
+            let parent = batch.parent.as_ref().unwrap().revisions[1].0.clone();
+            let before = parent.passive_revision().unwrap();
+            let moved = if replace {
+                "previous-objects"
+            } else {
+                "Objects"
+            };
+            std::fs::rename(
+                temporary.path().join("assets/objects"),
+                temporary.path().join("assets").join(moved),
+            )
+            .unwrap();
+            if replace {
+                std::fs::create_dir_all(temporary.path().join("assets/objects/bb")).unwrap();
+                std::fs::write(temporary.path().join(next.as_str()), b"next").unwrap();
+            }
+            require_changed_directory_revision(&parent, before, &temporary.path().join("assets"));
+            let refused = batch.observe_file(&next).is_err();
+            let revision_refused = revisions.validate_revision(&next, &expected).is_err();
+            let preserved =
+                std::fs::read(temporary.path().join("assets").join(moved).join("bb/next"))
+                    .is_ok_and(|bytes| bytes == b"next");
+            drop((parent, batch, revisions, operation, root));
+            if !refused || !revision_refused || !preserved {
+                eprintln!(
+                    "shared ancestor fixture retained at {}",
+                    temporary.keep().display()
+                );
+            }
+            assert!(refused && revision_refused && preserved);
+        }
+    }
+
+    #[test]
+    fn file_batch_sibling_absence_does_not_cache_a_missing_branch() {
+        let (temporary, root, operation) = file_batch_fixture();
+        let mut batch = operation.file_batch();
+        batch.observe_file(&batch_path("first")).unwrap().unwrap();
+        let path = PortableRelativePath::new_exact("assets/objects/bb/next").unwrap();
+        let observation = batch.observe_file_with_absence(&path).unwrap();
+        let valid_absence = matches!(&observation, FileObservation::Missing(absence) if absence.revalidate().is_ok());
+        std::fs::create_dir(temporary.path().join("assets/objects/bb")).unwrap();
+        std::fs::write(temporary.path().join(path.as_str()), b"next").unwrap();
+        let stale_absence_refused = matches!(&observation, FileObservation::Missing(absence) if absence.revalidate().is_err());
+        let observed = batch
+            .observe_file(&path)
+            .ok()
+            .flatten()
+            .is_some_and(|file| file.read_bounded(32).is_ok_and(|bytes| bytes == b"next"));
+        drop((observation, batch, operation, root));
+        if !valid_absence || !stale_absence_refused || !observed {
+            eprintln!(
+                "sibling absence fixture retained at {}",
+                temporary.keep().display()
+            );
+        }
+        assert!(valid_absence && stale_absence_refused && observed);
     }
 
     #[test]
