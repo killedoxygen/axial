@@ -397,19 +397,26 @@ impl LaunchCoordinator {
         projection: &PreflightProjection,
         instance: &crate::instances::model::Instance,
     ) -> Result<(), LaunchError> {
+        let _target = self
+            .instances
+            .exclusions()
+            .try_acquire([instance.id.as_str()], [])
+            .map_err(|_| LaunchError::InstanceBusy)?;
         let admitted = self
             .instances
             .admit_read(&instance.id)
             .map_err(instance_error)?;
-        let _target = self.validate_preflight_target(&admitted)?;
         let pin = self
             .instances
             .library()
             .admit()
             .map_err(|_| LaunchError::LibraryUnavailable)?;
-        if let Some(Ok(scan)) = &projection.scan
-            && (!scan.generation_matches(admitted.game_directory().pin())
-                || !scan.generation_matches(&pin))
+        let captured_pin = admitted.game_directory().pin();
+        if captured_pin.generation() != pin.generation()
+            || captured_pin.library_id() != pin.library_id()
+            || projection.scan.as_ref().is_some_and(|scan| {
+                scan.as_ref().is_ok_and(|scan| !scan.generation_matches(&pin))
+            })
         {
             return Err(LaunchError::LibraryUnavailable);
         }

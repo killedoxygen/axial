@@ -5567,6 +5567,351 @@ printf 'java.version = %s.0.3\nos.arch = {}\njava.vendor = Eclipse Adoptium\n' "
     }
 }
 
+#[test]
+#[cfg(unix)]
+fn grouped_readiness_final_target_refuses_settings_aba() {
+    check_grouped_target_change(TargetChange::Settings);
+}
+
+#[test]
+#[cfg(unix)]
+fn grouped_readiness_final_target_refuses_an_active_writer() {
+    check_grouped_target_change(TargetChange::Writer);
+}
+
+#[test]
+#[cfg(unix)]
+fn grouped_readiness_final_target_refuses_same_bytes_directory_replacement() {
+    check_grouped_target_change(TargetChange::Directory);
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum TargetChange {
+    Settings,
+    Writer,
+    Directory,
+}
+
+#[cfg(unix)]
+fn instance_contents(
+    root: &std::path::Path,
+) -> std::io::Result<BTreeMap<std::path::PathBuf, Option<Vec<u8>>>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        entries: &mut BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+        bytes: &mut u64,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if entries.len() == 128 || metadata.file_type().is_symlink() {
+                return Err(std::io::Error::other("unexpected instance fixture member"));
+            }
+            let relative = entry.path().strip_prefix(root).unwrap().to_owned();
+            if metadata.is_dir() {
+                entries.insert(relative, None);
+                visit(root, &entry.path(), entries, bytes)?;
+            } else if metadata.is_file() && metadata.len() <= 65536 - *bytes {
+                *bytes += metadata.len();
+                entries.insert(relative, Some(std::fs::read(entry.path())?));
+            } else {
+                return Err(std::io::Error::other(
+                    "instance fixture exceeds its byte bound",
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries, &mut 0)?;
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn check_grouped_target_change(change: TargetChange) {
+    use futures_util::FutureExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (root, service, accounts) = runtime.block_on(async { fixture() });
+    let service = Arc::new(service);
+    let mut waiter = None;
+    let mut writer = None;
+    let journey = async {
+        crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
+        accounts
+            .create_offline_with_preconditions(
+                "TargetPlayer",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let java = use_probe_java(
+            root.path(),
+            &service,
+            "probe_dir=${0%/*}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\nfi\n",
+        );
+        let second_java = root.path().join("second-java");
+        std::fs::copy(java, &second_java).unwrap();
+        let first = super::super::create::tests::create(&service.instances, "Earlier target").await;
+        let second = super::super::create::tests::create(&service.instances, "Later probe").await;
+        let second = service
+            .instances
+            .update(
+                &second.id,
+                super::super::model::InstancePatch {
+                    java_path: Some(second_java.to_str().unwrap().into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let first = service.instances.registry().get_live(&first.id).unwrap().instance;
+        let second = service.instances.registry().get_live(&second.id).unwrap().instance;
+        let input = vec![first.clone(), second.clone()];
+        let record = service.instances.registry().get_live(&first.id).unwrap();
+        let original = root.path().join("instances").join(&record.directory_name);
+        let displaced = root.path().join("displaced-target");
+        let replacement = root.path().join("replacement-target");
+        std::fs::write(original.join("canary"), b"preserved instance bytes").unwrap();
+        let contents = instance_contents(&original).unwrap();
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let original_identity = identity(&original);
+        let healthy =
+            serde_json::to_value(service.enrich_all(input.clone()).await.unwrap()).unwrap();
+        std::fs::write(root.path().join("probes"), b"").unwrap();
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        std::fs::write(root.path().join("probe-release"), b"").unwrap();
+        waiter = Some(tokio::spawn({
+            let service = service.clone();
+            let input = input.clone();
+            async move { service.enrich_all(input).await.unwrap() }
+        }));
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while std::fs::read_to_string(root.path().join("probes"))
+                .unwrap()
+                .lines()
+                .count()
+                < 2
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let pending = !waiter.as_ref().unwrap().is_finished();
+        let mut updated = None;
+        let mut rename_error = None;
+        let mut replacement_identity = None;
+        if matches!(change, TargetChange::Settings) {
+            updated = Some(
+                service
+                    .instances
+                    .update(
+                        &first.id,
+                        super::super::model::InstancePatch {
+                            max_memory_mb: Some(first.settings.max_memory_mb + 2048),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            );
+        } else {
+            if matches!(change, TargetChange::Writer) {
+                writer = Some(
+                    service
+                        .instances
+                        .directories()
+                        .exclusions()
+                        .try_acquire([first.id.as_str()], [])
+                        .unwrap(),
+                );
+            }
+            match std::fs::rename(&original, &displaced) {
+                Ok(()) if matches!(change, TargetChange::Directory) => {
+                    std::fs::create_dir(&original).unwrap();
+                    for (relative, bytes) in &contents {
+                        match bytes {
+                            Some(bytes) => std::fs::write(original.join(relative), bytes).unwrap(),
+                            None => std::fs::create_dir(original.join(relative)).unwrap(),
+                        }
+                    }
+                    replacement_identity = Some(identity(&original));
+                }
+                Ok(()) => {}
+                Err(error) => rename_error = Some(error),
+            }
+        }
+        std::fs::write(root.path().join("probe-release"), b"release").unwrap();
+        let rows = serde_json::to_value(waiter.take().unwrap().await.unwrap()).unwrap();
+        let moved = !matches!(change, TargetChange::Settings) && rename_error.is_none();
+        let observed = instance_contents(if moved { &displaced } else { &original }).unwrap();
+        let replacement_contents =
+            replacement_identity.map(|_| instance_contents(&original).unwrap());
+        let mut released_control = None;
+        if moved {
+            if replacement_identity.is_some() {
+                std::fs::rename(&original, &replacement).unwrap();
+            }
+            std::fs::rename(&displaced, &original).unwrap();
+        }
+        drop(writer.take());
+        if rename_error.is_some() {
+            let control = std::fs::rename(&original, &displaced);
+            if control.is_ok() {
+                std::fs::rename(&displaced, &original).unwrap();
+            }
+            released_control = Some(control);
+        }
+        let mut stale_after_restore = None;
+        let mut latest = first.clone();
+        if updated.is_some() {
+            latest = service
+                .instances
+                .update(
+                    &first.id,
+                    super::super::model::InstancePatch {
+                        max_memory_mb: Some(first.settings.max_memory_mb),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            std::fs::write(root.path().join("probe-first"), b"").unwrap();
+            stale_after_restore = Some(
+                serde_json::to_value(service.enrich_all(input.clone()).await.unwrap()).unwrap(),
+            );
+        }
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        let restored = serde_json::to_value(
+            service
+                .enrich_all(vec![latest.clone(), second])
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let restored_identity = identity(&original);
+        let restored_contents = instance_contents(&original).unwrap();
+        move || {
+            assert!(
+                paused.is_ok() && pending,
+                "later probe did not remain pending: {paused:?}"
+            );
+            assert!(
+                healthy
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["launchable"] == true),
+                "{healthy}"
+            );
+            assert_eq!(observed, contents);
+            assert_eq!(restored_contents, contents);
+            assert_eq!(restored_identity, original_identity);
+            assert_eq!(rows[1], healthy[1]);
+            let expected_error = match change {
+                TargetChange::Settings => Some(LaunchError::InstanceChanged),
+                TargetChange::Writer => Some(LaunchError::InstanceBusy),
+                TargetChange::Directory if moved => Some(LaunchError::InstanceChanged),
+                TargetChange::Directory => None,
+            };
+            if let Some(error) = expected_error {
+                assert_eq!(
+                    rows[0]["launchable"], false,
+                    "earlier target retained stale Launch: {}",
+                    rows[0]
+                );
+                assert_eq!(rows[0]["launch_action"]["launchable"], false);
+                assert_eq!(rows[0]["launch_action"]["state_id"], "blocked");
+                assert_eq!(rows[0]["launch_action"]["primary_action"], "blocked");
+                assert_eq!(rows[0]["status_detail"], error.to_string());
+            } else {
+                assert_eq!(rows, healthy);
+            }
+            if let Some(replaced) = replacement_identity {
+                assert_ne!(replaced, original_identity);
+                assert_eq!(replacement_contents.unwrap(), contents);
+            }
+            if let Some(error) = rename_error {
+                eprintln!(
+                    "Target fixture rename blocked: {error}; released control only, not post-mutation coverage"
+                );
+                assert!(released_control.unwrap().is_ok());
+            }
+            let mut expected = healthy;
+            if let Some(updated) = updated {
+                assert!(updated.revision > first.revision);
+                assert!(latest.revision > updated.revision);
+                assert_eq!(
+                    stale_after_restore.as_ref().unwrap()[0]["launchable"],
+                    false
+                );
+                assert_eq!(
+                    stale_after_restore.unwrap()[0]["status_detail"],
+                    LaunchError::InstanceChanged.to_string()
+                );
+                expected[0]["revision"] = serde_json::json!(latest.revision);
+            }
+            assert_eq!(restored, expected);
+            eprintln!("Projection target fixture {change:?}: namespace moved={moved}");
+        }
+    };
+    let journey = runtime.block_on(std::panic::AssertUnwindSafe(journey).catch_unwind());
+    let released = std::fs::write(root.path().join("probe-release"), b"release");
+    let remaining = runtime.block_on(async {
+        match waiter.take() {
+            Some(waiter) => Some(waiter.await),
+            None => None,
+        }
+    });
+    drop(writer.take());
+    let shutdown = runtime.block_on(
+        std::panic::AssertUnwindSafe(
+            service
+                .instances
+                .tasks
+                .shutdown(std::time::Duration::from_secs(5)),
+        )
+        .catch_unwind(),
+    );
+    let settled = matches!(&shutdown, Ok(Ok(()))) && service.instances.tasks.status().is_idle();
+    if !settled {
+        std::mem::forget((service, accounts, runtime));
+    }
+    let verification = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let verify = match journey {
+            Ok(verify) => verify,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        assert!(released.is_ok());
+        if let Some(result) = remaining {
+            assert!(result.is_ok(), "enrichment waiter did not join");
+        }
+        match shutdown {
+            Ok(result) => assert!(result.is_ok(), "{result:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        assert!(settled);
+        verify();
+    }));
+    if let Err(panic) = verification {
+        use std::io::Write;
+        let retained = root.keep();
+        let _ = writeln!(
+            std::io::stderr(),
+            "Retained projection target fixture: {}",
+            retained.display()
+        );
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[tokio::test]
 async fn create_view_download_indicators_use_settled_install_and_scanner_status() {
     let (root, mut service, _) = fixture();
