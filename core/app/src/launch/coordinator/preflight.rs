@@ -609,9 +609,13 @@ impl LaunchCoordinator {
                         }
                         let scan = owned_scan.lock().unwrap().clone()
                             .ok_or(LaunchError::PreparationFailed)??;
-                        budget.lock().unwrap().reserve_checks(scan.entry_count())
-                            .map_err(install_read_error)?;
-                        coordinator.revalidate_scan(scan.clone()).await?;
+                        // Summary inputs, including this scan, are revalidated
+                        // by the projection before it publishes any rows.
+                        if inspection != Inspection::Summary {
+                            budget.lock().unwrap().reserve_checks(scan.entry_count())
+                                .map_err(install_read_error)?;
+                            coordinator.revalidate_scan(scan.clone()).await?;
+                        }
                         #[cfg(test)]
                         coordinator
                             .fresh_install_checks

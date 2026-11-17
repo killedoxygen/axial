@@ -5184,18 +5184,32 @@ printf 'java.version = %s.0.3\nos.arch = {}\njava.vendor = Eclipse Adoptium\n' "
 #[test]
 #[cfg(unix)]
 fn grouped_readiness_blocks_rows_when_the_scan_changes_or_publication_starts() {
-    for (case, publication_starts) in [
-        ("library scan changes", false),
-        ("publication starts", true),
-    ] {
-        eprintln!("grouped readiness case: {case}");
-        check_grouped_readiness_invalidated(publication_starts);
+    for case in [ProjectionChange::Scan, ProjectionChange::Publication] {
+        eprintln!("grouped readiness case: {case:?}");
+        check_grouped_readiness_invalidated(case);
     }
 }
 
+#[test]
 #[cfg(unix)]
-fn check_grouped_readiness_invalidated(publication_starts: bool) {
+fn grouped_readiness_scan_drift_preserves_later_java_refusal() {
+    check_grouped_readiness_invalidated(ProjectionChange::ScanBeforeRefusedVersion);
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum ProjectionChange {
+    Scan,
+    Publication,
+    ScanBeforeRefusedVersion,
+}
+
+#[cfg(unix)]
+fn check_grouped_readiness_invalidated(change: ProjectionChange) {
     use futures_util::FutureExt;
+
+    let publication_starts = matches!(change, ProjectionChange::Publication);
+    let later_refusal = matches!(change, ProjectionChange::ScanBeforeRefusedVersion);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5205,15 +5219,94 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
     let service = Arc::new(service);
     let mut waiter = None;
     let mut publication = None;
-    let journey = runtime.block_on(std::panic::AssertUnwindSafe(async {
+    let journey = async {
         crate::install::queue::tests::install_ready_fixture(&service.installs, "1.21.4").await;
-        accounts.create_offline_with_preconditions("GroupedPlayer", crate::accounts::model::AccountPreconditions::default()).unwrap();
+        if later_refusal {
+            crate::install::queue::tests::install_ready_fixture(&service.installs, "1.20.1").await;
+        }
+        accounts
+            .create_offline_with_preconditions(
+                "GroupedPlayer",
+                crate::accounts::model::AccountPreconditions::default(),
+            )
+            .unwrap();
         std::fs::write(root.path().join("probe-first"), b"").unwrap();
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
-        use_probe_java(root.path(), &service, "probe_dir=${0%/*}\nprintf 'probe\\n' >> \"$probe_dir/probes\"\nif [ -s \"$probe_dir/probe-first\" ]; then\n  while [ ! -s \"$probe_dir/probe-release\" ]; do sleep 0.01; done\nelse\n  printf 'first' > \"$probe_dir/probe-first\"\nfi\n");
-        let first = super::super::create::tests::create(&service.instances, "First healthy").await;
+        let java = use_probe_java(root.path(), &service, "");
+        std::fs::write(
+            &java,
+            format!(
+                r#"#!/bin/sh
+probe_dir=${{0%/*}}
+printf 'probe\n' >> "$probe_dir/probes"
+if [ -s "$probe_dir/probe-first" ]; then
+  major=21
+else
+  printf 'first' > "$probe_dir/probe-first"
+  major={}
+fi
+while [ ! -s "$probe_dir/probe-release" ]; do sleep 0.01; done
+printf 'java.version = %s.0.3\nos.arch = {}\njava.vendor = Eclipse Adoptium\n' "$major" >&2
+"#,
+                if later_refusal { 17 } else { 21 },
+                std::env::consts::ARCH
+            ),
+        )
+        .unwrap();
+        let first = if later_refusal {
+            service
+                .instances
+                .create(
+                    CreateInstanceRequest {
+                        name: "First healthy".into(),
+                        selection_id: "vanilla|1.20.1".into(),
+                        ..Default::default()
+                    },
+                    CreateTarget {
+                        selection_id: "vanilla|1.20.1".into(),
+                        version_id: "1.20.1".into(),
+                        minecraft_version: "1.20.1".into(),
+                        loader_key: "vanilla".into(),
+                    },
+                    service
+                        .instances
+                        .creation_admission_for_tests()
+                        .await
+                        .unwrap(),
+                )
+                .unwrap()
+                .join()
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            super::super::create::tests::create(&service.instances, "First healthy").await
+        };
+        let bad = if later_refusal {
+            let bad = super::super::create::tests::create(&service.instances, "Bad Java").await;
+            Some(
+                service
+                    .instances
+                    .update(
+                        &bad.id,
+                        super::super::model::InstancePatch {
+                            java_path: Some(
+                                root.path().join("missing-java").to_str().unwrap().into(),
+                            ),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let bad_id = bad.as_ref().map(|instance| instance.id.clone());
         let last = super::super::create::tests::create(&service.instances, "Last healthy").await;
-        let input = vec![first.clone(), last];
+        let input: Vec<_> = std::iter::once(first.clone())
+            .chain(bad)
+            .chain([last])
+            .collect();
         let lane = root.path().join(".axial-publication");
         let saved_lane = root.path().join("previous-publication");
         if publication_starts {
@@ -5222,16 +5315,31 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
         let healthy = service.enrich_all(input.clone()).await.unwrap();
         let lane_absent = std::fs::symlink_metadata(&lane)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        let protected: Vec<_> = ["json", "jar"].into_iter().map(|extension| {
-            let path = root.path().join(format!("versions/1.21.4/1.21.4.{extension}"));
-            let bytes = std::fs::read(&path).unwrap();
-            (path, bytes)
-        }).collect();
+        let versions: &[&str] = if later_refusal {
+            &["1.20.1", "1.21.4"]
+        } else {
+            &["1.21.4"]
+        };
+        let protected: Vec<_> = versions
+            .iter()
+            .flat_map(|version| {
+                ["json", "jar"].map(|extension| {
+                    let path = root
+                        .path()
+                        .join(format!("versions/{version}/{version}.{extension}"));
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+            })
+            .collect();
         let versions_root = root.path().join("versions");
-        let revision_before = std::fs::metadata(&versions_root).unwrap().modified().unwrap();
+        let revision_before = std::fs::metadata(&versions_root)
+            .unwrap()
+            .modified()
+            .unwrap();
         std::fs::write(root.path().join("probes"), b"").unwrap();
-        // The projection probes its shared runtime once; hold that probe.
-        std::fs::write(root.path().join("probe-first"), b"hold").unwrap();
+        // Hold the first row's probe before any later fresh version is inspected.
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
         std::fs::write(root.path().join("probe-release"), b"").unwrap();
         waiter = Some(tokio::spawn({
             let service = service.clone();
@@ -5239,12 +5347,21 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
             async move { service.enrich_all(input).await.unwrap() }
         }));
         let paused = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while std::fs::read_to_string(root.path().join("probes")).unwrap().lines().count() < 1 {
+            while std::fs::read_to_string(root.path().join("probes"))
+                .unwrap()
+                .lines()
+                .count()
+                < 1
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-        }).await;
+        })
+        .await;
         let still_pending = !waiter.as_ref().unwrap().is_finished();
-        let probe_count = std::fs::read_to_string(root.path().join("probes")).unwrap().lines().count();
+        let probe_count = std::fs::read_to_string(root.path().join("probes"))
+            .unwrap()
+            .lines()
+            .count();
         let external = versions_root.join("external-degraded-entry");
         let absent_before = std::fs::symlink_metadata(&external)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
@@ -5254,16 +5371,23 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
             std::fs::rename(&saved_lane, &lane).unwrap();
             let pin = service.instances.directories().library().admit().unwrap();
             let operation = pin.managed_library().unwrap();
-            let guard = axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
+            let guard =
+                axial_minecraft::VersionBundlePublicationGuardForTest::acquire(&operation).unwrap();
             publication = Some((guard, operation, pin));
         } else {
             std::fs::create_dir(&external).unwrap();
             std::fs::write(&metadata, malformed).unwrap();
         }
-        let revision_after = std::fs::metadata(&versions_root).unwrap().modified().unwrap();
+        let revision_after = std::fs::metadata(&versions_root)
+            .unwrap()
+            .modified()
+            .unwrap();
         std::fs::write(root.path().join("probe-release"), b"release").unwrap();
         let rows = waiter.take().unwrap().await.unwrap();
-        let degraded = serde_json::to_value(service.launch.preflight(first.id.clone()).await).unwrap();
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
+        let degraded =
+            serde_json::to_value(service.launch.preflight(first.id.clone()).await).unwrap();
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
         let degraded_rows = service.enrich_all(input.clone()).await.unwrap();
         let preserved = if publication_starts {
             drop(publication.take());
@@ -5274,21 +5398,36 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
             std::fs::remove_dir(&external).unwrap();
             Some(bytes)
         };
+        std::fs::write(root.path().join("probe-first"), b"").unwrap();
         let restored = service.enrich_all(input.clone()).await.unwrap();
         move || {
-            assert!(paused.is_ok() && still_pending, "the shared probe did not remain pending");
+            assert!(
+                paused.is_ok() && still_pending,
+                "the shared probe did not remain pending"
+            );
             assert_eq!(probe_count, 1);
             assert!(absent_before);
             if publication_starts {
-                assert!(lane_absent, "cached rows must capture the absent publication lane");
-                assert_eq!(revision_after, revision_before, "version scan changed during publication control");
+                assert!(
+                    lane_absent,
+                    "cached rows must capture the absent publication lane"
+                );
+                assert_eq!(
+                    revision_after, revision_before,
+                    "version scan changed during publication control"
+                );
                 assert!(preserved.is_none());
             } else {
-                assert_ne!(revision_after, revision_before, "directory revision did not advance");
+                assert_ne!(
+                    revision_after, revision_before,
+                    "directory revision did not advance"
+                );
                 assert_eq!(preserved.unwrap(), malformed);
             }
-            assert!(std::fs::symlink_metadata(external)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound));
+            assert!(
+                std::fs::symlink_metadata(external)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
             for (path, bytes) in protected {
                 assert_eq!(std::fs::read(path).unwrap(), bytes);
             }
@@ -5296,30 +5435,59 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
                 assert_eq!(ready.len(), input.len());
                 for (row, instance) in ready.iter().zip(&input) {
                     assert_eq!(row.instance.id, instance.id);
-                    assert!(row.launchable, "{}", row.status_detail);
-                    assert!(row.launch_action.launchable);
-                    assert_eq!(row.launch_action.primary_action, LaunchPrimaryAction::Launch);
+                    let own_refusal = bad_id.as_ref() == Some(&instance.id);
+                    assert_eq!(row.launchable, !own_refusal, "{}", row.status_detail);
+                    assert_eq!(row.launch_action.launchable, !own_refusal);
+                    assert_eq!(
+                        row.launch_action.primary_action,
+                        if own_refusal {
+                            LaunchPrimaryAction::Blocked
+                        } else {
+                            LaunchPrimaryAction::Launch
+                        }
+                    );
+                    if own_refusal {
+                        assert_eq!(
+                            row.status_detail,
+                            "The selected Java executable is missing."
+                        );
+                    }
                     assert!(row.needs_install.is_empty());
                 }
             }
+            assert_eq!(
+                serde_json::to_value(&healthy).unwrap(),
+                serde_json::to_value(&restored).unwrap()
+            );
             assert_eq!(degraded_rows.len(), input.len());
             for (row, instance) in degraded_rows.iter().zip(&input) {
                 assert_eq!(row.instance.id, instance.id);
-                assert_eq!(row.version_display.minecraft_label, "1.21.4");
+                assert_eq!(
+                    row.version_display.minecraft_label,
+                    instance.minecraft_version
+                );
                 // An unrelated malformed version no longer blocks this target;
                 // a publication in progress still does.
-                assert_eq!(row.launchable, !publication_starts, "{}", row.status_detail);
+                assert_eq!(
+                    row.launchable,
+                    !publication_starts && bad_id.as_ref() != Some(&instance.id),
+                    "{}",
+                    row.status_detail
+                );
                 assert!(row.needs_install.is_empty());
             }
             assert_eq!(degraded["status"], "ready", "{degraded}");
             assert_eq!(degraded["launchable"], !publication_starts, "{degraded}");
             if publication_starts {
-                assert_eq!(degraded["readiness"], serde_json::json!({
-                    "launchable":false,"reasons":[{
-                        "id":"incomplete_install","severity":"blocking",
-                        "message":"Installation is changing. Wait for it to finish before launching."
-                    }]
-                }));
+                assert_eq!(
+                    degraded["readiness"],
+                    serde_json::json!({
+                        "launchable":false,"reasons":[{
+                            "id":"incomplete_install","severity":"blocking",
+                            "message":"Installation is changing. Wait for it to finish before launching."
+                        }]
+                    })
+                );
             } else {
                 assert_eq!(degraded["readiness"]["launchable"], true, "{degraded}");
             }
@@ -5328,11 +5496,28 @@ fn check_grouped_readiness_invalidated(publication_starts: bool) {
                 assert_eq!(row.instance.id, instance.id);
                 assert!(!row.launchable, "{} retained stale Launch", instance.name);
                 assert!(!row.launch_action.launchable);
-                assert_eq!(row.launch_action.primary_action, LaunchPrimaryAction::Blocked);
+                assert_eq!(
+                    row.launch_action.primary_action,
+                    LaunchPrimaryAction::Blocked
+                );
                 assert!(row.needs_install.is_empty());
+                let serialized = serde_json::to_value(row).unwrap();
+                assert_eq!(serialized["launchable"], false);
+                assert_eq!(serialized["launch_action"]["launchable"], false);
+                assert_eq!(serialized["launch_action"]["state_id"], "blocked");
+                assert_eq!(serialized["launch_action"]["primary_action"], "blocked");
+                if later_refusal {
+                    let expected = if bad_id.as_ref() == Some(&instance.id) {
+                        "The selected Java executable is missing."
+                    } else {
+                        "The selected library is unavailable. Reconnect it before launching."
+                    };
+                    assert_eq!(serialized["status_detail"], expected, "{serialized}");
+                }
             }
         }
-    }).catch_unwind());
+    };
+    let journey = runtime.block_on(std::panic::AssertUnwindSafe(journey).catch_unwind());
     let released = std::fs::write(root.path().join("probe-release"), b"release");
     let remaining = runtime.block_on(async {
         match waiter.take() {
