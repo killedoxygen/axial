@@ -647,6 +647,102 @@ test('delayed live status or Stop outcomes cannot undo verified settlement while
   }
 });
 
+test('lost or unclassified Stop responses reconcile terminal status without repeating Stop', async () => {
+  for (const error of [new Error('Stop response lost'), refusal(409, { error: 'Unknown outcome' })]) {
+    const h = launchHarness();
+    await flush();
+    h.postKill(async () => {
+      throw error;
+    });
+    let reads = 0;
+    h.readStatus(async () => {
+      reads++;
+      return status(6, true);
+    });
+    await h.launch.killGame();
+    assert.equal(reads, 1);
+    assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+    assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, true);
+    assert.deepEqual(h.errors, []);
+    h.finalLogs.resolve({ entries: [] });
+    await flush();
+    assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+  }
+});
+
+test('unreachable Stop status stays unknown and existing status tracking can later settle it', async () => {
+  const h = launchHarness();
+  await flush();
+  h.postKill(async () => {
+    throw new Error('Stop response lost');
+  });
+  h.readStatus(async () => {
+    throw new Error('Read unavailable');
+  });
+  await h.launch.killGame();
+  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, false);
+  assert.equal(h.store.launchSessions.value['instance-1'].stopping, false);
+  assert.deepEqual(h.errors, ['The stop response was interrupted. Game status is unavailable.']);
+  assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+  h.readStatus(async () => status(6, true));
+  h.poll();
+  await flush();
+  h.finalLogs.resolve({ entries: [] });
+  await flush();
+  assert.equal(h.store.launchSessions.value['instance-1'], undefined);
+  assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+});
+
+test('delayed Stop reconciliation cannot change a replacement or an already-settling session', async () => {
+  for (const change of ['replacement', 'settlement'] as const) {
+    const h = launchHarness();
+    await flush();
+    const reply = deferred<unknown>();
+    h.postKill(async () => {
+      throw new Error('Stop response lost');
+    });
+    h.readStatus(() => reply.promise);
+    const stopping = h.launch.killGame();
+    await flush();
+    if (change === 'replacement') {
+      h.actions.confirmLaunch('instance-1', {
+        sessionId: 'session-2',
+        launchedAt: '2026-09-08T08:00:01Z',
+        statusRevision: 1,
+        viewModel: status().view_model,
+      });
+    } else h.emit(status(7, true), 'status');
+    const current = h.store.launchSessions.value['instance-1'];
+    reply.resolve(status(6, true));
+    await stopping;
+    assert.equal(h.store.launchSessions.value['instance-1'], current);
+    assert.deepEqual(h.errors, []);
+    assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+    h.finalLogs.resolve({ entries: [] });
+    await flush();
+  }
+});
+
+test('the Stop owner refusal is surfaced without treating its HTTP status as an unknown mutation', async () => {
+  const h = launchHarness();
+  await flush();
+  h.postKill(async () => {
+    throw refusal(404, unknownSession);
+  });
+  let reads = 0;
+  h.readStatus(async () => {
+    reads++;
+    return status(6, true);
+  });
+  await h.launch.killGame();
+  assert.equal(reads, 0);
+  assert.equal(h.store.launchSessions.value['instance-1'].stopping, false);
+  assert.equal(h.store.launchSessions.value['instance-1'].viewModel.terminal, false);
+  assert.equal(h.calls.filter((path) => path.endsWith('/kill')).length, 1);
+  assert.equal(h.errors.length, 1);
+  assert.match(h.errors[0], /Stop request was refused/);
+});
+
 test('original final-log completion cannot clear a replacement launch or refresh its readiness', async () => {
   const h = await acceptedPlay();
   h.poll();

@@ -424,27 +424,44 @@ export async function killGame(): Promise<void> {
   if (session.stopping) return;
   if (!session.viewModel.can_stop) return;
 
+  let result: SessionSnapshot;
+  let interrupted = false;
   try {
     updateLaunchSessionState(inst.id, { stopping: true });
-    const result = await stopSession(session.sessionId);
-    if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
-    if (finishingSessions.has(session.sessionId)) return;
-    const update = convergeLaunchStatus(inst.id, session.sessionId, result);
-    if (update?.viewModel.terminal) {
-      onSessionTerminal(
-        update.outcome,
-        inst.id,
-        inst.name,
-        session.sessionId,
-        launchConnections.get(session.sessionId) ?? { close() {} },
-      );
-    } else if (update) {
-      updateLaunchSessionState(inst.id, { stopping: false });
-    }
+    result = await stopSession(session.sessionId);
   } catch (err: unknown) {
     if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
     if (finishingSessions.has(session.sessionId)) return;
+    const refusal = launchRefusal(err);
+    if (refusal?.code === 'invalid_request' || refusal?.code === 'instance_not_found') {
+      updateLaunchSessionState(inst.id, { stopping: false });
+      showError(`Stop request was refused: ${errMessage(err)}`);
+      return;
+    }
+    interrupted = true;
+    try {
+      result = await sessionStatus(session.sessionId);
+    } catch {
+      if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
+      if (finishingSessions.has(session.sessionId)) return;
+      updateLaunchSessionState(inst.id, { stopping: false });
+      showError('The stop response was interrupted. Game status is unavailable.');
+      return;
+    }
+  }
+  if (launchSessions.value[inst.id]?.sessionId !== session.sessionId) return;
+  if (finishingSessions.has(session.sessionId)) return;
+  const update = convergeLaunchStatus(inst.id, session.sessionId, result);
+  if (update?.viewModel.terminal) {
+    onSessionTerminal(
+      update.outcome,
+      inst.id,
+      inst.name,
+      session.sessionId,
+      launchConnections.get(session.sessionId) ?? { close() {} },
+    );
+  } else if (update || interrupted) {
     updateLaunchSessionState(inst.id, { stopping: false });
-    showError(`Could not stop the game: ${errMessage(err)}`);
+    if (interrupted) showError('The stop response was interrupted. Watching the current game status.');
   }
 }
