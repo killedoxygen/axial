@@ -1951,6 +1951,173 @@ async fn replaced_game_library_settles_accepted_session_without_spawning() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pre_spawn_proof_waits_for_library_scratch_without_spawning() {
+    use super::super::{
+        libraries,
+        prepare::tests::{attach_game_libraries, fixture},
+        session::{SessionPhase, SessionSnapshot},
+    };
+    use axial_minecraft::portable_path::PortableRelativePath;
+    use axial_resource::{PhysicalWorkClass, process_physical_work};
+    use std::time::Duration;
+
+    if !crate::install::artifacts::tests::preparation_child(
+        "launch::coordinator::tests::pre_spawn_proof_waits_for_library_scratch_without_spawning",
+    )
+    .await
+    {
+        return;
+    }
+    let work = process_physical_work();
+    let idle = work.snapshot(PhysicalWorkClass::Foreground);
+    let mut outcomes = Vec::new();
+    for release in [false, true] {
+        let (root, mut prepared, application) = fixture().await;
+        let source_path = root.path().join("libraries/fml/source.jar");
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::write(&source_path, b"abc").unwrap();
+        let source = prepared
+            .instance()
+            .generation()
+            .managed_library()
+            .unwrap()
+            .observe_file(&PortableRelativePath::new_exact("libraries/fml/source.jar").unwrap())
+            .unwrap()
+            .unwrap();
+        let game = prepared.instance().game_directory().clone();
+        attach_game_libraries(
+            &mut prepared,
+            libraries::tests::prepare_abc_copy(game, source),
+        );
+        let storage = Arc::new(MetadataStore::in_memory().unwrap());
+        let intents = durable_intents(storage.clone());
+        let mut request = request();
+        request.instance_id = prepared.instance_id().clone();
+        request.username = None;
+        let ReservedIntent::New {
+            key, session_id, ..
+        } = intents.reserve(&request).unwrap()
+        else {
+            panic!("fresh launch intent");
+        };
+        let acceptance = intents
+            .accept(&key, prepared.intent_binding(&application).unwrap())
+            .unwrap();
+        // The command's library proof needs scratch that is held elsewhere;
+        // composition proofs request none.
+        let available = work
+            .snapshot(PhysicalWorkClass::Foreground)
+            .available_scratch_bytes;
+        let mut scratch = Some(work.try_reserve_scratch(available).unwrap());
+
+        let tasks = TaskOwner::new(2).unwrap();
+        let sessions =
+            SessionManager::with_reports(tasks.clone(), intents.reports.clone().unwrap());
+        let started = sessions
+            .start_reserved(prepared, session_id.clone(), acceptance.clone())
+            .unwrap();
+        intents.settle(&key, Ok(started.clone()));
+        let mut changes = sessions.subscribe_by_session_id(&session_id).unwrap();
+        let until = |done: fn(&SessionSnapshot) -> bool,
+                     changes: &mut watch::Receiver<SessionSnapshot>| {
+            let mut changes = changes.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async move {
+                    loop {
+                        let snapshot = changes.borrow_and_update().clone();
+                        if done(&snapshot) {
+                            return Some(snapshot);
+                        }
+                        if changes.changed().await.is_err() {
+                            return None;
+                        }
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        };
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(300),
+            until(
+                |snapshot| snapshot.pid.is_some() || snapshot.phase != SessionPhase::Starting,
+                &mut changes,
+            ),
+        )
+        .await;
+        let current = sessions.snapshot_by_session_id(&session_id).unwrap();
+        let spawned = if release {
+            drop(scratch.take());
+            until(|snapshot| snapshot.pid.is_some(), &mut changes).await
+        } else {
+            sessions.stop_by_session_id(&session_id).unwrap();
+            None
+        };
+        let terminal = until(
+            |snapshot| snapshot.phase == SessionPhase::Exited,
+            &mut changes,
+        );
+        let session_shutdown = sessions.shutdown(Duration::from_secs(5)).await;
+        let terminal = terminal.await;
+        let task_shutdown = tasks.shutdown(Duration::from_secs(5)).await;
+        drop(scratch);
+        let bytes: Vec<u8> = storage
+            .read(|db| -> Result<_, StorageError> {
+                Ok(db.query_row(
+                    "SELECT settlement FROM launch_intents WHERE intent_key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        let observation = serde_json::to_value(
+            decode_settlement(&acceptance.record, &acceptance.payload, &bytes).unwrap(),
+        )
+        .unwrap();
+        outcomes.push((
+            release,
+            waiting.is_err(),
+            (current.phase, current.pid),
+            spawned.map(|snapshot| snapshot.pid.is_some()),
+            terminal.map(|snapshot| {
+                (
+                    snapshot.pid.is_some(),
+                    snapshot.process_alive,
+                    snapshot.tree_settled,
+                    snapshot.output_drained,
+                )
+            }),
+            observation["process"]["kind"].clone(),
+            observation["process"]["stopped"].clone(),
+            session_shutdown.is_ok() && task_shutdown.is_ok(),
+            terminal_ack(&storage, &key),
+        ));
+        drop(root);
+    }
+    let settled = work.snapshot(PhysicalWorkClass::Foreground);
+
+    // Held scratch keeps the accepted session waiting with no process: Stop
+    // settles it without a child, and releasing the scratch spawns the game,
+    // whose owner then stops it and joins its tree and output.
+    let (stopped, released) = (&outcomes[0], &outcomes[1]);
+    assert!(stopped.1, "no process appears while proof scratch is held");
+    assert_eq!(stopped.2, (SessionPhase::Starting, None));
+    assert_eq!(stopped.4, Some((false, false, true, true)));
+    assert_eq!(stopped.5, serde_json::json!("no_child"));
+    assert_eq!(stopped.6, serde_json::json!(true));
+    assert!(stopped.7 && stopped.8);
+    assert!(released.1, "no process appears while proof scratch is held");
+    assert_eq!(released.2, (SessionPhase::Starting, None));
+    assert_eq!(released.3, Some(true));
+    assert_eq!(released.4, Some((true, false, true, true)));
+    assert_ne!(released.5, serde_json::json!("no_child"));
+    assert!(released.7 && released.8);
+    assert_eq!(settled, idle);
+}
+
 fn refuse_reports(storage: &MetadataStore) {
     storage.transaction(|tx| -> Result<(), StorageError> {
         tx.execute_batch("CREATE TRIGGER refuse_report BEFORE INSERT ON launch_reports BEGIN SELECT RAISE(ABORT,'unavailable'); END;")?;

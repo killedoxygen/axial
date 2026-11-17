@@ -409,17 +409,6 @@ impl PhysicalWorkOwner {
         self.inner.scratch_limit_bytes
     }
 
-    pub fn try_run_inline<T, Work>(
-        &self,
-        request: PhysicalWorkRequest,
-        work: Work,
-    ) -> Result<T, PhysicalWorkError>
-    where
-        Work: FnOnce() -> T,
-    {
-        self.try_run_inline_parallel(request, |_| work())
-    }
-
     /// Runs `work` on the calling thread with the admitted workers available
     /// to its scoped jobs.
     pub fn try_run_inline_parallel<T, Work>(
@@ -431,39 +420,6 @@ impl PhysicalWorkOwner {
         Work: FnOnce(&PhysicalWorkParallelism) -> T,
     {
         Ok(self.try_admit(request)?.run_inline(work))
-    }
-
-    /// Runs `job` over contiguous ranges covering `0..len` on up to
-    /// `max_workers` foreground workers available now, or as one range on the
-    /// calling thread, and returns the results in range order. A job may run
-    /// again inline after a worker fails, so it must not apply effects.
-    pub fn run_ranges<T, Job>(
-        &self,
-        io: PhysicalIoClass,
-        len: usize,
-        max_workers: usize,
-        job: Job,
-    ) -> Vec<T>
-    where
-        T: Send,
-        Job: Fn(std::ops::Range<usize>) -> T + Sync,
-    {
-        for workers in (2..=max_workers.min(len)).rev() {
-            let span = len.div_ceil(workers);
-            let job = &job;
-            let jobs = (0..workers)
-                .map(|index| move || job(index * span..((index + 1) * span).min(len)))
-                .collect();
-            match self.try_run_inline_parallel(
-                PhysicalWorkRequest::foreground_parallel(io, 0, workers),
-                |parallelism| parallelism.run_scoped(jobs),
-            ) {
-                Ok(Ok(results)) => return results,
-                Err(PhysicalWorkError::Unavailable | PhysicalWorkError::WorkerLimit) => {}
-                Ok(Err(_)) | Err(_) => break,
-            }
-        }
-        vec![job(0..len)]
     }
 
     fn try_admit(
@@ -1050,9 +1006,9 @@ mod tests {
                     let snapshot = observed_owner.snapshot(PhysicalWorkClass::Foreground);
                     assert_eq!(snapshot.running_workers, 3);
                     assert_eq!(
-                        observed_owner.try_run_inline(
+                        observed_owner.try_run_inline_parallel(
                             PhysicalWorkRequest::foreground(PhysicalIoClass::Read, 0),
-                            || (),
+                            |_| (),
                         ),
                         Err(PhysicalWorkError::Unavailable)
                     );

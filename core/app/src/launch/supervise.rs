@@ -63,42 +63,83 @@ pub(super) async fn run(
         sentinel.settled = true;
         return;
     }
-    let validated = match prepared.revalidate_composition().await {
-        Ok(()) => axial_resource::process_physical_work()
-            .try_run_inline_parallel(
-                prepared.validated_command().revalidation_request(),
-                |workers| prepared.validate_before_spawn(workers),
-            )
-            .unwrap_or_else(|error| Err(super::coordinator::physical_work_error(error))),
-        Err(error) => Err(error),
+    if let Err(error) = prepared.revalidate_composition().await {
+        return refuse_input(&entry, &mut sentinel, &prepared, error).await;
+    }
+    // Waits only after the composition proof, so no worker is held across it.
+    let work = axial_resource::process_physical_work();
+    let mut stopping = stop.clone();
+    let admission = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        () = async {
+            if stopping.wait_for(|stopped| *stopped).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        } => None,
+        admission = work.admit(prepared.validated_command().revalidation_request()) => {
+            Some(admission)
+        }
     };
-    if let Err(error) = validated {
-        tracing::warn!(
-            stage = "input_revalidation",
-            cause = ?error,
-            "Accepted launch could not start."
-        );
-        finish_without_process(&entry, false, prepared.natives()).await;
-        sentinel.settled = true;
-        return;
+    let admission = match admission {
+        None => {
+            finish_without_process(&entry, true, prepared.natives()).await;
+            sentinel.settled = true;
+            return;
+        }
+        Some(Err(error)) => {
+            tracing::warn!(
+                stage = "spawn_admission",
+                cause = ?error,
+                "Accepted launch could not start."
+            );
+            finish_without_process(&entry, false, prepared.natives()).await;
+            sentinel.settled = true;
+            return;
+        }
+        Some(Ok(admission)) => admission,
+    };
+    enum Start {
+        Stopped,
+        Refused(super::coordinator::LaunchError),
+        Spawned(Result<(OwnedProcess, ProcessOutput), SpawnError>),
     }
-    let validated = prepared.validated_command();
-    let mut command = Command::new(validated.program());
-    command
-        .args(validated.args())
-        .envs(validated.env())
-        .current_dir(validated.cwd());
-    for key in [
-        "JAVA_TOOL_OPTIONS",
-        "_JAVA_OPTIONS",
-        "JDK_JAVA_OPTIONS",
-        "CLASSPATH",
-    ] {
-        command.env_remove(key);
-    }
-    let (process, output, spawn_failed) = match OwnedProcess::spawn(command) {
-        Ok((process, output)) => (process, output, false),
-        Err(SpawnError::BeforeSpawn(error)) => {
+    // The exact proof, command and spawn run with no await between them; the
+    // admission is released as soon as the process exists.
+    let start = admission.run_inline(|workers| {
+        if *stop.borrow() || cancellation.is_cancelled() {
+            return Start::Stopped;
+        }
+        if let Err(error) = prepared.validate_before_spawn(workers) {
+            return Start::Refused(error);
+        }
+        let validated = prepared.validated_command();
+        let mut command = Command::new(validated.program());
+        command
+            .args(validated.args())
+            .envs(validated.env())
+            .current_dir(validated.cwd());
+        for key in [
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "JDK_JAVA_OPTIONS",
+            "CLASSPATH",
+        ] {
+            command.env_remove(key);
+        }
+        Start::Spawned(OwnedProcess::spawn(command))
+    });
+    let (process, output, spawn_failed) = match start {
+        Start::Stopped => {
+            finish_without_process(&entry, true, prepared.natives()).await;
+            sentinel.settled = true;
+            return;
+        }
+        Start::Refused(error) => {
+            return refuse_input(&entry, &mut sentinel, &prepared, error).await;
+        }
+        Start::Spawned(Ok((process, output))) => (process, output, false),
+        Start::Spawned(Err(SpawnError::BeforeSpawn(error))) => {
             tracing::warn!(
                 stage = "process_spawn",
                 error_kind = ?error.kind(),
@@ -112,7 +153,7 @@ pub(super) async fn run(
             sentinel.settled = true;
             return;
         }
-        Err(SpawnError::Unsettled(process, output, error)) => {
+        Start::Spawned(Err(SpawnError::Unsettled(process, output, error))) => {
             tracing::warn!(
                 stage = "process_containment",
                 error_kind = ?error.kind(),
@@ -133,6 +174,21 @@ pub(super) async fn run(
         Some(prepared.instance().clone()),
     )
     .await;
+    sentinel.settled = true;
+}
+
+async fn refuse_input(
+    entry: &SessionEntry,
+    sentinel: &mut SettlementSentinel,
+    prepared: &PreparedSession,
+    error: super::coordinator::LaunchError,
+) {
+    tracing::warn!(
+        stage = "input_revalidation",
+        cause = ?error,
+        "Accepted launch could not start."
+    );
+    finish_without_process(entry, false, prepared.natives()).await;
     sentinel.settled = true;
 }
 

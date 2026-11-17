@@ -137,7 +137,8 @@ impl PreparedSession {
     }
 
     /// Repeats the composition owner's complete settled proof; the process
-    /// actor awaits it immediately before spawning.
+    /// actor awaits it before waiting for its spawn admission, and the
+    /// owner's current records are checked again beside the spawn.
     pub(super) async fn revalidate_composition(&self) -> Result<(), PrepareError> {
         self.composition.revalidate().await.map_err(|error| {
             tracing::warn!(
