@@ -213,6 +213,15 @@ mod tests {
         fn path(&self, relative: &str) -> PathBuf {
             self.temporary.path().join(relative)
         }
+
+        async fn release(self) -> PathBuf {
+            libraries::settle(self.retention.clone()).await;
+            let Self { temporary, _library: library, pin, retention, installed } = self;
+            drop((installed, retention, pin, library));
+            let diagnostic = temporary.keep();
+            eprintln!("legacy asset diagnostic fixture: {}", diagnostic.display());
+            diagnostic
+        }
     }
 
     /// A verified installation whose asset index carries `flag`.
@@ -343,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_resources_cannot_hide_a_replaced_installed_object() {
+    async fn warm_resources_keep_original_source_proof_and_refuse_a_changed_copy_source() {
         let fixture = fixture("map_to_resources");
         fixture.prepare().await.unwrap();
         let hash = hex::encode(Sha1::digest(b"step"));
@@ -351,14 +360,70 @@ mod tests {
         let preserved = fixture.path("preserved-source");
         std::fs::rename(&source, &preserved).unwrap();
         std::fs::write(&source, b"step").unwrap();
+        let warm = fixture.prepare().await;
+        let proof = crate::install::artifacts::tests::admitted(|workers| {
+            fixture.installed.revalidate(workers)
+        });
+        let target = fixture.path("game/resources/sound/step.ogg");
+        let target_bytes = std::fs::read(&target).unwrap();
+        std::fs::remove_file(&target).unwrap();
         let refused = fixture.prepare().await;
-        let source_bytes = std::fs::read(source).unwrap();
-        let preserved_bytes = std::fs::read(preserved).unwrap();
-        let target_bytes = std::fs::read(fixture.path("game/resources/sound/step.ogg")).unwrap();
-        drop(fixture);
+        let target_recreated = target.exists();
+        let source_bytes = std::fs::read(&source).unwrap();
+        let preserved_bytes = std::fs::read(&preserved).unwrap();
+        let tree = fixture.path("game/resources");
+        let diagnostic = fixture.release().await;
+        assert_eq!(warm, Ok(Some(tree)));
+        assert!(proof.is_err(), "warm targets must not refresh installed evidence");
         assert_eq!(refused, Err(LaunchError::InstallUnavailable));
+        assert!(!target_recreated);
         assert_eq!(source_bytes, b"step");
         assert_eq!(preserved_bytes, b"step");
         assert_eq!(target_bytes, b"step");
+        std::fs::remove_dir_all(diagnostic).unwrap();
+    }
+
+    #[tokio::test]
+    async fn virtual_tree_keeps_the_full_original_source_inventory_proof() {
+        let fixture = fixture("virtual");
+        let tree = fixture.prepare().await.unwrap().unwrap();
+        let hash = hex::encode(Sha1::digest(b"step"));
+        let source = fixture.path(&format!("assets/objects/{}/{hash}", &hash[..2]));
+        let preserved = fixture.path("preserved-source");
+        std::fs::rename(&source, &preserved).unwrap();
+        std::fs::write(&source, b"step").unwrap();
+        let refused = fixture.prepare().await;
+        let bytes = [
+            std::fs::read(source).unwrap(),
+            std::fs::read(preserved).unwrap(),
+            std::fs::read(tree.join("sound/step.ogg")).unwrap(),
+        ];
+        let diagnostic = fixture.release().await;
+        assert_eq!(refused, Err(LaunchError::InstallUnavailable));
+        assert!(bytes.iter().all(|bytes| bytes == b"step"));
+        std::fs::remove_dir_all(diagnostic).unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_index_is_refused_before_any_missing_target_is_published() {
+        for layout in ["virtual", "map_to_resources"] {
+            let fixture = fixture(layout);
+            let tree = fixture.prepare().await.unwrap().unwrap();
+            let target = tree.join("sound/step.ogg");
+            std::fs::remove_file(&target).unwrap();
+            let index = fixture.path("assets/indexes/legacy.json");
+            let preserved = fixture.path("preserved-index");
+            let original = std::fs::read(&index).unwrap();
+            std::fs::rename(&index, &preserved).unwrap();
+            std::fs::write(&index, &original).unwrap();
+            let refused = fixture.prepare().await;
+            let recreated = target.exists();
+            let bytes = [std::fs::read(index).unwrap(), std::fs::read(preserved).unwrap()];
+            let diagnostic = fixture.release().await;
+            assert_eq!(refused, Err(LaunchError::InstallUnavailable));
+            assert!(!recreated);
+            assert!(bytes.iter().all(|bytes| bytes == &original));
+            std::fs::remove_dir_all(diagnostic).unwrap();
+        }
     }
 }

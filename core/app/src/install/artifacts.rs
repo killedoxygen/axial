@@ -1341,7 +1341,12 @@ impl InstalledVersionReceipt {
                         return Err(InstallError::NotReady);
                     }
                 }
-                evidence.revalidate(&workers)?;
+                // The resource-copy owner checks each source it reads; the command
+                // proves the full retained inventory at admission and spawn. Virtual
+                // materialization writes the managed library and keeps this proof.
+                if assets.layout == axial_minecraft::LegacyAssetLayout::Virtual {
+                    evidence.revalidate(&workers)?;
+                }
                 Ok(Some(LegacyAssetInputs {
                     index_id,
                     assets,

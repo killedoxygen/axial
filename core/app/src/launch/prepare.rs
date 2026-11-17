@@ -616,6 +616,40 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn plan_admission_refuses_a_replaced_object_behind_valid_warm_resources() {
+        let mut captured = None;
+        let (root, result, application) = fixture_with_plan(true, false, async |request| {
+            let hash = hex::encode(Sha1::digest(b"step"));
+            let source = request.library_dir.join(format!("assets/objects/{}/{hash}", &hash[..2]));
+            let preserved = request.library_dir.join("preserved-object");
+            let target = request.game_assets.as_ref().unwrap().join("sound/step.ogg");
+            std::fs::rename(&source, &preserved).unwrap();
+            std::fs::write(&source, b"step").unwrap();
+            let context_unchanged = request.version_guard.revalidate().is_ok()
+                && request.runtime.revalidate().is_ok()
+                && request.library_operation.validate_read_projection(&request.library_dir).is_ok();
+            captured = Some((source, preserved, target, context_unchanged));
+            super::super::plan::build_admitted(
+                request,
+                &axial_resource::process_physical_work(),
+                &crate::tasks::CancellationToken::new(),
+            )
+            .await
+        })
+        .await;
+        let (source, preserved, target, context_unchanged) = captured.unwrap();
+        let bytes = [std::fs::read(source).unwrap(), std::fs::read(preserved).unwrap(), std::fs::read(target).unwrap()];
+        let result = result.map(drop);
+        drop(application);
+        let diagnostic = root.keep();
+        eprintln!("plan admission diagnostic fixture: {}", diagnostic.display());
+        assert!(context_unchanged);
+        assert!(matches!(result, Err(LaunchError::PlanRejected)));
+        assert!(bytes.iter().all(|bytes| bytes == b"step"));
+        std::fs::remove_dir_all(diagnostic).unwrap();
+    }
+
+    #[tokio::test]
     async fn changed_installation_is_rejected_at_the_actual_pre_spawn_boundary() {
         let (root, prepared, _application) = fixture().await;
         let prepared = construct(prepared).unwrap();
